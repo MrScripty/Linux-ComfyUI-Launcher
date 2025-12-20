@@ -2,12 +2,14 @@ import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Check, X, Terminal, ArrowDownToLine, Monitor, Menu, RefreshCw, Loader2 } from 'lucide-react';
 import { SpringyToggle } from './components/SpringyToggle';
+import { VersionSelector } from './components/VersionSelector';
 
 // TypeScript definitions for PyWebView API
 declare global {
   interface Window {
     pywebview?: {
       api: {
+        // Original API methods
         get_status: () => Promise<any>;
         install_deps: () => Promise<{ success: boolean }>;
         toggle_patch: () => Promise<{ success: boolean }>;
@@ -16,6 +18,27 @@ declare global {
         close_window: () => Promise<{ success: boolean }>;
         launch_comfyui: () => Promise<{ success: boolean }>;
         stop_comfyui: () => Promise<{ success: boolean }>;
+
+        // Version Management API (Phase 5)
+        get_available_versions: (force_refresh?: boolean) => Promise<{ success: boolean; versions: any[]; error?: string }>;
+        get_installed_versions: () => Promise<{ success: boolean; versions: string[]; error?: string }>;
+        install_version: (tag: string) => Promise<{ success: boolean; error?: string }>;
+        remove_version: (tag: string) => Promise<{ success: boolean; error?: string }>;
+        switch_version: (tag: string) => Promise<{ success: boolean; error?: string }>;
+        get_active_version: () => Promise<{ success: boolean; version: string; error?: string }>;
+        check_version_dependencies: (tag: string) => Promise<{ success: boolean; dependencies: any; error?: string }>;
+        install_version_dependencies: (tag: string) => Promise<{ success: boolean; error?: string }>;
+        get_version_status: () => Promise<{ success: boolean; status: any; error?: string }>;
+        get_version_info: (tag: string) => Promise<{ success: boolean; info: any; error?: string }>;
+        launch_version: (tag: string, extra_args?: string[]) => Promise<{ success: boolean; error?: string }>;
+
+        // Resource Management API (Phase 5)
+        get_models: () => Promise<{ success: boolean; models: any; error?: string }>;
+        get_custom_nodes: (version_tag: string) => Promise<{ success: boolean; nodes: string[]; error?: string }>;
+        install_custom_node: (git_url: string, version_tag: string, node_name?: string) => Promise<{ success: boolean; error?: string }>;
+        update_custom_node: (node_name: string, version_tag: string) => Promise<{ success: boolean; error?: string }>;
+        remove_custom_node: (node_name: string, version_tag: string) => Promise<{ success: boolean; error?: string }>;
+        scan_shared_storage: () => Promise<{ success: boolean; result: any; error?: string }>;
       };
     };
   }
@@ -290,7 +313,12 @@ export default function App() {
 
         {/* Main Content */}
         <div className="flex-1 p-6 flex flex-col items-center">
-          
+
+        {/* VERSION SELECTOR */}
+        <div className="w-full mb-4">
+          <VersionSelector />
+        </div>
+
         {/* DEPENDENCY SECTION */}
         <div className="w-full mb-6 min-h-[50px] flex items-center justify-center">
           <AnimatePresence mode="wait">

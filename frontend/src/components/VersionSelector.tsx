@@ -1,0 +1,140 @@
+import React, { useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { ChevronDown, RefreshCw, Check, Loader2 } from 'lucide-react';
+import { useVersions } from '../hooks/useVersions';
+
+export function VersionSelector() {
+  const {
+    installedVersions,
+    activeVersion,
+    isLoading,
+    switchVersion,
+    refreshAll,
+  } = useVersions();
+
+  const [isOpen, setIsOpen] = useState(false);
+  const [isSwitching, setIsSwitching] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const handleVersionSwitch = async (tag: string) => {
+    if (tag === activeVersion) {
+      setIsOpen(false);
+      return;
+    }
+
+    setIsSwitching(true);
+    try {
+      await switchVersion(tag);
+      setIsOpen(false);
+    } catch (e) {
+      console.error('Failed to switch version:', e);
+    } finally {
+      setIsSwitching(false);
+    }
+  };
+
+  const handleRefresh = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setIsRefreshing(true);
+    try {
+      await refreshAll(true); // Force refresh from GitHub
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const displayVersion = activeVersion || 'No version selected';
+  const hasInstalledVersions = installedVersions.length > 0;
+
+  return (
+    <div className="relative w-full">
+      {/* Version Selector Button */}
+      <button
+        onClick={() => hasInstalledVersions && setIsOpen(!isOpen)}
+        disabled={!hasInstalledVersions || isLoading || isSwitching}
+        className={`w-full h-10 bg-[#2a2a2a] hover:bg-[#333333] border border-[#444] rounded flex items-center justify-between px-3 transition-colors ${
+          !hasInstalledVersions || isLoading || isSwitching
+            ? 'opacity-50 cursor-not-allowed'
+            : 'cursor-pointer'
+        }`}
+      >
+        <div className="flex items-center gap-2">
+          {isSwitching ? (
+            <Loader2 size={14} className="text-gray-400 animate-spin" />
+          ) : (
+            <div className="w-2 h-2 rounded-full bg-[#55ff55]" />
+          )}
+          <span className="text-sm text-white font-medium">
+            {isSwitching ? 'Switching...' : displayVersion}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Refresh Button */}
+          <motion.button
+            onClick={handleRefresh}
+            disabled={isRefreshing || isLoading}
+            className="p-1 rounded hover:bg-[#444] transition-colors disabled:opacity-50"
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+          >
+            <RefreshCw
+              size={14}
+              className={`text-gray-400 ${isRefreshing ? 'animate-spin' : ''}`}
+            />
+          </motion.button>
+
+          {/* Dropdown Arrow */}
+          {hasInstalledVersions && (
+            <motion.div
+              animate={{ rotate: isOpen ? 180 : 0 }}
+              transition={{ duration: 0.2 }}
+            >
+              <ChevronDown size={16} className="text-gray-400" />
+            </motion.div>
+          )}
+        </div>
+      </button>
+
+      {/* Dropdown Menu */}
+      <AnimatePresence>
+        {isOpen && hasInstalledVersions && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ duration: 0.2 }}
+            className="absolute top-full left-0 right-0 mt-1 bg-[#2a2a2a] border border-[#444] rounded shadow-lg overflow-hidden z-50"
+          >
+            <div className="max-h-64 overflow-y-auto">
+              {installedVersions.map((version) => {
+                const isActive = version === activeVersion;
+                return (
+                  <button
+                    key={version}
+                    onClick={() => handleVersionSwitch(version)}
+                    disabled={isSwitching}
+                    className={`w-full px-3 py-2 text-left text-sm flex items-center justify-between transition-colors ${
+                      isActive
+                        ? 'bg-[#333333] text-[#55ff55]'
+                        : 'text-gray-300 hover:bg-[#333333] hover:text-white'
+                    } ${isSwitching ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    <span className="font-medium">{version}</span>
+                    {isActive && <Check size={14} className="text-[#55ff55]" />}
+                  </button>
+                );
+              })}
+            </div>
+
+            {installedVersions.length === 0 && (
+              <div className="px-3 py-4 text-sm text-gray-500 text-center">
+                No versions installed
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
