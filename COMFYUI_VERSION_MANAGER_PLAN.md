@@ -2,7 +2,7 @@
 
 **Project**: Linux ComfyUI Launcher - Multi-Version Management System
 **Date**: 2025-12-19
-**Last Updated**: 2025-12-19
+**Last Updated**: 2025-12-20
 **Purpose**: Enable installation, management, and switching between multiple ComfyUI versions with shared resources
 
 ---
@@ -71,9 +71,133 @@
 - PyWebView ready event handling
 - Full frontend-backend integration
 
+📋 **Phase 6.2.5: Enhanced Installation Experience** (Not Started)
+
+**Sub-phase 6.2.5a: Pre-caching Infrastructure**
+- Cache file structures for release data
+  - `release-requirements.json` - Cached requirements.txt for each release
+  - `package-sizes.json` - Package size lookup table
+  - `release-sizes.json` - Total sizes per release
+  - `installation-state.json` - Active installation progress tracking
+- `ReleaseDataFetcher` class
+  - Fetch requirements.txt from GitHub for each release
+  - Cache requirements.txt with hash
+  - Background task runner on app startup
+  - Process releases newest → oldest
+- `PackageSizeResolver` class
+  - Query PyPI JSON API for package sizes
+  - Platform detection (Linux/macOS/Windows)
+  - Python version detection
+  - Fallback to UV dry-run if needed
+  - Cache package sizes with platform identifier
+- `ReleaseSizeCalculator` class
+  - Calculate total size per release (archive + dependencies)
+  - Sort dependencies by size (largest first)
+  - Cache complete size data
+  - Invalidation based on requirements hash
+- Background pre-caching on app startup
+  - Non-blocking UI
+  - Progressive data availability
+
+**Sub-phase 6.2.5b: Progress Tracking System**
+- `InstallationProgressTracker` class
+  - Thread-safe state management
+  - JSON file-based progress writer
+  - Progress calculation with stage weighting
+  - Stage management (download, extract, venv, dependencies, setup)
+- Refactor `install_version()` for granular progress tracking
+  - Download progress (bytes, speed, ETA)
+  - Extraction progress
+  - Virtual environment creation progress
+  - Individual dependency installation tracking
+  - Track current package being installed
+  - Calculate overall progress and time remaining
+- Backend API endpoint
+  - `get_installation_progress()` method
+  - Return current state or null
+  - Support 1-second polling interval
+
+**Sub-phase 6.2.5c: Enhanced Progress UI**
+- `InstallationProgressDialog` component
+  - Multi-stage progress display (Stage X of 5)
+  - Progress bar with accurate percentage
+  - Download speed display (MB/s)
+  - Time remaining estimation
+  - Current item/package display
+  - Overall progress indicator
+- Collapsible completed items list
+  - Expandable section for completed packages
+  - Show package name, version, and size
+  - Checkmark indicators
+  - Auto-scroll to current item
+- Enhanced dependency list in install dialog
+  - Collapsible section (collapsed by default)
+  - Size-sorted display (largest first)
+  - Show size and percentage of total per package
+  - Total summary with package count
+  - Archive size vs dependencies breakdown
+- Install dialog size display improvements
+  - Show total download size immediately (from cache)
+  - Progressive enhancement for uncached releases
+  - "Calculating..." state for missing data
+  - Display format: "Total Size: 4.5 GB (12 dependencies)"
+
+**Sub-phase 6.2.5d: Installation Control**
+- Backend cancellation support
+  - Process tracking (store PID in state)
+  - Graceful subprocess termination
+  - Force kill fallback (5-second timeout)
+  - Cleanup on cancellation (remove partial files, update metadata)
+- Cancel button in progress UI
+  - Confirmation dialog before cancelling
+  - Call backend cancel method
+  - Show cleanup progress
+  - Return to install dialog
+- Window close handler during installation
+  - Detect active installations on close attempt
+  - Show warning dialog with options:
+    - Cancel installation and exit
+    - Continue installation (stay in app)
+  - Clean up processes on confirmed exit
+  - Prevent orphaned installation processes
+
+**Sub-phase 6.2.5e: UX Polish**
+- Version selector empty state improvements
+  - Remove hardcoded "0.2.0" placeholder
+  - Display "No Versions Installed" when empty
+  - Make selector clickable to open install dialog
+  - Highlight/emphasize download button when empty
+  - Guide user to first action
+- "Open in File Manager" functionality
+  - Cross-platform implementation (Linux/macOS/Windows)
+  - Add button to version selector for active version
+  - Add button to version manager view (Phase 6.3)
+  - Open installation directory in system file manager
+- Cache management (Settings - Phase 6.5)
+  - Cache statistics display
+  - Clear cache buttons (release data, UV cache, all)
+  - Warning messages about re-downloads
+  - Global cache clearing
+- Visual polish
+  - Loading states and animations
+  - Error state displays
+  - Success confirmations
+  - Smooth transitions
+
+**Key Features Summary**:
+- Accurate download size calculation with dependency sizes
+- Background pre-caching for instant size display
+- Real-time installation progress with download speeds
+- Ability to cancel installations with cleanup
+- Protection against accidental window close during installation
+- Improved empty state UX guiding users to install first version
+- Cross-platform file manager integration
+- Size-sorted dependency lists for transparency
+
 📋 **Phase 6.3: Version Manager View** (Not Started)
 - Table of installed versions with metadata
 - Version actions (Launch, Configure, Remove)
+- "Open in File Manager" button for each version
 - Update checking and notifications
 
 📋 **Phase 6.4: Resource Browser Component** (Not Started)
@@ -1069,39 +1193,206 @@ class MetadataManager:
 - `[⚙]` - Configure version (custom nodes, launch args)
 - `[🗑]` - Delete version
 
-### Install New Version Dialog
+### Install New Version Dialog (Enhanced - Phase 6.2.5)
 
+**With Size Information (Collapsed Dependencies)**:
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  Install ComfyUI Version                         [X]     │
 ├─────────────────────────────────────────────────────────┤
-│                                                          │
 │  Available Releases:                                     │
 │                                                          │
 │  ┌────────────────────────────────────────────────────┐ │
 │  │ v0.3.0 - Jan 25, 2025                 [Install]    │ │
 │  │ ─────────────────────────────────────────────────  │ │
+│  │ Total Size: 4.5 GB                                 │ │
+│  │ ComfyUI: 125 MB | Dependencies: 4.4 GB (12 pkgs)   │ │
+│  │                                                    │ │
+│  │ [▶ Show Dependencies (sorted by size)]             │ │
+│  │                                                    │ │
 │  │ ### New Features                                   │ │
 │  │ - Added XYZ plot node                              │ │
 │  │ - Improved performance                             │ │
 │  │                                                    │ │
-│  │ Custom Node Compatibility:                         │ │
-│  │ ✓ ComfyUI-Manager (compatible)                     │ │
-│  │ ✓ WAS-Node-Suite (compatible)                      │ │
-│  │ ✗ Advanced-ControlNet (incompatible - torch v2.2)  │ │
-│  │                                                    │ │
 │  │ v0.2.1 - Jan 18, 2025              [✓ Installed]  │ │
 │  │ ─────────────────────────────────────────────────  │ │
+│  │ Total Size: 4.5 GB                                 │ │
 │  │ Bug fixes and stability improvements               │ │
 │  │                                                    │ │
 │  │ v0.2.0 - Jan 10, 2025              [✓ Installed]  │ │
 │  │ ─────────────────────────────────────────────────  │ │
+│  │ Total Size: 4.5 GB                                 │ │
 │  │ Initial stable release                             │ │
 │  └────────────────────────────────────────────────────┘ │
 │                                                          │
-│  [ ] Show pre-releases                                   │
+│  [ ] Show pre-releases  [ ] Show installed               │
 │                                                          │
 │  [Cancel]                                                │
+└─────────────────────────────────────────────────────────┘
+```
+
+**With Expanded Dependencies**:
+```
+┌─────────────────────────────────────────────────────────┐
+│  Install ComfyUI Version                         [X]     │
+├─────────────────────────────────────────────────────────┤
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ v0.3.0 - Jan 25, 2025                 [Install]    │ │
+│  │ ─────────────────────────────────────────────────  │ │
+│  │ Total Size: 4.5 GB                                 │ │
+│  │ ComfyUI: 125 MB | Dependencies: 4.4 GB (12 pkgs)   │ │
+│  │                                                    │ │
+│  │ [▼ Hide Dependencies]                              │ │
+│  │ ┌──────────────────────────────────────────────┐   │ │
+│  │ │ Dependencies (sorted by size):               │   │ │
+│  │ │  1. torch==2.1.0           2.8 GB  (63%)     │   │ │
+│  │ │  2. torchvision==0.16.0    1.2 GB  (27%)     │   │ │
+│  │ │  3. transformers>=4.25.1   230 MB  (5%)      │   │ │
+│  │ │  4. safetensors>=0.4.2      45 MB  (1%)      │   │ │
+│  │ │  5. scipy                   32 MB  (<1%)     │   │ │
+│  │ │  6. Pillow                  28 MB  (<1%)     │   │ │
+│  │ │  ... 6 more packages        85 MB  (2%)      │   │ │
+│  │ │ Total: 4.4 GB across 12 packages             │   │ │
+│  │ └──────────────────────────────────────────────┘   │ │
+│  │                                                    │ │
+│  │ ### New Features                                   │ │
+│  │ - Added XYZ plot node                              │ │
+│  └────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Installation Progress Dialog (New - Phase 6.2.5)
+
+**During Download Stage**:
+```
+┌─────────────────────────────────────────────────────────┐
+│ Installing ComfyUI v0.2.0                               │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│ Stage 1 of 5: Downloading ComfyUI                       │
+│                                                         │
+│ [████████████████░░░░░░░░] 89.2 MB / 125 MB (71%)      │
+│                                                         │
+│ Download speed: 5.2 MB/s                                │
+│ Time remaining: ~7 seconds                              │
+│                                                         │
+│ Overall progress: 14%                                   │
+│                                                         │
+│                            [Cancel Installation]        │
+└─────────────────────────────────────────────────────────┘
+```
+
+**During Dependency Installation**:
+```
+┌─────────────────────────────────────────────────────────┐
+│ Installing ComfyUI v0.2.0                               │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│ Stage 4 of 5: Installing Dependencies                   │
+│                                                         │
+│ [██████████░░░░░░░░░░░░░░] 2.1 GB / 4.4 GB (48%)       │
+│                                                         │
+│ Currently installing: torch==2.1.0                      │
+│ Download speed: 4.8 MB/s                                │
+│ Time remaining: ~8 minutes                              │
+│                                                         │
+│ Completed: 3 of 12 packages                             │
+│ [▶ Show completed packages]                             │
+│                                                         │
+│ Overall progress: 52%                                   │
+│                                                         │
+│                            [Cancel Installation]        │
+└─────────────────────────────────────────────────────────┘
+```
+
+**With Completed Packages Expanded**:
+```
+┌─────────────────────────────────────────────────────────┐
+│ Installing ComfyUI v0.2.0                               │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│ Stage 4 of 5: Installing Dependencies                   │
+│                                                         │
+│ [██████████░░░░░░░░░░░░░░] 2.1 GB / 4.4 GB (48%)       │
+│                                                         │
+│ Currently installing: torch==2.1.0                      │
+│ Download speed: 4.8 MB/s                                │
+│ Time remaining: ~8 minutes                              │
+│                                                         │
+│ Completed: 3 of 12 packages                             │
+│ [▼ Hide completed packages]                             │
+│ ┌───────────────────────────────────────────────────┐   │
+│ │ ✓ Pillow==10.0.0            28 MB                 │   │
+│ │ ✓ numpy==1.24.0             12 MB                 │   │
+│ │ ✓ pyyaml==6.0.1              5 MB                 │   │
+│ └───────────────────────────────────────────────────┘   │
+│                                                         │
+│ Overall progress: 52%                                   │
+│                                                         │
+│                            [Cancel Installation]        │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Empty State Version Selector (Enhanced - Phase 6.2.5)
+
+**When No Versions Installed**:
+```
+┌─────────────────────────────────────────────────────────┐
+│  ComfyUI Launcher                                        │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │ ⬇ No Versions Installed - Click to Install     │◄─ Clickable
+│  └─────────────────────────────────────────────────┘   │
+│                     (Highlighted/Pulsing)               │
+│                                                         │
+│  [ Launch ComfyUI ] ← Disabled                          │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Cancellation Confirmation Dialog (New - Phase 6.2.5)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Cancel Installation?                                    │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│ Are you sure you want to cancel the installation       │
+│ of ComfyUI v0.2.0?                                      │
+│                                                         │
+│ Progress will be lost and all downloaded files          │
+│ will be deleted.                                        │
+│                                                         │
+│ Current progress: 52% (2.1 GB downloaded)               │
+│                                                         │
+│                  [No, Continue]  [Yes, Cancel]          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Window Close Warning Dialog (New - Phase 6.2.5)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Installation in Progress                                │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│ ComfyUI v0.2.0 is currently being installed            │
+│                                                         │
+│ Progress: Installing dependencies (3.2 GB / 4.5 GB)     │
+│                                                         │
+│ What would you like to do?                              │
+│                                                         │
+│ ┌───────────────────────────────────────────────────┐   │
+│ │ [🗑️ Cancel Installation and Exit]                 │   │
+│ │   Installation will be stopped and cleaned up      │   │
+│ └───────────────────────────────────────────────────┘   │
+│                                                         │
+│ ┌───────────────────────────────────────────────────┐   │
+│ │ [↩️ Continue Installation (Don't Exit)]           │   │
+│ │   Return to launcher to monitor progress           │   │
+│ └───────────────────────────────────────────────────┘   │
+│                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -1138,6 +1429,345 @@ class MetadataManager:
 ---
 
 ## Technical Specifications
+
+### Enhanced Installation Experience - Cache Structures (Phase 6.2.5)
+
+**Cache Directory Structure**:
+```
+launcher-data/cache/
+├── github-releases.json          # Existing: GitHub releases cache
+├── release-requirements.json      # NEW: Cached requirements.txt for each release
+├── package-sizes.json             # NEW: Package size lookup table
+├── release-sizes.json             # NEW: Total sizes per release
+├── installation-state.json        # NEW: Active installation progress
+└── uv-cache/                      # NEW: Shared UV package cache
+    └── (UV managed files)
+```
+
+**release-requirements.json**:
+```json
+{
+  "v0.2.0": {
+    "requirements_txt": "torch>=2.0.0\ntorchvision>=0.15.0\n...",
+    "requirements_hash": "sha256:abc123...",
+    "fetched_at": "2025-12-19T10:30:00Z",
+    "source_url": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/v0.2.0/requirements.txt"
+  },
+  "v0.2.1": {
+    "requirements_txt": "torch>=2.0.0\n...",
+    "requirements_hash": "sha256:def456...",
+    "fetched_at": "2025-12-19T10:31:00Z",
+    "source_url": "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/v0.2.1/requirements.txt"
+  }
+}
+```
+
+**package-sizes.json**:
+```json
+{
+  "packages": {
+    "torch==2.1.0+cpu": {
+      "size": 2847392012,
+      "platform": "linux_x86_64",
+      "python_version": "3.11",
+      "checked_at": "2025-12-19T10:30:00Z",
+      "wheel_filename": "torch-2.1.0-cp311-cp311-manylinux_2_17_x86_64.whl"
+    },
+    "torchvision==0.16.0": {
+      "size": 1250000000,
+      "platform": "linux_x86_64",
+      "python_version": "3.11",
+      "checked_at": "2025-12-19T10:30:00Z",
+      "wheel_filename": "torchvision-0.16.0-cp311-cp311-linux_x86_64.whl"
+    },
+    "transformers>=4.25.1": {
+      "size": 230000000,
+      "resolved_version": "4.36.0",
+      "platform": "any",
+      "python_version": "3.11",
+      "checked_at": "2025-12-19T10:30:00Z"
+    }
+  }
+}
+```
+
+**release-sizes.json**:
+```json
+{
+  "v0.2.0": {
+    "archive_size": 125000000,
+    "dependencies_size": 4375000000,
+    "total_size": 4500000000,
+    "requirements_hash": "sha256:abc123...",
+    "dependency_count": 12,
+    "calculated_at": "2025-12-19T10:30:00Z",
+    "dependencies": [
+      {
+        "name": "torch",
+        "version": "2.1.0",
+        "size": 2847392012,
+        "percentage": 63.2
+      },
+      {
+        "name": "torchvision",
+        "version": "0.16.0",
+        "size": 1250000000,
+        "percentage": 27.8
+      },
+      {
+        "name": "transformers",
+        "version": "4.36.0",
+        "size": 230000000,
+        "percentage": 5.1
+      }
+    ]
+  }
+}
+```
+
+**installation-state.json**:
+```json
+{
+  "active_installation": {
+    "tag": "v0.2.0",
+    "pid": 12345,
+    "status": "installing_dependencies",
+    "stage": 4,
+    "total_stages": 5,
+    "stage_name": "Installing Dependencies",
+    "progress": {
+      "current_bytes": 2147483648,
+      "total_bytes": 4500000000,
+      "percent": 47.7,
+      "current_item": "torch==2.1.0",
+      "items_completed": 3,
+      "items_total": 12,
+      "download_speed_bps": 5242880,
+      "estimated_seconds_remaining": 480
+    },
+    "completed_items": [
+      {"name": "Pillow", "version": "10.0.0", "size": 28000000},
+      {"name": "numpy", "version": "1.24.0", "size": 12000000},
+      {"name": "pyyaml", "version": "6.0.1", "size": 5000000}
+    ],
+    "started_at": "2025-12-19T10:30:00Z",
+    "last_update": "2025-12-19T10:35:42Z"
+  }
+}
+```
+
+### Package Size Resolution (Phase 6.2.5)
+
+**Method 1: PyPI JSON API** (Primary):
+```python
+def get_package_size_from_pypi(package_name: str, version: str) -> int:
+    """
+    Query PyPI JSON API for package size
+
+    Example URL: https://pypi.org/pypi/torch/2.1.0/json
+
+    Returns size in bytes for the appropriate wheel for current platform
+    """
+    # 1. Detect current platform (Linux/macOS/Windows)
+    # 2. Detect Python version (e.g., cp311)
+    # 3. Fetch JSON from PyPI
+    # 4. Find matching wheel file based on platform tags
+    # 5. Return size from wheel metadata
+    # 6. Fallback to source distribution if no wheel
+```
+
+**Method 2: UV Dry Run** (Fallback):
+```python
+def get_package_size_from_uv(package_spec: str) -> int:
+    """
+    Use UV to calculate download size without downloading
+
+    Command: uv pip install --dry-run --report - <package>
+
+    Returns JSON report with package info including sizes
+    """
+    # UV's --report flag outputs JSON with download sizes
+    # Parse to extract total download size
+```
+
+**Cache Invalidation Rules**:
+- `release-requirements.json`: Never expire (requirements.txt for a tag is immutable)
+- `package-sizes.json`: 30 days (packages rarely change, but new builds may appear)
+- `release-sizes.json`: Re-calculate only if requirements_hash changes
+- User can manually clear all caches via Settings
+
+### Background Pre-caching Strategy (Phase 6.2.5)
+
+**On Application Startup**:
+```python
+async def precache_release_data():
+    """
+    Background task to pre-cache release data on app startup
+    Runs newest → oldest to prioritize user-visible data
+    """
+    releases = await fetch_github_releases()
+
+    for release in sorted(releases, key=lambda r: r.published_at, reverse=True):
+        # 1. Fetch and cache requirements.txt if not cached
+        if not is_requirements_cached(release.tag):
+            await cache_requirements(release.tag)
+
+        # 2. Parse requirements
+        requirements = parse_requirements(release.tag)
+
+        # 3. Query and cache package sizes if not cached
+        for package in requirements:
+            if not is_package_size_cached(package):
+                size = await get_package_size(package)
+                cache_package_size(package, size)
+
+        # 4. Calculate and cache total release size
+        total_size = calculate_release_size(release.tag)
+        cache_release_size(release.tag, total_size)
+
+        # Yield to UI thread periodically
+        await asyncio.sleep(0)
+```
+
+### Progress Tracking State Machine (Phase 6.2.5)
+
+**Installation Stages**:
+1. **Downloading** (0-20% of overall progress)
+   - Download ComfyUI archive from GitHub
+   - Track bytes downloaded, speed, ETA
+
+2. **Extracting** (20-25% of overall progress)
+   - Extract tarball/zipball
+   - Indeterminate progress
+
+3. **Creating Virtual Environment** (25-30% of overall progress)
+   - Run UV to create venv
+   - Indeterminate progress
+
+4. **Installing Dependencies** (30-95% of overall progress)
+   - Install each package from requirements.txt
+   - Track current package, bytes downloaded
+   - Track completed packages
+   - Calculate speed and ETA
+
+5. **Setting Up Symlinks** (95-100% of overall progress)
+   - Create symlinks to shared resources
+   - Indeterminate progress
+
+**Progress Calculation**:
+```python
+def calculate_overall_progress(stage: str, stage_progress: float) -> float:
+    """
+    Calculate overall progress percentage
+
+    Stage weights:
+    - Download: 20%
+    - Extract: 5%
+    - Create venv: 5%
+    - Install deps: 65%
+    - Setup: 5%
+    """
+    stage_ranges = {
+        'downloading': (0, 20),
+        'extracting': (20, 25),
+        'creating_venv': (25, 30),
+        'installing_dependencies': (30, 95),
+        'setting_up': (95, 100)
+    }
+
+    start, end = stage_ranges[stage]
+    range_size = end - start
+
+    return start + (stage_progress * range_size / 100)
+```
+
+### Installation Cancellation (Phase 6.2.5)
+
+**Process Management**:
+```python
+class InstallationController:
+    """Manages installation processes and cancellation"""
+
+    def __init__(self):
+        self.active_processes = {}  # tag -> subprocess.Popen
+
+    def start_installation(self, tag: str) -> subprocess.Popen:
+        """Start installation subprocess and track it"""
+        process = subprocess.Popen([...])
+        self.active_processes[tag] = process
+        return process
+
+    def cancel_installation(self, tag: str) -> bool:
+        """Cancel active installation with cleanup"""
+        if tag not in self.active_processes:
+            return False
+
+        process = self.active_processes[tag]
+
+        # 1. Graceful termination (SIGTERM)
+        process.terminate()
+
+        # 2. Wait up to 5 seconds for graceful shutdown
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # 3. Force kill (SIGKILL)
+            process.kill()
+            process.wait()
+
+        # 4. Cleanup partial installation
+        self._cleanup_installation(tag)
+
+        # 5. Remove from active processes
+        del self.active_processes[tag]
+
+        return True
+
+    def _cleanup_installation(self, tag: str):
+        """Remove partial installation files"""
+        version_path = versions_dir / tag
+        if version_path.exists():
+            shutil.rmtree(version_path)
+
+        # Clean up temp downloads
+        temp_dir = launcher_root / "temp"
+        for file in temp_dir.glob(f"{tag}*"):
+            file.unlink()
+
+        # Update metadata
+        remove_from_metadata(tag)
+```
+
+### Cross-Platform File Manager Integration (Phase 6.2.5)
+
+```python
+def open_in_file_manager(path: Path) -> bool:
+    """
+    Open path in system file manager
+
+    Cross-platform implementation for Linux/macOS/Windows
+    """
+    import platform
+    import subprocess
+
+    system = platform.system()
+
+    try:
+        if system == "Linux":
+            # Try xdg-open (works on most Linux desktops)
+            subprocess.Popen(['xdg-open', str(path)])
+        elif system == "Darwin":  # macOS
+            subprocess.Popen(['open', str(path)])
+        elif system == "Windows":
+            subprocess.Popen(['explorer', str(path)])
+        else:
+            return False
+
+        return True
+    except Exception as e:
+        print(f"Error opening file manager: {e}")
+        return False
+```
 
 ### UV Package Manager Integration
 
