@@ -1,20 +1,26 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronDown, RefreshCw, Check, Loader2 } from 'lucide-react';
+import { ChevronDown, RefreshCw, Check, Loader2, Download } from 'lucide-react';
 import { useVersions } from '../hooks/useVersions';
+import { InstallDialog } from './InstallDialog';
 
 export function VersionSelector() {
   const {
     installedVersions,
     activeVersion,
+    availableVersions,
     isLoading,
     switchVersion,
+    installVersion,
     refreshAll,
   } = useVersions();
 
   const [isOpen, setIsOpen] = useState(false);
   const [isSwitching, setIsSwitching] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isInstallDialogOpen, setIsInstallDialogOpen] = useState(false);
+
+  console.log('VersionSelector mounted - installedVersions:', installedVersions.length, 'availableVersions:', availableVersions.length);
 
   const handleVersionSwitch = async (tag: string) => {
     if (tag === activeVersion) {
@@ -50,7 +56,13 @@ export function VersionSelector() {
     <div className="relative w-full">
       {/* Version Selector Button */}
       <button
-        onClick={() => hasInstalledVersions && setIsOpen(!isOpen)}
+        onClick={() => {
+          console.log('Version selector clicked, hasInstalledVersions:', hasInstalledVersions, 'isOpen:', isOpen);
+          if (hasInstalledVersions) {
+            setIsOpen(!isOpen);
+            console.log('Set isOpen to:', !isOpen);
+          }
+        }}
         disabled={!hasInstalledVersions || isLoading || isSwitching}
         className={`w-full h-10 bg-[#2a2a2a] hover:bg-[#333333] border border-[#444] rounded flex items-center justify-between px-3 transition-colors ${
           !hasInstalledVersions || isLoading || isSwitching
@@ -70,6 +82,23 @@ export function VersionSelector() {
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Download Button */}
+          <motion.button
+            onClick={(e) => {
+              console.log('Download button clicked!');
+              e.stopPropagation();
+              setIsInstallDialogOpen(true);
+              console.log('Install dialog state set to true');
+            }}
+            disabled={isLoading}
+            className="p-1 rounded hover:bg-[#444] transition-colors disabled:opacity-50"
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            title="Install new version"
+          >
+            <Download size={14} className="text-gray-400" />
+          </motion.button>
+
           {/* Refresh Button */}
           <motion.button
             onClick={handleRefresh}
@@ -77,6 +106,7 @@ export function VersionSelector() {
             className="p-1 rounded hover:bg-[#444] transition-colors disabled:opacity-50"
             whileHover={{ scale: 1.1 }}
             whileTap={{ scale: 0.9 }}
+            title="Refresh from GitHub"
           >
             <RefreshCw
               size={14}
@@ -135,6 +165,17 @@ export function VersionSelector() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Install Dialog */}
+      <InstallDialog
+        isOpen={isInstallDialogOpen}
+        onClose={() => setIsInstallDialogOpen(false)}
+        availableVersions={availableVersions}
+        installedVersions={installedVersions}
+        isLoading={isLoading}
+        onInstallVersion={installVersion}
+        onRefreshAll={refreshAll}
+      />
     </div>
   );
 }

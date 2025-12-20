@@ -7,7 +7,7 @@ Desktop application using PyWebView with React frontend
 import sys
 import webview
 from pathlib import Path
-from api import ComfyUISetupAPI
+from backend.api import ComfyUISetupAPI
 
 
 class JavaScriptAPI:
@@ -288,7 +288,8 @@ def main():
 
     # Start the webview application
     # Use 'gtk' backend on Linux for best compatibility with Debian/Mint
-    webview.start(debug=is_dev, gui='gtk')
+    # Force debug=True to enable developer console
+    webview.start(debug=True, gui='gtk')
 
 
 if __name__ == "__main__":

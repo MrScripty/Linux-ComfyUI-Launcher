@@ -76,17 +76,23 @@ export function useVersions() {
   // Fetch available versions from GitHub
   const fetchAvailableVersions = useCallback(async (forceRefresh: boolean = false) => {
     if (!window.pywebview?.api?.get_available_versions) {
+      console.error('get_available_versions not available');
       return;
     }
 
     try {
+      console.log('Fetching available versions, forceRefresh:', forceRefresh);
       const result = await window.pywebview.api.get_available_versions(forceRefresh);
+      console.log('Available versions result:', result);
       if (result.success) {
         setAvailableVersions(result.versions || []);
+        console.log('Set available versions:', result.versions?.length);
       } else {
+        console.error('Failed to fetch available versions:', result.error);
         setError(result.error || 'Failed to fetch available versions');
       }
     } catch (e) {
+      console.error('Exception fetching available versions:', e);
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
@@ -224,14 +230,32 @@ export function useVersions() {
     }
   }, [fetchInstalledVersions, fetchActiveVersion, fetchAvailableVersions, fetchVersionStatus]);
 
-  // Initial load
+  // Initial load - wait for PyWebView to be ready
   useEffect(() => {
-    if (!window.pywebview?.api) {
-      setIsLoading(false);
-      return;
-    }
+    const loadData = () => {
+      console.log('useVersions loadData - pywebview available:', !!window.pywebview, 'api available:', !!window.pywebview?.api);
+      if (!window.pywebview?.api) {
+        console.error('PyWebView API not available!');
+        setIsLoading(false);
+        return;
+      }
 
-    refreshAll(false);
+      console.log('Calling refreshAll...');
+      refreshAll(false);
+    };
+
+    // Check if pywebview is already available
+    if (window.pywebview?.api) {
+      console.log('PyWebView API already available, loading data immediately');
+      loadData();
+    } else {
+      // Wait for pywebviewready event
+      console.log('Waiting for pywebviewready event...');
+      window.addEventListener('pywebviewready', () => {
+        console.log('pywebviewready event fired!');
+        loadData();
+      });
+    }
   }, [refreshAll]);
 
   return {
