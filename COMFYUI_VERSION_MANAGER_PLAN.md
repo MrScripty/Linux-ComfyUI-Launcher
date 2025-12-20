@@ -52,12 +52,39 @@
 
 ### In Progress
 
-🔄 **Phase 6: Frontend UI Components** (Not Started)
-- React components for version management
-- Installation dialogs and progress indicators
-- Resource browsers for models, custom nodes, workflows
-- Custom node manager UI
-- Dependency check UI
+🔄 **Phase 6: Frontend UI Components** (In Progress - 2/5 complete)
+
+✅ **Phase 6.1: Version Selector Component** (Completed 2025-12-19)
+- Dropdown component showing installed versions
+- Active version indicator with visual feedback
+- Refresh button for GitHub releases
+- Version switching functionality
+- Loading states and animations
+- PyWebView API integration via useVersions hook
+
+✅ **Phase 6.2: Install Dialog Component** (Completed 2025-12-19)
+- Modal dialog for installing new versions from GitHub
+- Version cards with metadata (tag, date, release notes)
+- Filter controls (pre-releases, installed versions)
+- Install button with progress tracking
+- Error handling and user feedback
+- PyWebView ready event handling
+- Full frontend-backend integration
+
+📋 **Phase 6.3: Version Manager View** (Not Started)
+- Table of installed versions with metadata
+- Version actions (Launch, Configure, Remove)
+- Update checking and notifications
+
+📋 **Phase 6.4: Resource Browser Component** (Not Started)
+- Model browser with shared storage view
+- Custom node manager per version
+- Workflow organization
+
+📋 **Phase 6.5: Settings & Configuration** (Not Started)
+- Version-specific settings
+- Dependency management UI
+- Advanced options
 
 ### Planned
 
