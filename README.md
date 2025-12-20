@@ -1,12 +1,16 @@
 # Linux-ComfyUI-Launcher
 
-A simple launcher that opens ComfyUI as a standalone app, manages models accross installs, satisfy dependencies, and other minor QOL improvments.
+A comprehensive yet easy to use launcher that opens ComfyUI as a standalone app, manages models accross multiple installs, and other minor QOL improvments.
 
-### Features:
+## Features:
 
-- You dont need to `cd` or `source` to start ComfyUI
-- Includes a model manager to link your models accross new installs, no redownloading or copying files.
-- Creates system shortcuts with icons that run ComfyUI as a stand-alone desktop app
-- Starts and stops the ComfyUI server and names the process in task managers
-- Doesnt duplicate the interface or open browser tabs when starting/restarting
-- 
+- You get system shortcuts that run ComfyUI ASAP without starting the launcher
+- No more wasting time with terminal commands or URLs to start using ComfyUI
+- Be free from redownloading or copying files thanks to a smart automated managment system
+- Install and run different versions of ComfyUI with ease
+- Gohst buster the ComfyUI server when closing the app
+- And other technical mubo-jumbo
+- We have cookies
+
+## More Details Later (WIP)
+
