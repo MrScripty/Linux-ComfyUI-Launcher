@@ -158,19 +158,35 @@
   - ✅ Check for required files (main.py, venv, venv/bin/python)
   - ✅ Auto-cleanup of incomplete installations from metadata
   - ✅ Prevents showing "installed" for interrupted/deleted versions
+- ✅ Bug Fixes
+  - ✅ Fixed nested button HTML in VersionSelector preventing dialog from opening
+  - ✅ Fixed incorrect "installed" status for interrupted/deleted installations
+  - ✅ Fixed orphaned directories not being cleaned up after cancellation
+  - ✅ Fixed "directory exists" error when reinstalling after cancelled install
 - ⚠️ Size display per release - Deferred (infrastructure exists, frontend integration pending)
 
-**Sub-phase 6.2.5d: Installation Control** 📋 Pending
-- Backend cancellation support
-  - Process tracking (store PID in state) - Infrastructure exists
-  - Graceful subprocess termination
-  - Force kill fallback (5-second timeout)
-  - Cleanup on cancellation (remove partial files, update metadata)
-- Cancel button in progress UI
+**Sub-phase 6.2.5d: Installation Control** ✅ Completed
+- ✅ Backend cancellation support ([backend/version_manager.py](backend/version_manager.py))
+  - ✅ Process tracking with `_current_process` reference
+  - ✅ Immediate subprocess termination with `.kill()`
+  - ✅ Download cancellation with `_current_downloader` tracking
+  - ✅ Cleanup on cancellation (remove partial files, update metadata)
+  - ✅ Cancellation checks every 100ms during dependency installation
+- ✅ Download cancellation ([backend/github_integration.py](backend/github_integration.py))
+  - ✅ DownloadManager cancellation flag and `cancel()` method
+  - ✅ Cancellation check before each 8KB chunk read
+  - ✅ InterruptedError raised on cancellation
+  - ✅ Automatic cleanup of partial downloads
+  - ✅ Download interrupts within ~100ms
+- ✅ Cancel button in progress UI ([frontend/src/components/InstallDialog.tsx](frontend/src/components/InstallDialog.tsx))
   - ✅ Confirmation dialog before cancelling
-  - Backend cancel method implementation needed
-  - Show cleanup progress
-- Window close handler during installation
+  - ✅ Backend cancel method implementation (`cancel_installation()`)
+  - ✅ API integration ([backend/api.py](backend/api.py), [backend/main.py](backend/main.py))
+- ✅ Installation validation ([backend/version_manager.py](backend/version_manager.py), [frontend/src/hooks/useVersions.ts](frontend/src/hooks/useVersions.ts))
+  - ✅ Detect orphaned installation directories (no metadata entry)
+  - ✅ Auto-cleanup on app startup via `validate_installations()`
+  - ✅ Prevents "directory exists" errors on reinstall after cancelled install
+- ⚠️ Window close handler during installation - Deferred (not critical path)
   - Detect active installations on close attempt
   - Show warning dialog with options
   - Clean up processes on confirmed exit
