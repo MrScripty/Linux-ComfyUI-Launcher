@@ -63,6 +63,10 @@ class VersionManager:
         cache_dir = metadata_manager.launcher_data_dir / "cache"
         self.progress_tracker = InstallationProgressTracker(cache_dir)
 
+        # Cancellation flag (Phase 6.2.5d)
+        self._cancel_installation = False
+        self._installing_tag = None
+
     def get_installation_progress(self) -> Optional[Dict]:
         """
         Get current installation progress (Phase 6.2.5b)
@@ -71,6 +75,20 @@ class VersionManager:
             Progress state dict or None if no installation in progress
         """
         return self.progress_tracker.get_current_state()
+
+    def cancel_installation(self) -> bool:
+        """
+        Cancel the currently running installation (Phase 6.2.5d)
+
+        Returns:
+            True if cancellation was requested
+        """
+        if self._installing_tag:
+            print(f"Cancellation requested for {self._installing_tag}")
+            self._cancel_installation = True
+            self.progress_tracker.set_error("Installation cancelled by user")
+            return True
+        return False
 
     def get_available_releases(self, force_refresh: bool = False) -> List[GitHubRelease]:
         """
@@ -108,13 +126,79 @@ class VersionManager:
                 needs_cleanup = True
 
         # Clean up metadata if we found incomplete versions
+        # NOTE: This ONLY modifies the 'installed' dict in versions.json
+        # It does NOT touch the GitHub releases cache or any other cache files
         if needs_cleanup:
             for tag in metadata_versions:
                 if tag not in validated_versions:
                     del versions_metadata['installed'][tag]
             self.metadata_manager.save_versions(versions_metadata)
+            print(f"✓ Cleaned up metadata - removed {len(metadata_versions) - len(validated_versions)} incomplete version(s)")
 
         return validated_versions
+
+    def validate_installations(self) -> Dict[str, any]:
+        """
+        Validate all installations and return cleanup report
+
+        This is meant to be called at startup to detect and clean up
+        any incomplete installations, and report back to the frontend
+        so it can refresh the UI if needed.
+
+        Checks two scenarios:
+        1. Metadata says installed, but directory is incomplete/missing
+        2. Directory exists, but no metadata (cancelled/interrupted install)
+
+        Returns:
+            Dict with:
+                - had_invalid: bool - whether any invalid installations were found
+                - removed: List[str] - tags of removed versions
+                - valid: List[str] - tags of valid installed versions
+        """
+        versions_metadata = self.metadata_manager.load_versions()
+        metadata_versions = set(versions_metadata.get('installed', {}).keys())
+
+        validated_versions = []
+        removed_versions = []
+
+        # Check 1: Validate versions in metadata
+        for tag in metadata_versions:
+            version_path = self.versions_dir / tag
+            if self._is_version_complete(version_path):
+                validated_versions.append(tag)
+            else:
+                removed_versions.append(tag)
+                print(f"Warning: Version {tag} in metadata but directory incomplete/missing")
+
+        # Check 2: Look for orphaned directories (no metadata = incomplete install)
+        if self.versions_dir.exists():
+            for version_dir in self.versions_dir.iterdir():
+                if version_dir.is_dir():
+                    tag = version_dir.name
+                    # If directory exists but NOT in metadata, it's an incomplete install
+                    if tag not in metadata_versions:
+                        removed_versions.append(tag)
+                        print(f"Warning: Found incomplete installation directory: {tag} (not in metadata)")
+                        # Remove the orphaned directory
+                        try:
+                            shutil.rmtree(version_dir)
+                            print(f"✓ Removed incomplete installation directory: {tag}")
+                        except Exception as e:
+                            print(f"Error removing {tag}: {e}")
+
+        # Clean up metadata if we found incomplete versions in metadata
+        if any(tag in metadata_versions for tag in removed_versions):
+            for tag in removed_versions:
+                if tag in versions_metadata['installed']:
+                    del versions_metadata['installed'][tag]
+            self.metadata_manager.save_versions(versions_metadata)
+            print(f"✓ Cleaned up {len(removed_versions)} incomplete installation(s): {', '.join(removed_versions)}")
+
+        return {
+            'had_invalid': len(removed_versions) > 0,
+            'removed': removed_versions,
+            'valid': validated_versions
+        }
 
     def _is_version_complete(self, version_path: Path) -> bool:
         """
@@ -245,6 +329,10 @@ class VersionManager:
             return False
 
         try:
+            # Reset cancellation flag and set installing tag
+            self._cancel_installation = False
+            self._installing_tag = tag
+
             # Initialize progress tracking
             self.progress_tracker.start_installation(tag)
 
@@ -252,6 +340,10 @@ class VersionManager:
             self.progress_tracker.update_stage(InstallationStage.DOWNLOAD, 0, f"Downloading {tag}")
             if progress_callback:
                 progress_callback("Downloading release...", 1, 5)
+
+            # Check for cancellation
+            if self._cancel_installation:
+                raise InterruptedError("Installation cancelled by user")
 
             download_url = release.get('zipball_url') or release.get('tarball_url')
             if not download_url:
@@ -304,6 +396,10 @@ class VersionManager:
 
             self.progress_tracker.update_stage(InstallationStage.EXTRACT, 100, "Extraction complete")
 
+            # Check for cancellation
+            if self._cancel_installation:
+                raise InterruptedError("Installation cancelled by user")
+
             # GitHub archives extract to a subdirectory, find it
             extracted_contents = list(temp_extract_dir.iterdir())
             if len(extracted_contents) == 1 and extracted_contents[0].is_dir():
@@ -320,6 +416,10 @@ class VersionManager:
             if temp_extract_dir.exists():
                 shutil.rmtree(temp_extract_dir)
 
+            # Check for cancellation
+            if self._cancel_installation:
+                raise InterruptedError("Installation cancelled by user")
+
             # Step 3: Create venv with UV
             self.progress_tracker.update_stage(InstallationStage.VENV, 0, "Creating virtual environment")
             if progress_callback:
@@ -333,6 +433,10 @@ class VersionManager:
                 return False
 
             self.progress_tracker.update_stage(InstallationStage.VENV, 100, "Virtual environment created")
+
+            # Check for cancellation
+            if self._cancel_installation:
+                raise InterruptedError("Installation cancelled by user")
 
             # Step 4: Install dependencies with progress tracking
             self.progress_tracker.update_stage(InstallationStage.DEPENDENCIES, 0, "Installing dependencies")
@@ -372,6 +476,22 @@ class VersionManager:
             print(f"✓ Successfully installed {tag}")
             return True
 
+        except InterruptedError as e:
+            # Installation was cancelled by user
+            error_msg = str(e)
+            print(f"✓ {error_msg}")
+            self.progress_tracker.set_error(error_msg)
+            self.progress_tracker.complete_installation(False)
+
+            # Clean up cancelled installation
+            if version_path.exists():
+                print(f"Cleaning up cancelled installation: {version_path}")
+                try:
+                    shutil.rmtree(version_path)
+                    print(f"✓ Removed incomplete installation directory")
+                except Exception as cleanup_error:
+                    print(f"Warning: Failed to clean up directory: {cleanup_error}")
+            return False
         except Exception as e:
             error_msg = f"Error installing version {tag}: {e}"
             print(error_msg)
@@ -380,9 +500,18 @@ class VersionManager:
 
             # Clean up on failure
             if version_path.exists():
-                shutil.rmtree(version_path)
+                print(f"Cleaning up failed installation: {version_path}")
+                try:
+                    shutil.rmtree(version_path)
+                    print(f"✓ Removed incomplete installation directory")
+                except Exception as cleanup_error:
+                    print(f"Warning: Failed to clean up directory: {cleanup_error}")
             return False
         finally:
+            # Reset installation state
+            self._installing_tag = None
+            self._cancel_installation = False
+
             # Clear progress state after a short delay (allow UI to read final state)
             import time
             time.sleep(2)

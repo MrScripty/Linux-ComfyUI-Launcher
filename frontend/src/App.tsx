@@ -22,7 +22,9 @@ declare global {
         // Version Management API (Phase 5)
         get_available_versions: (force_refresh?: boolean) => Promise<{ success: boolean; versions: any[]; error?: string }>;
         get_installed_versions: () => Promise<{ success: boolean; versions: string[]; error?: string }>;
+        validate_installations: () => Promise<{ success: boolean; result: { had_invalid: boolean; removed: string[]; valid: string[] }; error?: string }>;
         install_version: (tag: string) => Promise<{ success: boolean; error?: string }>;
+        cancel_installation: () => Promise<{ success: boolean; error?: string }>;
         remove_version: (tag: string) => Promise<{ success: boolean; error?: string }>;
         switch_version: (tag: string) => Promise<{ success: boolean; error?: string }>;
         get_active_version: () => Promise<{ success: boolean; version: string; error?: string }>;

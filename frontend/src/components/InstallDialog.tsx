@@ -154,13 +154,20 @@ export function InstallDialog({
   };
 
   const handleCancelInstallation = async () => {
-    // TODO: Implement cancellation in Phase 6.2.5d
-    if (window.confirm('Are you sure you want to cancel the installation? This will stop the process and remove any partially installed files.')) {
-      console.log('Cancel installation requested');
-      // For now, just reset state
-      setInstallingVersion(null);
-      setProgress(null);
-      setShowDetails(false);
+    if (!window.confirm('Are you sure you want to cancel the installation? This will stop the process and remove any partially installed files.')) {
+      return;
+    }
+
+    try {
+      console.log('Cancelling installation...');
+      const result = await (window as any).pywebview.api.cancel_installation();
+      if (result.success) {
+        console.log('Installation cancelled successfully');
+      } else {
+        console.error('Failed to cancel installation:', result.error);
+      }
+    } catch (error) {
+      console.error('Error cancelling installation:', error);
     }
   };
 

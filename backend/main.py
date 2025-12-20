@@ -104,6 +104,22 @@ class JavaScriptAPI:
         except Exception as e:
             return {"success": False, "error": str(e), "versions": []}
 
+    def validate_installations(self):
+        """Validate all installations and clean up incomplete ones"""
+        try:
+            result = self.api.validate_installations()
+            return {"success": True, "result": result}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "result": {
+                    "had_invalid": False,
+                    "removed": [],
+                    "valid": []
+                }
+            }
+
     def get_installation_progress(self):
         """Get current installation progress (Phase 6.2.5b)"""
         try:
@@ -116,8 +132,16 @@ class JavaScriptAPI:
         """Install a ComfyUI version"""
         try:
             # Note: progress_callback not supported via PyWebView API
-            # Frontend should poll get_version_status() for progress
+            # Frontend should poll get_installation_progress() for progress
             success = self.api.install_version(tag)
+            return {"success": success}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def cancel_installation(self):
+        """Cancel the currently running installation"""
+        try:
+            success = self.api.cancel_installation()
             return {"success": success}
         except Exception as e:
             return {"success": False, "error": str(e)}

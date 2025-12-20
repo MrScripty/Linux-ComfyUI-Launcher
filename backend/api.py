@@ -710,6 +710,24 @@ Categories=Graphics;ArtificialIntelligence;
             return []
         return self.version_manager.get_installed_versions()
 
+    def validate_installations(self) -> Dict[str, Any]:
+        """
+        Validate all installations and clean up incomplete ones
+
+        Returns:
+            Dict with validation results:
+                - had_invalid: bool
+                - removed: List[str]
+                - valid: List[str]
+        """
+        if not self.version_manager:
+            return {
+                'had_invalid': False,
+                'removed': [],
+                'valid': []
+            }
+        return self.version_manager.validate_installations()
+
     def get_installation_progress(self) -> Optional[Dict[str, Any]]:
         """
         Get current installation progress (Phase 6.2.5b)
@@ -735,6 +753,17 @@ Categories=Graphics;ArtificialIntelligence;
         if not self.version_manager:
             return False
         return self.version_manager.install_version(tag, progress_callback)
+
+    def cancel_installation(self) -> bool:
+        """
+        Cancel the currently running installation
+
+        Returns:
+            True if cancellation was requested
+        """
+        if not self.version_manager:
+            return False
+        return self.version_manager.cancel_installation()
 
     def remove_version(self, tag: str) -> bool:
         """

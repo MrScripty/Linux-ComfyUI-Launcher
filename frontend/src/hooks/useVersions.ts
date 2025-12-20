@@ -232,12 +232,24 @@ export function useVersions() {
 
   // Initial load - wait for PyWebView to be ready
   useEffect(() => {
-    const loadData = () => {
+    const loadData = async () => {
       console.log('useVersions loadData - pywebview available:', !!window.pywebview, 'api available:', !!window.pywebview?.api);
       if (!window.pywebview?.api) {
         console.error('PyWebView API not available!');
         setIsLoading(false);
         return;
+      }
+
+      // Validate installations first to detect and clean up any incomplete installations
+      console.log('Validating installations...');
+      try {
+        const validationResult = await window.pywebview.api.validate_installations();
+        if (validationResult.success && validationResult.result.had_invalid) {
+          console.log('Found and cleaned up invalid installations:', validationResult.result.removed);
+          console.log('Valid installations:', validationResult.result.valid);
+        }
+      } catch (e) {
+        console.error('Failed to validate installations:', e);
       }
 
       console.log('Calling refreshAll...');
