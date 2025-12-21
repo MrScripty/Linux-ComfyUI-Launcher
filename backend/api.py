@@ -263,25 +263,83 @@ class ComfyUISetupAPI:
 
     # ==================== Patch Management ====================
 
-    def is_patched(self) -> bool:
-        """Check if main.py is patched with setproctitle"""
-        if not self.main_py.exists():
-            return False
-        content = self.main_py.read_text()
-        return 'setproctitle.setproctitle("ComfyUI Server")' in content
+    def _get_target_main_py(self, tag: Optional[str] = None) -> tuple[Optional[Path], Optional[str]]:
+        """
+        Resolve which main.py should be patched.
 
-    def patch_main_py(self) -> bool:
-        """Patch main.py to set process title"""
-        if self.is_patched():
+        Prefers the active managed version if one is selected, otherwise falls
+        back to the legacy single-install location.
+        """
+        active_tag = None
+
+        # Explicit tag override (used during installation)
+        if tag and self.version_manager:
+            try:
+                version_path = self.version_manager.get_version_path(tag)
+                if version_path:
+                    main_py = version_path / "main.py"
+                    if main_py.exists():
+                        return main_py, tag
+                    print(f"main.py not found for version {tag} at {main_py}")
+                    return None, tag
+            except Exception as e:
+                print(f"Error resolving main.py for version {tag}: {e}")
+                return None, tag
+
+        if self.version_manager:
+            try:
+                active_tag = self.version_manager.get_active_version()
+                if active_tag:
+                    version_path = self.version_manager.get_active_version_path()
+                    if version_path:
+                        main_py = version_path / "main.py"
+                        if main_py.exists():
+                            return main_py, active_tag
+                        print(f"main.py not found for active version {active_tag} at {main_py}")
+                        return None, active_tag
+            except Exception as e:
+                print(f"Error determining active version for patching: {e}")
+                return None, active_tag
+
+        if self.main_py.exists():
+            return self.main_py, None
+
+        print(f"No main.py found to patch at {self.main_py}")
+        return None, active_tag
+
+    def _is_main_py_patched(self, main_py: Path) -> bool:
+        """Check if the provided main.py is patched with setproctitle"""
+        try:
+            content = main_py.read_text()
+            return 'setproctitle.setproctitle("ComfyUI Server")' in content
+        except Exception as e:
+            print(f"Error reading {main_py} to check patch state: {e}")
+            return False
+
+    def is_patched(self, tag: Optional[str] = None) -> bool:
+        """Check if selected main.py is patched with setproctitle"""
+        main_py, _active_tag = self._get_target_main_py(tag)
+        if not main_py:
+            return False
+        return self._is_main_py_patched(main_py)
+
+    def patch_main_py(self, tag: Optional[str] = None) -> bool:
+        """Patch selected main.py to set process title"""
+        main_py, _active_tag = self._get_target_main_py(tag)
+        if not main_py:
+            print("No active version found to patch. Select a version first.")
+            return False
+
+        if self._is_main_py_patched(main_py):
             return False
 
         # Create backup
-        backup = self.main_py.with_suffix(".py.bak")
+        backup = main_py.with_suffix(".py.bak")
         if not backup.exists():
-            backup.write_bytes(self.main_py.read_bytes())
+            backup.write_bytes(main_py.read_bytes())
 
         # Insert patch code
-        content = self.main_py.read_text()
+        content = main_py.read_text()
         insert_code = (
             '\ntry:\n'
             '    import setproctitle\n'
@@ -298,35 +356,43 @@ class ComfyUISetupAPI:
         else:
             content += insert_code
 
-        self.main_py.write_text(content)
+        main_py.write_text(content)
         return True
 
-    def revert_main_py(self) -> bool:
-        """Revert main.py to original state"""
-        backup = self.main_py.with_suffix(".py.bak")
+    def revert_main_py(self, tag: Optional[str] = None) -> bool:
+        """Revert selected main.py to original state"""
+        main_py, active_tag = self._get_target_main_py(tag)
+        if not main_py:
+            print("No active version found to unpatch. Select a version first.")
+            return False
+
+        backup = main_py.with_suffix(".py.bak")
 
         # Try backup first
         if backup.exists():
-            self.main_py.write_bytes(backup.read_bytes())
+            main_py.write_bytes(backup.read_bytes())
             backup.unlink(missing_ok=True)
             return True
 
-        # Try git checkout
-        try:
-            subprocess.run(
-                ['git', '-C', str(self.comfyui_dir), 'checkout', '--', 'main.py'],
-                capture_output=True,
-                check=True
-            )
-            return True
-        except Exception:
-            pass
+        # Try git checkout (only if repo data is present)
+        repo_dir = main_py.parent
+        if (repo_dir / ".git").exists():
+            try:
+                subprocess.run(
+                    ['git', '-C', str(repo_dir), 'checkout', '--', main_py.name],
+                    capture_output=True,
+                    check=True
+                )
+                return True
+            except Exception:
+                pass
 
         # Try downloading from GitHub
         try:
-            url = "https://raw.githubusercontent.com/comfyanonymous/ComfyUI/master/main.py"
+            ref = active_tag or "master"
+            url = f"https://raw.githubusercontent.com/comfyanonymous/ComfyUI/{ref}/main.py"
             with urllib.request.urlopen(url, timeout=10) as resp:
-                self.main_py.write_bytes(resp.read())
+                main_py.write_bytes(resp.read())
             return True
         except Exception:
             return False
@@ -800,7 +866,17 @@ Categories=Graphics;ArtificialIntelligence;
         """
         if not self.version_manager:
             return False
-        return self.version_manager.install_version(tag, progress_callback)
+        install_ok = self.version_manager.install_version(tag, progress_callback)
+        if not install_ok:
+            return False
+
+        # Automatically patch the newly installed version so the UI button isn't needed
+        patched = self.patch_main_py(tag)
+        if not patched and not self.is_patched(tag):
+            print(f"Warning: Installation succeeded but patching {tag} failed.")
+            return False
+
+        return True
 
     def cancel_installation(self) -> bool:
         """

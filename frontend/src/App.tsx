@@ -12,7 +12,6 @@ declare global {
         // Original API methods
         get_status: () => Promise<any>;
         install_deps: () => Promise<{ success: boolean }>;
-        toggle_patch: () => Promise<{ success: boolean }>;
         toggle_menu: () => Promise<{ success: boolean }>;
         toggle_desktop: () => Promise<{ success: boolean }>;
         close_window: () => Promise<{ success: boolean }>;
@@ -209,15 +208,6 @@ export default function App() {
     setIsInstalling(false);
   };
 
-  const togglePatch = () => {
-    if (!window.pywebview) return;
-
-    callApi(
-      () => window.pywebview!.api.toggle_patch(),
-      isPatched ? "Removing patch..." : "Patching main.py..."
-    );
-  };
-
   const toggleMenu = () => {
     if (!window.pywebview) return;
 
@@ -404,30 +394,6 @@ export default function App() {
             }}
             transition={{ duration: 0.4 }}
           >
-            
-          {/* Patch Row */}
-          <div className="w-full flex items-center justify-center gap-4">
-            <div className="w-[18px] h-[18px] flex items-center justify-center">
-              {isLoading ? (
-                <Loader2 className="text-gray-400 animate-spin" size={14} />
-              ) : isPatched ? (
-                <motion.div
-                  initial={{ pathLength: 0, opacity: 0 }}
-                  animate={{ pathLength: 1, opacity: 1 }}
-                >
-                  <Check className="text-[#55ff55]" size={18} strokeWidth={3} />
-                </motion.div>
-              ) : null}
-            </div>
-
-            <button
-              onClick={togglePatch}
-              disabled={isLoading || comfyUIRunning}
-              className="bg-[#333333] hover:bg-[#444444] active:bg-[#2d2d2d] disabled:opacity-50 disabled:cursor-not-allowed text-[#aaaaaa] hover:text-white px-6 py-2 min-w-[140px] font-bold text-sm transition-colors rounded-sm"
-            >
-              {comfyUIRunning ? "Stop to Patch" : (isPatched ? "Unpatch ComfyUI" : "Patch ComfyUI")}
-            </button>
-          </div>
 
             {/* Status Footer Text */}
             <div className="h-6 text-center w-full px-2">
