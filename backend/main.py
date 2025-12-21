@@ -43,19 +43,59 @@ class JavaScriptAPI:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def toggle_menu(self):
-        """Toggle menu shortcut"""
+    def toggle_menu(self, tag=None):
+        """Toggle menu shortcut (active version when available)"""
         try:
-            success = self.api.toggle_menu()
+            success = self.api.toggle_menu(tag)
             return {"success": success}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def toggle_desktop(self):
-        """Toggle desktop shortcut"""
+    def toggle_desktop(self, tag=None):
+        """Toggle desktop shortcut (active version when available)"""
         try:
-            success = self.api.toggle_desktop()
+            success = self.api.toggle_desktop(tag)
             return {"success": success}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_version_shortcuts(self, tag):
+        """Get shortcut state for a specific version"""
+        try:
+            state = self.api.get_version_shortcut_state(tag)
+            return {"success": True, "state": state}
+        except Exception as e:
+            return {"success": False, "error": str(e), "state": {}}
+
+    def get_all_shortcut_states(self):
+        """Get shortcut states for all versions"""
+        try:
+            states = self.api.get_all_shortcut_states()
+            return {"success": True, "states": states}
+        except Exception as e:
+            return {"success": False, "error": str(e), "states": {}}
+
+    def set_version_shortcuts(self, tag, enabled):
+        """Enable/disable menu and desktop shortcuts for a version"""
+        try:
+            result = self.api.set_version_shortcuts(tag, bool(enabled))
+            return {"success": result.get("success", False), "state": result.get("state"), "tag": tag, "error": result.get("error")}
+        except Exception as e:
+            return {"success": False, "error": str(e), "state": {}}
+
+    def toggle_version_menu(self, tag):
+        """Toggle only the menu shortcut for a version"""
+        try:
+            result = self.api.toggle_version_menu_shortcut(tag)
+            return {"success": result.get("success", False), "state": result.get("state"), "tag": tag, "error": result.get("error")}
+        except Exception as e:
+            return {"success": False, "error": str(e), "state": {}}
+
+    def toggle_version_desktop(self, tag):
+        """Toggle only the desktop shortcut for a version"""
+        try:
+            result = self.api.toggle_version_desktop_shortcut(tag)
+            return {"success": result.get("success", False), "state": result.get("state"), "tag": tag, "error": result.get("error")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

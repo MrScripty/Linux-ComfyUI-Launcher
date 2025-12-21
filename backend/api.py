@@ -5,6 +5,7 @@ Handles all ComfyUI setup operations without UI dependencies
 """
 
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -14,6 +15,14 @@ import tomllib
 import webbrowser
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+
+# Optional Pillow import for icon editing (used for version-specific shortcut icons)
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
 
 class ComfyUISetupAPI:
@@ -49,11 +58,19 @@ class ComfyUISetupAPI:
         self.main_py = self.comfyui_dir / "main.py"
         self.icon_webp = self.script_dir / "comfyui-icon.webp"
         self.run_sh = self.script_dir / "run.sh"
+        self.launcher_data_dir = self.script_dir / "launcher-data"
+        self.shortcut_scripts_dir = self.launcher_data_dir / "shortcuts"
+        self.generated_icons_dir = self.launcher_data_dir / "icons"
 
         # System directories
         self.apps_dir = Path.home() / ".local" / "share" / "applications"
         self.apps_file = self.apps_dir / "ComfyUI.desktop"
         self.desktop_file = Path.home() / "Desktop" / "ComfyUI.desktop"
+        self._release_info_cache: Optional[Dict[str, Any]] = None
+
+        # Ensure directories used by shortcut tooling exist
+        self.shortcut_scripts_dir.mkdir(parents=True, exist_ok=True)
+        self.generated_icons_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize version management components (Phase 2-4)
         self._init_version_management()
@@ -172,8 +189,11 @@ class ComfyUISetupAPI:
 
         return "Unknown"
 
-    def check_for_new_release(self) -> Dict[str, Any]:
-        """Check if a new release is available on GitHub"""
+    def check_for_new_release(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Check if a new release is available on GitHub (cached)"""
+        if self._release_info_cache and not force_refresh:
+            return self._release_info_cache
+
         try:
             # Get current local version
             current_version = None
@@ -203,35 +223,38 @@ class ComfyUISetupAPI:
                 except Exception:
                     pass
 
-            # Get latest release from GitHub
-            with urllib.request.urlopen(
-                "https://api.github.com/repos/comfyanonymous/ComfyUI/releases/latest",
-                timeout=3
-            ) as resp:
-                data = json.loads(resp.read())
-                latest_tag = data.get('tag_name', '')
+            # Use cached GitHub releases (TTL handled by GitHubReleasesFetcher)
+            latest_tag = None
+            if self.github_fetcher:
+                try:
+                    releases = self.github_fetcher.get_releases(force_refresh=False)
+                    if releases:
+                        latest_tag = releases[0].get('tag_name') or None
+                except Exception as e:
+                    print(f"Warning: using cached/stale releases after error: {e}")
 
-                # Compare versions - check if current tag differs from latest
-                if current_tag and latest_tag:
-                    has_update = current_tag != latest_tag
-                    return {
-                        "has_update": has_update,
-                        "latest_version": latest_tag,
-                        "current_version": current_version or current_tag
-                    }
-                else:
-                    return {
-                        "has_update": False,
-                        "latest_version": latest_tag,
-                        "current_version": current_version
-                    }
+            if current_tag and latest_tag:
+                has_update = current_tag != latest_tag
+                self._release_info_cache = {
+                    "has_update": has_update,
+                    "latest_version": latest_tag,
+                    "current_version": current_version or current_tag
+                }
+            else:
+                self._release_info_cache = {
+                    "has_update": False,
+                    "latest_version": latest_tag,
+                    "current_version": current_version
+                }
         except Exception as e:
             print(f"Error checking for new release: {e}")
-            return {
+            self._release_info_cache = {
                 "has_update": False,
                 "latest_version": None,
                 "current_version": None
             }
+
+        return self._release_info_cache
 
     # ==================== Dependency Checking ====================
 
@@ -261,6 +284,21 @@ class ComfyUISetupAPI:
         if not self.check_brave():
             missing.append("brave-browser")
         return missing
+
+    def _build_server_title(self, tag: Optional[str] = None) -> str:
+        """
+        Build the process title for ComfyUI, including version when available.
+
+        Args:
+            tag: Optional version tag (e.g., v0.2.0)
+
+        Returns:
+            Process title string for setproctitle
+        """
+        base = "ComfyUI Server"
+        if tag:
+            return f"{base} - {tag}"
+        return base
 
     # ==================== Patch Management ====================
 
@@ -308,11 +346,24 @@ class ComfyUISetupAPI:
         print(f"No main.py found to patch at {self.main_py}")
         return None, active_tag
 
-    def _is_main_py_patched(self, main_py: Path) -> bool:
-        """Check if the provided main.py is patched with setproctitle"""
+    def _is_main_py_patched(self, main_py: Path, expected_title: Optional[str] = None) -> bool:
+        """
+        Check if the provided main.py is patched with setproctitle
+
+        Args:
+            main_py: Path to the target main.py
+            expected_title: Optional exact title to look for
+        """
         try:
             content = main_py.read_text()
-            return 'setproctitle.setproctitle("ComfyUI Server")' in content
+            if expected_title:
+                return (
+                    f'setproctitle.setproctitle("{expected_title}")' in content
+                    or f"setproctitle.setproctitle('{expected_title}')" in content
+                )
+
+            # Fallback: any ComfyUI Server setproctitle call (with or without version suffix)
+            return bool(re.search(r'setproctitle\\.setproctitle\\([\"\\\']ComfyUI Server[^\"\\\']*[\"\\\']\\)', content))
         except Exception as e:
             print(f"Error reading {main_py} to check patch state: {e}")
             return False
@@ -326,12 +377,24 @@ class ComfyUISetupAPI:
 
     def patch_main_py(self, tag: Optional[str] = None) -> bool:
         """Patch selected main.py to set process title"""
-        main_py, _active_tag = self._get_target_main_py(tag)
+        main_py, active_tag = self._get_target_main_py(tag)
         if not main_py:
             print("No active version found to patch. Select a version first.")
             return False
 
-        if self._is_main_py_patched(main_py):
+        server_title = self._build_server_title(active_tag)
+        expected_line = f'setproctitle.setproctitle("{server_title}")'
+        expected_line_single = f"setproctitle.setproctitle('{server_title}')"
+
+        # Read existing content first to determine patch state
+        try:
+            content = main_py.read_text()
+        except Exception as e:
+            print(f"Error reading {main_py} for patching: {e}")
+            return False
+
+        # Already patched with the correct title - nothing to do
+        if expected_line in content or expected_line_single in content:
             return False
 
         # Create backup
@@ -339,12 +402,18 @@ class ComfyUISetupAPI:
         if not backup.exists():
             backup.write_bytes(main_py.read_bytes())
 
+        # If an older patch exists, upgrade it to include the version-specific title
+        pattern = r'setproctitle\.setproctitle\(["\']ComfyUI Server[^"\']*["\']\)'
+        upgraded_content, replaced = re.subn(pattern, expected_line, content, count=1)
+        if replaced:
+            main_py.write_text(upgraded_content)
+            return True
+
         # Insert patch code
-        content = main_py.read_text()
         insert_code = (
             '\ntry:\n'
             '    import setproctitle\n'
-            '    setproctitle.setproctitle("ComfyUI Server")\n'
+            f'    setproctitle.setproctitle("{server_title}")\n'
             'except ImportError:\n'
             '    pass\n'
         )
@@ -352,7 +421,8 @@ class ComfyUISetupAPI:
         if 'if __name__ == "__main__":' in content:
             content = content.replace(
                 'if __name__ == "__main__":',
-                insert_code + 'if __name__ == "__main__":'
+                insert_code + 'if __name__ == "__main__":',
+                1
             )
         else:
             content += insert_code
@@ -399,6 +469,456 @@ class ComfyUISetupAPI:
             return False
 
     # ==================== Shortcut Management ====================
+
+    def _slugify_tag(self, tag: str) -> str:
+        """Convert a version tag into a filesystem-safe slug"""
+        if not tag:
+            return "unknown"
+        safe = ''.join(c if c.isalnum() or c in ('-', '_') else '-' for c in tag.strip().lower())
+        safe = safe.strip('-_') or "unknown"
+        return safe
+
+    def _get_version_paths(self, tag: str) -> Optional[Dict[str, Path]]:
+        """Resolve key paths for a specific installed version"""
+        if not self.version_manager:
+            return None
+
+        version_dir = self.version_manager.get_version_path(tag)
+        if not version_dir:
+            return None
+
+        venv_python = version_dir / "venv" / "bin" / "python"
+        main_py = version_dir / "main.py"
+
+        if not venv_python.exists() or not main_py.exists():
+            return None
+
+        return {
+            "version_dir": version_dir,
+            "venv_python": venv_python,
+            "main_py": main_py,
+            "pid_file": version_dir / "comfyui.pid",
+        }
+
+    def _get_version_shortcut_paths(self, tag: str) -> Dict[str, Path]:
+        """Return paths for version-specific shortcut artifacts"""
+        slug = self._slugify_tag(tag)
+        return {
+            "slug": slug,
+            "menu": self.apps_dir / f"ComfyUI-{slug}.desktop",
+            "desktop": Path.home() / "Desktop" / f"ComfyUI-{slug}.desktop",
+            "icon_name": f"comfyui-{slug}",
+            "launcher": self.shortcut_scripts_dir / f"launch-{slug}.sh",
+        }
+
+    def _remove_installed_icon(self, icon_name: str):
+        """Remove installed icon variants for a version-specific shortcut"""
+        icon_base_dir = Path.home() / ".local" / "share" / "icons" / "hicolor"
+        sizes = [256, 128, 64, 48]
+        for size in sizes:
+            icon_path = icon_base_dir / f"{size}x{size}" / "apps" / f"{icon_name}.png"
+            try:
+                if icon_path.exists():
+                    icon_path.unlink()
+            except Exception:
+                pass
+
+        scalable_dir = icon_base_dir / "scalable" / "apps"
+        for ext in ("png", "webp"):
+            try:
+                icon_path = scalable_dir / f"{icon_name}.{ext}"
+                if icon_path.exists():
+                    icon_path.unlink()
+            except Exception:
+                pass
+
+        generated_icon = self.generated_icons_dir / f"{icon_name}.png"
+        try:
+            if generated_icon.exists():
+                generated_icon.unlink()
+        except Exception:
+            pass
+
+    def _generate_version_icon(self, tag: str) -> Optional[Path]:
+        """Create a PNG icon with the version number overlaid"""
+        if not self.icon_webp.exists():
+            print("Base icon not found; cannot generate version-specific icon")
+            return None
+
+        if not (Image and ImageDraw and ImageFont):
+            print("Pillow not available; skipping version label overlay")
+            return None
+
+        slug = self._slugify_tag(tag)
+        dest_path = self.generated_icons_dir / f"comfyui-{slug}.png"
+
+        try:
+            base = Image.open(self.icon_webp).convert("RGBA")
+            size = max(base.size)
+
+            # Ensure we have a square canvas for consistent text placement
+            canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            offset = ((size - base.width) // 2, (size - base.height) // 2)
+            canvas.paste(base, offset)
+
+            draw = ImageDraw.Draw(canvas)
+            label = tag.lstrip('v')
+            if len(label) > 12:
+                label = label[:12]
+
+            try:
+                # Larger overlay text for legibility (+2px bump)
+                font_size = max(28, size // 5 + 2)
+                font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
+            except Exception:
+                font = ImageFont.load_default()
+
+            if hasattr(draw, "textbbox"):
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            else:
+                text_w, text_h = draw.textsize(label, font=font)
+
+            padding = max(6, size // 30)
+            banner_height = max(text_h + padding * 2, int(size * 0.28))
+            banner_y = (size - banner_height) // 2
+            background = (
+                padding,
+                banner_y,
+                size - padding,
+                banner_y + banner_height,
+            )
+
+            try:
+                draw.rounded_rectangle(background, radius=padding, fill=(0, 0, 0, 190))
+            except Exception:
+                draw.rectangle(background, fill=(0, 0, 0, 190))
+
+            draw.text(
+                ((size - text_w) / 2, banner_y + (banner_height - text_h) / 2),
+                label,
+                font=font,
+                fill=(255, 255, 255, 230),
+            )
+
+            canvas.save(dest_path, format="PNG")
+            return dest_path
+        except Exception as e:
+            print(f"Error generating icon for {tag}: {e}")
+            return None
+
+    def _install_version_icon(self, tag: str) -> str:
+        """Install a version-specific icon with the version label"""
+        slug = self._slugify_tag(tag)
+        icon_name = f"comfyui-{slug}"
+        icon_source = self._generate_version_icon(tag)
+
+        # Fallback to base icon if overlay generation fails
+        if not icon_source and self.icon_webp.exists():
+            icon_source = self.icon_webp
+
+        if not icon_source:
+            return "comfyui"
+
+        icon_base_dir = Path.home() / ".local" / "share" / "icons" / "hicolor"
+        png_sizes = [256, 128, 64, 48]
+        conversion_success = False
+
+        for size in png_sizes:
+            try:
+                icon_dir = icon_base_dir / f"{size}x{size}" / "apps"
+                icon_dir.mkdir(parents=True, exist_ok=True)
+                dest_icon = icon_dir / f"{icon_name}.png"
+
+                if Image:
+                    with Image.open(icon_source) as img:
+                        img = img.convert("RGBA")
+                        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+                        img.thumbnail((size, size), resample=resampling)
+                        img.save(dest_icon, format="PNG")
+                        conversion_success = True
+                else:
+                    result = subprocess.run(
+                        ['convert', str(icon_source), '-resize', f'{size}x{size}', str(dest_icon)],
+                        capture_output=True,
+                        timeout=10
+                    )
+                    if result.returncode == 0:
+                        conversion_success = True
+            except Exception as e:
+                print(f"Error installing icon size {size} for {tag}: {e}")
+
+        if not conversion_success:
+            try:
+                icon_dir = icon_base_dir / "scalable" / "apps"
+                icon_dir.mkdir(parents=True, exist_ok=True)
+                dest_icon = icon_dir / f"{icon_name}{icon_source.suffix}"
+                shutil.copy2(icon_source, dest_icon)
+
+                png_link = icon_dir / f"{icon_name}.png"
+                try:
+                    if png_link.exists():
+                        png_link.unlink()
+                    png_link.symlink_to(dest_icon)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Error installing fallback icon for {tag}: {e}")
+
+        # Update icon cache if available
+        try:
+            subprocess.run(['gtk-update-icon-cache', '-f', '-t', str(icon_base_dir)],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(
+                ['xdg-icon-resource', 'install', '--novendor', '--size', '256',
+                 str(icon_source), icon_name],
+                capture_output=True,
+                timeout=5
+            )
+        except Exception:
+            pass
+
+        return icon_name
+
+    def _write_version_launch_script(self, tag: str, version_dir: Path, slug: str) -> Optional[Path]:
+        """Create a launch script for a specific version"""
+        script_path = self.shortcut_scripts_dir / f"launch-{slug}.sh"
+        profile_dir = self.launcher_data_dir / "profiles" / slug
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        content = f"""#!/bin/bash
+set -euo pipefail
+
+VERSION_DIR="{version_dir}"
+VENV_PATH="$VERSION_DIR/venv"
+MAIN_PY="$VERSION_DIR/main.py"
+PID_FILE="$VERSION_DIR/comfyui.pid"
+URL="http://127.0.0.1:8188"
+WINDOW_CLASS="ComfyUI-{slug}"
+PROFILE_DIR="{profile_dir}"
+SERVER_START_DELAY=8
+SERVER_PID=""
+
+log() {{
+    echo "[\\$(date +'%H:%M:%S')] $*"
+}}
+
+stop_previous_instance() {{
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log "Stopping previous server (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+    fi
+}}
+
+close_existing_app_window() {{
+    if command -v wmctrl >/dev/null 2>&1; then
+        local wins
+        wins=$(wmctrl -l -x 2>/dev/null | grep -i "$WINDOW_CLASS" | awk '{{print $1}}' || true)
+        if [[ -n "$wins" ]]; then
+            for win_id in $wins; do
+                wmctrl -i -c "$win_id" || true
+            done
+            sleep 1
+        fi
+    fi
+}}
+
+start_comfyui() {{
+    if [[ ! -x "$VENV_PATH/bin/python" ]]; then
+        echo "Missing virtual environment for {tag}"
+        exit 1
+    fi
+
+    cd "$VERSION_DIR"
+    log "Starting ComfyUI {tag}..."
+    "$VENV_PATH/bin/python" "$MAIN_PY" --enable-manager &
+    SERVER_PID=$!
+    echo "$SERVER_PID" > "$PID_FILE"
+}}
+
+open_app() {{
+    if command -v brave-browser >/dev/null 2>&1; then
+        mkdir -p "$PROFILE_DIR"
+        log "Opening Brave window for {tag}..."
+        brave-browser --app="$URL" --new-window --user-data-dir="$PROFILE_DIR" --class="$WINDOW_CLASS" >/dev/null 2>&1 &
+    else
+        log "Opening default browser..."
+        xdg-open "$URL" >/dev/null 2>&1 &
+    fi
+}}
+
+cleanup() {{
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+}}
+
+trap cleanup EXIT
+
+stop_previous_instance
+close_existing_app_window
+start_comfyui
+
+log "Waiting $SERVER_START_DELAY seconds for server to start..."
+sleep "$SERVER_START_DELAY"
+open_app
+
+wait $SERVER_PID
+"""
+
+        try:
+            script_path.write_text(content)
+            script_path.chmod(0o755)
+            return script_path
+        except Exception as e:
+            print(f"Error writing launch script for {tag}: {e}")
+            return None
+
+    def get_version_shortcut_state(self, tag: str) -> Dict[str, Any]:
+        """Return the current shortcut state for a version"""
+        paths = self._get_version_shortcut_paths(tag)
+        return {
+            "tag": tag,
+            "menu": paths["menu"].exists(),
+            "desktop": paths["desktop"].exists(),
+        }
+
+    def get_all_shortcut_states(self) -> Dict[str, Any]:
+        """Get shortcut states for all installed versions"""
+        states: Dict[str, Any] = {}
+        if self.version_manager:
+            for tag in self.get_installed_versions():
+                states[tag] = self.get_version_shortcut_state(tag)
+        return {
+            "active": self.get_active_version(),
+            "states": states,
+        }
+
+    def create_version_shortcuts(self, tag: str, create_menu: bool = True, create_desktop: bool = True) -> Dict[str, Any]:
+        """Create menu/desktop shortcuts for a specific version"""
+        paths = self._get_version_paths(tag)
+        shortcut_paths = self._get_version_shortcut_paths(tag)
+
+        if not paths:
+            return {"success": False, "error": f"Version {tag} is not installed or incomplete."}
+
+        # Ensure base icon exists for menu entries (no version banner)
+        base_icon_name = "comfyui"
+        self.install_icon()
+
+        # Use version banner icon only for desktop shortcut
+        desktop_icon_name = self._install_version_icon(tag)
+        if not desktop_icon_name:
+            desktop_icon_name = base_icon_name
+
+        launcher_script = self._write_version_launch_script(tag, paths["version_dir"], shortcut_paths["slug"])
+
+        if not launcher_script:
+            return {"success": False, "error": "Failed to write launch script"}
+
+        results = {"menu": False, "desktop": False}
+
+        if create_menu:
+            try:
+                self.apps_dir.mkdir(parents=True, exist_ok=True)
+                content = f"""[Desktop Entry]
+Name=ComfyUI {tag}
+Comment=Launch ComfyUI {tag}
+Exec=bash "{launcher_script.resolve()}"
+Icon={base_icon_name}
+Terminal=false
+Type=Application
+Categories=Graphics;ArtificialIntelligence;
+"""
+                shortcut_paths["menu"].write_text(content)
+                # Mark executable to be trusted by desktop environments (especially on Desktop)
+                shortcut_paths["menu"].chmod(0o755)
+                results["menu"] = True
+            except Exception as e:
+                print(f"Error creating menu shortcut for {tag}: {e}")
+
+        if create_desktop:
+            try:
+                desktop_dir = shortcut_paths["desktop"].parent
+                desktop_dir.mkdir(parents=True, exist_ok=True)
+                content = f"""[Desktop Entry]
+Name=ComfyUI
+Comment=Launch ComfyUI {tag}
+Exec=bash "{launcher_script.resolve()}"
+Icon={desktop_icon_name}
+Terminal=false
+Type=Application
+Categories=Graphics;ArtificialIntelligence;
+"""
+                shortcut_paths["desktop"].write_text(content)
+                shortcut_paths["desktop"].chmod(0o755)
+                results["desktop"] = True
+            except Exception as e:
+                print(f"Error creating desktop shortcut for {tag}: {e}")
+
+        results["success"] = (not create_menu or results["menu"]) and (not create_desktop or results["desktop"])
+        results["state"] = self.get_version_shortcut_state(tag)
+        return results
+
+    def remove_version_shortcuts(self, tag: str, remove_menu: bool = True, remove_desktop: bool = True) -> Dict[str, Any]:
+        """Remove version-specific shortcuts and icons"""
+        paths = self._get_version_shortcut_paths(tag)
+        if remove_menu:
+            try:
+                paths["menu"].unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        if remove_desktop:
+            try:
+                paths["desktop"].unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Remove launcher script if no shortcuts remain
+        state_after = self.get_version_shortcut_state(tag)
+        if not state_after["menu"] and not state_after["desktop"]:
+            try:
+                paths["launcher"].unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._remove_installed_icon(paths["icon_name"])
+
+        return {"success": True, "state": state_after}
+
+    def set_version_shortcuts(self, tag: str, enabled: bool, menu: bool = True, desktop: bool = True) -> Dict[str, Any]:
+        """Ensure shortcuts for a version are enabled/disabled"""
+        if enabled:
+            result = self.create_version_shortcuts(tag, create_menu=menu, create_desktop=desktop)
+        else:
+            result = self.remove_version_shortcuts(tag, remove_menu=menu, remove_desktop=desktop)
+        result["state"] = self.get_version_shortcut_state(tag)
+        result["tag"] = tag
+        result["success"] = bool(result.get("success", False))
+        return result
+
+    def toggle_version_menu_shortcut(self, tag: str) -> Dict[str, Any]:
+        """Toggle only the menu shortcut for a version"""
+        current = self.get_version_shortcut_state(tag)
+        return self.set_version_shortcuts(tag, not current["menu"], menu=True, desktop=False)
+
+    def toggle_version_desktop_shortcut(self, tag: str) -> Dict[str, Any]:
+        """Toggle only the desktop shortcut for a version"""
+        current = self.get_version_shortcut_state(tag)
+        return self.set_version_shortcuts(tag, not current["desktop"], menu=False, desktop=True)
 
     def menu_exists(self) -> bool:
         """Check if menu shortcut exists"""
@@ -587,9 +1107,17 @@ Categories=Graphics;ArtificialIntelligence;
         missing_deps = self.get_missing_dependencies()
         deps_ready = len(missing_deps) == 0
         patched = self.is_patched()
-        menu = self.menu_exists()
-        desktop = self.desktop_exists()
-        running = self.is_comfyui_running()
+        active_version = self.get_active_version() if self.version_manager else None
+        if active_version:
+            shortcut_state = self.get_version_shortcut_state(active_version)
+            menu = shortcut_state["menu"]
+            desktop = shortcut_state["desktop"]
+        else:
+            shortcut_state = {"menu": self.menu_exists(), "desktop": self.desktop_exists()}
+            menu = shortcut_state["menu"]
+            desktop = shortcut_state["desktop"]
+        running_processes = self._detect_comfyui_processes()
+        running = bool(running_processes)
 
         # Check for new releases
         release_info = self.check_for_new_release()
@@ -602,7 +1130,7 @@ Categories=Graphics;ArtificialIntelligence;
         elif deps_ready and patched and menu and desktop:
             message = "Setup complete – everything is ready"
         else:
-            message = "System ready. Configure options below."
+            message = ""
 
         return {
             "version": self.get_comfyui_version(),
@@ -611,7 +1139,9 @@ Categories=Graphics;ArtificialIntelligence;
             "patched": patched,
             "menu_shortcut": menu,
             "desktop_shortcut": desktop,
+            "shortcut_version": active_version,
             "comfyui_running": running,
+            "running_processes": running_processes,
             "message": message,
             "release_info": release_info
         }
@@ -625,48 +1155,141 @@ Categories=Graphics;ArtificialIntelligence;
         else:
             return self.patch_main_py()
 
-    def toggle_menu(self) -> bool:
-        """Toggle menu shortcut"""
+    def toggle_menu(self, tag: Optional[str] = None) -> bool:
+        """Toggle menu shortcut (version-specific when available)"""
+        target = tag or (self.get_active_version() if self.version_manager else None)
+
+        if target:
+            result = self.toggle_version_menu_shortcut(target)
+            return bool(result.get("success", False))
+
         if self.menu_exists():
             return self.remove_menu_shortcut()
-        else:
-            return self.create_menu_shortcut()
+        return self.create_menu_shortcut()
 
-    def toggle_desktop(self) -> bool:
-        """Toggle desktop shortcut"""
+    def toggle_desktop(self, tag: Optional[str] = None) -> bool:
+        """Toggle desktop shortcut (version-specific when available)"""
+        target = tag or (self.get_active_version() if self.version_manager else None)
+
+        if target:
+            result = self.toggle_version_desktop_shortcut(target)
+            return bool(result.get("success", False))
+
         if self.desktop_exists():
             return self.remove_desktop_shortcut()
-        else:
-            return self.create_desktop_shortcut()
+        return self.create_desktop_shortcut()
+
+    def _get_known_version_paths(self) -> Dict[str, Path]:
+        """Return a mapping of installed version tags to their paths"""
+        tag_paths: Dict[str, Path] = {}
+        if not self.version_manager:
+            return tag_paths
+
+        try:
+            for tag in self.version_manager.get_installed_versions():
+                version_path = self.version_manager.get_version_path(tag)
+                if version_path:
+                    tag_paths[tag] = version_path
+        except Exception as e:
+            print(f"Error collecting version paths: {e}")
+
+        return tag_paths
+
+    def _detect_comfyui_processes(self) -> List[Dict[str, Any]]:
+        """
+        Detect running ComfyUI processes using PID files and process table scan.
+
+        Returns:
+            List of process info dictionaries (pid, source, tag, etc.)
+        """
+        processes: List[Dict[str, Any]] = []
+        seen_pids: set[int] = set()
+
+        tag_paths = self._get_known_version_paths()
+
+        # 1) PID file checks (legacy root + per-version)
+        pid_candidates: List[tuple[Optional[str], Path]] = [
+            (None, self.comfyui_dir / "comfyui.pid")
+        ]
+        pid_candidates.extend([
+            (tag, path / "comfyui.pid") for tag, path in tag_paths.items()
+        ])
+
+        for tag, pid_file in pid_candidates:
+            if not pid_file.exists():
+                continue
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)
+                if pid not in seen_pids:
+                    processes.append({
+                        "pid": pid,
+                        "source": "pid_file",
+                        "tag": tag,
+                        "pid_file": str(pid_file)
+                    })
+                    seen_pids.add(pid)
+            except (ValueError, ProcessLookupError, OSError):
+                continue
+
+        # 2) Process table scan (helps when PID files are missing/stale)
+        try:
+            ps = subprocess.run(
+                ['ps', '-eo', 'pid=,args='],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            ps_output = ps.stdout.splitlines()
+        except Exception as e:
+            print(f"Error scanning process table: {e}")
+            ps_output = []
+
+        for line in ps_output:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+
+            pid_str, cmdline = parts
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+
+            if pid in seen_pids:
+                continue
+
+            lower_cmd = cmdline.lower()
+            has_title = "comfyui server" in lower_cmd
+            has_main = "main.py" in cmdline and ("comfyui" in lower_cmd)
+
+            if not (has_title or has_main):
+                continue
+
+            inferred_tag = None
+            for tag, path in tag_paths.items():
+                if str(path) in cmdline:
+                    inferred_tag = tag
+                    break
+
+            processes.append({
+                "pid": pid,
+                "source": "process_scan",
+                "tag": inferred_tag,
+                "cmd": cmdline
+            })
+            seen_pids.add(pid)
+
+        return processes
 
     def is_comfyui_running(self) -> bool:
         """Check if ComfyUI is currently running"""
         try:
-            # Method 1: Check for PID file (created by run.sh)
-            pid_file = self.comfyui_dir / "comfyui.pid"
-            if pid_file.exists():
-                try:
-                    pid = int(pid_file.read_text().strip())
-                    # Check if process with this PID exists
-                    os.kill(pid, 0)  # Signal 0 just checks if process exists
-                    return True
-                except (ValueError, ProcessLookupError, OSError):
-                    # PID file is stale
-                    pass
-
-            # Method 2: Search for process by name (if patched)
-            if self.is_patched():
-                try:
-                    result = subprocess.run(
-                        ['pgrep', '-f', 'ComfyUI Server'],
-                        capture_output=True,
-                        text=True
-                    )
-                    return result.returncode == 0 and result.stdout.strip()
-                except Exception:
-                    pass
-
-            return False
+            return bool(self._detect_comfyui_processes())
         except Exception:
             return False
 
@@ -696,31 +1319,43 @@ Categories=Graphics;ArtificialIntelligence;
             except Exception:
                 pass  # Continue even if this fails
 
-            # Stop the ComfyUI server
-            pid_file = self.comfyui_dir / "comfyui.pid"
-            if pid_file.exists():
-                try:
-                    pid = int(pid_file.read_text().strip())
-                    os.kill(pid, 15)  # SIGTERM for graceful shutdown
-                    # Wait a moment
-                    time.sleep(1)
-                    # Force kill if still running
-                    try:
-                        os.kill(pid, 9)  # SIGKILL
-                    except ProcessLookupError:
-                        pass  # Already dead
-                    pid_file.unlink(missing_ok=True)
-                    return True
-                except (ValueError, ProcessLookupError):
-                    pid_file.unlink(missing_ok=True)
+            # Stop the ComfyUI server (all detected processes)
+            processes = self._detect_comfyui_processes()
+            killed = False
 
-            # Try by process name if patched
-            if self.is_patched():
+            for proc in processes:
+                pid = proc.get("pid")
+                if pid is None:
+                    continue
                 try:
-                    subprocess.run(['pkill', '-9', '-f', 'ComfyUI Server'], check=False)
-                    return True
-                except Exception:
+                    os.kill(pid, 15)  # SIGTERM for graceful shutdown
+                    time.sleep(0.5)
+                    try:
+                        os.kill(pid, 9)  # SIGKILL as fallback
+                    except ProcessLookupError:
+                        pass
+                    killed = True
+                except (ProcessLookupError, OSError):
                     pass
+                except Exception as e:
+                    print(f"Error stopping PID {pid}: {e}")
+
+                pid_file = proc.get("pid_file")
+                if pid_file:
+                    try:
+                        Path(pid_file).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            if killed:
+                return True
+
+            # Fallback: try process name kill if nothing was found
+            try:
+                subprocess.run(['pkill', '-9', '-f', 'ComfyUI Server'], check=False)
+                return True
+            except Exception:
+                pass
 
             return False
         except Exception as e:
@@ -777,7 +1412,26 @@ Categories=Graphics;ArtificialIntelligence;
         if not self.version_manager:
             return []
 
-        releases = self.version_manager.get_available_releases(force_refresh)
+        releases_source = "cache"
+        releases = []
+
+        # Try to fetch (optionally forced); on failure, fall back to cached data without clearing it
+        try:
+            releases = self.version_manager.get_available_releases(force_refresh)
+            releases_source = "remote" if force_refresh else "cache/remote"
+        except Exception as e:
+            print(f"Error fetching releases (force_refresh={force_refresh}): {e}")
+            releases = []
+
+        if force_refresh and not releases:
+            try:
+                cache = self.metadata_manager.load_github_cache() if self.metadata_manager else None
+                if cache and cache.get("releases"):
+                    releases = cache.get("releases", [])
+                    releases_source = "cache-fallback"
+                    print("Using cached releases due to fetch error/rate-limit.")
+            except Exception as e:
+                print(f"Error loading cached releases after fetch failure: {e}")
 
         # When the user forces a refresh, also refresh the cached download sizes
         if force_refresh:
@@ -904,7 +1558,11 @@ Categories=Graphics;ArtificialIntelligence;
         """
         if not self.version_manager:
             return False
-        return self.version_manager.remove_version(tag)
+        removed = self.version_manager.remove_version(tag)
+        if removed:
+            # Clean up any version-specific shortcuts and icons
+            self.remove_version_shortcuts(tag, remove_menu=True, remove_desktop=True)
+        return removed
 
     def switch_version(self, tag: str) -> bool:
         """

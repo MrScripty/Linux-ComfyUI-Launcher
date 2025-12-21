@@ -1,7 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Check, Loader2, Download, FolderOpen, CheckCircle2 } from 'lucide-react';
-import { SpringyToggle } from './SpringyToggle';
 
 interface VersionSelectorProps {
   installedVersions: string[];
@@ -10,6 +9,7 @@ interface VersionSelectorProps {
   switchVersion: (tag: string) => Promise<boolean>;
   openActiveInstall: () => Promise<boolean>;
   onOpenVersionManager: () => void;
+  activeShortcutState?: { menu: boolean; desktop: boolean };
 }
 
 export function VersionSelector({
@@ -19,6 +19,7 @@ export function VersionSelector({
   switchVersion,
   openActiveInstall,
   onOpenVersionManager,
+  activeShortcutState,
 }: VersionSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [isSwitching, setIsSwitching] = useState(false);
@@ -28,7 +29,28 @@ export function VersionSelector({
   const [hoveredVersion, setHoveredVersion] = useState<string | null>(null);
   const [shortcutState, setShortcutState] = useState<Record<string, { menu: boolean; desktop: boolean }>>({});
 
-  console.log('VersionSelector mounted - installedVersions:', installedVersions.length);
+  const refreshShortcutStates = useCallback(async () => {
+    if (!window.pywebview?.api?.get_all_shortcut_states) {
+      return;
+    }
+
+    try {
+      const result = await window.pywebview.api.get_all_shortcut_states();
+      const states = result?.states?.states;
+      if (result.success && states) {
+        const mapped: Record<string, { menu: boolean; desktop: boolean }> = {};
+        Object.entries(states).forEach(([tag, state]) => {
+          mapped[tag] = {
+            menu: Boolean((state as any).menu),
+            desktop: Boolean((state as any).desktop),
+          };
+        });
+        setShortcutState(mapped);
+      }
+    } catch (err) {
+      console.error('Failed to fetch shortcut states', err);
+    }
+  }, []);
 
   const handleVersionSwitch = async (tag: string) => {
     if (tag === activeVersion) {
@@ -80,6 +102,28 @@ export function VersionSelector({
       }
     };
   }, []);
+
+  // Refresh shortcut states when installed versions change
+  useEffect(() => {
+    if (!installedVersions.length) {
+      setShortcutState({});
+      return;
+    }
+    refreshShortcutStates();
+  }, [installedVersions, refreshShortcutStates]);
+
+  // Keep active version shortcut in sync with main toggle state
+  useEffect(() => {
+    if (activeVersion && activeShortcutState) {
+      setShortcutState((prev) => ({
+        ...prev,
+        [activeVersion]: {
+          menu: activeShortcutState.menu,
+          desktop: activeShortcutState.desktop,
+        },
+      }));
+    }
+  }, [activeVersion, activeShortcutState?.menu, activeShortcutState?.desktop]);
 
   return (
     <div className="relative w-full">
@@ -170,6 +214,8 @@ export function VersionSelector({
               {installedVersions.map((version) => {
                 const isActive = version === activeVersion;
                 const toggles = shortcutState[version] || { menu: false, desktop: false };
+                const isEnabled = toggles.menu && toggles.desktop;
+                const isPartial = toggles.menu !== toggles.desktop;
                 const showHover = hoveredVersion === version;
                 return (
                   <div
@@ -197,22 +243,53 @@ export function VersionSelector({
                         onClick={(e) => e.stopPropagation()}
                       >
                         <button
-                          onClick={() => {
-                            const next = !toggles.menu;
+                          onClick={async () => {
+                            if (!window.pywebview?.api?.set_version_shortcuts) {
+                              console.warn('Shortcut API not available');
+                              return;
+                            }
+
+                            const next = !isEnabled;
                             setShortcutState((prev) => ({
                               ...prev,
-                              [version]: { ...toggles, menu: next },
+                              [version]: { menu: next, desktop: next },
                             }));
-                            console.log('Toggled shortcut for', version, 'to', next);
+
+                            try {
+                              if (window.pywebview?.api?.set_version_shortcuts) {
+                                const result = await window.pywebview.api.set_version_shortcuts(version, next);
+                                if (result?.state) {
+                                  setShortcutState((prev) => ({
+                                    ...prev,
+                                    [version]: {
+                                      menu: Boolean(result.state.menu),
+                                      desktop: Boolean(result.state.desktop),
+                                    },
+                                  }));
+                                }
+                              }
+                            } catch (err) {
+                              console.error('Failed to toggle shortcuts', err);
+                              // revert on failure
+                              setShortcutState((prev) => ({
+                                ...prev,
+                                [version]: { menu: isEnabled, desktop: isEnabled },
+                              }));
+                            }
                           }}
-                          disabled={isSwitching}
+                          disabled={isSwitching || isLoading}
                           className={`relative w-8 h-4 rounded-full border transition-colors align-middle ${
-                            toggles.menu ? 'bg-[#55ff55]/30 border-[#55ff55]/70' : 'bg-[#2f2f2f] border-[#555]'
-                          } ${isSwitching ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            isEnabled
+                              ? 'bg-[#55ff55]/30 border-[#55ff55]/70'
+                              : isPartial
+                                ? 'bg-[#4a3c2a] border-amber-400/80'
+                                : 'bg-[#2f2f2f] border-[#555]'
+                          } ${isSwitching || isLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          title={isEnabled ? 'Remove menu + desktop shortcuts for this version' : 'Create menu + desktop shortcuts for this version'}
                         >
                           <span
                             className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full bg-white transition-transform ${
-                              toggles.menu ? 'translate-x-4 bg-[#55ff55]' : 'translate-x-0'
+                              isEnabled ? 'translate-x-4 bg-[#55ff55]' : 'translate-x-0'
                             }`}
                           />
                         </button>

@@ -8,7 +8,7 @@
     "unknown_size_count": 0,
     "dependencies": [],
     "requirements_hash": "sha256:ac88ff0031f9ae405b74e2258dc04a5a6ff815df49342c697c26e50f11dee845",
-    "calculated_at": "2025-12-21T09:23:56.775569+00:00",
+    "calculated_at": "2025-12-21T23:12:07.625547+00:00",
     "platform": "linux_x86_64",
     "python_version": "3.12",
     "dependencies_size_source": "pip_report"

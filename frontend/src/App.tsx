@@ -1,7 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Terminal, ArrowDownToLine, Monitor, Menu, Loader2, ArrowLeft, RefreshCw, Play, Square } from 'lucide-react';
-import { SpringyToggle } from './components/SpringyToggle';
+import { X, ArrowDownToLine, Loader2, ArrowLeft, RefreshCw, Play, Square } from 'lucide-react';
 import { VersionSelector } from './components/VersionSelector';
 import { InstallDialog } from './components/InstallDialog';
 import { useVersions } from './hooks/useVersions';
@@ -14,11 +13,16 @@ declare global {
         // Original API methods
         get_status: () => Promise<any>;
         install_deps: () => Promise<{ success: boolean }>;
-        toggle_menu: () => Promise<{ success: boolean }>;
-        toggle_desktop: () => Promise<{ success: boolean }>;
+        toggle_menu: (tag?: string) => Promise<{ success: boolean }>;
+        toggle_desktop: (tag?: string) => Promise<{ success: boolean }>;
         close_window: () => Promise<{ success: boolean }>;
         launch_comfyui: () => Promise<{ success: boolean }>;
         stop_comfyui: () => Promise<{ success: boolean }>;
+        get_version_shortcuts: (tag: string) => Promise<{ success: boolean; state: { menu: boolean; desktop: boolean; tag: string }; error?: string }>;
+        get_all_shortcut_states: () => Promise<{ success: boolean; states: { active: string | null; states: Record<string, { menu: boolean; desktop: boolean; tag?: string }> }; error?: string }>;
+        set_version_shortcuts: (tag: string, enabled: boolean) => Promise<{ success: boolean; state: { menu: boolean; desktop: boolean; tag: string }; error?: string }>;
+        toggle_version_menu: (tag: string) => Promise<{ success: boolean; state: any; error?: string }>;
+        toggle_version_desktop: (tag: string) => Promise<{ success: boolean; state: any; error?: string }>;
 
         // Version Management API (Phase 5)
         get_available_versions: (force_refresh?: boolean) => Promise<{ success: boolean; versions: any[]; error?: string }>;
@@ -67,6 +71,7 @@ export default function App() {
   const [isPatched, setIsPatched] = useState(false);
   const [menuShortcut, setMenuShortcut] = useState(false);
   const [desktopShortcut, setDesktopShortcut] = useState(false);
+  const [shortcutVersion, setShortcutVersion] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState("Checking system status...");
 
   // Release info
@@ -80,6 +85,7 @@ export default function App() {
   const [isLaunchHover, setIsLaunchHover] = useState(false);
   const [launcherVersion, setLauncherVersion] = useState<string | null>(null);
   const [spinnerFrame, setSpinnerFrame] = useState(0);
+  const isPolling = useRef(false);
 
   // Version data (shared between selector and manager view)
   const {
@@ -115,6 +121,7 @@ export default function App() {
         setIsCheckingDeps(false);
         setDepsInstalled(false);
         setVersion("Dev Mode");
+        setShortcutVersion(null);
         return;
       }
 
@@ -123,6 +130,7 @@ export default function App() {
       setIsPatched(data.patched);
       setMenuShortcut(data.menu_shortcut);
       setDesktopShortcut(data.desktop_shortcut);
+      setShortcutVersion(data.shortcut_version || null);
       setStatusMessage(data.message);
       setComfyUIRunning(data.comfyui_running || false);
 
@@ -155,6 +163,7 @@ export default function App() {
       setIsCheckingDeps(false);
       setDepsInstalled(false);
       setVersion("Error");
+      setShortcutVersion(null);
     }
   };
 
@@ -205,21 +214,30 @@ export default function App() {
     waitForPyWebView();
   }, []); // Empty dependency array - runs only once on mount
 
-  // Polling effect - only polls when ComfyUI is running
+  // Polling effect - keep UI state in sync with the actual server process
   useEffect(() => {
-    if (!comfyUIRunning) {
-      return; // Don't set up interval if ComfyUI is not running
-    }
-
-    // Poll every 5 seconds while ComfyUI is running
-    const interval = setInterval(() => {
-      if (window.pywebview && window.pywebview.api) {
-        fetchStatus(false);
+    const pollStatus = async () => {
+      if (isPolling.current || !window.pywebview?.api?.get_status) {
+        return;
       }
-    }, 5000);
+
+      isPolling.current = true;
+      try {
+        await fetchStatus(false);
+      } catch (err) {
+        console.error('Status polling error:', err);
+      } finally {
+        isPolling.current = false;
+      }
+    };
+
+    // Poll every 4 seconds regardless of launch source
+    const interval = setInterval(() => {
+      void pollStatus();
+    }, 4000);
 
     return () => clearInterval(interval);
-  }, [comfyUIRunning]); // Re-run when comfyUIRunning changes
+  }, []); // Runs continuously in the background
 
   // Spinner frame updater for running state
   useEffect(() => {
@@ -238,6 +256,15 @@ export default function App() {
     return () => clearInterval(interval);
   }, [comfyUIRunning, isLaunchHover]);
 
+  // Keep shortcut + status state aligned with active version changes
+  useEffect(() => {
+    if (!activeVersion || !window.pywebview?.api) {
+      return;
+    }
+    fetchStatus(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVersion]);
+
   // --- Handlers ---
 
   const handleInstallDeps = async () => {
@@ -252,24 +279,6 @@ export default function App() {
     setIsInstalling(false);
   };
 
-  const toggleMenu = () => {
-    if (!window.pywebview) return;
-
-    callApi(
-      () => window.pywebview!.api.toggle_menu(),
-      menuShortcut ? "Removing menu shortcut..." : "Creating menu shortcut..."
-    );
-  };
-
-  const toggleDesktop = () => {
-    if (!window.pywebview) return;
-
-    callApi(
-      () => window.pywebview!.api.toggle_desktop(),
-      desktopShortcut ? "Removing desktop shortcut..." : "Creating desktop shortcut..."
-    );
-  };
-
   const closeWindow = () => {
     if (window.pywebview) {
       window.pywebview.api.close_window();
@@ -282,40 +291,27 @@ export default function App() {
   const handleLaunchComfyUI = async () => {
     if (!window.pywebview) return;
 
-    if (comfyUIRunning) {
-      // Stop ComfyUI
-      setStatusMessage("Stopping ComfyUI...");
-      try {
-        const result = await window.pywebview.api.stop_comfyui();
-        if (result.success) {
-          setStatusMessage("ComfyUI stopped successfully");
-          setComfyUIRunning(false);
-        } else {
-          setStatusMessage("Failed to stop ComfyUI");
-        }
-      } catch (e) {
-        setStatusMessage("Error stopping ComfyUI");
-        console.error("Stop Error:", e);
-      }
-    } else {
-      // Launch ComfyUI
-      setStatusMessage("Launching ComfyUI...");
-      try {
-        const result = await window.pywebview.api.launch_comfyui();
-        if (result.success) {
-          setStatusMessage("ComfyUI launched successfully");
-          setComfyUIRunning(true);
-        } else {
-          setStatusMessage("Failed to launch ComfyUI");
-        }
-      } catch (e) {
-        setStatusMessage("Error launching ComfyUI");
-        console.error("Launch Error:", e);
-      }
-    }
+    const action = comfyUIRunning ? 'stop' : 'launch';
+    setStatusMessage(comfyUIRunning ? "Stopping ComfyUI..." : "Launching ComfyUI...");
 
-    // Refresh status after a moment
-    setTimeout(() => fetchStatus(false), 1000);
+    try {
+      const result = comfyUIRunning
+        ? await window.pywebview.api.stop_comfyui()
+        : await window.pywebview.api.launch_comfyui();
+
+      if (result.success) {
+        setStatusMessage(comfyUIRunning ? "ComfyUI stopped successfully" : "ComfyUI launched successfully");
+      } else {
+        setStatusMessage(`Failed to ${action} ComfyUI`);
+      }
+    } catch (e) {
+      setStatusMessage(`Error trying to ${action} ComfyUI`);
+      console.error(`${action === 'launch' ? 'Launch' : 'Stop'} Error:`, e);
+    } finally {
+      // Pull fresh state from backend instead of maintaining a local flag
+      await fetchStatus(false);
+      setTimeout(() => fetchStatus(false), 1200);
+    }
   };
 
   const isSetupComplete = depsInstalled === true && isPatched && menuShortcut && desktopShortcut;
@@ -460,6 +456,7 @@ export default function App() {
                 switchVersion={switchVersion}
                 openActiveInstall={openActiveInstall}
                 onOpenVersionManager={() => setShowVersionManager(true)}
+                activeShortcutState={{ menu: menuShortcut, desktop: desktopShortcut }}
               />
             </div>
 
@@ -522,39 +519,6 @@ export default function App() {
                   </span>
                 </div>
               )}
-
-            {/* Toggles */}
-            <div className="flex flex-col gap-4">
-              <div className="flex items-center gap-3">
-                {isLoading ? (
-                  <Loader2 size={14} className="text-gray-400 animate-spin" />
-                ) : (
-                  <Menu size={16} className="text-[#555]" />
-                )}
-                <SpringyToggle
-                  isOn={menuShortcut}
-                  onToggle={toggleMenu}
-                  disabled={isLoading}
-                  labelOff="No Shortcut"
-                  labelOn="Menu Shortcut"
-                />
-              </div>
-
-              <div className="flex items-center gap-3">
-                {isLoading ? (
-                  <Loader2 size={14} className="text-gray-400 animate-spin" />
-                ) : (
-                  <Monitor size={16} className="text-[#555]" />
-                )}
-                <SpringyToggle
-                  isOn={desktopShortcut}
-                  onToggle={toggleDesktop}
-                  disabled={isLoading}
-                  labelOff="No Shortcut"
-                  labelOn="Desktop Shortcut"
-                />
-              </div>
-            </div>
 
           </motion.div>
           </>

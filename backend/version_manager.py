@@ -11,8 +11,10 @@ import tarfile
 import zipfile
 import subprocess
 import time
+import re
 from pathlib import Path
 from typing import Optional, List, Callable, Dict, Tuple
+from packaging.utils import canonicalize_name
 from backend.models import (
     VersionsMetadata, VersionInfo, VersionConfig, DependencyStatus,
     GitHubRelease, get_iso_timestamp
@@ -766,8 +768,28 @@ class VersionManager:
                 'requirementsFile': None
             }
 
-        # Parse requirements
+        # Parse requirements (split required vs optional)
         requirements = parse_requirements_file(requirements_file)
+        optional_requirements: set[str] = set()
+        try:
+            optional_mode = False
+            with open(requirements_file, 'r') as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    if raw.startswith('#'):
+                        if raw.lower().startswith("#non essential dependencies"):
+                            optional_mode = True
+                        continue
+                    if raw.startswith('-'):
+                        continue
+                    if optional_mode:
+                        pkg = raw.split('==')[0].split('>=')[0].split('<=')[0].split('<')[0].split('>')[0].split('@')[0].strip()
+                        if pkg:
+                            optional_requirements.add(canonicalize_name(pkg))
+        except Exception as e:
+            print(f"Warning: could not parse optional dependencies in {requirements_file}: {e}")
 
         venv_python = version_path / "venv" / "bin" / "python"
 
@@ -780,30 +802,26 @@ class VersionManager:
             }
 
         # Check which packages are installed
-        installed = []
-        missing = []
+        installed: list[str] = []
+        missing: list[str] = []
+
+        installed_names = self._get_installed_package_names(tag, venv_python)
+        if installed_names is None:
+            # If inspection fails, don't block launch; assume satisfied
+            print(f"Warning: Could not inspect installed packages for {tag}, assuming dependencies are present")
+            return {
+                'installed': list(requirements.keys()),
+                'missing': [],
+                'requirementsFile': str(requirements_file.relative_to(self.launcher_root))
+            }
 
         for package in requirements.keys():
-            # Use pip list to check if package is installed
-            success, stdout, stderr = run_command(
-                [str(venv_python), '-m', 'pip', 'list', '--format=freeze'],
-                timeout=30
-            )
-
-            if success:
-                # Check if package is in the output
-                package_lower = package.lower()
-                found = any(
-                    line.lower().startswith(package_lower + '==')
-                    for line in stdout.split('\n')
-                )
-
-                if found:
-                    installed.append(package)
-                else:
-                    missing.append(package)
+            canon = canonicalize_name(package)
+            if canon in optional_requirements:
+                continue  # optional; ignore for blocking
+            if canon in installed_names:
+                installed.append(package)
             else:
-                # If we can't check, assume missing
                 missing.append(package)
 
         return {
@@ -811,6 +829,169 @@ class VersionManager:
             'missing': missing,
             'requirementsFile': str(requirements_file.relative_to(self.launcher_root))
         }
+
+    def _get_installed_package_names(self, tag: str, venv_python: Path) -> Optional[set[str]]:
+        """
+        Inspect installed packages in the version venv.
+
+        Returns:
+            Set of canonicalized package names, or None if inspection failed.
+        """
+        installed_names: set[str] = set()
+
+        # First try pip list JSON (fast to parse)
+        success, stdout, stderr = run_command(
+            [str(venv_python), '-m', 'pip', 'list', '--format=json'],
+            timeout=30
+        )
+
+        if success:
+            try:
+                import json as _json
+                parsed = _json.loads(stdout)
+                installed_names = {
+                    canonicalize_name(pkg.get('name', ''))
+                    for pkg in parsed
+                    if pkg.get('name')
+                }
+                return installed_names
+            except Exception as e:
+                print(f"Error parsing pip list JSON for {tag}: {e}")
+
+        # Fallback to freeze format
+        success, stdout, stderr = run_command(
+            [str(venv_python), '-m', 'pip', 'list', '--format=freeze'],
+            timeout=30
+        )
+        if success:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                pkg = line.split('==')[0].split('@')[0].strip()
+                if pkg:
+                    installed_names.add(canonicalize_name(pkg))
+            return installed_names
+
+        print(f"Warning: pip list failed for {tag}: {stderr}")
+        return None
+
+    def _slugify_tag(self, tag: str) -> str:
+        """Safe slug for filenames"""
+        if not tag:
+            return "comfyui"
+        safe = ''.join(c if c.isalnum() or c in ('-', '_') else '-' for c in tag.strip().lower())
+        # Drop a leading 'v' (v0.5.1 -> 0-5-1) to match requested naming
+        if safe.startswith('v') and len(safe) > 1:
+            safe = safe[1:]
+        safe = re.sub(r'-+', '-', safe).strip('-_')
+        return safe or "comfyui"
+
+    def _ensure_version_run_script(self, tag: str, version_path: Path) -> Path:
+        """
+        Ensure a version-specific run.sh exists that also opens the UI.
+
+        Returns:
+            Path to the run script.
+        """
+        slug = self._slugify_tag(tag)
+        script_path = version_path / f"run_{slug}.sh"
+        profile_dir = self.metadata_manager.launcher_data_dir / "profiles" / slug
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        content = f"""#!/bin/bash
+set -euo pipefail
+
+VERSION_DIR="{version_path}"
+VENV_PATH="$VERSION_DIR/venv"
+MAIN_PY="$VERSION_DIR/main.py"
+PID_FILE="$VERSION_DIR/comfyui.pid"
+URL="http://127.0.0.1:8188"
+WINDOW_CLASS="ComfyUI-{slug}"
+PROFILE_DIR="{profile_dir}"
+SERVER_START_DELAY=8
+SERVER_PID=""
+
+log() {{
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}}
+
+stop_previous_instance() {{
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log "Stopping previous server (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+    fi
+}}
+
+close_existing_app_window() {{
+    if command -v wmctrl >/dev/null 2>&1; then
+        local wins
+        wins=$(wmctrl -l -x 2>/dev/null | grep -i "$WINDOW_CLASS" | awk '{{print $1}}' || true)
+        if [[ -n "$wins" ]]; then
+            for win_id in $wins; do
+                wmctrl -i -c "$win_id" || true
+            done
+            sleep 1
+        fi
+    fi
+}}
+
+start_comfyui() {{
+    if [[ ! -x "$VENV_PATH/bin/python" ]]; then
+        echo "Missing virtual environment for {tag}"
+        exit 1
+    fi
+
+    cd "$VERSION_DIR"
+    log "Starting ComfyUI {tag}..."
+    "$VENV_PATH/bin/python" "$MAIN_PY" --enable-manager &
+    SERVER_PID=$!
+    echo "$SERVER_PID" > "$PID_FILE"
+}}
+
+open_app() {{
+    if command -v brave-browser >/dev/null 2>&1; then
+        mkdir -p "$PROFILE_DIR"
+        log "Opening Brave window for {tag}..."
+        brave-browser --app="$URL" --new-window --user-data-dir="$PROFILE_DIR" --class="$WINDOW_CLASS" >/dev/null 2>&1 &
+    else
+        log "Opening default browser..."
+        xdg-open "$URL" >/dev/null 2>&1 &
+    fi
+}}
+
+cleanup() {{
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+}}
+
+trap cleanup EXIT
+
+stop_previous_instance
+close_existing_app_window
+start_comfyui
+
+log "Waiting $SERVER_START_DELAY seconds for server to start..."
+sleep "$SERVER_START_DELAY"
+open_app
+
+wait $SERVER_PID
+"""
+        try:
+            script_path.write_text(content)
+            script_path.chmod(0o755)
+        except Exception as e:
+            print(f"Warning: could not write run.sh for {tag}: {e}")
+        return script_path
 
     def install_dependencies(
         self,
@@ -1158,9 +1339,21 @@ class VersionManager:
             print(f"Virtual environment not found for {tag}")
             return (False, None)
 
-        # Build command
-        cmd = [str(venv_python), str(main_py)]
+        # Ensure run script exists so the UI opens consistently
+        run_script = self._ensure_version_run_script(tag, version_path)
+        log_file = version_path / "launcher-run.log"
+        # Start fresh each launch so logs reflect the current run only
+        try:
+            log_file.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"Warning: could not clear old log file {log_file} for {tag}: {e}")
+        log_handle = None
+        try:
+            log_handle = open(log_file, "a")
+        except Exception as e:
+            print(f"Warning: could not open log file {log_file} for {tag}: {e}")
 
+        cmd = ['bash', str(run_script)]
         if extra_args:
             cmd.extend(extra_args)
 
@@ -1172,10 +1365,31 @@ class VersionManager:
             process = subprocess.Popen(
                 cmd,
                 cwd=str(version_path),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                stdout=log_handle or subprocess.DEVNULL,
+                stderr=log_handle or subprocess.DEVNULL,
+                start_new_session=True
             )
+
+            if log_handle:
+                try:
+                    log_handle.flush()
+                except Exception:
+                    pass
+
+            # Give the script a moment to start and detect early failure
+            time.sleep(1.0)
+            if process.poll() is not None:
+                exit_code = process.returncode
+                print(f"ComfyUI {tag} launch script exited immediately with code {exit_code}")
+                try:
+                    if log_file.exists():
+                        tail = log_file.read_text().splitlines()[-20:]
+                        print("Launcher run log (last lines):")
+                        for line in tail:
+                            print(line)
+                except Exception as log_err:
+                    print(f"Unable to read launcher log for {tag}: {log_err}")
+                return (False, None)
 
             print(f"✓ ComfyUI {tag} started (PID: {process.pid})")
             print("Use the returned process object to monitor or terminate")
@@ -1185,6 +1399,12 @@ class VersionManager:
         except Exception as e:
             print(f"Error launching ComfyUI: {e}")
             return (False, None)
+        finally:
+            if log_handle:
+                try:
+                    log_handle.close()
+                except Exception:
+                    pass
 
     def get_version_status(self) -> Dict[str, any]:
         """
