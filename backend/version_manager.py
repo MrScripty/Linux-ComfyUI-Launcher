@@ -674,6 +674,12 @@ class VersionManager:
         env['UV_LINK_MODE'] = env.get('UV_LINK_MODE', 'copy')
         return env
 
+    def _get_global_required_packages(self) -> list[str]:
+        """
+        Packages that must be installed in every ComfyUI venv regardless of requirements.txt
+        """
+        return ["setproctitle"]
+
     def _create_venv(self, version_path: Path) -> bool:
         """
         Create virtual environment for a version using UV
@@ -760,36 +766,41 @@ class VersionManager:
             }
 
         requirements_file = version_path / "requirements.txt"
+        requirements_file_rel = str(requirements_file.relative_to(self.launcher_root)) if requirements_file.exists() else None
 
-        if not requirements_file.exists():
-            return {
-                'installed': [],
-                'missing': [],
-                'requirementsFile': None
-            }
+        requirements = parse_requirements_file(requirements_file) if requirements_file.exists() else {}
 
         # Parse requirements (split required vs optional)
-        requirements = parse_requirements_file(requirements_file)
         optional_requirements: set[str] = set()
-        try:
-            optional_mode = False
-            with open(requirements_file, 'r') as f:
-                for line in f:
-                    raw = line.strip()
-                    if not raw:
-                        continue
-                    if raw.startswith('#'):
-                        if raw.lower().startswith("#non essential dependencies"):
-                            optional_mode = True
-                        continue
-                    if raw.startswith('-'):
-                        continue
-                    if optional_mode:
-                        pkg = raw.split('==')[0].split('>=')[0].split('<=')[0].split('<')[0].split('>')[0].split('@')[0].strip()
-                        if pkg:
-                            optional_requirements.add(canonicalize_name(pkg))
-        except Exception as e:
-            print(f"Warning: could not parse optional dependencies in {requirements_file}: {e}")
+        if requirements_file.exists():
+            try:
+                optional_mode = False
+                with open(requirements_file, 'r') as f:
+                    for line in f:
+                        raw = line.strip()
+                        if not raw:
+                            continue
+                        if raw.startswith('#'):
+                            if raw.lower().startswith("#non essential dependencies"):
+                                optional_mode = True
+                            continue
+                        if raw.startswith('-'):
+                            continue
+                        if optional_mode:
+                            pkg = raw.split('==')[0].split('>=')[0].split('<=')[0].split('<')[0].split('>')[0].split('@')[0].strip()
+                            if pkg:
+                                optional_requirements.add(canonicalize_name(pkg))
+            except Exception as e:
+                print(f"Warning: could not parse optional dependencies in {requirements_file}: {e}")
+
+        # Add global required packages (e.g., setproctitle for process naming)
+        global_required = self._get_global_required_packages()
+        existing_canon = {canonicalize_name(pkg) for pkg in requirements}
+        for pkg in global_required:
+            canon = canonicalize_name(pkg)
+            if canon not in existing_canon:
+                requirements[pkg] = ""
+                existing_canon.add(canon)
 
         venv_python = version_path / "venv" / "bin" / "python"
 
@@ -798,7 +809,7 @@ class VersionManager:
             return {
                 'installed': [],
                 'missing': list(requirements.keys()),
-                'requirementsFile': str(requirements_file.relative_to(self.launcher_root))
+                'requirementsFile': requirements_file_rel
             }
 
         # Check which packages are installed
@@ -812,7 +823,7 @@ class VersionManager:
             return {
                 'installed': list(requirements.keys()),
                 'missing': [],
-                'requirementsFile': str(requirements_file.relative_to(self.launcher_root))
+                'requirementsFile': requirements_file_rel
             }
 
         for package in requirements.keys():
@@ -827,7 +838,7 @@ class VersionManager:
         return {
             'installed': installed,
             'missing': missing,
-            'requirementsFile': str(requirements_file.relative_to(self.launcher_root))
+            'requirementsFile': requirements_file_rel
         }
 
     def _get_installed_package_names(self, tag: str, venv_python: Path) -> Optional[set[str]]:
@@ -838,8 +849,51 @@ class VersionManager:
             Set of canonicalized package names, or None if inspection failed.
         """
         installed_names: set[str] = set()
+        uv_env = self._build_uv_env()
+        errors: list[str] = []
 
-        # First try pip list JSON (fast to parse)
+        # Prefer uv pip list JSON (works even if pip isn't in the venv)
+        success, stdout, stderr = run_command(
+            ['uv', 'pip', 'list', '--format=json', '--python', str(venv_python)],
+            timeout=30,
+            env=uv_env
+        )
+
+        if success:
+            try:
+                import json as _json
+                parsed = _json.loads(stdout)
+                installed_names = {
+                    canonicalize_name(pkg.get('name', ''))
+                    for pkg in parsed
+                    if pkg.get('name')
+                }
+                return installed_names
+            except Exception as e:
+                errors.append(f"uv json parse: {e}")
+                print(f"Error parsing uv pip list JSON for {tag}: {e}")
+        else:
+            errors.append(f"uv json: {stderr}")
+
+        # Fallback to freeze format
+        success, stdout, stderr = run_command(
+            ['uv', 'pip', 'list', '--format=freeze', '--python', str(venv_python)],
+            timeout=30,
+            env=uv_env
+        )
+        if success:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                pkg = line.split('==')[0].split('@')[0].strip()
+                if pkg:
+                    installed_names.add(canonicalize_name(pkg))
+            return installed_names
+        else:
+            errors.append(f"uv freeze: {stderr}")
+
+        # Last resort: try venv's pip directly if available
         success, stdout, stderr = run_command(
             [str(venv_python), '-m', 'pip', 'list', '--format=json'],
             timeout=30
@@ -856,9 +910,11 @@ class VersionManager:
                 }
                 return installed_names
             except Exception as e:
+                errors.append(f"pip json parse: {e}")
                 print(f"Error parsing pip list JSON for {tag}: {e}")
+        else:
+            errors.append(f"pip json: {stderr}")
 
-        # Fallback to freeze format
         success, stdout, stderr = run_command(
             [str(venv_python), '-m', 'pip', 'list', '--format=freeze'],
             timeout=30
@@ -872,8 +928,11 @@ class VersionManager:
                 if pkg:
                     installed_names.add(canonicalize_name(pkg))
             return installed_names
+        else:
+            errors.append(f"pip freeze: {stderr}")
 
-        print(f"Warning: pip list failed for {tag}: {stderr}")
+        error_msg = '; '.join([e for e in errors if e]) or "unknown error"
+        print(f"Warning: dependency inspection failed for {tag}: {error_msg}")
         return None
 
     def _slugify_tag(self, tag: str) -> str:
@@ -1017,8 +1076,7 @@ wait $SERVER_PID
         requirements_file = version_path / "requirements.txt"
 
         if not requirements_file.exists():
-            print(f"No requirements.txt found for {tag}")
-            return True  # No requirements is not an error
+            print(f"No requirements.txt found for {tag} (will still install global dependencies)")
 
         venv_python = version_path / "venv" / "bin" / "python"
 
@@ -1031,17 +1089,18 @@ wait $SERVER_PID
         if progress_callback:
             progress_callback("Installing Python packages...")
 
+        global_required = self._get_global_required_packages()
         uv_env = self._build_uv_env()
-        # Use UV to install requirements
-        success, stdout, stderr = run_command(
-            [
-                'uv', 'pip', 'install',
-                '-r', str(requirements_file),
-                '--python', str(venv_python)
-            ],
-            timeout=600,  # 10 minute timeout for large installs
-            env=uv_env
-        )
+        # Use UV to install requirements plus global packages
+        install_cmd = [
+            'uv', 'pip', 'install',
+            '--python', str(venv_python)
+        ]
+        if requirements_file.exists():
+            install_cmd += ['-r', str(requirements_file)]
+        install_cmd += global_required
+
+        success, stdout, stderr = run_command(install_cmd, timeout=600, env=uv_env)
 
         if success:
             print("✓ Dependencies installed successfully")
@@ -1052,18 +1111,17 @@ wait $SERVER_PID
         print(f"Error installing dependencies with uv: {stderr}")
         print("Attempting pip fallback...")
 
-        success, stdout, stderr = run_command(
-            [
-                str(venv_python),
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                str(requirements_file),
-            ],
-            timeout=900,
-            env=uv_env
-        )
+        pip_cmd = [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+        ]
+        if requirements_file.exists():
+            pip_cmd += ["-r", str(requirements_file)]
+        pip_cmd += global_required
+
+        success, stdout, stderr = run_command(pip_cmd, timeout=900, env=uv_env)
 
         if success:
             print("✓ Dependencies installed successfully via pip fallback")
@@ -1092,10 +1150,6 @@ wait $SERVER_PID
 
         requirements_file = version_path / "requirements.txt"
 
-        if not requirements_file.exists():
-            print(f"No requirements.txt found for {tag}")
-            return True  # No requirements is not an error
-
         venv_python = version_path / "venv" / "bin" / "python"
 
         if not venv_python.exists():
@@ -1103,8 +1157,19 @@ wait $SERVER_PID
             return False
 
         # Parse requirements to get package list
-        requirements = parse_requirements_file(requirements_file)
-        package_count = len(requirements)
+        requirements = parse_requirements_file(requirements_file) if requirements_file.exists() else {}
+        global_required = self._get_global_required_packages()
+        # Add global packages that are not already in requirements
+        existing_canon = {canonicalize_name(pkg) for pkg in requirements}
+        extra_global = []
+        for pkg in global_required:
+            canon = canonicalize_name(pkg)
+            if canon not in existing_canon:
+                extra_global.append(pkg)
+                existing_canon.add(canon)
+
+        package_entries = list(requirements.items()) + [(pkg, "") for pkg in extra_global]
+        package_count = len(package_entries)
 
         print(f"Installing {package_count} dependencies for {tag}...")
 
@@ -1127,12 +1192,16 @@ wait $SERVER_PID
         last_sample_time = time.time()
         uv_stdout = ""
         uv_stderr = ""
+        uv_cmd = [
+            'uv', 'pip', 'install',
+            '--python', str(venv_python)
+        ]
+        if requirements_file.exists():
+            uv_cmd += ['-r', str(requirements_file)]
+        uv_cmd += extra_global
+
         self._current_process = subprocess.Popen(
-            [
-                'uv', 'pip', 'install',
-                '-r', str(requirements_file),
-                '--python', str(venv_python)
-            ],
+            uv_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1192,7 +1261,7 @@ wait $SERVER_PID
 
         if success:
             # Mark all dependencies as completed
-            for i, (package, version_spec) in enumerate(requirements.items(), 1):
+            for i, (package, version_spec) in enumerate(package_entries, 1):
                 self.progress_tracker.update_dependency_progress(
                     f"{package}{version_spec}",
                     i,
@@ -1210,21 +1279,20 @@ wait $SERVER_PID
 
             # Fallback: use venv's pip directly (still reuses cache via env)
             print("Attempting fallback install with pip...")
-            success, stdout, stderr = run_command(
-                [
-                    str(venv_python),
-                    "-m",
-                    "pip",
-                    "install",
-                    "-r",
-                    str(requirements_file),
-                ],
-                timeout=900,
-                env=uv_env
-            )
+            pip_cmd = [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+            ]
+            if requirements_file.exists():
+                pip_cmd += ["-r", str(requirements_file)]
+            pip_cmd += extra_global
+
+            success, stdout, stderr = run_command(pip_cmd, timeout=900, env=uv_env)
 
             if success:
-                for i, (package, version_spec) in enumerate(requirements.items(), 1):
+                for i, (package, version_spec) in enumerate(package_entries, 1):
                     self.progress_tracker.update_dependency_progress(
                         f"{package}{version_spec}",
                         i,

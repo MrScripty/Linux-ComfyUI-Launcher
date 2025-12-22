@@ -2,7 +2,7 @@
 
 **Project**: Linux ComfyUI Launcher - Multi-Version Management System
 **Date**: 2025-12-19
-**Last Updated**: 2025-12-20
+**Last Updated**: 2025-12-21
 **Purpose**: Enable installation, management, and switching between multiple ComfyUI versions with shared resources
 
 ---
@@ -19,7 +19,8 @@
 
 ✅ **Phase 2: GitHub Integration** (Completed 2025-12-19)
 - GitHub releases API integration with caching (1-hour TTL)
-- Release fetching with pagination support
+- Release fetching with pagination support (expand to fetch all pages and display only the newest patch per minor)
+- Background fetch of releases at app startup when cache is empty (no waiting for dialog open)
 - Download manager with progress tracking and retry logic
 - Rate limiting and error handling
 - All tests passing
@@ -197,6 +198,10 @@
   - ✅ Display "No version selected" when empty
   - Highlight/emphasize download button when empty
   - Guide user to first action
+- Release list updates
+  - Fetch all GitHub release pages and collapse display to only the latest patch per minor (e.g., show 0.5.1, 0.4.0, 0.3.76, 0.2.x; hide older 0.5.0/0.3.75, etc.)
+  - Show in-progress installs in both the VersionSelector dropdown and InstallDialog cards with an "Installing" badge; persist that state when leaving and reopening the install view
+  - If no cached releases, fetch from GitHub in the background on startup so size/status data is ready before the user opens Install
 - Open in File Manager functionality
   - Cross-platform implementation (Linux/macOS/Windows)
   - Add button to version selector for active version
@@ -230,7 +235,8 @@
 - Update checking and notifications
 
 📋 **Phase 6.4: Resource Browser Component** (Not Started)
-- Model browser with shared storage view
+- Model browser with shared storage view and per-version symlink controls
+- Version-range symlink rules so specific models can be linked only to selected ComfyUI version ranges (e.g., older models limited to legacy versions)
 - Custom node manager per version
 - Workflow organization
 
@@ -1180,47 +1186,56 @@ class MetadataManager:
 
 ## UI/UX Design
 
-### Main Dashboard Layout
+### Main Dashboard Layout (Current UI)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  ComfyUI Launcher                               [X]      │
+│ ComfyUI Setup                          [Launch/Stop] [X] │
+│ Launcher: vX.Y.Z   (spinner when loading)               │
 ├─────────────────────────────────────────────────────────┤
-│                                                          │
-│  Active Version: [v0.2.1 ▼]  [🔄]  [⬇]                 │
-│                                                          │
-│  ┌────────────────────────────────────────────────────┐ │
-│  │ Status: Ready to launch                            │ │
-│  │ Dependencies: ✓ All installed                      │ │
-│  │ Update Available: v0.3.0                           │ │
-│  └────────────────────────────────────────────────────┘ │
-│                                                          │
-│  [ Launch ComfyUI ]        [ Stop ]                     │
-│                                                          │
-│  ┌─ Installed Versions ──────────────────────────────┐ │
-│  │                                                    │ │
-│  │  v0.3.0    Jan 25  1.2GB  ✓  [Launch] [⚙] [🗑]   │ │
-│  │  v0.2.1    Jan 20  1.2GB  ✓  [Launch] [⚙] [🗑]   │ │
-│  │  v0.2.0    Jan 15  1.2GB  ✓  [Launch] [⚙] [🗑]   │ │
-│  │                                                    │ │
-│  └────────────────────────────────────────────────────┘ │
-│                                                          │
-│  ┌─ Tabs ──────────────────────────────────────────┐   │
-│  │ [Models] [Custom Nodes] [Workflows] [Settings]  │   │
-│  │                                                  │   │
-│  │  [Content based on selected tab]                │   │
-│  │                                                  │   │
-│  └──────────────────────────────────────────────────┘   │
-│                                                          │
+│ [Version Selector: active tag or "No version selected"] │
+│  • Dropdown of installed versions with shortcut toggle  │
+│  • Buttons: Open install path, Open Install Manager     │
+│                                                        │
+│ [Install Missing Dependencies] (only when deps missing) │
+│                                                        │
+│ [Status line: ready/loading/error text, green when ready]│
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Legend**:
-- `[v0.2.1 ▼]` - Version dropdown selector
-- `[🔄]` - Refresh releases from GitHub
-- `[⬇]` - Download/install new version
-- `[⚙]` - Configure version (custom nodes, launch args)
-- `[🗑]` - Delete version
+### Install Manager (Current UI)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Install Versions (page mode)   [Back] [Refresh]         │
+│ Filters: [x] Pre-releases  [x] Show installed           │
+│                                                          │
+│ Card list (newest patch per minor):                      │
+│ ┌──────────────────────────────────────────────┐         │
+│ │ v0.5.1   Jan 10   Size: 4.5 GB   [Install]   │         │
+│ │  - Link to release notes                     │         │
+│ │  - Badges: Installing / Installed / Uninstall│         │
+│ └──────────────────────────────────────────────┘         │
+│ ┌──────────────────────────────────────────────┐         │
+│ │ v0.4.0   Dec 01   Size: 4.1 GB   [Installed] │         │
+│ └──────────────────────────────────────────────┘         │
+│ ... (0.3.latest, 0.2.latest)                             │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Installation Progress (Inline in Install Manager)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Installing v0.5.1                                       │
+│ Overall: [██████░░░░] 52%                               │
+│ Stage: Dependencies  (48%)   Current: torch==2.1.0      │
+│ Download: 2.1 GB / 4.4 GB   Speed: 4.8 MB/s   ETA: 8m   │
+│ Packages: 3 / 12                                         │
+│ Completed items (collapsible list)                      │
+│ [Cancel]                                                │
+└─────────────────────────────────────────────────────────┘
+```
 
 ### Install New Version Dialog (Enhanced - Phase 6.2.5)
 

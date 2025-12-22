@@ -1124,7 +1124,7 @@ Categories=Graphics;ArtificialIntelligence;
 
         # Determine status message
         if running:
-            message = "ComfyUI is running"
+            message = ""  # Suppress running banner text in GUI
         elif not deps_ready:
             message = "Missing dependencies detected."
         elif deps_ready and patched and menu and desktop:
