@@ -12,9 +12,18 @@ import zipfile
 import subprocess
 import time
 import re
+import urllib.request
+from datetime import datetime, timezone
+try:
+    import psutil
+except Exception:
+    psutil = None
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Callable, Dict, Tuple
 from packaging.utils import canonicalize_name
+from packaging.version import Version
+from packaging.specifiers import SpecifierSet
 from backend.models import (
     VersionsMetadata, VersionInfo, VersionConfig, DependencyStatus,
     GitHubRelease, get_iso_timestamp
@@ -24,7 +33,7 @@ from backend.github_integration import GitHubReleasesFetcher, DownloadManager
 from backend.resource_manager import ResourceManager
 from backend.utils import (
     ensure_directory, run_command, check_command_exists, get_directory_size,
-    parse_requirements_file
+    parse_requirements_file, safe_filename
 )
 from backend.installation_progress_tracker import (
     InstallationProgressTracker,
@@ -55,6 +64,23 @@ class VersionManager:
         self.metadata_manager = metadata_manager
         self.github_fetcher = github_fetcher
         self.resource_manager = resource_manager
+        self.logs_dir = self.metadata_manager.launcher_data_dir / "logs"
+        ensure_directory(self.logs_dir)
+        self.constraints_dir = self.metadata_manager.cache_dir / "constraints"
+        ensure_directory(self.constraints_dir)
+        self._constraints_cache_file = self.metadata_manager.cache_dir / "constraints-cache.json"
+        self._constraints_cache: Dict[str, Dict[str, str]] = self._load_constraints_cache()
+        self._pypi_release_cache: Dict[str, Dict[str, datetime]] = {}
+        self.logs_dir = self.metadata_manager.launcher_data_dir / "logs"
+        ensure_directory(self.logs_dir)
+        self.constraints_dir = self.metadata_manager.cache_dir / "constraints"
+        ensure_directory(self.constraints_dir)
+        self._constraints_cache_file = self.metadata_manager.cache_dir / "constraints-cache.json"
+        self._constraints_cache: Dict[str, Dict[str, str]] = self._load_constraints_cache()
+        self._pypi_release_cache: Dict[str, Dict[str, list]] = {}
+
+        # Track active version for this session so user selections are not overridden
+        self._active_version: Optional[str] = None
 
         # Directories
         self.versions_dir = self.launcher_root / "comfyui-versions"
@@ -66,6 +92,7 @@ class VersionManager:
         self.uv_cache_dir = self.resource_manager.shared_dir / "uv"
         if ensure_directory(self.uv_cache_dir):
             print(f"Using UV cache directory at {self.uv_cache_dir}")
+        self.active_uv_cache_dir = self.uv_cache_dir
 
         # Initialize progress tracker (Phase 6.2.5b)
         cache_dir = metadata_manager.launcher_data_dir / "cache"
@@ -76,6 +103,299 @@ class VersionManager:
         self._installing_tag = None
         self._current_process = None  # Track active subprocess for immediate kill
         self._current_downloader = None  # Track active downloader for immediate cancel
+        self._install_log_handle = None
+        self._current_install_log_path: Optional[Path] = None
+
+        # Establish startup active version using priority rules
+        self._initialize_active_version()
+
+    def _write_active_version_file(self, tag: Optional[str]) -> bool:
+        """Persist active version tag to file or clear it when None."""
+        try:
+            if tag:
+                self.active_version_file.write_text(tag)
+            else:
+                if self.active_version_file.exists():
+                    self.active_version_file.unlink()
+            return True
+        except Exception as exc:
+            print(f"Error writing active version file: {exc}")
+            return False
+
+    def _set_active_version_state(self, tag: Optional[str], update_last_selected: bool) -> bool:
+        """
+        Update in-memory and on-disk active version state.
+
+        Args:
+            tag: Version tag to mark active, or None
+            update_last_selected: When True, persist as lastSelectedVersion (user choice)
+        """
+        self._active_version = tag
+        success = self._write_active_version_file(tag)
+
+        if update_last_selected:
+            versions_metadata = self.metadata_manager.load_versions()
+            versions_metadata['lastSelectedVersion'] = tag
+            success = self.metadata_manager.save_versions(versions_metadata) and success
+
+        return success
+
+    def _initialize_active_version(self) -> Optional[str]:
+        """
+        Set the startup active version using priority:
+        1) defaultVersion
+        2) lastSelectedVersion
+        3) newest installed
+        """
+        installed_versions = self.get_installed_versions()
+        if not installed_versions:
+            self._set_active_version_state(None, update_last_selected=False)
+            return None
+
+        versions_metadata = self.metadata_manager.load_versions()
+        candidates = [
+            versions_metadata.get('defaultVersion'),
+            versions_metadata.get('lastSelectedVersion')
+        ]
+
+        for candidate in candidates:
+            if candidate and candidate in installed_versions:
+                self._set_active_version_state(candidate, update_last_selected=False)
+                return candidate
+
+        newest = sorted(installed_versions, reverse=True)[0]
+        self._set_active_version_state(newest, update_last_selected=False)
+        return newest
+
+    def _load_constraints_cache(self) -> Dict[str, Dict[str, str]]:
+        """Load cached per-tag constraints to avoid recomputation."""
+        try:
+            if self._constraints_cache_file.exists():
+                with open(self._constraints_cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            print(f"Warning: unable to read constraints cache: {exc}")
+        return {}
+
+    def _save_constraints_cache(self):
+        """Persist constraints cache safely."""
+        try:
+            tmp = self._constraints_cache_file.with_suffix('.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._constraints_cache, f, indent=2)
+            tmp.replace(self._constraints_cache_file)
+        except Exception as exc:
+            print(f"Warning: unable to write constraints cache: {exc}")
+
+    def _open_install_log(self, prefix: str) -> Path:
+        """Create/open an install log file for the current attempt."""
+        timestamp = int(time.time())
+        filename = f"{prefix}-{timestamp}.log"
+        log_path = self.logs_dir / filename
+        try:
+            self._install_log_handle = open(log_path, "a", encoding="utf-8")
+            self._current_install_log_path = log_path
+            header = f"{'='*30} INSTALL START {prefix} @ {datetime.now(timezone.utc).isoformat()} {'='*30}\n"
+            self._install_log_handle.write(header)
+            self._install_log_handle.flush()
+        except Exception as exc:
+            print(f"Warning: unable to open install log at {log_path}: {exc}")
+            self._install_log_handle = None
+            self._current_install_log_path = log_path
+        return log_path
+
+    def _log_install(self, message: str):
+        """Append a line to the current install log."""
+        if not message:
+            return
+        if self._install_log_handle:
+            try:
+                self._install_log_handle.write(message.rstrip() + "\n")
+                self._install_log_handle.flush()
+            except Exception as exc:
+                print(f"Warning: failed to write to install log: {exc}")
+
+    def _get_process_io_bytes(self, pid: int, include_children: bool = True) -> Optional[int]:
+        """
+        Return total read+write bytes for a process (and optionally its children),
+        using psutil as a proxy for download activity.
+        """
+        if not psutil or not pid:
+            return None
+        try:
+            proc = psutil.Process(pid)
+            procs = [proc]
+            if include_children:
+                procs += proc.children(recursive=True)
+            total = 0
+            for p in procs:
+                try:
+                    io = p.io_counters()
+                    total += io.read_bytes + io.write_bytes
+                except Exception:
+                    continue
+            return total
+        except Exception:
+            return None
+
+
+    def _get_release_date(self, tag: str, release: Optional[GitHubRelease]) -> Optional[datetime]:
+        """Return release date in UTC for a tag."""
+        if not release:
+            return None
+        published_at = release.get("published_at")
+        if not published_at:
+            return None
+        try:
+            # GitHub timestamps are ISO with Z suffix
+            if isinstance(published_at, str):
+                ts = published_at.replace("Z", "+00:00")
+                return datetime.fromisoformat(ts).astimezone(timezone.utc)
+        except Exception as exc:
+            print(f"Warning: could not parse release date for {tag}: {exc}")
+        return None
+
+    def _get_constraints_path(self, tag: str) -> Path:
+        """Path to the cached constraints file for a tag."""
+        safe_tag = safe_filename(tag) or "unknown"
+        return self.constraints_dir / f"{safe_tag}.txt"
+
+    def _fetch_pypi_versions(self, package: str) -> Dict[str, datetime]:
+        """
+        Fetch release versions and upload times for a package from PyPI.
+        Returns mapping version->upload datetime (UTC).
+        """
+        canon = canonicalize_name(package)
+        if canon in self._pypi_release_cache:
+            return self._pypi_release_cache[canon]
+
+        url = f"https://pypi.org/pypi/{package}/json"
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.load(resp)
+        except Exception as exc:
+            print(f"Warning: failed to fetch PyPI data for {package}: {exc}")
+            return {}
+
+        releases = data.get("releases", {})
+        result: Dict[str, datetime] = {}
+
+        for version_str, files in releases.items():
+            upload_times = []
+            for file_entry in files or []:
+                upload_time = file_entry.get("upload_time_iso_8601") or file_entry.get("upload_time")
+                if upload_time:
+                    try:
+                        upload_times.append(datetime.fromisoformat(upload_time.replace("Z", "+00:00")).astimezone(timezone.utc))
+                    except Exception:
+                        continue
+            if upload_times:
+                result[version_str] = max(upload_times)
+
+        self._pypi_release_cache[canon] = result
+        return result
+
+    def _select_version_for_date(self, package: str, spec: str, release_date: Optional[datetime]) -> Optional[str]:
+        """
+        Choose the newest version that satisfies the spec and is uploaded on/before the release date.
+        If release_date is None, picks the newest version satisfying the spec.
+        """
+        releases = self._fetch_pypi_versions(package)
+        if not releases:
+            return None
+
+        try:
+            spec_set = SpecifierSet(spec) if spec else SpecifierSet()
+        except Exception as exc:
+            print(f"Warning: invalid specifier for {package} ({spec}): {exc}")
+            spec_set = SpecifierSet()
+
+        candidates = []
+        for ver_str, uploaded_at in releases.items():
+            try:
+                ver = Version(ver_str)
+            except Exception:
+                continue
+            if spec_set and ver not in spec_set:
+                continue
+            if release_date and uploaded_at and uploaded_at > release_date:
+                continue
+            candidates.append((ver, ver_str))
+
+        if not candidates:
+            return None
+
+        candidates.sort()
+        return candidates[-1][1]
+
+    def _build_constraints_for_tag(self, tag: str, requirements_file: Path, release: Optional[GitHubRelease]) -> Optional[Path]:
+        """
+        Build a constraints file when requirements are not fully pinned.
+        """
+        constraints_path = self._get_constraints_path(tag)
+        if constraints_path.exists():
+            return constraints_path
+
+        if not requirements_file.exists():
+            return None
+
+        requirements = parse_requirements_file(requirements_file)
+        unpinned = {pkg: spec for pkg, spec in requirements.items() if not spec or not spec.startswith("==")}
+        if not unpinned:
+            return None  # already pinned
+
+        release_date = self._get_release_date(tag, release)
+        resolved: Dict[str, str] = {}
+
+        for pkg, spec in unpinned.items():
+            version_str = self._select_version_for_date(pkg, spec, release_date)
+            if version_str:
+                resolved[pkg] = f"=={version_str}"
+            else:
+                resolved[pkg] = spec or ""
+                print(f"Warning: unable to resolve pinned version for {pkg} (spec: '{spec}')")
+
+        combined: Dict[str, str] = {}
+        for pkg, spec in requirements.items():
+            combined[pkg] = resolved.get(pkg, spec if spec else "")
+
+        try:
+            with open(constraints_path, 'w', encoding='utf-8') as f:
+                for pkg, spec in combined.items():
+                    if spec:
+                        f.write(f"{pkg}{spec}\n")
+                    else:
+                        f.write(f"{pkg}\n")
+        except Exception as exc:
+            print(f"Warning: failed to write constraints file for {tag}: {exc}")
+            return None
+
+        self._constraints_cache[tag] = combined
+        self._save_constraints_cache()
+
+        return constraints_path
+
+    def _load_constraints_cache(self) -> Dict[str, Dict[str, str]]:
+        """Load cached per-tag constraints to avoid recomputation."""
+        try:
+            if self._constraints_cache_file.exists():
+                with open(self._constraints_cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            print(f"Warning: unable to read constraints cache: {exc}")
+        return {}
+
+    def _save_constraints_cache(self):
+        """Persist constraints cache safely."""
+        try:
+            tmp = self._constraints_cache_file.with_suffix('.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._constraints_cache, f, indent=2)
+            tmp.replace(self._constraints_cache_file)
+        except Exception as exc:
+            print(f"Warning: unable to write constraints cache: {exc}")
 
     def get_installation_progress(self) -> Optional[Dict]:
         """
@@ -346,37 +666,28 @@ class VersionManager:
 
     def get_active_version(self) -> Optional[str]:
         """
-        Get currently active version tag
+        Get currently active version tag for this session.
 
-        Priority order:
-        1. lastSelectedVersion (user's explicit choice - takes precedence)
-        2. defaultVersion (if set and installed, only when no user choice)
-        3. newest installed version (fallback)
-        4. None (nothing installed)
+        If the session has no active version (or it points to a missing install),
+        re-evaluate using startup priority: defaultVersion → lastSelectedVersion
+        → newest installed.
 
         Returns:
             Active version tag or None
         """
-        versions_metadata = self.metadata_manager.load_versions()
         installed_versions = self.get_installed_versions()
 
         # If no versions installed, return None
         if not installed_versions:
+            self._active_version = None
             return None
 
-        # Priority 1: Use last selected version if installed (user's explicit choice)
-        last_selected = versions_metadata.get('lastSelectedVersion')
-        if last_selected and last_selected in installed_versions:
-            return last_selected
+        # Honor current session selection if still valid
+        if self._active_version in installed_versions:
+            return self._active_version
 
-        # Priority 2: Use default version if set and installed (only when no user choice)
-        default_version = versions_metadata.get('defaultVersion')
-        if default_version and default_version in installed_versions:
-            return default_version
-
-        # Priority 3: Use newest installed version (fallback)
-        sorted_versions = sorted(installed_versions, reverse=True)
-        return sorted_versions[0] if sorted_versions else None
+        # Re-evaluate using startup priority when session state is missing/stale
+        return self._initialize_active_version()
 
     def get_active_version_path(self) -> Optional[Path]:
         """
@@ -414,18 +725,9 @@ class VersionManager:
             print(f"Warning: Found {len(repair_report['broken'])} broken symlinks")
             print(f"Repaired: {len(repair_report['repaired'])}, Removed: {len(repair_report['removed'])}")
 
-        # Update active version file
-        try:
-            self.active_version_file.write_text(tag)
-        except Exception as e:
-            print(f"Error writing active version file: {e}")
+        # Update active version state (persist as user choice)
+        if not self._set_active_version_state(tag, update_last_selected=True):
             return False
-
-        # Update metadata
-        versions_metadata = self.metadata_manager.load_versions()
-        versions_metadata['lastSelectedVersion'] = tag
-
-        self.metadata_manager.save_versions(versions_metadata)
 
         print(f"✓ Activated version: {tag}")
         return True
@@ -452,6 +754,70 @@ class VersionManager:
         self.metadata_manager.save_versions(versions_metadata)
         print(f"✓ Default version set to: {tag}")
         return True
+
+    def _wait_for_server_ready(self, url: str, process: subprocess.Popen, log_file: Path, timeout: int = 90) -> Tuple[bool, Optional[str]]:
+        """
+        Poll the server URL until ready or process exits.
+
+        Returns:
+            (ready, error_message)
+        """
+        start = time.time()
+        last_error = None
+        while True:
+            if process.poll() is not None:
+                exit_code = process.returncode
+                msg = f"ComfyUI process exited early with code {exit_code}"
+                print(msg)
+                return False, msg
+
+            try:
+                with urllib.request.urlopen(url, timeout=3) as resp:
+                    if resp.status == 200:
+                        return True, None
+            except Exception as exc:
+                last_error = str(exc)
+
+            if time.time() - start > timeout:
+                return False, last_error or "Timed out waiting for server"
+
+            time.sleep(1)
+
+    def _tail_log(self, log_file: Path, lines: int = 20) -> List[str]:
+        """Return the last N lines of a log file."""
+        if not log_file.exists():
+            return []
+        try:
+            content = log_file.read_text().splitlines()
+            return content[-lines:]
+        except Exception:
+            return []
+
+    def _open_frontend(self, url: str, slug: str):
+        """Open the ComfyUI frontend in a browser profile (prefers Brave)."""
+        profile_dir = self.metadata_manager.launcher_data_dir / "profiles" / slug
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if shutil.which("brave-browser"):
+                subprocess.Popen(
+                    [
+                        "brave-browser",
+                        f"--app={url}",
+                        "--new-window",
+                        f"--user-data-dir={profile_dir}",
+                        f"--class=ComfyUI-{slug}"
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                subprocess.Popen(
+                    ["xdg-open", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+        except Exception as exc:
+            print(f"Warning: failed to open frontend: {exc}")
 
     def install_version(
         self,
@@ -486,18 +852,22 @@ class VersionManager:
             print(f"Version directory already exists: {version_path}")
             return False
 
+        install_log_path = self._open_install_log(f"install-{safe_filename(tag)}")
+        self._log_install(f"Starting install for {tag}")
+
         try:
             # Reset cancellation flag and set installing tag
             self._cancel_installation = False
             self._installing_tag = tag
 
             # Initialize progress tracking
-            self.progress_tracker.start_installation(tag)
+            self.progress_tracker.start_installation(tag, log_path=str(install_log_path))
 
             # Step 1: Download release
             self.progress_tracker.update_stage(InstallationStage.DOWNLOAD, 0, f"Downloading {tag}")
             if progress_callback:
                 progress_callback("Downloading release...", 1, 5)
+            self._log_install(f"Downloading release from GitHub for {tag}")
 
             # Check for cancellation
             if self._cancel_installation:
@@ -507,6 +877,7 @@ class VersionManager:
             if not download_url:
                 error_msg = "No download URL found in release"
                 print(error_msg)
+                self._log_install(error_msg)
                 self.progress_tracker.set_error(error_msg)
                 return False
 
@@ -551,6 +922,7 @@ class VersionManager:
                 if not success:
                     error_msg = "Download failed"
                     print(error_msg)
+                    self._log_install(error_msg)
                     self.progress_tracker.set_error(error_msg)
                     return False
             finally:
@@ -560,6 +932,7 @@ class VersionManager:
             archive_size = archive_path.stat().st_size
             self.progress_tracker.update_download_progress(archive_size, archive_size)
             self.progress_tracker.add_completed_item(archive_path.name, 'archive', archive_size)
+            self._log_install(f"Downloaded archive to {archive_path} ({archive_size} bytes)")
 
             # Check for cancellation after download
             if self._cancel_installation:
@@ -571,6 +944,7 @@ class VersionManager:
                 progress_callback("Extracting archive...", 2, 5)
 
             print(f"Extracting {archive_path.name}...")
+            self._log_install(f"Extracting archive {archive_path.name}")
             temp_extract_dir = download_dir / f"extract-{tag}"
             ensure_directory(temp_extract_dir)
 
@@ -615,11 +989,13 @@ class VersionManager:
             if not self._create_venv(version_path):
                 error_msg = "Failed to create virtual environment"
                 print(error_msg)
+                self._log_install(error_msg)
                 self.progress_tracker.set_error(error_msg)
                 shutil.rmtree(version_path)
                 return False
 
             self.progress_tracker.update_stage(InstallationStage.VENV, 100, "Virtual environment created")
+            self._log_install("Virtual environment created successfully")
 
             # Check for cancellation
             if self._cancel_installation:
@@ -633,8 +1009,19 @@ class VersionManager:
             deps_success = self._install_dependencies_with_progress(tag)
             if not deps_success:
                 print("Warning: Dependency installation had errors")
+                self._log_install("Dependency installation failed; aborting setup")
                 self.progress_tracker.set_error("Dependency installation failed")
-                # Continue to finish setup, but installation will be marked as failed
+                # Clean up failed install
+                if version_path.exists():
+                    try:
+                        shutil.rmtree(version_path)
+                        print(f"✓ Removed incomplete installation directory")
+                    except Exception as cleanup_error:
+                        print(f"Warning: Failed to clean up directory: {cleanup_error}")
+                self.progress_tracker.complete_installation(False)
+                return False
+            else:
+                self._log_install("Dependencies installed successfully")
 
             # Step 5: Setup symlinks
             self.progress_tracker.update_stage(InstallationStage.SETUP, 0, "Setting up symlinks")
@@ -664,14 +1051,17 @@ class VersionManager:
 
             if deps_success:
                 print(f"✓ Successfully installed {tag}")
+                self._log_install(f"✓ Successfully installed {tag}")
             else:
                 print(f"Installation completed with dependency errors for {tag}")
+                self._log_install(f"Installation completed with dependency errors for {tag}")
             return deps_success
 
         except InterruptedError as e:
             # Installation was cancelled by user
             error_msg = str(e)
             print(f"✓ {error_msg}")
+            self._log_install(error_msg)
             self.progress_tracker.set_error(error_msg)
             self.progress_tracker.complete_installation(False)
 
@@ -687,6 +1077,7 @@ class VersionManager:
         except Exception as e:
             error_msg = f"Error installing version {tag}: {e}"
             print(error_msg)
+            self._log_install(error_msg)
             self.progress_tracker.set_error(error_msg)
             self.progress_tracker.complete_installation(False)
 
@@ -703,29 +1094,79 @@ class VersionManager:
             # Reset installation state
             self._installing_tag = None
             self._cancel_installation = False
-
-            # Clear progress state after a short delay (allow UI to read final state)
-            time.sleep(2)
-            self.progress_tracker.clear_state()
+            if self._install_log_handle:
+                try:
+                    self._install_log_handle.write(f"{'='*30} INSTALL END {tag} {'='*30}\n")
+                    self._install_log_handle.close()
+                except Exception:
+                    pass
+                self._install_log_handle = None
+            # Preserve progress state so UI can read failure logs; it will be overwritten by the next install
 
     def _build_uv_env(self) -> Dict[str, str]:
         """
         Build environment variables for UV commands, ensuring cache is shared
         """
         env = os.environ.copy()
-        if ensure_directory(self.uv_cache_dir):
-            env['UV_CACHE_DIR'] = str(self.uv_cache_dir)
-            # Also point pip to a persistent cache alongside UV's cache
-            pip_cache = self.uv_cache_dir / "pip-cache"
+        cache_dir = self.uv_cache_dir
+        if " " in str(cache_dir):
+            # Fallback to a space-free cache path to avoid tooling bugs with spaces
+            cache_dir = Path.home() / ".cache" / "comfyui-uv-cache"
+        if ensure_directory(cache_dir):
+            env['UV_CACHE_DIR'] = str(cache_dir)
+            pip_cache = cache_dir / "pip-cache"
             try:
                 pip_cache.mkdir(parents=True, exist_ok=True)
                 env['PIP_CACHE_DIR'] = str(pip_cache)
             except Exception:
                 pass
+            self.active_uv_cache_dir = cache_dir
         else:
-            print(f"Warning: Unable to create UV cache directory at {self.uv_cache_dir}")
+            print(f"Warning: Unable to create UV cache directory at {cache_dir}")
+            self.active_uv_cache_dir = self.uv_cache_dir
         env['UV_LINK_MODE'] = env.get('UV_LINK_MODE', 'copy')
         return env
+
+    def _create_space_safe_requirements(
+        self,
+        tag: str,
+        requirements_file: Optional[Path],
+        constraints_path: Optional[Path]
+    ) -> tuple[Optional[Path], Optional[Path]]:
+        """
+        UV can stumble on paths with spaces; copy requirements/constraints to a cache dir without spaces.
+        """
+        if not requirements_file and not constraints_path:
+            return None, None
+
+        safe_dir = self.metadata_manager.cache_dir / "requirements-safe"
+        try:
+            safe_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            print(f"Warning: could not create safe requirements dir: {exc}")
+            return requirements_file, constraints_path
+
+        safe_tag = safe_filename(tag) or "req"
+        safe_req = None
+        safe_constraints = None
+
+        try:
+            if requirements_file and requirements_file.exists():
+                safe_req = safe_dir / f"{safe_tag}-requirements.txt"
+                shutil.copyfile(requirements_file, safe_req)
+        except Exception as exc:
+            print(f"Warning: could not copy requirements.txt to safe path: {exc}")
+            safe_req = requirements_file
+
+        try:
+            if constraints_path and constraints_path.exists():
+                safe_constraints = safe_dir / f"{safe_tag}-constraints.txt"
+                shutil.copyfile(constraints_path, safe_constraints)
+        except Exception as exc:
+            print(f"Warning: could not copy constraints to safe path: {exc}")
+            safe_constraints = constraints_path
+
+        return safe_req or requirements_file, safe_constraints or constraints_path
 
     def _get_global_required_packages(self) -> list[str]:
         """
@@ -1021,7 +1462,7 @@ PID_FILE="$VERSION_DIR/comfyui.pid"
 URL="http://127.0.0.1:8188"
 WINDOW_CLASS="ComfyUI-{slug}"
 PROFILE_DIR="{profile_dir}"
-SERVER_START_DELAY=8
+SERVER_START_DELAY="${{SERVER_START_DELAY:-8}}"
 SERVER_PID=""
 
 log() {{
@@ -1092,9 +1533,13 @@ stop_previous_instance
 close_existing_app_window
 start_comfyui
 
-log "Waiting $SERVER_START_DELAY seconds for server to start..."
-sleep "$SERVER_START_DELAY"
-open_app
+if [[ "${SKIP_BROWSER:-0}" != "1" ]]; then
+    log "Waiting $SERVER_START_DELAY seconds for server to start..."
+    sleep "$SERVER_START_DELAY"
+    open_app
+else
+    log "Browser auto-open skipped by SKIP_BROWSER"
+fi
 
 wait $SERVER_PID
 """
@@ -1143,14 +1588,28 @@ wait $SERVER_PID
             progress_callback("Installing Python packages...")
 
         global_required = self._get_global_required_packages()
+        constraints_path = None
+        try:
+            release = self.github_fetcher.get_release_by_tag(tag)
+        except Exception:
+            release = None
+        if requirements_file.exists():
+            constraints_path = self._build_constraints_for_tag(tag, requirements_file, release)
+            if constraints_path:
+                print(f"Using pinned constraints for {tag}: {constraints_path}")
+                self._log_install(f"Using constraints file: {constraints_path}")
+
         uv_env = self._build_uv_env()
+        safe_req, safe_constraints = self._create_space_safe_requirements(tag, requirements_file if requirements_file.exists() else None, constraints_path)
         # Use UV to install requirements plus global packages
         install_cmd = [
             'uv', 'pip', 'install',
             '--python', str(venv_python)
         ]
-        if requirements_file.exists():
-            install_cmd += ['-r', str(requirements_file)]
+        if safe_req:
+            install_cmd += ['-r', str(Path(safe_req))]
+        if safe_constraints:
+            install_cmd += ['-c', str(Path(safe_constraints))]
         install_cmd += global_required
 
         success, stdout, stderr = run_command(install_cmd, timeout=600, env=uv_env)
@@ -1159,10 +1618,16 @@ wait $SERVER_PID
             print("✓ Dependencies installed successfully")
             if stdout:
                 print(stdout)
+                self._log_install(stdout)
             return True
 
         print(f"Error installing dependencies with uv: {stderr}")
+        self._log_install(f"uv dependency install failed: {stderr}")
         print("Attempting pip fallback...")
+
+        # Ensure pip is present in the venv before fallback
+        run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=uv_env)
+        run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=uv_env)
 
         pip_cmd = [
             str(venv_python),
@@ -1170,8 +1635,10 @@ wait $SERVER_PID
             "pip",
             "install",
         ]
-        if requirements_file.exists():
-            pip_cmd += ["-r", str(requirements_file)]
+        if safe_req:
+            pip_cmd += ["-r", str(Path(safe_req))]
+        if safe_constraints:
+            pip_cmd += ["-c", str(Path(safe_constraints))]
         pip_cmd += global_required
 
         success, stdout, stderr = run_command(pip_cmd, timeout=900, env=uv_env)
@@ -1180,9 +1647,11 @@ wait $SERVER_PID
             print("✓ Dependencies installed successfully via pip fallback")
             if stdout:
                 print(stdout)
+                self._log_install(stdout)
             return True
 
-        print(f"Dependency installation failed via uv and pip: {stderr}")
+        print(f"Dependency installation failed via uv: {stderr}")
+        self._log_install(f"uv dependency install failed: {stderr}")
         return False
 
     def _install_dependencies_with_progress(self, tag: str) -> bool:
@@ -1212,6 +1681,16 @@ wait $SERVER_PID
         # Parse requirements to get package list
         requirements = parse_requirements_file(requirements_file) if requirements_file.exists() else {}
         global_required = self._get_global_required_packages()
+        constraints_path = None
+        try:
+            release = self.github_fetcher.get_release_by_tag(tag)
+        except Exception:
+            release = None
+        if requirements_file.exists():
+            constraints_path = self._build_constraints_for_tag(tag, requirements_file, release)
+            if constraints_path:
+                self._log_install(f"Using constraints for {tag}: {constraints_path}")
+
         # Add global packages that are not already in requirements
         existing_canon = {canonicalize_name(pkg) for pkg in requirements}
         extra_global = []
@@ -1240,7 +1719,14 @@ wait $SERVER_PID
         # Use Popen to allow immediate cancellation
         print("Starting dependency installation...")
         uv_env = self._build_uv_env()
-        cache_start_size = get_directory_size(self.uv_cache_dir) if self.uv_cache_dir.exists() else 0
+        safe_req, safe_constraints = self._create_space_safe_requirements(tag, requirements_file if requirements_file.exists() else None, constraints_path)
+        io_pid = None
+        io_baseline = None
+        io_last_bytes = None
+        io_last_time = None
+
+        cache_dir = self.active_uv_cache_dir or self.uv_cache_dir
+        cache_start_size = get_directory_size(cache_dir) if cache_dir and cache_dir.exists() else 0
         last_cache_size = cache_start_size
         last_sample_time = time.time()
         uv_stdout = ""
@@ -1249,8 +1735,10 @@ wait $SERVER_PID
             'uv', 'pip', 'install',
             '--python', str(venv_python)
         ]
-        if requirements_file.exists():
-            uv_cmd += ['-r', str(requirements_file)]
+        if safe_req:
+            uv_cmd += ['-r', str(Path(safe_req))]
+        if safe_constraints:
+            uv_cmd += ['-c', str(Path(safe_constraints))]
         uv_cmd += extra_global
 
         self._current_process = subprocess.Popen(
@@ -1262,6 +1750,11 @@ wait $SERVER_PID
             preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
             env=uv_env
         )
+        io_pid = self._current_process.pid if self._current_process else None
+        if io_pid:
+            io_baseline = self._get_process_io_bytes(io_pid, include_children=True)
+            io_last_bytes = io_baseline
+            io_last_time = time.time()
 
         try:
             # Wait for process to complete, checking cancellation flag
@@ -1272,20 +1765,37 @@ wait $SERVER_PID
                 # Update approximate download speed based on UV cache growth
                 now = time.time()
                 if now - last_sample_time >= 0.75:
-                    current_cache_size = get_directory_size(self.uv_cache_dir) if self.uv_cache_dir.exists() else 0
-                    bytes_since_last = current_cache_size - last_cache_size
-                    elapsed = now - last_sample_time
-                    speed = bytes_since_last / elapsed if elapsed > 0 else None
+                    speed = None
+                    downloaded = None
 
-                    total_downloaded = max(current_cache_size - cache_start_size, 0)
-                    self.progress_tracker.update_download_progress(
-                        total_downloaded,
-                        None,
-                        speed
-                    )
+                    if io_pid:
+                        current_io = self._get_process_io_bytes(io_pid, include_children=True)
+                        if current_io is not None and io_baseline is not None and io_last_bytes is not None and io_last_time is not None:
+                            elapsed_io = now - io_last_time
+                            delta_io = current_io - io_last_bytes
+                            if elapsed_io > 0 and delta_io >= 0:
+                                speed = delta_io / elapsed_io
+                            downloaded = max(0, current_io - io_baseline)
+                            io_last_bytes = current_io
+                            io_last_time = now
 
-                    last_cache_size = current_cache_size
+                    # Fallback to cache growth if IO metrics unavailable
+                    if speed is None:
+                        current_cache_size = get_directory_size(cache_dir) if cache_dir and cache_dir.exists() else 0
+                        bytes_since_last = current_cache_size - last_cache_size
+                        elapsed = now - last_sample_time
+                        speed = bytes_since_last / elapsed if elapsed > 0 else None
+                        downloaded = max(current_cache_size - cache_start_size, 0)
+                        last_cache_size = current_cache_size
+
                     last_sample_time = now
+
+                    if downloaded is not None:
+                        self.progress_tracker.update_download_progress(
+                            downloaded,
+                            None,
+                            speed if speed is not None else 0
+                        )
 
                 # Check if process was killed by cancel_installation()
                 if self._cancel_installation:
@@ -1325,24 +1835,97 @@ wait $SERVER_PID
             print("✓ Dependencies installed successfully")
             if uv_stdout:
                 print(uv_stdout)
+                self._log_install(uv_stdout)
             return True
         else:
             print(f"Error installing dependencies with uv: {uv_stderr}")
-            self.progress_tracker.set_error("Dependency installation failed with uv, attempting pip fallback")
-
-            # Fallback: use venv's pip directly (still reuses cache via env)
+            self._log_install(f"uv install error:\n{uv_stderr}")
+            # Fallback with pip
             print("Attempting fallback install with pip...")
+            run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=uv_env)
+            run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=uv_env)
             pip_cmd = [
                 str(venv_python),
                 "-m",
                 "pip",
                 "install",
             ]
-            if requirements_file.exists():
-                pip_cmd += ["-r", str(requirements_file)]
+            if safe_req:
+                pip_cmd += ["-r", str(Path(safe_req))]
+            if safe_constraints:
+                pip_cmd += ["-c", str(Path(safe_constraints))]
             pip_cmd += extra_global
 
-            success, stdout, stderr = run_command(pip_cmd, timeout=900, env=uv_env)
+            # Stream pip output while sampling IO for speed
+            pip_stdout = ""
+            pip_stderr = ""
+            self._current_process = subprocess.Popen(
+                pip_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
+                env=uv_env
+            )
+            io_pid = self._current_process.pid if self._current_process else None
+            if io_pid:
+                io_baseline = self._get_process_io_bytes(io_pid, include_children=True)
+                io_last_bytes = io_baseline
+                io_last_time = time.time()
+            # Reset cache sampling baselines for the pip attempt
+            cache_start_size = get_directory_size(cache_dir) if cache_dir and cache_dir.exists() else 0
+            last_cache_size = cache_start_size
+            last_sample_time = time.time()
+
+            try:
+                while self._current_process.poll() is None:
+                    time.sleep(0.1)
+
+                    now = time.time()
+                    if now - last_sample_time >= 0.75:
+                        speed = None
+                        downloaded = None
+
+                        if io_pid:
+                            current_io = self._get_process_io_bytes(io_pid, include_children=True)
+                            if current_io is not None and io_baseline is not None and io_last_bytes is not None and io_last_time is not None:
+                                elapsed_io = now - io_last_time
+                                delta_io = current_io - io_last_bytes
+                                if elapsed_io > 0 and delta_io >= 0:
+                                    speed = delta_io / elapsed_io
+                                downloaded = max(0, current_io - io_baseline)
+                                io_last_bytes = current_io
+                                io_last_time = now
+
+                        if speed is None:
+                            current_cache_size = get_directory_size(cache_dir) if cache_dir and cache_dir.exists() else 0
+                            bytes_since_last = current_cache_size - last_cache_size
+                            elapsed = now - last_sample_time
+                            speed = bytes_since_last / elapsed if elapsed > 0 else None
+                            downloaded = max(current_cache_size - cache_start_size, 0)
+                            last_cache_size = current_cache_size
+
+                        last_sample_time = now
+
+                        if downloaded is not None:
+                            self.progress_tracker.update_download_progress(
+                                downloaded,
+                                None,
+                                speed if speed is not None else 0
+                            )
+
+                    if self._cancel_installation:
+                        raise InterruptedError("Installation cancelled during dependency installation (pip fallback)")
+
+                pip_stdout, pip_stderr = self._current_process.communicate()
+                success = self._current_process.returncode == 0
+            except InterruptedError:
+                raise
+            except Exception as e:
+                print(f"Error during pip fallback installation: {e}")
+                success = False
+            finally:
+                self._current_process = None
 
             if success:
                 for i, (package, version_spec) in enumerate(package_entries, 1):
@@ -1353,12 +1936,14 @@ wait $SERVER_PID
                     )
                     self.progress_tracker.add_completed_item(package, 'package')
                 print("✓ Dependencies installed successfully via pip fallback")
-                if stdout:
-                    print(stdout)
+                if pip_stdout:
+                    print(pip_stdout)
+                    self._log_install(pip_stdout)
                 return True
 
-            error_msg = f"Dependency installation failed via uv and pip. uv stderr: {uv_stderr[:500]} pip stderr: {stderr[:500]}"
+            error_msg = f"Dependency installation failed via uv and pip. uv stderr: {uv_stderr[:500]} pip stderr: {pip_stderr[:500]}"
             print(error_msg)
+            self._log_install(error_msg)
             self.progress_tracker.set_error(error_msg)
             return False
 
@@ -1411,25 +1996,21 @@ wait $SERVER_PID
         self,
         tag: str,
         extra_args: Optional[List[str]] = None
-    ) -> Tuple[bool, Optional[subprocess.Popen]]:
+    ) -> Tuple[bool, Optional[subprocess.Popen], Optional[str], Optional[str], Optional[bool]]:
         """
-        Launch a ComfyUI version
-
-        Args:
-            tag: Version tag to launch
-            extra_args: Optional extra arguments for main.py
+        Launch a ComfyUI version with readiness detection.
 
         Returns:
-            Tuple of (success, process) - process is None if launch failed
+            (success, process, log_path, error_message, ready)
         """
         if tag not in self.get_installed_versions():
             print(f"Version {tag} is not installed")
-            return (False, None)
+            return (False, None, None, "Version not installed", None)
 
         # Set as active version
         if not self.set_active_version(tag):
             print("Failed to activate version")
-            return (False, None)
+            return (False, None, None, "Failed to activate version", None)
 
         # Check dependencies
         dep_status = self.check_dependencies(tag)
@@ -1438,12 +2019,12 @@ wait $SERVER_PID
             print("Attempting to install missing dependencies before launch...")
             if not self.install_dependencies(tag):
                 print("Failed to install dependencies, aborting launch.")
-                return (False, None)
+                return (False, None, None, "Dependencies missing", None)
             # Re-check after install
             dep_status = self.check_dependencies(tag)
             if dep_status['missing']:
                 print(f"Dependencies still missing after install: {dep_status['missing']}")
-                return (False, None)
+                return (False, None, None, "Dependencies still missing after install", None)
 
         # Validate symlinks
         repair_report = self.resource_manager.validate_and_repair_symlinks(tag)
@@ -1455,25 +2036,23 @@ wait $SERVER_PID
 
         if not main_py.exists():
             print(f"main.py not found in {tag}")
-            return (False, None)
+            return (False, None, None, "main.py missing", None)
 
         venv_python = version_path / "venv" / "bin" / "python"
 
         if not venv_python.exists():
             print(f"Virtual environment not found for {tag}")
-            return (False, None)
+            return (False, None, None, "Virtual environment missing", None)
 
         # Ensure run script exists so the UI opens consistently
         run_script = self._ensure_version_run_script(tag, version_path)
-        log_file = version_path / "launcher-run.log"
-        # Start fresh each launch so logs reflect the current run only
-        try:
-            log_file.unlink(missing_ok=True)
-        except Exception as e:
-            print(f"Warning: could not clear old log file {log_file} for {tag}: {e}")
+        slug = self._slugify_tag(tag)
+        url = "http://127.0.0.1:8188"
+
+        log_file = self.logs_dir / f"launch-{slug}-{int(time.time())}.log"
         log_handle = None
         try:
-            log_handle = open(log_file, "a")
+            log_handle = open(log_file, "a", encoding="utf-8")
         except Exception as e:
             print(f"Warning: could not open log file {log_file} for {tag}: {e}")
 
@@ -1484,45 +2063,38 @@ wait $SERVER_PID
         print(f"Launching ComfyUI {tag}...")
         print(f"Command: {' '.join(cmd)}")
 
+        env = os.environ.copy()
+        env["SKIP_BROWSER"] = "1"
+
+        process = None
         try:
-            # Launch as subprocess (non-blocking)
             process = subprocess.Popen(
                 cmd,
                 cwd=str(version_path),
                 stdout=log_handle or subprocess.DEVNULL,
                 stderr=log_handle or subprocess.DEVNULL,
-                start_new_session=True
+                start_new_session=True,
+                env=env
             )
 
-            if log_handle:
-                try:
-                    log_handle.flush()
-                except Exception:
-                    pass
+            ready, ready_error = self._wait_for_server_ready(url, process, log_file)
 
-            # Give the script a moment to start and detect early failure
-            time.sleep(1.0)
-            if process.poll() is not None:
-                exit_code = process.returncode
-                print(f"ComfyUI {tag} launch script exited immediately with code {exit_code}")
-                try:
-                    if log_file.exists():
-                        tail = log_file.read_text().splitlines()[-20:]
-                        print("Launcher run log (last lines):")
-                        for line in tail:
-                            print(line)
-                except Exception as log_err:
-                    print(f"Unable to read launcher log for {tag}: {log_err}")
-                return (False, None)
+            if ready:
+                print(f"✓ ComfyUI {tag} reported ready (PID: {process.pid})")
+                self._open_frontend(url, slug)
+                return (True, process, str(log_file), None, True)
 
-            print(f"✓ ComfyUI {tag} started (PID: {process.pid})")
-            print("Use the returned process object to monitor or terminate")
-
-            return (True, process)
+            # If process crashed or timeout
+            tail = self._tail_log(log_file)
+            if tail:
+                print("Launch log tail:")
+                for line in tail:
+                    print(line)
+            return (False, process if process and process.poll() is None else None, str(log_file), ready_error, False)
 
         except Exception as e:
             print(f"Error launching ComfyUI: {e}")
-            return (False, None)
+            return (False, None, str(log_file), str(e), None)
         finally:
             if log_handle:
                 try:

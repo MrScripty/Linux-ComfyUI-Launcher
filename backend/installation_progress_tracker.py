@@ -52,7 +52,8 @@ class InstallationProgressTracker:
         self,
         tag: str,
         total_size: Optional[int] = None,
-        dependency_count: Optional[int] = None
+        dependency_count: Optional[int] = None,
+        log_path: Optional[str] = None
     ):
         """
         Start tracking a new installation
@@ -78,7 +79,8 @@ class InstallationProgressTracker:
                 'completed_dependencies': 0,
                 'completed_items': [],
                 'error': None,
-                'pid': None
+                'pid': None,
+                'log_path': log_path
             }
             self._save_state()
 

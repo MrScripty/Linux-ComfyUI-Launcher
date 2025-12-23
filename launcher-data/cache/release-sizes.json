@@ -8,7 +8,7 @@
     "unknown_size_count": 0,
     "dependencies": [],
     "requirements_hash": "sha256:ac88ff0031f9ae405b74e2258dc04a5a6ff815df49342c697c26e50f11dee845",
-    "calculated_at": "2025-12-22T10:55:56.062818+00:00",
+    "calculated_at": "2025-12-23T00:23:50.918820+00:00",
     "platform": "linux_x86_64",
     "python_version": "3.12",
     "dependencies_size_source": "pip_report"
@@ -36,21 +36,21 @@
     "unknown_size_count": 0,
     "dependencies": [],
     "requirements_hash": "sha256:726c21a70307ccc91718eec1561dafb7428382b7cc3a4466d42cf6c3823ab92e",
-    "calculated_at": "2025-12-22T10:56:59.118223+00:00",
+    "calculated_at": "2025-12-23T00:24:17.968882+00:00",
     "platform": "linux_x86_64",
     "python_version": "3.12",
     "dependencies_size_source": "pip_report"
   },
   "v0.3.76": {
     "tag": "v0.3.76",
-    "total_size": 4455364045,
-    "archive_size": 131072000,
+    "total_size": 4331383454,
+    "archive_size": 7091409,
     "dependencies_size": 4324292045,
     "dependency_count": 27,
     "unknown_size_count": 0,
     "dependencies": [],
     "requirements_hash": "sha256:cefb74dc24181613a0b6f3e7a2b11bc1bdf41312afba7e0aa76c9e3a68f757f3",
-    "calculated_at": "2025-12-22T10:58:41.347170+00:00",
+    "calculated_at": "2025-12-23T00:22:26.660743+00:00",
     "platform": "linux_x86_64",
     "python_version": "3.12",
     "dependencies_size_source": "pip_report"
@@ -428,7 +428,7 @@
     "unknown_size_count": 0,
     "dependencies": [],
     "requirements_hash": "sha256:ee97a0a81f88b675c7c08e37da673e80973ea8809b1d52cae51aa2a13d8013bd",
-    "calculated_at": "2025-12-22T10:59:44.055640+00:00",
+    "calculated_at": "2025-12-23T00:22:46.538508+00:00",
     "platform": "linux_x86_64",
     "python_version": "3.12",
     "dependencies_size_source": "pip_report"
@@ -442,7 +442,7 @@
     "unknown_size_count": 0,
     "dependencies": [],
     "requirements_hash": "sha256:ee97a0a81f88b675c7c08e37da673e80973ea8809b1d52cae51aa2a13d8013bd",
-    "calculated_at": "2025-12-22T11:00:22.312038+00:00",
+    "calculated_at": "2025-12-23T00:23:05.671293+00:00",
     "platform": "linux_x86_64",
     "python_version": "3.12",
     "dependencies_size_source": "pip_report"
@@ -456,7 +456,7 @@
     "unknown_size_count": 0,
     "dependencies": [],
     "requirements_hash": "sha256:ee97a0a81f88b675c7c08e37da673e80973ea8809b1d52cae51aa2a13d8013bd",
-    "calculated_at": "2025-12-22T11:00:58.469678+00:00",
+    "calculated_at": "2025-12-23T00:23:24.848400+00:00",
     "platform": "linux_x86_64",
     "python_version": "3.12",
     "dependencies_size_source": "pip_report"

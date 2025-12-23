@@ -65,6 +65,8 @@ class ComfyUISetupAPI:
         self.launcher_data_dir = self.script_dir / "launcher-data"
         self.shortcut_scripts_dir = self.launcher_data_dir / "shortcuts"
         self.generated_icons_dir = self.launcher_data_dir / "icons"
+        self.last_launch_log: Optional[str] = None
+        self.last_launch_error: Optional[str] = None
 
         # System directories
         self.apps_dir = Path.home() / ".local" / "share" / "applications"
@@ -1204,7 +1206,9 @@ Categories=Graphics;ArtificialIntelligence;
             "comfyui_running": running,
             "running_processes": running_processes,
             "message": message,
-            "release_info": release_info
+            "release_info": release_info,
+            "last_launch_log": self.last_launch_log,
+            "last_launch_error": self.last_launch_error
         }
 
     def get_disk_space(self) -> Dict[str, Any]:
@@ -1452,28 +1456,37 @@ Categories=Graphics;ArtificialIntelligence;
             print(f"Error stopping ComfyUI: {e}")
             return False
 
-    def launch_comfyui(self) -> bool:
-        """Launch ComfyUI using run.sh script"""
+    def launch_comfyui(self) -> Dict[str, Any]:
+        """Launch ComfyUI using run.sh script with readiness detection."""
         try:
             # Prefer launching the active managed version if available
             if self.version_manager:
                 active_tag = self.version_manager.get_active_version()
                 if active_tag:
-                    success, _process = self.version_manager.launch_version(active_tag)
+                    success, _process, log_path, error_msg, ready = self.version_manager.launch_version(active_tag)
                     if success:
                         print(f"Launched active managed version: {active_tag}")
-                        return True
+                        self.last_launch_log = log_path
+                        self.last_launch_error = None
+                        return {"success": True, "log_path": log_path, "ready": ready}
                     else:
                         print(f"Failed to launch managed version {active_tag}, falling back to legacy run.sh")
+                        self.last_launch_log = log_path
+                        self.last_launch_error = error_msg
+                        return {"success": False, "log_path": log_path, "error": error_msg, "ready": ready}
 
             if not self.run_sh.exists():
                 print(f"Error: run.sh not found at {self.run_sh}")
-                return False
+                self.last_launch_error = "run.sh not found"
+                self.last_launch_log = None
+                return {"success": False, "error": "run.sh not found"}
 
             # Check if already running
             if self.is_comfyui_running():
                 print("ComfyUI is already running")
-                return False
+                self.last_launch_error = "ComfyUI already running"
+                self.last_launch_log = None
+                return {"success": False, "error": "ComfyUI already running"}
 
             # Launch run.sh in the background
             subprocess.Popen(
@@ -1482,10 +1495,13 @@ Categories=Graphics;ArtificialIntelligence;
                 stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
-            return True
+            self.last_launch_log = None
+            self.last_launch_error = None
+            return {"success": True, "ready": None}
         except Exception as e:
             print(f"Error launching ComfyUI: {e}")
-            return False
+            self.last_launch_error = str(e)
+            return {"success": False, "error": str(e)}
 
     # ==================== Version Management API (Phase 5) ====================
 
@@ -1823,7 +1839,7 @@ Categories=Graphics;ArtificialIntelligence;
 
         return self.open_path(str(active_path))
 
-    def launch_version(self, tag: str, extra_args: List[str] = None) -> bool:
+    def launch_version(self, tag: str, extra_args: List[str] = None) -> Dict[str, Any]:
         """
         Launch a specific ComfyUI version
 
@@ -1832,12 +1848,12 @@ Categories=Graphics;ArtificialIntelligence;
             extra_args: Optional additional command line arguments
 
         Returns:
-            True if launch successful
+            Dict with success status, log_path, ready flag, and optional error
         """
         if not self.version_manager:
-            return False
-        success, process = self.version_manager.launch_version(tag, extra_args)
-        return success
+            return {"success": False, "error": "Version manager unavailable"}
+        success, process, log_path, error_msg, ready = self.version_manager.launch_version(tag, extra_args)
+        return {"success": success, "log_path": log_path, "ready": ready, "error": error_msg}
 
     def calculate_release_size(self, tag: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         """

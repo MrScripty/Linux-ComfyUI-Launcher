@@ -129,8 +129,8 @@ class JavaScriptAPI:
     def launch_comfyui(self):
         """Launch ComfyUI using run.sh"""
         try:
-            success = self.api.launch_comfyui()
-            return {"success": success}
+            result = self.api.launch_comfyui()
+            return {"success": result.get("success", False), "log_path": result.get("log_path"), "error": result.get("error"), "ready": result.get("ready")}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -316,8 +316,13 @@ class JavaScriptAPI:
     def launch_version(self, tag, extra_args=None):
         """Launch a specific ComfyUI version"""
         try:
-            success = self.api.launch_version(tag, extra_args)
-            return {"success": success}
+            result = self.api.launch_version(tag, extra_args)
+            return {
+                "success": result.get("success", False),
+                "log_path": result.get("log_path"),
+                "error": result.get("error"),
+                "ready": result.get("ready"),
+            }
         except Exception as e:
             return {"success": False, "error": str(e)}
 

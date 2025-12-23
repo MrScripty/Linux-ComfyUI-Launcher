@@ -57,6 +57,7 @@ export interface InstallationProgress {
   error: string | null;
   completed_at?: string;
   success?: boolean;
+  log_path?: string | null;
 }
 
 export type InstallNetworkStatus = 'idle' | 'downloading' | 'stalled' | 'failed';
@@ -78,6 +79,11 @@ export function useVersions() {
   const lastDownloadTagRef = useRef<string | null>(null);
   const topSpeedRef = useRef<number>(0);
   const lowSinceRef = useRef<number | null>(null);
+  const downloadSamplesRef = useRef<{ ts: number; bytes: number }[]>([]);
+  const lastStageRef = useRef<InstallationProgress['stage'] | null>(null);
+  const initializedRef = useRef(false);
+  const refreshAllRef = useRef<(forceRefresh?: boolean) => Promise<void>>(() => Promise.resolve());
+  const fetchInstallationProgressRef = useRef<() => Promise<InstallationProgress | null>>(() => Promise.resolve(null));
 
   // Fetch installed versions
   const fetchInstalledVersions = useCallback(async () => {
@@ -141,7 +147,6 @@ export function useVersions() {
 
         if (progress && !progress.completed_at) {
           setInstallingTag(progress.tag || null);
-          setInstallationProgress(progress);
           const now = Date.now();
           const downloadedBytes = progress.downloaded_bytes || 0;
           const speed = progress.download_speed || 0;
@@ -152,7 +157,57 @@ export function useVersions() {
             lastDownloadTagRef.current = progress.tag || null;
             topSpeedRef.current = speed || 0;
             lowSinceRef.current = null;
+            downloadSamplesRef.current = [];
+            lastStageRef.current = progress.stage || null;
+          } else if (progress.stage !== lastStageRef.current) {
+            downloadSamplesRef.current = [];
+            lastStageRef.current = progress.stage || null;
           }
+
+          downloadSamplesRef.current.push({ ts: now, bytes: downloadedBytes });
+          downloadSamplesRef.current = downloadSamplesRef.current.filter(
+            (sample) => now - sample.ts <= 5000
+          );
+          const sampleStart = downloadSamplesRef.current[0];
+          const sampleEnd = downloadSamplesRef.current[downloadSamplesRef.current.length - 1];
+          let averageSpeed = 0;
+          if (sampleStart && sampleEnd && sampleEnd.ts > sampleStart.ts) {
+            const deltaBytes = sampleEnd.bytes - sampleStart.bytes;
+            const deltaTime = (sampleEnd.ts - sampleStart.ts) / 1000;
+            if (deltaTime > 0 && deltaBytes >= 0) {
+              averageSpeed = deltaBytes / deltaTime;
+            }
+          }
+
+          const release = availableVersions.find((release) => release.tag_name === progress.tag);
+          const archiveEstimate = release?.archive_size ?? null;
+          const dependencyEstimate = release?.dependencies_size ??
+            (release?.total_size && release?.archive_size
+              ? Math.max(release.total_size - release.archive_size, 0)
+              : null);
+
+          let expectedTotal: number | null = null;
+          if (progress.stage === 'download') {
+            expectedTotal = progress.total_size ?? archiveEstimate ?? release?.total_size ?? null;
+          } else if (progress.stage === 'dependencies') {
+            expectedTotal = dependencyEstimate ?? release?.total_size ?? null;
+          }
+
+          let etaSeconds: number | null = null;
+          const etaSpeed = averageSpeed > 0 ? averageSpeed : speed;
+          if ((progress.stage === 'download' || progress.stage === 'dependencies') && expectedTotal && etaSpeed > 0) {
+            const remaining = Math.max(expectedTotal - downloadedBytes, 0);
+            etaSeconds = Math.ceil(remaining / etaSpeed);
+          }
+
+          const adjustedProgress = {
+            ...progress,
+            download_speed: progress.download_speed ?? (averageSpeed > 0 ? averageSpeed : null),
+            eta_seconds: etaSeconds,
+            total_size: expectedTotal ?? progress.total_size ?? null,
+          };
+
+          setInstallationProgress(adjustedProgress);
 
           // Compute network status
           let status: InstallNetworkStatus = 'downloading';
@@ -199,6 +254,9 @@ export function useVersions() {
 
           setInstallNetworkStatus(status);
       } else {
+        if (!progress && installingTag) {
+          return progress || null;
+        }
         setInstallingTag(null);
         setInstallationProgress(progress || null);
         setInstallNetworkStatus('idle');
@@ -206,6 +264,8 @@ export function useVersions() {
         lastDownloadTagRef.current = null;
         topSpeedRef.current = 0;
         lowSinceRef.current = null;
+        downloadSamplesRef.current = [];
+        lastStageRef.current = null;
       }
 
       return progress || null;
@@ -214,7 +274,7 @@ export function useVersions() {
       setInstallNetworkStatus('failed');
       return null;
     }
-  }, []);
+  }, [availableVersions, installingTag]);
 
   // Fetch available versions from GitHub
   const fetchAvailableVersions = useCallback(async (forceRefresh: boolean = false) => {
@@ -439,6 +499,14 @@ export function useVersions() {
     }
   }, [fetchInstalledVersions, fetchActiveVersion, fetchDefaultVersion, fetchAvailableVersions, fetchVersionStatus, fetchInstallationProgress]);
 
+  useEffect(() => {
+    refreshAllRef.current = refreshAll;
+  }, [refreshAll]);
+
+  useEffect(() => {
+    fetchInstallationProgressRef.current = fetchInstallationProgress;
+  }, [fetchInstallationProgress]);
+
   // Refresh available versions only (non-blocking UI)
   const refreshAvailableVersions = useCallback(async (forceRefresh: boolean = false) => {
     setError(null);
@@ -515,16 +583,20 @@ export function useVersions() {
       }
 
       // Capture any in-progress installation before loading lists
-      await fetchInstallationProgress();
+      await fetchInstallationProgressRef.current();
 
       console.log('Calling refreshAll...');
-      refreshAll(false);
+      refreshAllRef.current(false);
     };
 
     // Poll for PyWebView API to be ready with actual methods (same approach as App.tsx)
     const waitForPyWebView = () => {
+      if (initializedRef.current) {
+        return;
+      }
       if (window.pywebview?.api && typeof window.pywebview.api.get_available_versions === 'function') {
         console.log('PyWebView API ready with methods, loading version data...');
+        initializedRef.current = true;
         loadData();
       } else {
         console.log('Waiting for PyWebView API methods...');
@@ -533,7 +605,7 @@ export function useVersions() {
     };
 
     waitForPyWebView();
-  }, [refreshAll, fetchInstallationProgress]);
+  }, []);
 
   // Cleanup timers on unmount
   useEffect(() => {

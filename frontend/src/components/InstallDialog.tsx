@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Download, Check, AlertCircle, Loader2, ChevronDown, ChevronUp, Package, FolderArchive, Settings, CheckCircle2, Clock, ExternalLink, File, Settings as Gear } from 'lucide-react';
+import { X, Download, Check, AlertCircle, Loader2, ChevronDown, ChevronUp, Package, FolderArchive, Settings, CheckCircle2, Clock, ExternalLink, Settings as Gear, ArrowLeft, FileText, XCircle, Infinity } from 'lucide-react';
 import { VersionRelease, InstallationProgress } from '../hooks/useVersions';
+import { ProgressRing } from './ProgressRing';
 
 interface InstallDialogProps {
   isOpen: boolean;
@@ -15,6 +16,7 @@ interface InstallDialogProps {
   displayMode?: 'modal' | 'page';
   installingTag?: string | null;
   installationProgress?: InstallationProgress | null;
+  installNetworkStatus?: 'idle' | 'downloading' | 'stalled' | 'failed';
   onRefreshProgress?: () => Promise<void>;
 }
 
@@ -69,6 +71,7 @@ export function InstallDialog({
   displayMode = 'modal',
   installingTag,
   installationProgress,
+  installNetworkStatus = 'idle',
   onRefreshProgress,
 }: InstallDialogProps) {
   console.log('InstallDialog render - isOpen:', isOpen, 'availableVersions:', availableVersions.length);
@@ -80,12 +83,15 @@ export function InstallDialog({
   const [progress, setProgress] = useState<InstallationProgress | null>(installationProgress || null);
   const [errorVersion, setErrorVersion] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [showDetails, setShowDetails] = useState(false);
+  const [viewMode, setViewMode] = useState<'list' | 'details'>('list');
+  const [showCompletedItems, setShowCompletedItems] = useState(false);
   const [pollInterval, setPollInterval] = useState<NodeJS.Timeout | null>(null);
   const [cancellationNotice, setCancellationNotice] = useState<string | null>(null);
   const [noticeTimeout, setNoticeTimeout] = useState<NodeJS.Timeout | null>(null);
   const cancellationRef = useRef(false);
   const [hoveredTag, setHoveredTag] = useState<string | null>(null);
+  const [cancelHoverTag, setCancelHoverTag] = useState<string | null>(null);
+  const [failedInstall, setFailedInstall] = useState<{ tag: string; log: string | null } | null>(null);
 
   // Sync local state with external installation progress/tag
   useEffect(() => {
@@ -94,16 +100,41 @@ export function InstallDialog({
       if (installationProgress.tag) {
         setInstallingVersion(installationProgress.tag);
       }
+
+      const isCancelled = installationProgress.error?.toLowerCase().includes('cancel');
+      if (installationProgress.completed_at && !installationProgress.success && installationProgress.tag && !isCancelled) {
+        setFailedInstall({
+          tag: installationProgress.tag,
+          log: installationProgress.log_path || null,
+        });
+      } else if (installationProgress.completed_at && installationProgress.success && installationProgress.tag && failedInstall?.tag === installationProgress.tag) {
+        setFailedInstall(null);
+      }
     }
-  }, [installationProgress]);
+  }, [installationProgress, failedInstall]);
 
   useEffect(() => {
     if (installingTag) {
       setInstallingVersion(installingTag);
+      if (failedInstall?.tag === installingTag) {
+        setFailedInstall(null);
+      }
     } else if (!installationProgress || installationProgress.completed_at) {
       setInstallingVersion(null);
     }
-  }, [installingTag, installationProgress]);
+  }, [installingTag, installationProgress, failedInstall]);
+
+  useEffect(() => {
+    if (isOpen) {
+      setViewMode('list');
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (viewMode === 'details' && (!installingVersion || !progress)) {
+      setViewMode('list');
+    }
+  }, [viewMode, installingVersion, progress]);
 
   // Filter versions based on user preferences
   const filteredVersions = availableVersions.filter((release) => {
@@ -119,6 +150,11 @@ export function InstallDialog({
 
     return true;
   });
+
+  const failedTag = progress && progress.completed_at && !progress.success ? progress.tag : null;
+  const failedLogPath = progress && progress.completed_at && !progress.success ? progress.log_path || null : null;
+  const stickyFailedTag = failedTag || failedInstall?.tag || null;
+  const stickyFailedLogPath = failedLogPath || failedInstall?.log || null;
 
   // Poll for progress updates when installing
   useEffect(() => {
@@ -156,7 +192,8 @@ export function InstallDialog({
             setTimeout(() => {
               setInstallingVersion(null);
               setProgress(null);
-              setShowDetails(false);
+              setShowCompletedItems(false);
+              setViewMode('list');
             }, resetDelay);
           }, 1000);
         }
@@ -206,7 +243,8 @@ export function InstallDialog({
     const timer = setTimeout(() => {
       setInstallingVersion(null);
       setProgress(null);
-      setShowDetails(false);
+      setShowCompletedItems(false);
+      setViewMode('list');
     }, resetDelay);
 
     return () => clearTimeout(timer);
@@ -222,11 +260,31 @@ export function InstallDialog({
     setNoticeTimeout(timeoutId);
   };
 
+  const openLogPath = async (path?: string | null) => {
+    if (!path || !(window as any).pywebview?.api?.open_path) return;
+    try {
+      await (window as any).pywebview.api.open_path(path);
+    } catch (err) {
+      console.error('Failed to open log path', err);
+    }
+  };
+
+  const openDetailView = () => {
+    if (!progress || !installingVersion) {
+      return;
+    }
+    setViewMode('details');
+    if (onRefreshProgress) {
+      void onRefreshProgress();
+    }
+  };
+
   const handleInstall = async (tag: string) => {
     setInstallingVersion(tag);
     setErrorVersion(null);
     setErrorMessage(null);
-    setShowDetails(false);
+    setShowCompletedItems(false);
+    setViewMode('list');
     cancellationRef.current = false;
     if (noticeTimeout) {
       clearTimeout(noticeTimeout);
@@ -263,6 +321,10 @@ export function InstallDialog({
       return;
     }
 
+    cancellationRef.current = true;
+    setErrorVersion(null);
+    setErrorMessage(null);
+
     try {
       console.log('Cancelling installation...');
       const result = await (window as any).pywebview.api.cancel_installation();
@@ -270,6 +332,11 @@ export function InstallDialog({
         console.log('Installation cancelled successfully');
         cancellationRef.current = true;
         showCancellationNotice();
+        setInstallingVersion(null);
+        setProgress(null);
+        setShowCompletedItems(false);
+        setViewMode('list');
+        setCancelHoverTag(null);
       } else {
         console.error('Failed to cancel installation:', result.error);
       }
@@ -340,9 +407,11 @@ export function InstallDialog({
   };
 
   const formatETA = (seconds: number): string => {
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+    const maxEtaSeconds = 48 * 3600 + 59 * 60;
+    const clampedSeconds = Math.min(seconds, maxEtaSeconds);
+    if (clampedSeconds < 60) return `${Math.round(clampedSeconds)}s`;
+    if (clampedSeconds < 3600) return `${Math.floor(clampedSeconds / 60)}m ${Math.round(clampedSeconds % 60)}s`;
+    return `${Math.floor(clampedSeconds / 3600)}h ${Math.floor((clampedSeconds % 3600) / 60)}m`;
   };
 
   const formatElapsedTime = (startedAt: string): string => {
@@ -383,6 +452,7 @@ export function InstallDialog({
   }, [isOpen, isPageMode, onClose]);
 
   const CurrentStageIcon = progress ? STAGE_ICONS[progress.stage] : Loader2;
+  const showProgressDetails = viewMode === 'details' && Boolean(installingVersion && progress);
 
   const containerClasses = isPageMode
     ? 'bg-[#2a2a2a] border border-[#444] rounded-lg shadow-inner w-full h-full flex flex-col'
@@ -427,9 +497,22 @@ export function InstallDialog({
           )}
         </AnimatePresence>
 
-        {installingVersion && progress ? (
+        {showProgressDetails ? (
           /* Installation Progress View */
           <div className="space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <button
+                onClick={() => setViewMode('list')}
+                className="flex items-center gap-2 px-3 py-2 rounded border border-[#333] bg-[#2a2a2a] hover:bg-[#333] text-white text-sm transition-colors"
+              >
+                <ArrowLeft size={14} />
+                <span>Back to versions</span>
+              </button>
+              <div className="text-sm text-gray-400 truncate">
+                {installingVersion ? `Installing ${installingVersion}` : 'Installation details'}
+              </div>
+            </div>
+
             {/* Overall Progress */}
             <div>
               <div className="flex items-center justify-between mb-2">
@@ -528,7 +611,7 @@ export function InstallDialog({
             {progress.completed_items.length > 0 && (
               <div className="bg-[#333] rounded-lg overflow-hidden">
                 <button
-                  onClick={() => setShowDetails(!showDetails)}
+                  onClick={() => setShowCompletedItems(!showCompletedItems)}
                   className="w-full flex items-center justify-between p-3 hover:bg-[#3a3a3a] transition-colors"
                 >
                   <div className="flex items-center gap-2">
@@ -537,14 +620,14 @@ export function InstallDialog({
                       Completed Items ({progress.completed_items.length})
                     </span>
                   </div>
-                  {showDetails ? (
+                  {showCompletedItems ? (
                     <ChevronUp size={14} className="text-gray-400" />
                   ) : (
                     <ChevronDown size={14} className="text-gray-400" />
                   )}
                 </button>
                 <AnimatePresence>
-                  {showDetails && (
+                  {showCompletedItems && (
                     <motion.div
                       initial={{ height: 0 }}
                       animate={{ height: 'auto' }}
@@ -592,14 +675,23 @@ export function InstallDialog({
                   /* Error Message */
                   <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 flex items-center gap-3">
                     <AlertCircle size={20} className="text-red-400" />
-                    <div>
-                      <p className="text-red-400 font-medium text-sm">Installation Failed</p>
-                      <p className="text-xs text-gray-400 mt-1">{progress.error}</p>
-                    </div>
+                  <div>
+                    <p className="text-red-400 font-medium text-sm">Installation Failed</p>
+                    <p className="text-xs text-gray-400 mt-1">{progress.error}</p>
+                    {progress.log_path && (
+                      <button
+                        onClick={() => openLogPath(progress.log_path)}
+                        className="mt-2 inline-flex items-center gap-2 px-2 py-1 rounded border border-red-500/40 text-xs text-red-200 hover:bg-red-500/10"
+                      >
+                        <FileText size={12} />
+                        <span>Open log</span>
+                      </button>
+                    )}
                   </div>
-                )}
-              </>
-            )}
+                </div>
+              )}
+            </>
+          )}
 
             {/* Success Message */}
             {progress.completed_at && progress.success && (
@@ -634,21 +726,49 @@ export function InstallDialog({
               const installed = isInstalled(release.tag_name);
               const hasError = errorVersion === release.tag_name;
               const isCurrent = installingVersion === release.tag_name;
-              const isDownloading = isCurrent && progress && progress.stage === 'download' && !progress.completed_at;
-              const isInstalling = isCurrent && progress && progress.stage !== 'download' && !progress.completed_at;
-              const isComplete = installed || (isCurrent && progress?.success && !!progress?.completed_at);
-              const totalBytes = (isCurrent ? progress?.total_size : null) ?? release.total_size ?? null;
-              const downloadedBytes = isCurrent ? progress?.downloaded_bytes ?? 0 : 0;
+              const currentProgress = isCurrent ? progress : null;
+              const isComplete = installed || (isCurrent && currentProgress?.success && !!currentProgress?.completed_at);
+              const totalBytes = (currentProgress ? currentProgress.total_size : null) ?? release.total_size ?? null;
               const releaseUrl = getReleaseUrl(release);
               const isHovering = hoveredTag === release.tag_name;
               const showUninstall = installed && !isCurrent && isHovering;
-
-              const downloadLabel =
-                isDownloading && totalBytes
-                  ? `${formatGB(downloadedBytes)} / ${formatGB(totalBytes)}`
-                  : totalBytes
-                  ? formatGB(totalBytes)
-                  : '...';
+              const overallPercent = currentProgress ? Math.round(currentProgress.overall_progress || 0) : null;
+              const downloadPercent =
+                currentProgress && currentProgress.total_size && currentProgress.total_size > 0
+                  ? Math.min(
+                      100,
+                      Math.round((currentProgress.downloaded_bytes / currentProgress.total_size) * 100)
+                    )
+                  : null;
+              const stagePercent = currentProgress ? currentProgress.stage_progress : null;
+              const ringPercent =
+                currentProgress && (currentProgress.stage === 'download' || currentProgress.stage === 'dependencies')
+                  ? downloadPercent ?? stagePercent ?? overallPercent
+                  : overallPercent ?? stagePercent;
+              const speedLabel = currentProgress?.download_speed !== null && currentProgress?.download_speed !== undefined
+                ? formatSpeed(currentProgress.download_speed)
+                : 'Waiting...';
+              const etaLabel = currentProgress?.eta_seconds !== null && currentProgress?.eta_seconds !== undefined
+                ? formatETA(currentProgress.eta_seconds)
+                : '...';
+              const ringColor = currentProgress?.error ? '#ff6b6b' : '#55ff55';
+              const isCancelHover = isCurrent && cancelHoverTag === release.tag_name;
+              const etaButtonLabel = etaLabel !== '...' ? etaLabel : 'Estimating…';
+              const etaOverflow = currentProgress?.eta_seconds !== null
+                && currentProgress?.eta_seconds !== undefined
+                && currentProgress.eta_seconds > (48 * 3600 + 59 * 60);
+              const downloadIconClass =
+                installNetworkStatus === 'stalled'
+                  ? 'animate-pulse text-[#ffc266]'
+                  : installNetworkStatus === 'failed'
+                    ? 'animate-pulse text-[#ff6b6b]'
+                    : 'animate-pulse text-[#7dff7d]';
+              const downloadIconStyle =
+                installNetworkStatus === 'stalled'
+                  ? { filter: 'drop-shadow(0 0 6px #ffc266)' }
+                  : installNetworkStatus === 'failed'
+                    ? { filter: 'drop-shadow(0 0 6px #ff6b6b)' }
+                    : { filter: 'drop-shadow(0 0 6px #7dff7d)' };
 
               return (
                 <motion.div
@@ -674,13 +794,7 @@ export function InstallDialog({
                             <h3 className="text-white font-medium truncate">
                               {displayTag}
                             </h3>
-                            {isCurrent && !isComplete && (
-                              <span className="px-2 py-0.5 bg-amber-500/20 text-amber-300 text-[11px] rounded-full flex items-center gap-1">
-                                <Loader2 size={12} className="animate-spin" />
-                                Installing
-                              </span>
-                            )}
-                            <button
+                          <button
                               onClick={(e) => {
                                 e.stopPropagation();
                                 openReleaseLink(releaseUrl);
@@ -690,6 +804,18 @@ export function InstallDialog({
                             >
                               <ExternalLink size={14} className="text-gray-300" />
                             </button>
+                            {stickyFailedTag === release.tag_name && stickyFailedLogPath && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openLogPath(stickyFailedLogPath);
+                                }}
+                                className="p-1 rounded hover:bg-[#444] transition-colors flex-shrink-0"
+                                title="Open last install log"
+                              >
+                                <FileText size={14} className="text-red-300" />
+                              </button>
+                            )}
                             {release.prerelease && (
                               <span className="px-2 py-0.5 bg-yellow-500/20 text-yellow-400 text-[11px] rounded-full">
                                 Pre
@@ -715,60 +841,79 @@ export function InstallDialog({
                     <div className="flex items-center gap-2 flex-shrink-0">
                       <motion.button
                         onClick={() => {
+                          if (isCurrent) {
+                            handleCancelInstallation();
+                            return;
+                          }
                           if (installed && !isCurrent) {
                             onRemoveVersion(release.tag_name).catch(err => console.error('Remove failed', err));
                           } else {
                             handleInstall(release.tag_name);
                           }
                         }}
-                        disabled={isCurrent}
+                        onMouseEnter={() => {
+                          if (isCurrent) {
+                            setCancelHoverTag(release.tag_name);
+                          }
+                        }}
+                        onMouseLeave={() => {
+                          if (isCurrent) {
+                            setCancelHoverTag(null);
+                          }
+                        }}
                         whileHover={!isCurrent ? { scale: 1.05 } : {}}
                         whileTap={!isCurrent ? { scale: 0.96 } : {}}
-                        className={`flex items-center gap-2 px-3 py-2 rounded text-sm font-medium transition-colors border ${
+                        className={`flex items-center gap-2 px-3 py-2 rounded text-sm font-medium transition-colors border w-[150px] min-w-[150px] overflow-hidden ${
                           isCurrent
-                            ? 'bg-[#1f1f1f] border-[#888]/40 text-gray-200 cursor-not-allowed opacity-80'
+                            ? isCancelHover
+                              ? 'bg-[#2a1a1a] border-[#ff6666] text-[#ffcccc]'
+                              : 'bg-[#2f2f2f] border-[#555] text-white'
                             : showUninstall
                               ? 'bg-[#2a1a1a] border-[#ff6666] text-[#ffcccc]'
                               : installed
                                 ? 'bg-[#55ff55]/20 border-[#55ff55]/60 text-[#0f2b0f]'
-                                : isDownloading
-                                  ? 'bg-[#122812] border-[#55ff55]/70 text-[#55ff55]'
-                                  : isInstalling
-                                    ? 'bg-[#1f1f1f] border-[#888]/40 text-gray-200'
-                                    : isComplete
-                                      ? 'bg-[#55ff55]/20 border-[#55ff55]/60 text-[#0f2b0f]'
-                                      : 'bg-[#2f2f2f] border-[#555] text-white hover:border-[#66ff66] hover:text-[#66ff66]'
+                                : isComplete
+                                  ? 'bg-[#55ff55]/20 border-[#55ff55]/60 text-[#0f2b0f]'
+                                  : 'bg-[#2f2f2f] border-[#555] text-white hover:border-[#66ff66] hover:text-[#66ff66]'
                         }`}
                       >
                         {installed && !showUninstall ? (
                           <>
                             <Check size={16} className="text-[#0f2b0f]" />
-                            <span className="text-xs font-semibold text-[#0f2b0f]">Installed</span>
+                            <span className="text-xs font-semibold text-[#0f2b0f] truncate whitespace-nowrap flex-1 min-w-0">Ready</span>
                           </>
                         ) : showUninstall ? (
                           <>
                             <X size={16} className="text-[#ffcccc]" />
-                            <span className="text-xs font-semibold text-[#ffcccc]">Uninstall</span>
+                            <span className="text-xs font-semibold text-[#ffcccc] truncate whitespace-nowrap flex-1 min-w-0">Uninstall</span>
                           </>
-                        ) : isDownloading ? (
+                        ) : isCurrent ? (
                           <>
-                            <Download
-                              size={16}
-                              className="text-[#55ff55] animate-pulse"
-                            />
-                            <span className="text-xs font-semibold">{downloadLabel}</span>
-                          </>
-                        ) : isInstalling ? (
-                          <>
-                            <File size={16} className="text-[#55ff55] animate-pulse" />
-                            <span className="text-xs text-gray-300">
-                              Installing…
-                            </span>
+                            {isCancelHover ? (
+                              <XCircle size={16} className="text-[#ffcccc]" />
+                            ) : (
+                              <ProgressRing
+                                progress={ringPercent ?? 0}
+                                size={18}
+                                strokeWidth={2}
+                                trackColor="#2f2f2f"
+                                indicatorColor={ringColor}
+                              >
+                                <Download size={14} className={downloadIconClass} style={downloadIconStyle} />
+                              </ProgressRing>
+                            )}
+                            {isCancelHover ? (
+                              <span className="text-xs font-semibold text-[#ffcccc] truncate whitespace-nowrap flex-1 min-w-0">Cancel</span>
+                            ) : etaOverflow ? (
+                              <Infinity size={16} className="text-[#7dff7d]" />
+                            ) : (
+                              <span className="text-xs font-semibold truncate whitespace-nowrap flex-1 min-w-0">{etaButtonLabel}</span>
+                            )}
                           </>
                         ) : (
                           <>
                             <Download size={16} />
-                            <span className="text-xs">
+                            <span className="text-xs truncate whitespace-nowrap flex-1 min-w-0">
                               {totalBytes ? formatGB(totalBytes) : 'Size TBD'}
                             </span>
                           </>
@@ -777,6 +922,7 @@ export function InstallDialog({
                       <Gear size={16} className="text-gray-400" />
                     </div>
                   </div>
+
                 </motion.div>
               );
             })}

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, ArrowDownToLine, Loader2, ArrowLeft, RefreshCw, Play, Square } from 'lucide-react';
+import { X, ArrowDownToLine, Loader2, ArrowLeft, RefreshCw, Play, Square, AlertTriangle, FileText } from 'lucide-react';
 import { VersionSelector } from './components/VersionSelector';
 import { InstallDialog } from './components/InstallDialog';
 import { useVersions } from './hooks/useVersions';
@@ -17,7 +17,8 @@ declare global {
         toggle_menu: (tag?: string) => Promise<{ success: boolean }>;
         toggle_desktop: (tag?: string) => Promise<{ success: boolean }>;
         close_window: () => Promise<{ success: boolean }>;
-        launch_comfyui: () => Promise<{ success: boolean }>;
+        launch_comfyui: () => Promise<{ success: boolean; error?: string; log_path?: string; ready?: boolean }>;
+        open_path: (path: string) => Promise<{ success: boolean; error?: string }>;
         stop_comfyui: () => Promise<{ success: boolean }>;
         get_version_shortcuts: (tag: string) => Promise<{ success: boolean; state: { menu: boolean; desktop: boolean; tag: string }; error?: string }>;
         get_all_shortcut_states: () => Promise<{ success: boolean; states: { active: string | null; states: Record<string, { menu: boolean; desktop: boolean; tag?: string }> }; error?: string }>;
@@ -39,7 +40,7 @@ declare global {
         install_version_dependencies: (tag: string) => Promise<{ success: boolean; error?: string }>;
         get_version_status: () => Promise<{ success: boolean; status: any; error?: string }>;
         get_version_info: (tag: string) => Promise<{ success: boolean; info: any; error?: string }>;
-        launch_version: (tag: string, extra_args?: string[]) => Promise<{ success: boolean; error?: string }>;
+        launch_version: (tag: string, extra_args?: string[]) => Promise<{ success: boolean; error?: string; log_path?: string; ready?: boolean }>;
         get_default_version: () => Promise<{ success: boolean; version: string; error?: string }>;
         set_default_version: (tag?: string | null) => Promise<{ success: boolean; error?: string }>;
 
@@ -76,6 +77,9 @@ export default function App() {
   const [desktopShortcut, setDesktopShortcut] = useState(false);
   const [shortcutVersion, setShortcutVersion] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState("Checking system status...");
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const [launchLogPath, setLaunchLogPath] = useState<string | null>(null);
+  const [launchErrorFlash, setLaunchErrorFlash] = useState(false);
 
   // Release info
   const [hasUpdate, setHasUpdate] = useState(false);
@@ -158,6 +162,8 @@ export default function App() {
       setShortcutVersion(data.shortcut_version || null);
       setStatusMessage(data.message);
       setComfyUIRunning(data.comfyui_running || false);
+      setLaunchError(data.last_launch_error || null);
+      setLaunchLogPath(data.last_launch_log || null);
 
       // Handle release info
       if (data.release_info) {
@@ -284,6 +290,16 @@ export default function App() {
     return () => clearInterval(interval);
   }, [comfyUIRunning, isLaunchHover]);
 
+  // Flash the launch icon when a launch error is present
+  useEffect(() => {
+    if (!launchError) {
+      setLaunchErrorFlash(false);
+      return;
+    }
+    const interval = setInterval(() => setLaunchErrorFlash((prev) => !prev), 650);
+    return () => clearInterval(interval);
+  }, [launchError]);
+
   // Keep shortcut + status state aligned with active version changes
   useEffect(() => {
     if (!activeVersion || !window.pywebview?.api) {
@@ -305,6 +321,15 @@ export default function App() {
       "Installing dependencies..."
     );
     setIsInstalling(false);
+  };
+
+  const openLogPath = async (path: string | null | undefined) => {
+    if (!path || !window.pywebview?.api?.open_path) return;
+    try {
+      await window.pywebview.api.open_path(path);
+    } catch (err) {
+      console.error("Failed to open log path", err);
+    }
   };
 
   const closeWindow = () => {
@@ -329,11 +354,18 @@ export default function App() {
 
       if (result.success) {
         setStatusMessage(comfyUIRunning ? "ComfyUI stopped successfully" : "ComfyUI launched successfully");
+        setLaunchError(null);
+        setLaunchLogPath(result.log_path || null);
       } else {
-        setStatusMessage(`Failed to ${action} ComfyUI`);
+        const errMsg = result.error || `Failed to ${action} ComfyUI`;
+        setStatusMessage(errMsg);
+        setLaunchError(errMsg);
+        setLaunchLogPath(result.log_path || null);
       }
     } catch (e) {
-      setStatusMessage(`Error trying to ${action} ComfyUI`);
+      const errMsg = `Error trying to ${action} ComfyUI`;
+      setStatusMessage(errMsg);
+      setLaunchError(errMsg);
       console.error(`${action === 'launch' ? 'Launch' : 'Stop'} Error:`, e);
     } finally {
       // Pull fresh state from backend instead of maintaining a local flag
@@ -396,6 +428,12 @@ export default function App() {
                     {spinnerFrames[spinnerFrame]}
                   </span>
                 )
+              ) : launchError ? (
+                launchErrorFlash ? (
+                  <AlertTriangle size={18} className="text-[#ff6b6b]" />
+                ) : (
+                  <Play size={20} className="flex-shrink-0 text-[#ff6b6b]" />
+                )
               ) : (
                 <Play size={20} className="flex-shrink-0 text-[#55ff55]" style={idleIconGlow} />
               )}
@@ -409,6 +447,17 @@ export default function App() {
               </span>
             </div>
           </motion.button>
+          {launchLogPath && (
+            <motion.button
+              onClick={() => openLogPath(launchLogPath)}
+              className="p-2 rounded hover:bg-[#333] transition-colors"
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.96 }}
+              title="Open last launch log"
+            >
+              <FileText size={18} className={launchError ? 'text-[#ff6b6b]' : 'text-gray-300'} />
+            </motion.button>
+          )}
           <div className="h-14 w-14 flex items-center justify-center">
             <div
               onClick={closeWindow}
@@ -471,6 +520,7 @@ export default function App() {
                 onRefreshAll={refreshAll}
                 installingTag={installingTag}
                 installationProgress={installationProgress}
+                installNetworkStatus={installNetworkStatus}
                 onRefreshProgress={fetchInstallationProgress}
                 displayMode="page"
               />
