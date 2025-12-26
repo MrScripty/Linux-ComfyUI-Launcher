@@ -62,7 +62,6 @@ class ComfyUISetupAPI:
 
         self.main_py = self.comfyui_dir / "main.py"
         self.icon_webp = self.script_dir / "comfyui-icon.webp"
-        self.run_sh = self.script_dir / "run.sh"
         self.launcher_data_dir = self.script_dir / "launcher-data"
         self.shortcut_scripts_dir = self.launcher_data_dir / "shortcuts"
         self.generated_icons_dir = self.launcher_data_dir / "icons"
@@ -113,7 +112,7 @@ class ComfyUISetupAPI:
                 cache_dir,
                 self.release_data_fetcher,
                 self.package_size_resolver,
-                self.resource_manager.shared_dir / "uv"
+                cache_dir / "pip"
             )
 
             self._prefetch_releases_if_needed()
@@ -1106,62 +1105,13 @@ Categories=Graphics;ArtificialIntelligence;
 
     def create_menu_shortcut(self) -> bool:
         """Create application menu shortcut"""
-        # Check if run.sh exists
-        if not self.run_sh.exists():
-            print(f"Warning: run.sh not found at {self.run_sh}")
-            print("Shortcut will be created but may not work until run.sh is present.")
-
-        # Install icon to system directory
-        self.install_icon()
-
-        self.apps_dir.mkdir(parents=True, exist_ok=True)
-
-        # Use the installed system icon instead of direct path
-        icon_line = "Icon=comfyui"  # Use icon name instead of full path
-
-        content = f"""[Desktop Entry]
-Name=ComfyUI
-Comment=Launch ComfyUI with isolated Brave window
-Exec=bash "{self.run_sh.resolve()}"
-{icon_line}
-Terminal=false
-Type=Application
-Categories=Graphics;ArtificialIntelligence;
-"""
-
-        self.apps_file.write_text(content)
-        self.apps_file.chmod(0o644)
-        return True
+        print("Legacy shortcuts are disabled; use version-specific shortcuts instead.")
+        return False
 
     def create_desktop_shortcut(self) -> bool:
         """Create desktop shortcut"""
-        if self.desktop_exists():
-            return False
-
-        # Check if run.sh exists
-        if not self.run_sh.exists():
-            print(f"Warning: run.sh not found at {self.run_sh}")
-            print("Shortcut will be created but may not work until run.sh is present.")
-
-        # Install icon to system directory
-        self.install_icon()
-
-        # Use the installed system icon instead of direct path
-        icon_line = "Icon=comfyui"  # Use icon name instead of full path
-
-        content = f"""[Desktop Entry]
-Name=ComfyUI
-Comment=Launch ComfyUI with isolated Brave window
-Exec=bash "{self.run_sh.resolve()}"
-{icon_line}
-Terminal=false
-Type=Application
-Categories=Graphics;ArtificialIntelligence;
-"""
-
-        self.desktop_file.write_text(content)
-        self.desktop_file.chmod(0o755)
-        return True
+        print("Legacy shortcuts are disabled; use version-specific shortcuts instead.")
+        return False
 
     def remove_menu_shortcut(self) -> bool:
         """Remove application menu shortcut"""
@@ -1190,10 +1140,15 @@ Categories=Graphics;ArtificialIntelligence;
         # Install Python packages
         if "setproctitle" in missing:
             try:
+                pip_cache_dir = self.script_dir / "launcher-data" / "cache" / "pip"
+                pip_cache_dir.mkdir(parents=True, exist_ok=True)
+                pip_env = os.environ.copy()
+                pip_env["PIP_CACHE_DIR"] = str(pip_cache_dir)
                 subprocess.run(
                     ['pip3', 'install', '--user', 'setproctitle'],
                     check=True,
-                    stdout=subprocess.DEVNULL
+                    stdout=subprocess.DEVNULL,
+                    env=pip_env
                 )
             except Exception:
                 success = False
@@ -1222,9 +1177,8 @@ Categories=Graphics;ArtificialIntelligence;
             menu = shortcut_state["menu"]
             desktop = shortcut_state["desktop"]
         else:
-            shortcut_state = {"menu": self.menu_exists(), "desktop": self.desktop_exists()}
-            menu = shortcut_state["menu"]
-            desktop = shortcut_state["desktop"]
+            menu = False
+            desktop = False
         running_processes = self._detect_comfyui_processes()
         running = bool(running_processes)
 
@@ -1303,9 +1257,8 @@ Categories=Graphics;ArtificialIntelligence;
             result = self.toggle_version_menu_shortcut(target)
             return bool(result.get("success", False))
 
-        if self.menu_exists():
-            return self.remove_menu_shortcut()
-        return self.create_menu_shortcut()
+        print("No active version available for menu shortcut")
+        return False
 
     def toggle_desktop(self, tag: Optional[str] = None) -> bool:
         """Toggle desktop shortcut (version-specific when available)"""
@@ -1315,9 +1268,8 @@ Categories=Graphics;ArtificialIntelligence;
             result = self.toggle_version_desktop_shortcut(target)
             return bool(result.get("success", False))
 
-        if self.desktop_exists():
-            return self.remove_desktop_shortcut()
-        return self.create_desktop_shortcut()
+        print("No active version available for desktop shortcut")
+        return False
 
     def _get_known_version_paths(self) -> Dict[str, Path]:
         """Return a mapping of installed version tags to their paths"""
@@ -1521,9 +1473,8 @@ Categories=Graphics;ArtificialIntelligence;
             return False
 
     def launch_comfyui(self) -> Dict[str, Any]:
-        """Launch ComfyUI using run.sh script with readiness detection."""
+        """Launch the active ComfyUI version with readiness detection."""
         try:
-            # Prefer launching the active managed version if available
             if self.version_manager:
                 active_tag = self.version_manager.get_active_version()
                 if active_tag:
@@ -1533,35 +1484,15 @@ Categories=Graphics;ArtificialIntelligence;
                         self.last_launch_log = log_path
                         self.last_launch_error = None
                         return {"success": True, "log_path": log_path, "ready": ready}
-                    else:
-                        print(f"Failed to launch managed version {active_tag}, falling back to legacy run.sh")
-                        self.last_launch_log = log_path
-                        self.last_launch_error = error_msg
-                        return {"success": False, "log_path": log_path, "error": error_msg, "ready": ready}
 
-            if not self.run_sh.exists():
-                print(f"Error: run.sh not found at {self.run_sh}")
-                self.last_launch_error = "run.sh not found"
-                self.last_launch_log = None
-                return {"success": False, "error": "run.sh not found"}
+                    print(f"Failed to launch managed version {active_tag}")
+                    self.last_launch_log = log_path
+                    self.last_launch_error = error_msg
+                    return {"success": False, "log_path": log_path, "error": error_msg, "ready": ready}
 
-            # Check if already running
-            if self.is_comfyui_running():
-                print("ComfyUI is already running")
-                self.last_launch_error = "ComfyUI already running"
-                self.last_launch_log = None
-                return {"success": False, "error": "ComfyUI already running"}
-
-            # Launch run.sh in the background
-            subprocess.Popen(
-                ['bash', str(self.run_sh)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
+            self.last_launch_error = "No active version selected"
             self.last_launch_log = None
-            self.last_launch_error = None
-            return {"success": True, "ready": None}
+            return {"success": False, "error": "No active version selected"}
         except Exception as e:
             print(f"Error launching ComfyUI: {e}")
             self.last_launch_error = str(e)

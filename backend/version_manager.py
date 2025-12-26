@@ -32,7 +32,7 @@ from backend.metadata_manager import MetadataManager
 from backend.github_integration import GitHubReleasesFetcher, DownloadManager
 from backend.resource_manager import ResourceManager
 from backend.utils import (
-    ensure_directory, run_command, check_command_exists, get_directory_size,
+    ensure_directory, run_command, get_directory_size,
     parse_requirements_file, safe_filename
 )
 from backend.installation_progress_tracker import (
@@ -90,11 +90,11 @@ class VersionManager:
 
         # Ensure versions directory exists
         ensure_directory(self.versions_dir)
-        # Shared UV cache directory (persists across installs)
-        self.uv_cache_dir = self.resource_manager.shared_dir / "uv"
-        if ensure_directory(self.uv_cache_dir):
-            print(f"Using UV cache directory at {self.uv_cache_dir}")
-        self.active_uv_cache_dir = self.uv_cache_dir
+        # Shared pip cache directory (persists across installs)
+        self.pip_cache_dir = self.metadata_manager.cache_dir / "pip"
+        if ensure_directory(self.pip_cache_dir):
+            print(f"Using pip cache directory at {self.pip_cache_dir}")
+        self.active_pip_cache_dir = self.pip_cache_dir
 
         # Initialize progress tracker (Phase 6.2.5b)
         cache_dir = metadata_manager.launcher_data_dir / "cache"
@@ -719,14 +719,6 @@ class VersionManager:
             print(f"Version {tag} is not installed")
             return False
 
-        # Validate symlinks
-        print(f"Validating symlinks for {tag}...")
-        repair_report = self.resource_manager.validate_and_repair_symlinks(tag)
-
-        if repair_report['broken']:
-            print(f"Warning: Found {len(repair_report['broken'])} broken symlinks")
-            print(f"Repaired: {len(repair_report['repaired'])}, Removed: {len(repair_report['removed'])}")
-
         # Update active version state (persist as user choice)
         if not self._set_active_version_state(tag, update_last_selected=True):
             return False
@@ -783,7 +775,7 @@ class VersionManager:
             if time.time() - start > timeout:
                 return False, last_error or "Timed out waiting for server"
 
-            time.sleep(1)
+            time.sleep(0.5)
 
     def _tail_log(self, log_file: Path, lines: int = 20) -> List[str]:
         """Return the last N lines of a log file."""
@@ -983,7 +975,7 @@ class VersionManager:
             if self._cancel_installation:
                 raise InterruptedError("Installation cancelled by user")
 
-            # Step 3: Create venv with UV
+            # Step 3: Create venv with python3
             self.progress_tracker.update_stage(InstallationStage.VENV, 0, "Creating virtual environment")
             if progress_callback:
                 progress_callback("Creating virtual environment...", 3, 5)
@@ -1105,28 +1097,18 @@ class VersionManager:
                 self._install_log_handle = None
             # Preserve progress state so UI can read failure logs; it will be overwritten by the next install
 
-    def _build_uv_env(self) -> Dict[str, str]:
+    def _build_pip_env(self) -> Dict[str, str]:
         """
-        Build environment variables for UV commands, ensuring cache is shared
+        Build environment variables for pip commands, ensuring cache is shared.
         """
         env = os.environ.copy()
-        cache_dir = self.uv_cache_dir
-        if " " in str(cache_dir):
-            # Fallback to a space-free cache path to avoid tooling bugs with spaces
-            cache_dir = Path.home() / ".cache" / "comfyui-uv-cache"
+        cache_dir = self.pip_cache_dir
         if ensure_directory(cache_dir):
-            env['UV_CACHE_DIR'] = str(cache_dir)
-            pip_cache = cache_dir / "pip-cache"
-            try:
-                pip_cache.mkdir(parents=True, exist_ok=True)
-                env['PIP_CACHE_DIR'] = str(pip_cache)
-            except Exception:
-                pass
-            self.active_uv_cache_dir = cache_dir
+            env['PIP_CACHE_DIR'] = str(cache_dir)
+            self.active_pip_cache_dir = cache_dir
         else:
-            print(f"Warning: Unable to create UV cache directory at {cache_dir}")
-            self.active_uv_cache_dir = self.uv_cache_dir
-        env['UV_LINK_MODE'] = env.get('UV_LINK_MODE', 'copy')
+            print(f"Warning: Unable to create pip cache directory at {cache_dir}")
+            self.active_pip_cache_dir = self.pip_cache_dir
         return env
 
     def _create_space_safe_requirements(
@@ -1136,7 +1118,7 @@ class VersionManager:
         constraints_path: Optional[Path]
     ) -> tuple[Optional[Path], Optional[Path]]:
         """
-        UV can stumble on paths with spaces; copy requirements/constraints to a cache dir without spaces.
+        Some tools can stumble on paths with spaces; copy requirements/constraints to a cache dir without spaces.
         """
         if not requirements_file and not constraints_path:
             return None, None
@@ -1178,7 +1160,7 @@ class VersionManager:
 
     def _create_venv(self, version_path: Path) -> bool:
         """
-        Create virtual environment for a version using UV
+        Create virtual environment for a version using python3.
 
         Args:
             version_path: Path to version directory
@@ -1186,32 +1168,24 @@ class VersionManager:
         Returns:
             True if successful
         """
-        # Check if UV is installed
-        if not check_command_exists('uv'):
-            print("UV package manager not found. Attempting to install...")
-            # Try to install UV
-            success, stdout, stderr = run_command(
-                ['pip', 'install', 'uv'],
-                timeout=INSTALLATION.SUBPROCESS_LONG_TIMEOUT_SEC
-            )
-            if not success:
-                print("Failed to install UV. Please install it manually:")
-                print("  pip install uv")
-                return False
-
         venv_path = version_path / "venv"
 
-        print(f"Creating virtual environment with UV...")
-        uv_env = self._build_uv_env()
+        print("Creating virtual environment with python3...")
+        pip_env = self._build_pip_env()
         success, stdout, stderr = run_command(
-            ['uv', 'venv', str(venv_path)],
+            ['python3', '-m', 'venv', str(venv_path)],
             timeout=INSTALLATION.VENV_CREATION_TIMEOUT_SEC,
-            env=uv_env
+            env=pip_env
         )
 
         if not success:
             print(f"Failed to create venv: {stderr}")
             return False
+
+        venv_python = venv_path / "bin" / "python"
+        if venv_python.exists():
+            run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=pip_env)
+            run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=pip_env)
 
         print("✓ Virtual environment created")
         return True
@@ -1308,19 +1282,24 @@ class VersionManager:
                 'requirementsFile': requirements_file_rel
             }
 
+        pip_env = self._build_pip_env()
+        pip_ok, _stdout, _stderr = run_command(
+            [str(venv_python), "-m", "pip", "--version"],
+            timeout=INSTALLATION.SUBPROCESS_STANDARD_TIMEOUT_SEC,
+            env=pip_env
+        )
+        if not pip_ok:
+            run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=pip_env)
+            run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=pip_env)
+
         # Check which packages are installed
         installed: list[str] = []
         missing: list[str] = []
 
         installed_names = self._get_installed_package_names(tag, venv_python)
         if installed_names is None:
-            # If inspection fails, don't block launch; assume satisfied
-            print(f"Warning: Could not inspect installed packages for {tag}, assuming dependencies are present")
-            return {
-                'installed': list(requirements.keys()),
-                'missing': [],
-                'requirementsFile': requirements_file_rel
-            }
+            print(f"Warning: Could not inspect installed packages for {tag}, treating dependencies as missing")
+            installed_names = set()
 
         for package in requirements.keys():
             canon = canonicalize_name(package)
@@ -1345,54 +1324,13 @@ class VersionManager:
             Set of canonicalized package names, or None if inspection failed.
         """
         installed_names: set[str] = set()
-        uv_env = self._build_uv_env()
+        pip_env = self._build_pip_env()
         errors: list[str] = []
 
-        # Prefer uv pip list JSON (works even if pip isn't in the venv)
-        success, stdout, stderr = run_command(
-            ['uv', 'pip', 'list', '--format=json', '--python', str(venv_python)],
-            timeout=INSTALLATION.SUBPROCESS_STANDARD_TIMEOUT_SEC,
-            env=uv_env
-        )
-
-        if success:
-            try:
-                import json as _json
-                parsed = _json.loads(stdout)
-                installed_names = {
-                    canonicalize_name(pkg.get('name', ''))
-                    for pkg in parsed
-                    if pkg.get('name')
-                }
-                return installed_names
-            except Exception as e:
-                errors.append(f"uv json parse: {e}")
-                print(f"Error parsing uv pip list JSON for {tag}: {e}")
-        else:
-            errors.append(f"uv json: {stderr}")
-
-        # Fallback to freeze format
-        success, stdout, stderr = run_command(
-            ['uv', 'pip', 'list', '--format=freeze', '--python', str(venv_python)],
-            timeout=INSTALLATION.SUBPROCESS_STANDARD_TIMEOUT_SEC,
-            env=uv_env
-        )
-        if success:
-            for line in stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                pkg = line.split('==')[0].split('@')[0].strip()
-                if pkg:
-                    installed_names.add(canonicalize_name(pkg))
-            return installed_names
-        else:
-            errors.append(f"uv freeze: {stderr}")
-
-        # Last resort: try venv's pip directly if available
         success, stdout, stderr = run_command(
             [str(venv_python), '-m', 'pip', 'list', '--format=json'],
-            timeout=INSTALLATION.SUBPROCESS_STANDARD_TIMEOUT_SEC
+            timeout=INSTALLATION.SUBPROCESS_STANDARD_TIMEOUT_SEC,
+            env=pip_env
         )
 
         if success:
@@ -1413,7 +1351,8 @@ class VersionManager:
 
         success, stdout, stderr = run_command(
             [str(venv_python), '-m', 'pip', 'list', '--format=freeze'],
-            timeout=INSTALLATION.SUBPROCESS_STANDARD_TIMEOUT_SEC
+            timeout=INSTALLATION.SUBPROCESS_STANDARD_TIMEOUT_SEC,
+            env=pip_env
         )
         if success:
             for line in stdout.splitlines():
@@ -1535,7 +1474,7 @@ stop_previous_instance
 close_existing_app_window
 start_comfyui
 
-if [[ "${SKIP_BROWSER:-0}" != "1" ]]; then
+if [[ "${{SKIP_BROWSER:-0}}" != "1" ]]; then
     log "Waiting $SERVER_START_DELAY seconds for server to start..."
     sleep "$SERVER_START_DELAY"
     open_app
@@ -1581,8 +1520,13 @@ wait $SERVER_PID
         venv_python = version_path / "venv" / "bin" / "python"
 
         if not venv_python.exists():
-            print(f"Virtual environment not found for {tag}")
-            return False
+            print(f"Virtual environment not found for {tag}; creating...")
+            if not self._create_venv(version_path):
+                return False
+            venv_python = version_path / "venv" / "bin" / "python"
+            if not venv_python.exists():
+                print(f"Virtual environment not found for {tag}")
+                return False
 
         print(f"Installing dependencies for {tag}...")
 
@@ -1601,20 +1545,33 @@ wait $SERVER_PID
                 print(f"Using pinned constraints for {tag}: {constraints_path}")
                 self._log_install(f"Using constraints file: {constraints_path}")
 
-        uv_env = self._build_uv_env()
-        safe_req, safe_constraints = self._create_space_safe_requirements(tag, requirements_file if requirements_file.exists() else None, constraints_path)
-        # Use UV to install requirements plus global packages
+        pip_env = self._build_pip_env()
+        safe_req, safe_constraints = self._create_space_safe_requirements(
+            tag,
+            requirements_file if requirements_file.exists() else None,
+            constraints_path
+        )
+
+        run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=pip_env)
+        run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=pip_env)
+
         install_cmd = [
-            'uv', 'pip', 'install',
-            '--python', str(venv_python)
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
         ]
         if safe_req:
-            install_cmd += ['-r', str(Path(safe_req))]
+            install_cmd += ["-r", str(Path(safe_req))]
         if safe_constraints:
-            install_cmd += ['-c', str(Path(safe_constraints))]
+            install_cmd += ["-c", str(Path(safe_constraints))]
         install_cmd += global_required
 
-        success, stdout, stderr = run_command(install_cmd, timeout=INSTALLATION.UV_INSTALL_TIMEOUT_SEC, env=uv_env)
+        success, stdout, stderr = run_command(
+            install_cmd,
+            timeout=INSTALLATION.PIP_FALLBACK_TIMEOUT_SEC,
+            env=pip_env
+        )
 
         if success:
             print("✓ Dependencies installed successfully")
@@ -1623,53 +1580,23 @@ wait $SERVER_PID
                 self._log_install(stdout)
             return True
 
-        print(f"Error installing dependencies with uv: {stderr}")
-        self._log_install(f"uv dependency install failed: {stderr}")
-        print("Attempting pip fallback...")
-
-        # Ensure pip is present in the venv before fallback
-        run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=uv_env)
-        run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=uv_env)
-
-        pip_cmd = [
-            str(venv_python),
-            "-m",
-            "pip",
-            "install",
-        ]
-        if safe_req:
-            pip_cmd += ["-r", str(Path(safe_req))]
-        if safe_constraints:
-            pip_cmd += ["-c", str(Path(safe_constraints))]
-        pip_cmd += global_required
-
-        success, stdout, stderr = run_command(pip_cmd, timeout=INSTALLATION.PIP_FALLBACK_TIMEOUT_SEC, env=uv_env)
-
-        if success:
-            print("✓ Dependencies installed successfully via pip fallback")
-            if stdout:
-                print(stdout)
-                self._log_install(stdout)
-            return True
-
-        print(f"Dependency installation failed via uv: {stderr}")
-        self._log_install(f"uv dependency install failed: {stderr}")
+        print(f"Dependency installation failed: {stderr}")
+        self._log_install(f"pip dependency install failed: {stderr}")
         return False
 
     def _install_dependencies_with_progress(self, tag: str) -> bool:
         """
         Install Python dependencies with real-time progress tracking.
 
-        Uses UV package manager with pip fallback. Tracks download speed
-        via process I/O counters and cache directory growth. Supports
-        cancellation via the _cancel_installation flag.
+        Uses pip and tracks download speed via process I/O counters and
+        cache directory growth. Supports cancellation via the
+        _cancel_installation flag.
 
         Process:
         1. Parses requirements.txt and constraints
-        2. Attempts installation with UV (faster)
-        3. Falls back to pip if UV fails
-        4. Monitors download progress via ProcessIOTracker
-        5. Updates progress_tracker with real-time metrics
+        2. Ensures venv + pip are present
+        3. Installs with pip while monitoring download progress
+        4. Updates progress_tracker with real-time metrics
 
         Args:
             tag: Version tag being installed
@@ -1697,8 +1624,13 @@ wait $SERVER_PID
         venv_python = version_path / "venv" / "bin" / "python"
 
         if not venv_python.exists():
-            print(f"Virtual environment not found for {tag}")
-            return False
+            print(f"Virtual environment not found for {tag}; creating...")
+            if not self._create_venv(version_path):
+                return False
+            venv_python = version_path / "venv" / "bin" / "python"
+            if not venv_python.exists():
+                print(f"Virtual environment not found for {tag}")
+                return False
 
         # Parse requirements to get package list
         requirements = parse_requirements_file(requirements_file) if requirements_file.exists() else {}
@@ -1735,35 +1667,44 @@ wait $SERVER_PID
                 "Preparing...",
                 0,
                 package_count
-        )
+            )
 
-        # Use UV to install requirements
+        # Use pip to install requirements
         # Use Popen to allow immediate cancellation
         print("Starting dependency installation...")
-        uv_env = self._build_uv_env()
-        safe_req, safe_constraints = self._create_space_safe_requirements(tag, requirements_file if requirements_file.exists() else None, constraints_path)
+        pip_env = self._build_pip_env()
+        safe_req, safe_constraints = self._create_space_safe_requirements(
+            tag,
+            requirements_file if requirements_file.exists() else None,
+            constraints_path
+        )
 
-        cache_dir = self.active_uv_cache_dir or self.uv_cache_dir
-        uv_stdout = ""
-        uv_stderr = ""
-        uv_cmd = [
-            'uv', 'pip', 'install',
-            '--python', str(venv_python)
+        run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=pip_env)
+        run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=pip_env)
+
+        cache_dir = self.active_pip_cache_dir or self.pip_cache_dir
+        pip_stdout = ""
+        pip_stderr = ""
+        pip_cmd = [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
         ]
         if safe_req:
-            uv_cmd += ['-r', str(Path(safe_req))]
+            pip_cmd += ["-r", str(Path(safe_req))]
         if safe_constraints:
-            uv_cmd += ['-c', str(Path(safe_constraints))]
-        uv_cmd += extra_global
+            pip_cmd += ["-c", str(Path(safe_constraints))]
+        pip_cmd += extra_global
 
         self._current_process = subprocess.Popen(
-            uv_cmd,
+            pip_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             # Create new process group so we can kill the entire tree
             preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
-            env=uv_env
+            env=pip_env
         )
 
         # Initialize process I/O tracker for monitoring download progress
@@ -1795,7 +1736,7 @@ wait $SERVER_PID
                     raise InterruptedError("Installation cancelled during dependency installation")
 
             # Process completed, get output
-            uv_stdout, uv_stderr = self._current_process.communicate()
+            pip_stdout, pip_stderr = self._current_process.communicate()
             success = self._current_process.returncode == 0
 
         except InterruptedError:
@@ -1826,95 +1767,16 @@ wait $SERVER_PID
                 self.progress_tracker.add_completed_item(package, 'package')
 
             print("✓ Dependencies installed successfully")
-            if uv_stdout:
-                print(uv_stdout)
-                self._log_install(uv_stdout)
+            if pip_stdout:
+                print(pip_stdout)
+                self._log_install(pip_stdout)
             return True
-        else:
-            print(f"Error installing dependencies with uv: {uv_stderr}")
-            self._log_install(f"uv install error:\n{uv_stderr}")
-            # Fallback with pip
-            print("Attempting fallback install with pip...")
-            run_command([str(venv_python), "-m", "ensurepip", "--upgrade"], env=uv_env)
-            run_command([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], env=uv_env)
-            pip_cmd = [
-                str(venv_python),
-                "-m",
-                "pip",
-                "install",
-            ]
-            if safe_req:
-                pip_cmd += ["-r", str(Path(safe_req))]
-            if safe_constraints:
-                pip_cmd += ["-c", str(Path(safe_constraints))]
-            pip_cmd += extra_global
 
-            # Stream pip output while sampling IO for speed
-            pip_stdout = ""
-            pip_stderr = ""
-            self._current_process = subprocess.Popen(
-                pip_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
-                env=uv_env
-            )
-
-            # Initialize process I/O tracker for pip fallback
-            io_tracker = ProcessIOTracker(
-                pid=self._current_process.pid if self._current_process else None,
-                cache_dir=cache_dir,
-                io_bytes_getter=self._get_process_io_bytes
-            )
-
-            try:
-                while self._current_process.poll() is None:
-                    time.sleep(0.1)
-
-                    # Update download progress metrics
-                    if io_tracker.should_update(min_interval_sec=0.75):
-                        downloaded, speed = io_tracker.get_download_metrics()
-
-                        if downloaded is not None:
-                            self.progress_tracker.update_download_progress(
-                                downloaded,
-                                None,
-                                speed if speed is not None else 0
-                            )
-
-                    if self._cancel_installation:
-                        raise InterruptedError("Installation cancelled during dependency installation (pip fallback)")
-
-                pip_stdout, pip_stderr = self._current_process.communicate()
-                success = self._current_process.returncode == 0
-            except InterruptedError:
-                raise
-            except Exception as e:
-                print(f"Error during pip fallback installation: {e}")
-                success = False
-            finally:
-                self._current_process = None
-
-            if success:
-                for i, (package, version_spec) in enumerate(package_entries, 1):
-                    self.progress_tracker.update_dependency_progress(
-                        f"{package}{version_spec}",
-                        i,
-                        package_count
-                    )
-                    self.progress_tracker.add_completed_item(package, 'package')
-                print("✓ Dependencies installed successfully via pip fallback")
-                if pip_stdout:
-                    print(pip_stdout)
-                    self._log_install(pip_stdout)
-                return True
-
-            error_msg = f"Dependency installation failed via uv and pip. uv stderr: {uv_stderr[:500]} pip stderr: {pip_stderr[:500]}"
-            print(error_msg)
-            self._log_install(error_msg)
-            self.progress_tracker.set_error(error_msg)
-            return False
+        error_msg = f"Dependency installation failed via pip: {pip_stderr[:500]}"
+        print(error_msg)
+        self._log_install(error_msg)
+        self.progress_tracker.set_error(error_msg)
+        return False
 
     def remove_version(self, tag: str) -> bool:
         """

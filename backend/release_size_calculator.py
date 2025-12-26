@@ -23,7 +23,7 @@ class ReleaseSizeCalculator:
         cache_dir: Path,
         release_data_fetcher,
         package_size_resolver,
-        uv_cache_dir: Optional[Path] = None
+        pip_cache_dir: Optional[Path] = None
     ):
         """
         Initialize ReleaseSizeCalculator
@@ -41,8 +41,8 @@ class ReleaseSizeCalculator:
         self.package_size_resolver = package_size_resolver
 
         self._cache: Dict = self._load_cache()
-        # Optional shared UV cache to reuse metadata downloads if present
-        self.uv_cache_dir = Path(uv_cache_dir) if uv_cache_dir else None
+        # Optional shared pip cache to reuse metadata downloads if present
+        self.pip_cache_dir = Path(pip_cache_dir) if pip_cache_dir else None
 
     def _load_cache(self) -> Dict:
         """Load release sizes cache from disk"""
@@ -116,7 +116,7 @@ class ReleaseSizeCalculator:
             requirements_data['requirements_txt']
         )
 
-        # Fast total estimate using pip/uv resolver (captures transitives)
+        # Fast total estimate using pip resolver (captures transitives)
         print(f"Estimating total dependency download size for {tag} via resolver report...")
         pip_estimate = self._estimate_dependencies_size_via_pip(
             requirements_data['requirements_txt'],
@@ -227,7 +227,6 @@ class ReleaseSizeCalculator:
                 "--dry-run",
                 "--report",
                 str(report_file),
-                "--no-cache-dir",
                 "--disable-pip-version-check",
                 "--no-input",
                 "-r",
@@ -244,58 +243,9 @@ class ReleaseSizeCalculator:
 
         except Exception as e:
             print(f"Error estimating dependency size via pip for {tag}: {e}")
-            return self._estimate_dependencies_size_via_uv(requirements_txt, tag)
+            return None
         finally:
             # Clean up temp dir to avoid disk bloat
-            try:
-                if temp_root.exists():
-                    shutil.rmtree(temp_root)
-            except Exception:
-                pass
-
-    def _estimate_dependencies_size_via_uv(
-        self,
-        requirements_txt: str,
-        tag: str
-    ) -> Optional[int]:
-        """
-        Use uv pip --dry-run --report to estimate total download size including transitives.
-        """
-        temp_root = self.cache_dir / "uv-size-estimates" / tag
-        report_file = temp_root / "report.json"
-        try:
-            if temp_root.exists():
-                shutil.rmtree(temp_root)
-            temp_root.mkdir(parents=True, exist_ok=True)
-
-            req_file = temp_root / "requirements.txt"
-            req_file.write_text(requirements_txt)
-
-            cmd = [
-                "uv",
-                "pip",
-                "install",
-                "--dry-run",
-                "--report",
-                str(report_file),
-                "-r",
-                str(req_file),
-            ]
-
-            return self._estimate_dependencies_size_via_report(
-                tag,
-                "uv",
-                cmd,
-                temp_root,
-                report_file
-            )
-
-        except FileNotFoundError:
-            return None
-        except Exception as e:
-            print(f"Error estimating dependency size via uv for {tag}: {e}")
-            return None
-        finally:
             try:
                 if temp_root.exists():
                     shutil.rmtree(temp_root)
@@ -318,7 +268,7 @@ class ReleaseSizeCalculator:
             capture_output=True,
             text=True,
             timeout=600,
-            env=self._build_uv_env()
+            env=self._build_pip_env()
         )
 
         if result.returncode != 0:
@@ -388,21 +338,21 @@ class ReleaseSizeCalculator:
             print(f"Warning: HEAD failed for {url}: {e}")
         return None
 
-    def _build_uv_env(self) -> Optional[Dict[str, str]]:
+    def _build_pip_env(self) -> Optional[Dict[str, str]]:
         """
-        Build env for pip to reuse UV cache if provided.
+        Build env for pip to reuse the shared pip cache if provided.
         """
-        if not self.uv_cache_dir:
+        if not self.pip_cache_dir:
             return None
 
         try:
-            self.uv_cache_dir.mkdir(parents=True, exist_ok=True)
+            self.pip_cache_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            print(f"Warning: Could not ensure UV cache directory {self.uv_cache_dir}: {e}")
+            print(f"Warning: Could not ensure pip cache directory {self.pip_cache_dir}: {e}")
             return None
 
         env = os.environ.copy()
-        env['UV_CACHE_DIR'] = str(self.uv_cache_dir)
+        env['PIP_CACHE_DIR'] = str(self.pip_cache_dir)
         return env
 
     def get_size_breakdown(self, tag: str) -> Optional[Dict[str, any]]:

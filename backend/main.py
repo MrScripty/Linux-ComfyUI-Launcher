@@ -431,6 +431,12 @@ def get_entrypoint():
 
 def main():
     """Main application entry point"""
+    try:
+        import setproctitle
+        setproctitle.setproctitle("Linux AI Launcher")
+    except Exception:
+        pass
+
     # Create JavaScript API instance
     js_api = JavaScriptAPI()
 

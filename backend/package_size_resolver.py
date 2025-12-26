@@ -8,7 +8,6 @@ import json
 import platform
 import sys
 import urllib.request
-import subprocess
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Set
 from datetime import datetime, timezone
@@ -311,22 +310,6 @@ class PackageSizeResolver:
             self._save_cache()
             return result
 
-        # Fallback to UV dry-run if PyPI query fails
-        fallback_size = self._fallback_uv_dry_run(package_spec)
-        if fallback_size is not None:
-            fallback_entry = {
-                'size': fallback_size,
-                'dependencies': [],
-                'platform': self.platform,
-                'python_version': self.python_version,
-                'checked_at': self._get_iso_timestamp(),
-                'wheel_filename': None,
-                'resolved_version': None
-            }
-            self._cache[cache_key] = fallback_entry
-            self._save_cache()
-            return fallback_entry
-
         return None
 
     def get_package_size(
@@ -468,36 +451,6 @@ class PackageSizeResolver:
                 continue
 
         return dependencies
-
-    def _fallback_uv_dry_run(self, package_spec: str) -> Optional[int]:
-        """
-        Fallback to UV dry-run to estimate package size
-
-        Args:
-            package_spec: Package specification
-
-        Returns:
-            Estimated size in bytes or None
-        """
-        try:
-            # Use UV with --dry-run to see what would be installed
-            result = subprocess.run(
-                ['uv', 'pip', 'install', '--dry-run', package_spec],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                # UV output doesn't directly show sizes, so this is limited
-                # Return a conservative estimate
-                print(f"Warning: Using UV dry-run fallback for {package_spec}")
-                return None
-
-        except Exception as e:
-            print(f"UV dry-run fallback failed for {package_spec}: {e}")
-
-        return None
 
     def get_multiple_package_sizes(
         self,
