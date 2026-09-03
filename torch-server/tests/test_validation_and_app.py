@@ -143,6 +143,7 @@ class TorchValidationTests(unittest.TestCase):
         os.environ.pop("PUMAS_TORCH_MODEL_ROOTS", None)
 
         self.control_api = importlib.import_module("control_api")
+        self.openai_api = importlib.import_module("openai_api")
         self.serve = importlib.import_module("serve")
 
     def test_load_request_canonicalizes_existing_model_path(self):
@@ -260,6 +261,167 @@ class TorchValidationTests(unittest.TestCase):
                 "lan_access": False,
             },
         )
+
+    def test_openai_text_request_subset_accepts_only_implemented_values(self):
+        chat = self.openai_api.ChatCompletionRequest(
+            model="local-chat",
+            messages=[
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+            ],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=1,
+        )
+        completion = self.openai_api.CompletionRequest(
+            model="local-text",
+            prompt="Complete this",
+            temperature=2.0,
+            top_p=0.5,
+            max_tokens=4096,
+        )
+
+        self.assertEqual(chat.stream, False)
+        self.assertIsNone(chat.stop)
+        self.assertEqual(completion.stream, False)
+        self.assertIsNone(completion.stop)
+
+    def test_openai_chat_response_allows_empty_assistant_output(self):
+        response = self.openai_api.ChatCompletionResponse(
+            id="chatcmpl-test",
+            created=1,
+            model="local-chat",
+            choices=[
+                self.openai_api.ChatChoice(
+                    message=self.openai_api.AssistantMessage(
+                        role="assistant",
+                        content="",
+                    )
+                )
+            ],
+        )
+
+        self.assertEqual(response.choices[0].message.content, "")
+        self.assertEqual(response.choices[0].message.role, "assistant")
+
+    def test_openai_text_request_subset_rejects_unknown_fields(self):
+        with self.assertRaises(ValueError):
+            self.openai_api.CompletionRequest(
+                model="local-text",
+                prompt="Hello",
+                seed=42,
+            )
+
+        with self.assertRaises(ValueError):
+            self.openai_api.ChatCompletionRequest(
+                model="local-chat",
+                messages=[{"role": "user", "content": "Hello", "name": "caller"}],
+            )
+
+    def test_openai_text_request_subset_rejects_unsupported_roles_and_values(self):
+        invalid_chat_requests = [
+            {"model": "local-chat", "messages": []},
+            {"model": "local-chat", "messages": [{"role": "tool", "content": "result"}]},
+            {"model": "local-chat", "messages": [{"role": "user", "content": ""}]},
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "temperature": -0.1,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "temperature": 2.1,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "top_p": 0.0,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "top_p": 1.1,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "temperature": 0.0,
+                "top_p": 0.5,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 0,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4097,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": "12",
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+            {
+                "model": "local-chat",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stop": ["END"],
+            },
+        ]
+
+        for request in invalid_chat_requests:
+            with self.subTest(request=request), self.assertRaises(ValueError):
+                self.openai_api.ChatCompletionRequest(**request)
+
+        with self.assertRaises(ValueError):
+            self.openai_api.CompletionRequest(
+                model="local-text",
+                prompt="Hello",
+                temperature=0.0,
+                top_p=0.5,
+            )
+
+    def test_openai_text_request_subset_enforces_input_resource_bounds(self):
+        with self.assertRaises(ValueError):
+            self.openai_api.CompletionRequest(model="", prompt="Hello")
+
+        with self.assertRaises(ValueError):
+            self.openai_api.CompletionRequest(model="   ", prompt="Hello")
+
+        with self.assertRaises(ValueError):
+            self.openai_api.CompletionRequest(model="m" * 257, prompt="Hello")
+
+        with self.assertRaises(ValueError):
+            self.openai_api.CompletionRequest(model="local-text", prompt="")
+
+        with self.assertRaises(ValueError):
+            self.openai_api.CompletionRequest(
+                model="local-text",
+                prompt="p" * 1_000_001,
+            )
+
+        with self.assertRaises(ValueError):
+            self.openai_api.ChatCompletionRequest(
+                model="local-chat",
+                messages=[{"role": "user", "content": "x"}] * 257,
+            )
+
+        with self.assertRaises(ValueError):
+            self.openai_api.ChatCompletionRequest(
+                model="local-chat",
+                messages=[
+                    {"role": "user", "content": "x" * 600_000},
+                    {"role": "assistant", "content": "y" * 400_001},
+                ],
+            )
 
 
 if __name__ == "__main__":

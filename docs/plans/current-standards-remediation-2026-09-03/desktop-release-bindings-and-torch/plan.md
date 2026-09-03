@@ -2,13 +2,15 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestone 4 launcher platform and process outcomes.
+**Current phase:** Milestone 3 Torch request-contract boundary accepted;
+runtime/deployment evidence unavailable.
 
-**Next slice:** Cross-review the green Linux launcher source/test boundary,
-reconcile only evidence-backed launcher behavior in the reserved root docs,
-and route the same suite to required-real Windows x64 and macOS arm64 runners.
-Milestone 1 remains blocked until the Rust plan hands off a complete zero-legacy
-canonical request, response, error, and event projection.
+**Next slice:** No further Torch source slice is admitted. Resolve a production
+dependency set, a managed sidecar deployment path, and one real local
+model/device fixture before selecting or implementing the inference work owner,
+usage, cancellation, overload, failure, health, or shutdown contract. Milestone
+1 remains blocked on the complete Rust producer projection, and Milestone 4
+remains pending required-real Windows/macOS evidence.
 
 **Acceptance status:** `pending`
 
@@ -180,6 +182,7 @@ artifact, dependency, license, version, and target promises.
 | GitHub Releases exposes only a `preview` channel. Its desktop matrix is Linux x64 AppImage/Debian, Windows x64 NSIS/portable, and macOS arm64 DMG; a repository maintainer alone manually promotes an evidence-complete draft. | Product/release owner plus Milestones 0, 4, and 6 | Accepted 2026-09-03 decision | `v0.*`-derived prerelease state and build-only support inference |
 | UniFFI, Rustler/Elixir, Go, and all generated host-binding release bundles are removed because no real host consumer exists. A later binding is a new consumer/matrix decision, not retained experimental machinery. | Product/release owner; Rust owns source seams and this plan owns release/host projections | Accepted 2026-09-03 decision and bounded consumer search | Five hypothetical UniFFI release seams, non-core Rustler surface, and false Go claim |
 | Torch remains a non-shipped source capability until Milestone 3 proves and records one real runtime/platform/device tuple. | Product/release owner plus Milestone 3 | Accepted 2026-09-03 decision | Development source or fake tests treated as deployment support |
+| Until a real consumer and runtime tuple prove a broader contract, Torch exposes only an OpenAI-shaped, text-only, non-streaming request subset: exact known fields; `system`, `user`, and `assistant` text messages; bounded prompt/message/model/token values; implemented temperature and nucleus sampling; and no stop sequences. Unsupported streaming and stop behavior is rejected and its dead implementation is removed. | Milestone 3 | Bounded consumer inventory, current implementation inventory, and official OpenAI API reference comparison in `reports/torch-runtime-evidence.md` | General “OpenAI-compatible” inference claim, silently ignored inputs, and retained unreachable streaming behavior |
 | The repository maintainer owns manual draft promotion and third-party notice interpretation/acceptance for each final artifact. | Product/release owner plus Milestone 6 | Accepted 2026-09-03 decision | Ambient GitHub permissions or generated inventory treated as approval |
 
 ## Evidence And Oracle Plan
@@ -476,7 +479,7 @@ path cannot starve control traffic or lose accepted work at shutdown.
 and a resolved real-runtime suite proves the supported subset and responsiveness
 budget on each accepted runtime/device class.
 
-**Status:** `Planned`
+**Status:** `Active`
 
 ### Milestone 4: Complete Launcher Platform and Process Outcomes
 

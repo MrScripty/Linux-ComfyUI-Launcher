@@ -18,8 +18,10 @@
 - Milestone 1 is `Blocked`: Rust's credential-disclosure prerequisite is
   accepted, but the canonical producer projection still contains legacy
   operations and handler-owned event shapes.
-- Current slice: Milestone 4 wrapper parity, explicit platform selection, and
-  bounded launcher-owned process-tree outcomes.
+- Milestone 4 is locally green but remains `Active`/pending until required-real
+  Windows x64 and macOS arm64 launcher evidence exists.
+- Current slice: Milestone 3 bounded Torch request-contract narrowing; runtime
+  scheduling and deployment remain blocked on a real tuple and fixture.
 
 ## Entries
 
@@ -231,6 +233,126 @@
   substitute for real Windows process semantics. Windows x64 and macOS arm64
   remain `unavailable`; Milestone 4 and DRBT-A6 remain `Active`/`pending`.
 
+### 2026-09-03 — Start Milestone 3 Torch investigation
+
+- Operation: `continue`; plan remains `Active` and Milestone 3 moves from
+  `Planned` to `Active` while Milestone 4 retains its pending cross-target
+  evidence state.
+- Development decision: `investigate`. The current compatibility claim,
+  accepted fields, ignored values, usage accounting, actual consumers,
+  dependency tuple, model/device fixture, and async work owner are facts needed
+  before a safe implementation shape can be selected.
+- Bounded investigation: inventory the public ASGI request/response/stream
+  Interface, every accepted-but-ignored input, usage behavior, task/thread/
+  process ownership, control-route schedulability, production and development
+  dependency facts, model/device support, shutdown behavior, and reachable
+  consumers. Compare only current claimed compatibility to official OpenAI
+  primary documentation.
+- Initial exact write set:
+  - this plan, ledger, issues, and `reports/torch-runtime-evidence.md`
+- Held files: all `torch-server/**` source/tests, both requirements files,
+  `.github/workflows/build.yml`, `RELEASING.md`, `docs/SECURITY.md`, root
+  `README.md`, and root package files remain read-only until investigation
+  selects a coherent slice and any shared ownership is serialized.
+- Stopping condition: every reachable Torch consumer and every accepted field,
+  value, output, error, usage, lifecycle, dependency, runtime, platform, and
+  device claim has a supported, rejected, or typed `unavailable` disposition;
+  otherwise the implementation slice remains blocked.
+- Skill note: the research workflow's background delegation could not start
+  because all five worker slots are occupied by the standards program. The
+  platform owner performs the same primary-source comparison directly.
+
+### 2026-09-03 — Complete M3 investigation and admit the first source slice
+
+- Investigation result: the stopping condition passed for current facts.
+  `reports/torch-runtime-evidence.md` inventories all registered routes,
+  request fields and ignored values, response/stream/usage behavior, task and
+  resource ownership, dependency/runtime/device evidence, and reachable
+  consumers. Unknown runtime claims remain explicit `unavailable` outcomes.
+- Consumer decision: the only concrete first-party consumers use `/health`
+  and `/api/*` control routes. No Pumas, Pantograph, Pixapillars, or puma-bot
+  path was found that targets the sidecar's port or consumes its chat/text
+  completion contract. The general OpenAI compatibility promise therefore has
+  no retention authority.
+- External authority: current official OpenAI API documentation confirms that
+  chat messages, legacy prompt forms, stop behavior, streaming usage, finish
+  reasons, and request ranges are broader and more precise than this server.
+  The report links the exact primary sources; local similarity is not treated
+  as conformance.
+- Runtime result: this Linux x64/Python 3.12.3 environment lacks Torch,
+  Transformers, safetensors, FastAPI, Uvicorn, and Accelerate. The 13 passing
+  tests install local dependency fakes and prove only their focused control
+  logic. No production model/device tuple, ASGI path, inference result, or
+  responsiveness budget is accepted.
+- Cross-plan deployment blocker: the managed Torch installer downloads the
+  upstream `pytorch/pytorch` source release, while launch expects Pumas
+  `serve.py` and a POSIX `venv/bin/python`; the configured Python version is
+  3.10 while the repository pins 3.12.3. Rust/process/plugin owners must repair
+  that deployment composition before it can prove an accepted tuple.
+- Development decision: `implement` one reversible contract-narrowing slice.
+  No real inference consumer requires retention of silently ignored or
+  unschedulable behavior, and validation/deletion can be proved without
+  pretending the fake environment is a production runtime.
+- Exact source/test write set:
+  - `torch-server/openai_api.py`
+  - `torch-server/tests/test_validation_and_app.py`
+  - this plan, ledger, issues, and `reports/torch-runtime-evidence.md`
+- Slice contract: retain the existing request-model Interface as the one
+  inbound decoder; close it over exact known fields, text-only supported roles,
+  bounded inputs, implemented sampling values, and positive bounded token
+  counts. Treat non-null `stop` and `stream: true` as well-formed but
+  unsupported, then delete the unreachable stream implementation.
+- First red oracle: construct the public Pydantic request models with one valid
+  request and one independently changed invalid/unsupported field per case.
+  Before implementation, unknown fields, ignored roles, empty/unbounded input,
+  invalid ranges, non-null stop, and streaming are all accepted.
+- Held files: `torch-server/README.md` remains held until the source/test
+  boundary is reviewed. Requirements, shared CI, release/security/root docs,
+  root package files, Rust, frontend, and plugin configuration remain excluded
+  and require their owning handoff.
+- Claim boundary: this slice supplies focused contract evidence toward
+  DRBT-A5. It cannot satisfy DRBT-A5's required-real system claim, select an
+  inference worker/thread/process owner, or close runtime/deployment issues.
+
+### 2026-09-03 — Accept the first M3 request-contract slice
+
+- Operation: `continue`; Milestone 3 and DRBT-A5 remain `Active`/`pending`.
+  Root accepted this boundary only as incremental request-validation evidence,
+  not as real ASGI, inference, device, scheduling, usage, or deployment proof.
+- Initial red oracle: 14 of 15 focused public-model tests failed before the
+  decoder was closed. Unknown fields, unsupported roles, empty and over-budget
+  inputs, invalid sampling/token values, non-null `stop`, and `stream: true`
+  crossed the boundary.
+- Review red oracle: an empty generated assistant response failed construction
+  because the response reused the stricter inbound message type; nonblank model
+  identity and the `temperature=0`/`top_p` no-op relationship were not closed.
+- Implementation: one shared closed request model rejects extra fields and
+  coercion, centralizes model/sampling/token validation, and gives chat and
+  completion their bounded text shapes. A distinct assistant response model
+  permits empty generated output. `temperature=0` requires `top_p=1`, blank
+  model identifiers are rejected, and the unreachable stream implementation
+  is deleted.
+- Module result: the existing Pydantic request decoder remains the single
+  Interface and owns the supported subset. The slice adds no worker, queue,
+  executor, framework, dependency, schema artifact, or compatibility shim.
+- Documentation: `torch-server/README.md` now states the exact OpenAI-shaped,
+  text-only, non-streaming request subset; Torch's non-shipped state; the
+  fake-test boundary; and the known real-runtime and managed-deployment
+  blockers.
+- Green evidence:
+  - focused validation/application test module: 16/16 passing, including the
+    five new public request/response contract regressions;
+  - full fake-backed Torch unit suite: 18/18 passing;
+  - `python3 -m py_compile torch-server/openai_api.py
+    torch-server/tests/test_validation_and_app.py`: passed;
+  - Ruff check and format check over the two changed Python files: passed;
+  - scoped whitespace diff check: passed.
+- Held claims: placeholder usage, terminal-reason truth, redacted HTTP
+  failures, event-loop responsiveness, admission, overload, cancellation,
+  disconnect, shutdown, production dependencies, managed deployment, and one
+  required-real model/device tuple remain unresolved under DRBT-I7 through
+  DRBT-I9. Milestone 3 and DRBT-A5 therefore remain open.
+
 ## Reports
 
 | Planned report | Milestone | Status |
@@ -238,7 +360,7 @@
 | `reports/release-and-host-contract-decision.md` | 0 | `accepted` |
 | `reports/rpc-contract-conformance.md` | 1 | `pending` |
 | `reports/desktop-lifecycle-evidence.md` | 2 | `pending` |
-| `reports/torch-runtime-evidence.md` | 3 | `pending` |
+| `reports/torch-runtime-evidence.md` | 3 | `active` |
 | `reports/launcher-platform-evidence.md` | 4 | `pending` |
 | `reports/binding-host-matrix.md` | 5 | `pending` |
 | `reports/release-evidence.md` | 6 | `pending` |

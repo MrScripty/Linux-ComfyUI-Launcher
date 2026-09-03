@@ -10,6 +10,69 @@
 
 ## Active Issues
 
+### DRBT-I7 — No accepted Torch runtime/model/device tuple
+
+- Severity: High; blocks DRBT-A5 and any shipped Torch promise.
+- Evidence: the current Linux x64/Python 3.12.3 environment has no Torch,
+  Transformers, safetensors, FastAPI, Uvicorn, or Accelerate installation. The
+  current 18-test suite installs fakes and never traverses a real ASGI,
+  production loader, tokenizer, model generation, or device path.
+- Relationship: the inference work owner, thread/process suitability,
+  responsiveness budget, dependency resolution, shutdown behavior, and real
+  usage semantics cannot be accepted without this tuple.
+- Owner/boundary: Milestone 3 owns the Torch request/work Module and evidence;
+  dependency and release owners must accept the resolved production stack.
+- Disposition: keep Torch non-shipped. Narrow the independently provable
+  request contract now, but do not select an executor, worker process, model
+  architecture, or device from fake evidence.
+- Verification: resolve one production stack and execute real ASGI requests,
+  production loading/generation, control responsiveness, overload,
+  cancellation, disconnect, failure, and bounded shutdown on its accepted
+  local model/device fixture.
+- Revisit trigger: an accepted resolved environment and local offline fixture.
+
+### DRBT-I8 — Managed Torch installation does not install the sidecar
+
+- Severity: High; current GUI-managed install/launch cannot establish a valid
+  Pumas Torch deployment.
+- Evidence: `launcher-data/plugins/torch.json` selects GitHub repository
+  `pytorch/pytorch`; the generic Python installer downloads and installs that
+  source tree, while `BinaryLaunchConfig::torch` expects Pumas `serve.py` in the
+  installed version directory. It also hard-codes POSIX `venv/bin/python`, and
+  plugin Python 3.10 conflicts with repository `.python-version` 3.12.3.
+- Relationship: blocks DRBT-A5's required-real process/deployment path and the
+  tuple required to move Torch out of non-shipped state.
+- Owner/boundary: Rust process/version-management and plugin manifest owners;
+  this plan records the dependency but does not mutate those concurrent write
+  sets without a serialized cross-plan handoff.
+- Disposition: `invalid`, not an alternate supported installer. Define one
+  sidecar source/version/dependency identity and cross-platform interpreter
+  path before enabling managed deployment.
+- Verification: install from the selected source into an isolated root, prove
+  exact dependency identity, launch the installed `serve.py`, traverse health
+  and one accepted real request, and stop with no owned work remaining.
+- Revisit trigger: Rust and plugin owners admit the deployment repair.
+
+### DRBT-I9 — Shared OpenAI-compatibility claims exceed the accepted subset
+
+- Severity: Medium now; High if Torch becomes shipped.
+- Evidence: source, the accepted request-contract slice, and bounded official-
+  reference comparison support only a narrow OpenAI-shaped text subset.
+  `torch-server/README.md` now states that local boundary accurately, but
+  `launcher-data/plugins/torch.json` and `frontend/src/config/apps.ts` still
+  advertise an unqualified “OpenAI-compatible API”; they are outside this
+  slice's write ownership.
+- Relationship: leaves DRBT-A9 pending and can mislead users even after the
+  local request decoder rejects unsupported behavior.
+- Owner/boundary: Torch boundary docs, frontend product copy, and plugin
+  manifest owners must project the same accepted capability state.
+- Disposition: narrow or remove the shared claim after the focused source
+  contract is reviewed; do not add compatibility shims for absent consumers.
+- Verification: search all advertised/registered surfaces and compare each
+  statement to the executable accepted subset and real evidence.
+- Revisit trigger: serialized frontend/plugin ownership or an accepted broader
+  real contract.
+
 ### DRBT-I6 — Windows and macOS launcher evidence unavailable locally
 
 - Severity: High for release promotion; no effect on bounded Linux
