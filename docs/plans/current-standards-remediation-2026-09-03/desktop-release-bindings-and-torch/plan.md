@@ -1,10 +1,13 @@
 # Plan: Trustworthy Desktop, Torch, Binding, and Release Boundaries
 
-**Plan status:** `Planned`
+**Plan status:** `Active`
 
-**Current phase:** Awaiting explicit `start`; no implementation slice is active.
+**Current phase:** Milestone 1 canonical Rust producer handoff review.
 
-**Next slice:** On explicit `start`, Milestone 0 — inventory real consumers and decide the release unit, artifact roles, channels, target matrix, binding host matrix, version policy, and license/SBOM obligations; record unknown facts as `unavailable` rather than inferring support from current generators or CI jobs.
+**Next slice:** Confirm the Rust plan's canonical request, response, error, and
+event declaration plus projection mechanism and completed credential-disclosure
+repair, then implement Milestone 1's generated Electron projection and runtime
+decoders without creating a second semantic authority.
 
 **Acceptance status:** `pending`
 
@@ -172,6 +175,11 @@ artifact, dependency, license, version, and target promises.
 | Launcher-root states distinguish absent, valid, invalid, and unavailable authority; only the accepted recovery path may replace a bad persisted owner. | Milestone 2 | P-08 and persistence/resilience rules | Corrupt/unreadable state mapped to absence |
 | Launcher wrappers delegate the same validated actions to one process-execution Module; target and termination behavior remain explicit per accepted OS. | Milestone 4 | P-09 and Launcher/Cross-Platform standards | Unknown-to-Linux fallback and wrapper-specific release path |
 | Obsolete release documents, snapshots, and notice inventories stay deleted. Current evidence is derived from accepted inputs and final shipped artifacts. | Milestone 6 | Planning baseline `d84e2b35` and P-05 | Restoring stale checked-in evidence |
+| Pumas has one lockstep product version projected by root, frontend, Electron, and Cargo manifests; the source-level Rust contract is consumed by exact Git revision and is not a standalone GitHub `.crate` artifact. | Product/release owner plus Milestones 0 and 6 | Accepted 2026-09-03 decision and real Pantograph consumer inventory | Unused `.crate` release asset and independently inferred workspace versions |
+| GitHub Releases exposes only a `preview` channel. Its desktop matrix is Linux x64 AppImage/Debian, Windows x64 NSIS/portable, and macOS arm64 DMG; a repository maintainer alone manually promotes an evidence-complete draft. | Product/release owner plus Milestones 0, 4, and 6 | Accepted 2026-09-03 decision | `v0.*`-derived prerelease state and build-only support inference |
+| UniFFI, Rustler/Elixir, Go, and all generated host-binding release bundles are removed because no real host consumer exists. A later binding is a new consumer/matrix decision, not retained experimental machinery. | Product/release owner; Rust owns source seams and this plan owns release/host projections | Accepted 2026-09-03 decision and bounded consumer search | Five hypothetical UniFFI release seams, non-core Rustler surface, and false Go claim |
+| Torch remains a non-shipped source capability until Milestone 3 proves and records one real runtime/platform/device tuple. | Product/release owner plus Milestone 3 | Accepted 2026-09-03 decision | Development source or fake tests treated as deployment support |
+| The repository maintainer owns manual draft promotion and third-party notice interpretation/acceptance for each final artifact. | Product/release owner plus Milestone 6 | Accepted 2026-09-03 decision | Ambient GitHub permissions or generated inventory treated as approval |
 
 ## Evidence And Oracle Plan
 
@@ -278,31 +286,32 @@ release implementation while those facts are missing.
 - `docs/plans/current-standards-remediation-2026-09-03/desktop-release-bindings-and-torch/execution-ledger.md`
 - `docs/plans/current-standards-remediation-2026-09-03/desktop-release-bindings-and-torch/issues.md`
 - `docs/plans/current-standards-remediation-2026-09-03/desktop-release-bindings-and-torch/reports/release-and-host-contract-decision.md`
+- `.gitignore`
 - `scripts/release/artifact-plan.json`
 - `bindings/support-matrix.json`
 
 **Tasks:**
 
-- [ ] Inventory actual release consumers and distribution channels; distinguish
+- [x] Inventory actual release consumers and distribution channels; distinguish
   desktop installers, Rust source/native/RPC artifacts, generated host sources,
   host packages, and optional Torch deployment by role rather than file suffix.
-- [ ] For each artifact, record release unit, consumer, channel, target,
+- [x] For each artifact, record release unit, consumer, channel, target,
   composition, version/tag relationship, promotion rule, compatibility promise,
   expected evidence, and missing/unexpected-output behavior.
-- [ ] For Python, Kotlin, Swift, Ruby, C#, Rustler/Elixir, and any currently
+- [x] For Python, Kotlin, Swift, Ruby, C#, Rustler/Elixir, and any currently
   documented Go surface, record host runtime, native OS/architecture/profile,
   generator/provisioning authority, supported operations, async/error/event
   behavior, package channel/tier, real-host oracle, and retain/remove/unavailable
   disposition. Generator availability is not support evidence.
-- [ ] Decide the release-channel and prerelease rule from product facts rather
+- [x] Decide the release-channel and prerelease rule from product facts rather
   than `v0.*` syntax, and identify who may promote a draft.
-- [ ] Record the required resolved dependency graphs, SBOM/provenance,
+- [x] Record the required resolved dependency graphs, SBOM/provenance,
   checksum, license, notice, vulnerability, and retention evidence per final
   artifact. Route unresolved license interpretation to the designated authority.
-- [ ] Record the accepted facts in `scripts/release/artifact-plan.json` and
+- [x] Record the accepted facts in `scripts/release/artifact-plan.json` and
   `bindings/support-matrix.json`; keep decision reasoning in the report and run
   the deletion/pass-through test before admitting parser or release machinery.
-- [ ] Cross-review the decisions with Rust, frontend, governance, and product/
+- [x] Cross-review the decisions with Rust, frontend, governance, and product/
   release owners; record contradictory facts as `invalid` and absent facts as
   `unavailable` in `issues.md`.
 
@@ -311,7 +320,7 @@ released output and every public consumer claim, with no support inferred from
 incumbent workflow shape. The report fixes exact downstream Interfaces,
 matrices, evidence environments, and write sets or blocks the affected tuple.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 1: Generate and Enforce the Desktop RPC Contract
 
@@ -631,15 +640,16 @@ artifact plan.
 
 ## Blockers
 
-- `none` for the current Milestone 0 investigation.
+- Milestone 0 is accepted; the report and canonical matrices agree and are
+  visible versioned inputs.
 - Milestone 1 is blocked until the Rust plan provides an accepted canonical
   DTO/error declaration and projection capability; an absent capability is
   recorded as `unavailable`, not replaced with hand-maintained schema.
 - Any binding host, desktop target, Torch device/runtime class, or release
   channel without a real consumer and adequate environment remains blocked or
   removed from the accepted matrix.
-- License interpretation or notice completeness that requires designated legal
-  authority remains blocked until that authority accepts the evidence.
+- The repository maintainer owns license/notice interpretation; missing or
+  contradictory final-artifact notice evidence still blocks promotion.
 - Shared CI edits remain blocked until the governance plan's earlier CI write
   set is integrated or explicit serial ownership is recorded.
 
@@ -681,4 +691,4 @@ admitted by this plan.
 - Deferred follow-ups: `none`; unsupported or unavailable hosts, targets,
   channels, and compatibility features are explicit contract outcomes, not
   deferred acceptance debt.
-- Final status: `Planned`
+- Final status: `Active`

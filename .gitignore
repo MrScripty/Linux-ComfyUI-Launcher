@@ -95,6 +95,7 @@ bindings/
 !bindings/
 bindings/*
 !bindings/README.md
+!bindings/support-matrix.json
 !bindings/csharp-test/
 bindings/csharp-test/*
 !bindings/csharp-test/README.md

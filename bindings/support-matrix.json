@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "release_artifact_plan": "scripts/release/artifact-plan.json",
+  "contract": {
+    "status": "no_supported_host_bindings",
+    "accepted_host_tuples": [],
+    "admission_rule": "A future tuple requires a named real consumer, exact host runtime and native target, supported operation and lifecycle contract, deterministic cohort generation, and real-host package evidence."
+  },
+  "removed_surfaces": [
+    {
+      "id": "uniffi-python",
+      "host": "python",
+      "former_generator": "uniffi-0.28",
+      "former_native_targets": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin"
+      ],
+      "reason": "no real host consumer or host-runtime evidence",
+      "remove": [
+        "adapter",
+        "generator",
+        "tests",
+        "packaging",
+        "release",
+        "documentation"
+      ]
+    },
+    {
+      "id": "uniffi-kotlin",
+      "host": "kotlin",
+      "former_generator": "uniffi-0.28",
+      "former_native_targets": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin"
+      ],
+      "reason": "no real host consumer or host-runtime evidence",
+      "remove": [
+        "adapter",
+        "generator",
+        "tests",
+        "packaging",
+        "release",
+        "documentation"
+      ]
+    },
+    {
+      "id": "uniffi-swift",
+      "host": "swift",
+      "former_generator": "uniffi-0.28",
+      "former_native_targets": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin"
+      ],
+      "reason": "no real host consumer or host-runtime evidence",
+      "remove": [
+        "adapter",
+        "generator",
+        "tests",
+        "packaging",
+        "release",
+        "documentation"
+      ]
+    },
+    {
+      "id": "uniffi-ruby",
+      "host": "ruby",
+      "former_generator": "uniffi-0.28",
+      "former_native_targets": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin"
+      ],
+      "reason": "no real host consumer or host-runtime evidence",
+      "remove": [
+        "adapter",
+        "generator",
+        "tests",
+        "packaging",
+        "release",
+        "documentation"
+      ]
+    },
+    {
+      "id": "uniffi-csharp",
+      "host": "csharp",
+      "former_generator": "uniffi-bindgen-cs-v0.9.0+v0.28.3",
+      "former_native_targets": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-apple-darwin"
+      ],
+      "reason": "no Pumas host consumer; the local smoke proves only a synchronous Linux development call",
+      "remove": [
+        "adapter",
+        "generator",
+        "tests",
+        "packaging",
+        "release",
+        "documentation"
+      ]
+    },
+    {
+      "id": "rustler-elixir",
+      "host": "elixir-erlang",
+      "former_generator": "rustler-0.34",
+      "former_native_targets": [],
+      "reason": "no real host consumer, no BEAM host evidence, and no core Pumas interface",
+      "remove": [
+        "adapter",
+        "generator",
+        "tests",
+        "packaging",
+        "release",
+        "documentation"
+      ]
+    },
+    {
+      "id": "uniffi-go",
+      "host": "go",
+      "former_generator": null,
+      "former_native_targets": [],
+      "reason": "documentation claim only; no generator, artifact, consumer, or host evidence",
+      "remove": [
+        "documentation"
+      ]
+    }
+  ],
+  "unsupported_request": "unsupported",
+  "missing_consumer_or_environment": "unavailable",
+  "contradictory_claim": "invalid"
+}

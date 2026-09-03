@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "release_unit": {
+    "id": "pumas-library",
+    "product": "Pumas Library",
+    "version_contract": {
+      "kind": "lockstep_semver",
+      "sources": [
+        "package.json",
+        "frontend/package.json",
+        "electron/package.json",
+        "rust/Cargo.toml#workspace.package.version"
+      ],
+      "candidate_tag": "v{version}",
+      "require_exact_match": true
+    }
+  },
+  "binding_support_matrix": "bindings/support-matrix.json",
+  "channels": [
+    {
+      "id": "preview",
+      "destination": "github-releases",
+      "audience": "early adopters",
+      "stability": "preview",
+      "maintenance_window": null,
+      "discovery": "repository releases page",
+      "candidate_visibility": "draft",
+      "promotion": {
+        "mode": "manual",
+        "authority": "repository_maintainer",
+        "requires_all_evidence": true
+      },
+      "retention": {
+        "support_line": false,
+        "withdrawal_authority": "repository_maintainer",
+        "withdrawal_triggers": [
+          "security",
+          "legal",
+          "invalid_artifact"
+        ]
+      }
+    }
+  ],
+  "source_consumers": [
+    {
+      "id": "pantograph",
+      "interface": "pumas-library-rust-source",
+      "acquisition": "cargo-git",
+      "version_selection": "immutable_git_revision",
+      "compatibility_owner": "pantograph",
+      "release_artifact": false,
+      "required_evidence": [
+        "pumas-contract-verification",
+        "consumer-locked-build-and-tests"
+      ]
+    }
+  ],
+  "desktop_targets": [
+    {
+      "id": "linux-x86_64-gnu",
+      "os": "linux",
+      "architecture": "x86_64",
+      "rust_target": "x86_64-unknown-linux-gnu",
+      "runner": "ubuntu-latest",
+      "artifacts": [
+        "desktop-linux-appimage",
+        "desktop-linux-deb"
+      ],
+      "required_real_evidence": [
+        "exact-package-extraction",
+        "packaged-rpc-start",
+        "desktop-workflow",
+        "launcher-root-recovery",
+        "launcher-process-termination"
+      ]
+    },
+    {
+      "id": "windows-x86_64-msvc",
+      "os": "windows",
+      "architecture": "x86_64",
+      "rust_target": "x86_64-pc-windows-msvc",
+      "runner": "windows-latest",
+      "artifacts": [
+        "desktop-windows-nsis",
+        "desktop-windows-portable"
+      ],
+      "required_real_evidence": [
+        "exact-package-extraction",
+        "packaged-rpc-start",
+        "desktop-workflow",
+        "launcher-root-recovery",
+        "launcher-wrapper-equivalence",
+        "launcher-process-tree-termination"
+      ]
+    },
+    {
+      "id": "macos-arm64",
+      "os": "macos",
+      "architecture": "arm64",
+      "rust_target": "aarch64-apple-darwin",
+      "runner": "macos-14",
+      "artifacts": [
+        "desktop-macos-dmg"
+      ],
+      "required_real_evidence": [
+        "exact-package-extraction",
+        "packaged-rpc-start",
+        "desktop-workflow",
+        "launcher-root-recovery",
+        "launcher-process-termination"
+      ]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "desktop-linux-appimage",
+      "role": "desktop_application",
+      "target": "linux-x86_64-gnu",
+      "format": "appimage",
+      "filename": "Pumas.Library-{version}.AppImage",
+      "consumer_install": "download, mark executable, and run",
+      "required_contents": [
+        "electron-main",
+        "renderer",
+        "pumas-rpc",
+        "LICENSE.txt",
+        "THIRD-PARTY-NOTICES.txt"
+      ]
+    },
+    {
+      "id": "desktop-linux-deb",
+      "role": "desktop_application",
+      "target": "linux-x86_64-gnu",
+      "format": "deb",
+      "filename": "pumas-library-electron_{version}_amd64.deb",
+      "consumer_install": "install with a Debian-compatible package manager",
+      "required_contents": [
+        "electron-main",
+        "renderer",
+        "pumas-rpc",
+        "LICENSE.txt",
+        "THIRD-PARTY-NOTICES.txt"
+      ]
+    },
+    {
+      "id": "desktop-windows-nsis",
+      "role": "desktop_application",
+      "target": "windows-x86_64-msvc",
+      "format": "nsis",
+      "filename": "Pumas.Library.Setup.{version}.exe",
+      "consumer_install": "run the interactive installer",
+      "required_contents": [
+        "electron-main",
+        "renderer",
+        "pumas-rpc.exe",
+        "LICENSE.txt",
+        "THIRD-PARTY-NOTICES.txt"
+      ]
+    },
+    {
+      "id": "desktop-windows-portable",
+      "role": "desktop_application",
+      "target": "windows-x86_64-msvc",
+      "format": "portable-exe",
+      "filename": "Pumas.Library.{version}.exe",
+      "consumer_install": "download and run without installation",
+      "required_contents": [
+        "electron-main",
+        "renderer",
+        "pumas-rpc.exe",
+        "LICENSE.txt",
+        "THIRD-PARTY-NOTICES.txt"
+      ]
+    },
+    {
+      "id": "desktop-macos-dmg",
+      "role": "desktop_application",
+      "target": "macos-arm64",
+      "format": "dmg",
+      "filename": "Pumas.Library-{version}-arm64.dmg",
+      "consumer_install": "mount and copy the application bundle",
+      "required_contents": [
+        "electron-main",
+        "renderer",
+        "pumas-rpc",
+        "LICENSE.txt",
+        "THIRD-PARTY-NOTICES.txt"
+      ]
+    }
+  ],
+  "release_metadata": {
+    "required": [
+      {
+        "id": "checksums",
+        "format": "sha256",
+        "filename": "checksums-sha256.txt",
+        "covers": "all other final release files"
+      },
+      {
+        "id": "third-party-notices",
+        "format": "text",
+        "filename": "THIRD-PARTY-NOTICES-{version}.txt",
+        "covers": "all shipped dependency closures",
+        "acceptance_authority": "repository_maintainer",
+        "artifact_embedding": {
+          "filename": "THIRD-PARTY-NOTICES.txt",
+          "require_content_identity": true
+        }
+      },
+      {
+        "id": "release-provenance",
+        "format": "in-toto-jsonl",
+        "filename": "pumas-library-{version}.provenance.jsonl",
+        "covers": "all desktop artifacts"
+      }
+    ],
+    "per_artifact": [
+      {
+        "id_suffix": "sbom",
+        "format": "spdx-json",
+        "filename": "{artifact_filename}.spdx.json",
+        "covers": "one extracted final desktop artifact"
+      }
+    ],
+    "dependency_authorities": [
+      "pnpm-lock.yaml",
+      "rust/Cargo.lock",
+      "final-artifact inspection"
+    ],
+    "required_reviews": [
+      "current-vulnerability-results",
+      "project-license-presence",
+      "third-party-license-and-notice-acceptance"
+    ]
+  },
+  "required_acceptance_claims": [
+    "DRBT-A1",
+    "DRBT-A2",
+    "DRBT-A3",
+    "DRBT-A4",
+    "DRBT-A5",
+    "DRBT-A6",
+    "DRBT-A7",
+    "DRBT-A8",
+    "DRBT-A9",
+    "PRG-A1",
+    "PRG-A2",
+    "PRG-A3",
+    "PRG-A4",
+    "PRG-A5",
+    "PRG-A6",
+    "PRG-A7"
+  ],
+  "missing_output": "invalid",
+  "duplicate_output": "invalid",
+  "unexpected_output": "invalid",
+  "unverified_target": "unavailable",
+  "excluded_outputs": [
+    {
+      "id": "pumas-library-crate",
+      "reason": "no release-asset consumer; Pantograph consumes an immutable Git revision"
+    },
+    {
+      "id": "pumas-rpc-standalone",
+      "reason": "RPC is an internal desktop cohort member, not a standalone product"
+    },
+    {
+      "id": "host-binding-bundles",
+      "reason": "binding support matrix contains no accepted host tuple"
+    },
+    {
+      "id": "torch-sidecar",
+      "reason": "non-shipped until a real runtime/platform/device tuple is accepted"
+    }
+  ]
+}
