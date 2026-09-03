@@ -332,6 +332,7 @@ const electronAPI = {
   // Status & System
   // ========================================
   get_status: () => apiCall('get_status'),
+  get_status_telemetry_snapshot: () => apiCall('get_status_telemetry_snapshot'),
   get_disk_space: () => apiCall('get_disk_space'),
   get_system_resources: () => apiCall('get_system_resources'),
 
@@ -862,8 +863,10 @@ const electronAPI = {
     };
 
     ipcRenderer.on('runtime-profile:update', listener);
+    void ipcRenderer.invoke('runtime-profile:subscribe');
     return () => {
       ipcRenderer.removeListener('runtime-profile:update', listener);
+      void ipcRenderer.invoke('runtime-profile:unsubscribe');
     };
   },
   onServingStatusUpdate: (

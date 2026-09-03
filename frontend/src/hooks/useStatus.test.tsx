@@ -31,13 +31,7 @@ describe('useStatus', () => {
     status: {
       success: true,
       version: 'test',
-      deps_ready: true,
-      patched: true,
-      menu_shortcut: true,
-      desktop_shortcut: true,
-      shortcut_version: null,
       message: 'ready',
-      comfyui_running: false,
       ollama_running: false,
       torch_running: false,
       last_launch_error: null,
@@ -174,6 +168,31 @@ describe('useStatus', () => {
     setIntervalSpy.mockRestore();
   });
 
+  it('keeps the refetch callback stable when pushed telemetry rerenders consumers', async () => {
+    const { result } = renderHook(() => useStatus({ initialLoad: true }));
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const initialRefetch = result.current.refetch;
+
+    act(() => {
+      telemetryCallback?.({
+        cursor: 'status-telemetry:2',
+        snapshot: {
+          ...snapshot,
+          cursor: 'status-telemetry:2',
+          revision: 2,
+        },
+        stale_cursor: false,
+        snapshot_required: false,
+      });
+    });
+
+    expect(result.current.refetch).toBe(initialRefetch);
+  });
+
   it('cleans up telemetry subscription and delayed loading timers on unmount', async () => {
     const clearTimeoutSpy = vi.spyOn(global, 'clearTimeout');
 
@@ -212,7 +231,7 @@ describe('useStatus', () => {
     expect(unsubscribeMock).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps enriched status fields when pushed telemetry omits them', async () => {
+  it('accepts a complete pushed status update', async () => {
     const { result } = renderHook(() => useStatus({ initialLoad: true }));
 
     await act(async () => {
@@ -231,8 +250,7 @@ describe('useStatus', () => {
             success: true,
             version: 'test',
             message: 'lightweight update',
-            comfyui_running: true,
-            ollama_running: false,
+            ollama_running: true,
             torch_running: false,
             last_launch_error: null,
             last_launch_log: null,
@@ -244,10 +262,6 @@ describe('useStatus', () => {
     });
 
     expect(result.current.status?.message).toBe('lightweight update');
-    expect(result.current.status?.deps_ready).toBe(true);
-    expect(result.current.status?.patched).toBe(true);
-    expect(result.current.status?.menu_shortcut).toBe(true);
-    expect(result.current.status?.desktop_shortcut).toBe(true);
-    expect(result.current.status?.shortcut_version).toBeNull();
+    expect(result.current.status?.ollama_running).toBe(true);
   });
 });

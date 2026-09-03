@@ -59,7 +59,11 @@ export function useNetworkStatus() {
   const [status, setStatus] = useState<NetworkStatus>(DEFAULT_STATUS);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const telemetry = useStatusTelemetry({ loadInitial: true });
+  const {
+    snapshot: telemetrySnapshot,
+    error: telemetryError,
+    refetch: refetchTelemetry,
+  } = useStatusTelemetry({ loadInitial: true });
 
   const applySnapshot = useCallback((snapshot: StatusTelemetrySnapshot) => {
     setStatus(mapNetworkStatus(snapshot.network));
@@ -68,24 +72,24 @@ export function useNetworkStatus() {
   }, []);
 
   const fetchStatus = useCallback(async () => {
-    await telemetry.refetch();
-  }, [telemetry]);
+    await refetchTelemetry();
+  }, [refetchTelemetry]);
 
   useEffect(() => {
-    if (!telemetry.snapshot) {
+    if (!telemetrySnapshot) {
       return;
     }
 
-    applySnapshot(telemetry.snapshot);
-  }, [applySnapshot, telemetry.snapshot]);
+    applySnapshot(telemetrySnapshot);
+  }, [applySnapshot, telemetrySnapshot]);
 
   useEffect(() => {
-    if (telemetry.error) {
-      logger.error('Error fetching status telemetry network state', { error: telemetry.error });
-      setError(telemetry.error);
+    if (telemetryError) {
+      logger.error('Error fetching status telemetry network state', { error: telemetryError });
+      setError(telemetryError);
       setIsLoading(false);
     }
-  }, [telemetry.error]);
+  }, [telemetryError]);
 
   const refresh = useCallback(() => {
     void fetchStatus();

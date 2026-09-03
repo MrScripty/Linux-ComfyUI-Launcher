@@ -293,6 +293,7 @@ export class PythonBridge {
   private options: Required<Omit<PythonBridgeOptions, 'timerController'>>;
   private timerController: PythonBridgeTimerController;
   private process: ChildProcess | null = null;
+  private serverReady = false;
   private port = 0;
   private restartCount = 0;
   private isShuttingDown = false;
@@ -405,6 +406,7 @@ export class PythonBridge {
     }
 
     this.isShuttingDown = false;
+    this.serverReady = false;
     this.clearRestartTimer();
     this.clearHealthCheckTimer();
 
@@ -453,6 +455,7 @@ export class PythonBridge {
     // Handle process exit
     this.process.on('exit', (code, signal) => {
       log.info(`${backendLabel} process exited: code=${code}, signal=${signal}`);
+      this.serverReady = false;
       this.process = null;
       this.clearHealthCheckTimer();
       this.closeAllUpdateStreams();
@@ -470,6 +473,7 @@ export class PythonBridge {
 
     // Handle process error
     this.process.on('error', (error) => {
+      this.serverReady = false;
       log.error(`${backendLabel} process error:`, error);
     });
 
@@ -481,6 +485,7 @@ export class PythonBridge {
 
     // Reset restart counter on successful start
     this.restartCount = 0;
+    this.serverReady = true;
 
     this.resumeListeningUpdateStreams();
 
@@ -547,6 +552,7 @@ export class PythonBridge {
    */
   async stop(): Promise<void> {
     this.isShuttingDown = true;
+    this.serverReady = false;
 
     // Stop health check interval
     this.clearHealthCheckTimer();
@@ -773,7 +779,7 @@ export class PythonBridge {
    * Check if the bridge is running
    */
   isRunning(): boolean {
-    return this.process !== null;
+    return this.process !== null && this.serverReady;
   }
 
   /**

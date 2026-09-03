@@ -28,7 +28,11 @@ export function useStatus(options: UseStatusOptions = {}) {
   const pendingRefresh = useRef<{ isInitialLoad: boolean; force: boolean } | null>(null);
   const loadingDelayTimeout = useRef<NodeJS.Timeout | null>(null);
   const initialLoadStartedAt = useRef(Date.now());
-  const telemetry = useStatusTelemetry({ loadInitial: initialLoad });
+  const {
+    snapshot: telemetrySnapshot,
+    error: telemetryError,
+    refetch: refetchTelemetry,
+  } = useStatusTelemetry({ loadInitial: initialLoad });
 
   const clearLoadingDelay = useCallback(() => {
     if (loadingDelayTimeout.current) {
@@ -62,14 +66,14 @@ export function useStatus(options: UseStatusOptions = {}) {
       setIsCheckingDeps(true);
     }
 
-    await telemetry.refetch();
+    await refetchTelemetry();
 
     if (isInitialLoad) {
       finishInitialLoad(startedAt);
     } else {
       setIsLoading(false);
     }
-  }, [finishInitialLoad, telemetry]);
+  }, [finishInitialLoad, refetchTelemetry]);
 
   const fetchStatus = useCallback(async (isInitialLoad = false, force = false) => {
     if (inFlightRequest.current) {
@@ -101,26 +105,26 @@ export function useStatus(options: UseStatusOptions = {}) {
   }, [clearLoadingDelay]);
 
   useEffect(() => {
-    if (!telemetry.snapshot) {
+    if (!telemetrySnapshot) {
       return;
     }
 
-    applySnapshot(telemetry.snapshot);
+    applySnapshot(telemetrySnapshot);
     if (initialLoad && isLoading) {
       finishInitialLoad(initialLoadStartedAt.current);
     } else {
       setIsLoading(false);
       setIsCheckingDeps(false);
     }
-  }, [applySnapshot, finishInitialLoad, initialLoad, isLoading, telemetry.snapshot]);
+  }, [applySnapshot, finishInitialLoad, initialLoad, isLoading, telemetrySnapshot]);
 
   useEffect(() => {
-    if (telemetry.error) {
+    if (telemetryError) {
       clearLoadingDelay();
       setIsLoading(false);
       setIsCheckingDeps(false);
     }
-  }, [clearLoadingDelay, telemetry.error]);
+  }, [clearLoadingDelay, telemetryError]);
 
   return {
     status: statusData,

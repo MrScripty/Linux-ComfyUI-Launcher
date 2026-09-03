@@ -32,13 +32,7 @@ describe('useNetworkStatus', () => {
     status: {
       success: true,
       version: 'test',
-      deps_ready: true,
-      patched: true,
-      menu_shortcut: true,
-      desktop_shortcut: true,
-      shortcut_version: null,
       message: 'ready',
-      comfyui_running: false,
       ollama_running: false,
       torch_running: false,
       last_launch_error: null,
@@ -199,7 +193,7 @@ describe('useNetworkStatus', () => {
     expect(unsubscribeMock).toHaveBeenCalledTimes(1);
   });
 
-  it('preserves enriched status fields when lightweight telemetry is pushed', async () => {
+  it('applies the complete status supplied by pushed telemetry', async () => {
     const { result } = renderHook(() => useStatus({ initialLoad: true }));
 
     await act(async () => {
@@ -218,8 +212,7 @@ describe('useNetworkStatus', () => {
             success: true,
             version: 'test',
             message: 'lightweight',
-            comfyui_running: true,
-            ollama_running: false,
+            ollama_running: true,
             torch_running: false,
             last_launch_error: null,
             last_launch_log: null,
@@ -231,11 +224,7 @@ describe('useNetworkStatus', () => {
     });
 
     expect(result.current.status?.message).toBe('lightweight');
-    expect(result.current.status?.deps_ready).toBe(true);
-    expect(result.current.status?.patched).toBe(true);
-    expect(result.current.status?.menu_shortcut).toBe(true);
-    expect(result.current.status?.desktop_shortcut).toBe(true);
-    expect(result.current.status?.shortcut_version).toBeNull();
+    expect(result.current.status?.ollama_running).toBe(true);
   });
 
   it('supports manual refresh and surfaces thrown errors', async () => {

@@ -1,7 +1,7 @@
 import { useCallback, useSyncExternalStore } from 'react';
 import { api, getElectronAPI, isAPIAvailable } from '../api/adapter';
 import { APIError } from '../errors';
-import type { StatusResponse, StatusTelemetrySnapshot } from '../types/api';
+import type { StatusTelemetrySnapshot } from '../types/api';
 import { getLogger } from '../utils/logger';
 
 const logger = getLogger('statusTelemetryStore');
@@ -14,14 +14,6 @@ type StatusTelemetryState = {
 type SubscriptionOptions = {
   loadInitial?: boolean;
 };
-
-const ENRICHED_STATUS_FIELDS: Array<keyof StatusResponse> = [
-  'deps_ready',
-  'patched',
-  'menu_shortcut',
-  'desktop_shortcut',
-  'shortcut_version',
-];
 
 let state: StatusTelemetryState = {
   snapshot: null,
@@ -47,22 +39,9 @@ function setState(nextState: StatusTelemetryState) {
 
 function mergeSnapshot(
   nextSnapshot: StatusTelemetrySnapshot,
-  options: { preserveEnrichedStatusFields?: boolean } = {},
+  _options: { preserveEnrichedStatusFields?: boolean } = {},
 ): StatusTelemetrySnapshot {
-  const previousStatus = state.snapshot?.status;
-  if (!previousStatus || !options.preserveEnrichedStatusFields) {
-    return nextSnapshot;
-  }
-
-  const nextStatus = { ...nextSnapshot.status } as Partial<StatusResponse>;
-  ENRICHED_STATUS_FIELDS.forEach((field) => {
-    nextStatus[field] = previousStatus[field] as never;
-  });
-
-  return {
-    ...nextSnapshot,
-    status: nextStatus as StatusResponse,
-  };
+  return nextSnapshot;
 }
 
 function applySnapshot(
@@ -206,6 +185,10 @@ export function useStatusTelemetry(options: SubscriptionOptions = {}) {
     (listener: () => void) => subscribeStatusTelemetry(listener, { loadInitial }),
     [loadInitial],
   );
+  const refetch = useCallback(
+    () => fetchStatusTelemetrySnapshot({ queueIfInFlight: true }),
+    [],
+  );
   const telemetryState = useSyncExternalStore(
     subscribe,
     getStatusTelemetryState,
@@ -214,6 +197,6 @@ export function useStatusTelemetry(options: SubscriptionOptions = {}) {
 
   return {
     ...telemetryState,
-    refetch: () => fetchStatusTelemetrySnapshot({ queueIfInFlight: true }),
+    refetch,
   };
 }

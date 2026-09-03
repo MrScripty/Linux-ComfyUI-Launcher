@@ -52,6 +52,19 @@ function createBridge(timerController) {
   });
 }
 
+test('bridge is not reported running until the RPC server is ready', () => {
+  const bridge = createBridge(new FakeTimerController());
+  bridge.process = {};
+
+  assert.equal(bridge.isRunning(), false);
+
+  bridge.serverReady = true;
+  assert.equal(bridge.isRunning(), true);
+
+  bridge.process = null;
+  assert.equal(bridge.isRunning(), false);
+});
+
 test('stop clears bridge lifecycle timers when backend is idle', async () => {
   const timers = new FakeTimerController();
   const bridge = createBridge(timers);

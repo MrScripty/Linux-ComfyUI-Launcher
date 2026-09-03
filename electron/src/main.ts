@@ -32,6 +32,8 @@ const MODEL_DOWNLOAD_UPDATE_CHANNEL = 'model-download:update';
 const MODEL_DOWNLOAD_SUBSCRIBE_CHANNEL = 'model-download:subscribe';
 const MODEL_DOWNLOAD_UNSUBSCRIBE_CHANNEL = 'model-download:unsubscribe';
 const RUNTIME_PROFILE_UPDATE_CHANNEL = 'runtime-profile:update';
+const RUNTIME_PROFILE_SUBSCRIBE_CHANNEL = 'runtime-profile:subscribe';
+const RUNTIME_PROFILE_UNSUBSCRIBE_CHANNEL = 'runtime-profile:unsubscribe';
 const SERVING_STATUS_UPDATE_CHANNEL = 'serving-status:update';
 const SERVING_STATUS_ERROR_CHANNEL = 'serving-status:error';
 const SERVING_STATUS_SUBSCRIBE_CHANNEL = 'serving-status:subscribe';
@@ -45,6 +47,7 @@ let pythonBridge: PythonBridge | null = null;
 let mainWindow: BrowserWindow | null = null;
 let backendInitializationPromise: Promise<void> | null = null;
 let modelDownloadRendererSubscriptions = 0;
+let runtimeProfileRendererSubscriptions = 0;
 let servingStatusRendererSubscriptions = 0;
 let statusTelemetryRendererSubscriptions = 0;
 
@@ -205,8 +208,10 @@ async function createWindow(): Promise<void> {
   // Handle window closed
   mainWindow.on('closed', () => {
     servingStatusRendererSubscriptions = 0;
+    runtimeProfileRendererSubscriptions = 0;
     statusTelemetryRendererSubscriptions = 0;
     pythonBridge?.stopServingStatusUpdateStream();
+    pythonBridge?.stopRuntimeProfileUpdateStream();
     pythonBridge?.stopStatusTelemetryUpdateStream();
     mainWindow = null;
   });
@@ -340,6 +345,20 @@ function registerIPCHandlers(): void {
     }
   });
 
+  ipcMain.handle(RUNTIME_PROFILE_SUBSCRIBE_CHANNEL, () => {
+    runtimeProfileRendererSubscriptions += 1;
+    if (runtimeProfileRendererSubscriptions === 1) {
+      startRuntimeProfileUpdateForwarder();
+    }
+  });
+
+  ipcMain.handle(RUNTIME_PROFILE_UNSUBSCRIBE_CHANNEL, () => {
+    runtimeProfileRendererSubscriptions = Math.max(0, runtimeProfileRendererSubscriptions - 1);
+    if (runtimeProfileRendererSubscriptions === 0) {
+      pythonBridge?.stopRuntimeProfileUpdateStream();
+    }
+  });
+
   ipcMain.handle(SERVING_STATUS_SUBSCRIBE_CHANNEL, () => {
     servingStatusRendererSubscriptions += 1;
     if (servingStatusRendererSubscriptions === 1) {
@@ -363,7 +382,7 @@ function registerIPCHandlers(): void {
 }
 
 function startModelLibraryUpdateForwarder(): void {
-  if (!pythonBridge) {
+  if (!pythonBridge?.isRunning()) {
     return;
   }
 
@@ -378,7 +397,7 @@ function startModelLibraryUpdateForwarder(): void {
 }
 
 function startRuntimeProfileUpdateForwarder(): void {
-  if (!pythonBridge) {
+  if (!pythonBridge?.isRunning() || runtimeProfileRendererSubscriptions === 0) {
     return;
   }
 
@@ -393,7 +412,7 @@ function startRuntimeProfileUpdateForwarder(): void {
 }
 
 function startModelDownloadUpdateForwarder(): void {
-  if (!pythonBridge || modelDownloadRendererSubscriptions === 0) {
+  if (!pythonBridge?.isRunning() || modelDownloadRendererSubscriptions === 0) {
     return;
   }
 
@@ -408,7 +427,7 @@ function startModelDownloadUpdateForwarder(): void {
 }
 
 function startStatusTelemetryUpdateForwarder(): void {
-  if (!pythonBridge || statusTelemetryRendererSubscriptions === 0) {
+  if (!pythonBridge?.isRunning() || statusTelemetryRendererSubscriptions === 0) {
     return;
   }
 
@@ -423,10 +442,7 @@ function startStatusTelemetryUpdateForwarder(): void {
 }
 
 function startServingStatusUpdateForwarder(): void {
-  if (!pythonBridge || servingStatusRendererSubscriptions === 0) {
-    return;
-  }
-  if (!pythonBridge.isRunning()) {
+  if (!pythonBridge?.isRunning() || servingStatusRendererSubscriptions === 0) {
     return;
   }
 

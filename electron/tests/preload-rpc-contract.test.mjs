@@ -26,6 +26,13 @@ test('preload apiCall methods are registered or tracked deferred drift', () => {
   assert.deepEqual(unregisteredMethods, DEFERRED_UNREGISTERED_PRELOAD_METHODS);
 });
 
+test('preload exposes the status telemetry snapshot method used by the renderer', () => {
+  assert.match(
+    PRELOAD_SOURCE,
+    /get_status_telemetry_snapshot:\s*\(\)\s*=>\s*apiCall\('get_status_telemetry_snapshot'\)/
+  );
+});
+
 test('deferred preload drift exceptions still describe live drift', () => {
   const registeredMethods = new Set(RPC_METHOD_REGISTRY.methods);
   const preloadMethods = new Set(preloadRpcMethodNames());
