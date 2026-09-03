@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 
 export interface LauncherRootResolutionOptions {
   appImagePath?: string;
@@ -14,6 +15,53 @@ export interface LauncherRootResolutionOptions {
 export interface LauncherRootFileSystem {
   readFileSync(filePath: string, encoding: 'utf8'): string;
   statSync(filePath: string): { isDirectory(): boolean };
+}
+
+export interface LauncherRootPersistenceAdapter {
+  ensureDirectory(directoryPath: string): void;
+  openParentDirectory(directoryPath: string): number;
+  createTemporaryName(authorityFilename: string): string;
+  openTemporaryFile(temporaryPath: string): number;
+  writeTemporaryFile(descriptor: number, serializedConfig: string): void;
+  syncTemporaryFile(descriptor: number): void;
+  closeTemporaryFile(descriptor: number): void;
+  replaceAuthority(temporaryPath: string, authorityPath: string): void;
+  syncParentDirectory(descriptor: number): void;
+  closeParentDirectory(descriptor: number): void;
+  removeTemporaryFile(temporaryPath: string): void;
+}
+
+export type LauncherRootPersistenceStage =
+  | 'directory-ensure'
+  | 'parent-open'
+  | 'temporary-name'
+  | 'temporary-open'
+  | 'temporary-write'
+  | 'temporary-sync'
+  | 'temporary-close'
+  | 'replace'
+  | 'parent-sync'
+  | 'parent-close';
+
+export type LauncherRootAuthorityState =
+  | 'unchanged'
+  | 'replacement-visibility-unknown'
+  | 'published-durability-unavailable';
+
+export type LauncherRootCleanupState = 'not-required' | 'complete' | 'incomplete';
+
+export class LauncherRootPersistenceError extends Error {
+  readonly code = 'launcher_root_persistence_unavailable';
+
+  constructor(
+    readonly stage: LauncherRootPersistenceStage,
+    readonly authorityState: LauncherRootAuthorityState,
+    readonly cleanupState: LauncherRootCleanupState,
+    cause: unknown
+  ) {
+    super('Unable to persist launcher root selection.', { cause });
+    this.name = 'LauncherRootPersistenceError';
+  }
 }
 
 export type PersistedLauncherRootState =
@@ -74,7 +122,7 @@ export type LauncherRootResolution =
       message: string;
     };
 
-interface PersistedLauncherRootConfig {
+export interface PersistedLauncherRootConfig {
   launcherRoot: string;
   selectedPath?: string;
   updatedAt: string;
@@ -92,6 +140,23 @@ const UNAVAILABLE_EXPLICIT_AUTHORITY_MESSAGE =
 const NODE_LAUNCHER_ROOT_FILE_SYSTEM: LauncherRootFileSystem = {
   readFileSync: (filePath, encoding) => fs.readFileSync(filePath, encoding),
   statSync: (filePath) => fs.statSync(filePath),
+};
+const NODE_LAUNCHER_ROOT_PERSISTENCE_ADAPTER: LauncherRootPersistenceAdapter = {
+  ensureDirectory: (directoryPath) => fs.mkdirSync(directoryPath, { recursive: true }),
+  openParentDirectory: (directoryPath) => fs.openSync(directoryPath, 'r'),
+  createTemporaryName: (authorityFilename) => `${authorityFilename}.tmp-${randomUUID()}`,
+  openTemporaryFile: (temporaryPath) => fs.openSync(temporaryPath, 'wx', 0o600),
+  writeTemporaryFile: (descriptor, serializedConfig) => {
+    fs.writeFileSync(descriptor, serializedConfig, 'utf8');
+  },
+  syncTemporaryFile: (descriptor) => fs.fsyncSync(descriptor),
+  closeTemporaryFile: (descriptor) => fs.closeSync(descriptor),
+  replaceAuthority: (temporaryPath, authorityPath) => {
+    fs.renameSync(temporaryPath, authorityPath);
+  },
+  syncParentDirectory: (descriptor) => fs.fsyncSync(descriptor),
+  closeParentDirectory: (descriptor) => fs.closeSync(descriptor),
+  removeTemporaryFile: (temporaryPath) => fs.unlinkSync(temporaryPath),
 };
 const INVALID_PATH_ERROR_CODES = new Set([
   'ENOENT',
@@ -246,7 +311,8 @@ function resolvedLauncherRoot(
 
 export function persistLauncherRootOverride(
   userDataPath: string,
-  selectedPath: string
+  selectedPath: string,
+  persistence: LauncherRootPersistenceAdapter = NODE_LAUNCHER_ROOT_PERSISTENCE_ADAPTER
 ): PersistedLauncherRootConfig {
   const validation = validateLauncherRootSelection(
     selectedPath,
@@ -259,21 +325,116 @@ export function persistLauncherRootOverride(
   }
   const launcherRoot = validation.launcherRoot;
 
-  fs.mkdirSync(userDataPath, { recursive: true });
-
   const config: PersistedLauncherRootConfig = {
     launcherRoot,
     selectedPath: path.resolve(selectedPath),
     updatedAt: new Date().toISOString(),
   };
 
-  fs.writeFileSync(
-    launcherRootOverrideConfigPath(userDataPath),
-    `${JSON.stringify(config, null, 2)}\n`,
-    'utf8'
-  );
+  const authorityPath = launcherRootOverrideConfigPath(userDataPath);
+  const serializedConfig = `${JSON.stringify(config, null, 2)}\n`;
 
-  return config;
+  let stage: LauncherRootPersistenceStage = 'directory-ensure';
+  let temporaryPath: string | undefined;
+  let parentDescriptor: number | undefined;
+  let temporaryDescriptor: number | undefined;
+  let temporaryOwned = false;
+  let published = false;
+
+  try {
+    persistence.ensureDirectory(userDataPath);
+
+    stage = 'parent-open';
+    parentDescriptor = persistence.openParentDirectory(userDataPath);
+
+    stage = 'temporary-name';
+    temporaryPath = path.join(
+      userDataPath,
+      persistence.createTemporaryName(LAUNCHER_ROOT_OVERRIDE_FILENAME)
+    );
+
+    stage = 'temporary-open';
+    temporaryDescriptor = persistence.openTemporaryFile(temporaryPath);
+    temporaryOwned = true;
+
+    stage = 'temporary-write';
+    persistence.writeTemporaryFile(temporaryDescriptor, serializedConfig);
+
+    stage = 'temporary-sync';
+    persistence.syncTemporaryFile(temporaryDescriptor);
+
+    stage = 'temporary-close';
+    const descriptorToClose = temporaryDescriptor;
+    temporaryDescriptor = undefined;
+    persistence.closeTemporaryFile(descriptorToClose);
+
+    stage = 'replace';
+    persistence.replaceAuthority(temporaryPath, authorityPath);
+    published = true;
+    temporaryOwned = false;
+
+    stage = 'parent-sync';
+    persistence.syncParentDirectory(parentDescriptor);
+
+    stage = 'parent-close';
+    const parentDescriptorToClose = parentDescriptor;
+    parentDescriptor = undefined;
+    persistence.closeParentDirectory(parentDescriptorToClose);
+
+    return config;
+  } catch (cause) {
+    const authorityState: LauncherRootAuthorityState = published
+      ? 'published-durability-unavailable'
+      : stage === 'replace'
+        ? 'replacement-visibility-unknown'
+        : 'unchanged';
+    const cleanupRequired =
+      temporaryDescriptor !== undefined ||
+      temporaryOwned ||
+      parentDescriptor !== undefined ||
+      stage === 'temporary-close' ||
+      stage === 'parent-close';
+    let cleanupState: LauncherRootCleanupState = cleanupRequired
+      ? 'complete'
+      : 'not-required';
+
+    if (stage === 'temporary-close' || stage === 'parent-close') {
+      cleanupState = 'incomplete';
+    }
+
+    if (temporaryDescriptor !== undefined) {
+      try {
+        persistence.closeTemporaryFile(temporaryDescriptor);
+      } catch {
+        cleanupState = 'incomplete';
+      }
+    }
+
+    if (temporaryOwned && temporaryPath !== undefined) {
+      try {
+        persistence.removeTemporaryFile(temporaryPath);
+      } catch (cleanupError) {
+        if (errorCode(cleanupError) !== 'ENOENT') {
+          cleanupState = 'incomplete';
+        }
+      }
+    }
+
+    if (parentDescriptor !== undefined) {
+      try {
+        persistence.closeParentDirectory(parentDescriptor);
+      } catch {
+        cleanupState = 'incomplete';
+      }
+    }
+
+    throw new LauncherRootPersistenceError(
+      stage,
+      authorityState,
+      cleanupState,
+      cause
+    );
+  }
 }
 
 export function launcherRootOverrideConfigPath(userDataPath: string): string {
@@ -338,7 +499,7 @@ function readPersistedLauncherRootAuthority(
   try {
     serializedConfig = fileSystem.readFileSync(configPath, 'utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+    if (errorCode(error) === 'ENOENT') {
       return { state: 'absent' };
     }
     return { state: 'unavailable' };
@@ -458,7 +619,20 @@ function inspectDirectory(
   try {
     return fileSystem.statSync(candidate).isDirectory() ? 'directory' : 'invalid';
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
+    const code = errorCode(error);
     return code && INVALID_PATH_ERROR_CODES.has(code) ? 'invalid' : 'unavailable';
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) {
+    return undefined;
+  }
+
+  try {
+    const code = (error as Record<string, unknown>)['code'];
+    return typeof code === 'string' ? code : undefined;
+  } catch {
+    return undefined;
   }
 }

@@ -2,15 +2,14 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestone 2 persisted launcher-root authority at focused
-review boundary.
+**Current phase:** Milestone 2 same-directory atomic launcher-root persistence
+at focused review boundary.
 
-**Next slice:** Cross-review the corrected closed launcher-root resolution and
-startup-observation Interfaces plus Linux real-filesystem unit evidence. No further source slice is admitted;
-same-directory atomic replacement and stream ownership remain separate later
-slices. Milestone 1 remains blocked on the complete Rust producer projection,
-Milestone 3 runtime/deployment remains unavailable, and Milestone 4 remains
-pending required-real Windows/macOS evidence.
+**Next slice:** Cross-review the green six-file atomic-persistence boundary. No
+further source slice is admitted; renderer recovery and stream ownership remain
+separate later slices. Milestone 1 remains blocked on the complete Rust producer
+projection, Milestone 3 runtime/deployment remains unavailable, and Milestone 4
+remains pending required-real Windows/macOS evidence.
 
 **Acceptance status:** `pending`
 

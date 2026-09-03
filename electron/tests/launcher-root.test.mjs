@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import {
+  closeSync,
+  fsyncSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -12,7 +18,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  LauncherRootPersistenceError,
   launcherRootOverrideConfigPath,
+  persistLauncherRootOverride,
   resolveLauncherRoot,
 } from '../dist/launcher-root.js';
 import {
@@ -23,6 +31,459 @@ import {
 
 function createLauncherRoot(root) {
   mkdirSync(join(root, 'shared-resources', 'models'), { recursive: true });
+}
+
+const LAUNCHER_ROOT_TEMP_PREFIX = 'launcher-root.json.tmp-';
+
+function persistenceFailure(stage, code = 'EIO') {
+  const error = new Error(`injected ${stage} failure`);
+  error.code = code;
+  return error;
+}
+
+function createPersistenceAdapter({ failureStage, events = [] } = {}) {
+  return {
+    ensureDirectory(directoryPath) {
+      events.push('ensure-directory');
+      if (failureStage === 'directory-ensure') {
+        throw persistenceFailure(failureStage);
+      }
+      mkdirSync(directoryPath, { recursive: true });
+    },
+    openParentDirectory(directoryPath) {
+      events.push('open-parent');
+      if (failureStage === 'parent-open') {
+        throw persistenceFailure(failureStage);
+      }
+      return openSync(directoryPath, 'r');
+    },
+    createTemporaryName(authorityFilename) {
+      events.push('create-temporary-name');
+      if (failureStage === 'temporary-name') {
+        throw persistenceFailure(failureStage);
+      }
+      return `${authorityFilename}.tmp-test-${process.pid}`;
+    },
+    openTemporaryFile(temporaryPath) {
+      events.push('open-temporary');
+      if (failureStage === 'temporary-open') {
+        throw persistenceFailure(failureStage);
+      }
+      return openSync(temporaryPath, 'wx', 0o600);
+    },
+    writeTemporaryFile(descriptor, serializedConfig) {
+      events.push('write-temporary');
+      if (failureStage === 'partial-write') {
+        writeFileSync(descriptor, serializedConfig.slice(0, 7), 'utf8');
+        throw persistenceFailure(failureStage);
+      }
+      writeFileSync(descriptor, serializedConfig, 'utf8');
+      if (failureStage === 'full-write') {
+        throw persistenceFailure(failureStage);
+      }
+    },
+    syncTemporaryFile(descriptor) {
+      events.push('sync-temporary');
+      if (failureStage === 'temporary-sync') {
+        throw persistenceFailure(failureStage);
+      }
+      fsyncSync(descriptor);
+    },
+    closeTemporaryFile(descriptor) {
+      events.push('close-temporary');
+      closeSync(descriptor);
+      if (failureStage === 'temporary-close') {
+        throw persistenceFailure(failureStage);
+      }
+    },
+    replaceAuthority(temporaryPath, authorityPath) {
+      events.push('replace-authority');
+      if (failureStage === 'replace') {
+        throw persistenceFailure(failureStage, 'EXDEV');
+      }
+      renameSync(temporaryPath, authorityPath);
+    },
+    syncParentDirectory(descriptor) {
+      events.push('sync-parent');
+      if (failureStage === 'parent-sync') {
+        throw persistenceFailure(failureStage);
+      }
+      fsyncSync(descriptor);
+    },
+    closeParentDirectory(descriptor) {
+      events.push('close-parent');
+      closeSync(descriptor);
+      if (failureStage === 'parent-close') {
+        throw persistenceFailure(failureStage);
+      }
+    },
+    removeTemporaryFile(temporaryPath) {
+      events.push('remove-temporary');
+      if (failureStage === 'cleanup') {
+        throw persistenceFailure(failureStage);
+      }
+      unlinkSync(temporaryPath);
+    },
+  };
+}
+
+function launcherRootResolutionOptions(userDataPath) {
+  return {
+    argv: [],
+    devRoot: join(userDataPath, 'development-default'),
+    env: {},
+    execPath: join(userDataPath, 'pumas-library'),
+    isPackaged: true,
+    userDataPath,
+  };
+}
+
+function assertPersistedRoot(userDataPath, launcherRoot) {
+  assert.deepEqual(resolveLauncherRoot(launcherRootResolutionOptions(userDataPath)), {
+    status: 'resolved',
+    launcherRoot,
+    source: 'persisted',
+    persistedState: 'valid',
+  });
+}
+
+function launcherRootTemporaryFiles(userDataPath) {
+  return readdirSync(userDataPath).filter((entry) => entry.startsWith(LAUNCHER_ROOT_TEMP_PREFIX));
+}
+
+for (const interruption of [
+  {
+    failureStage: 'directory-ensure',
+    expectedStage: 'directory-ensure',
+    cleanupState: 'not-required',
+  },
+  { failureStage: 'parent-open', expectedStage: 'parent-open', cleanupState: 'not-required' },
+  { failureStage: 'temporary-name', expectedStage: 'temporary-name', cleanupState: 'complete' },
+  { failureStage: 'temporary-open', expectedStage: 'temporary-open', cleanupState: 'complete' },
+  { failureStage: 'partial-write', expectedStage: 'temporary-write', cleanupState: 'complete' },
+  { failureStage: 'full-write', expectedStage: 'temporary-write', cleanupState: 'complete' },
+  { failureStage: 'temporary-sync', expectedStage: 'temporary-sync', cleanupState: 'complete' },
+  { failureStage: 'temporary-close', expectedStage: 'temporary-close', cleanupState: 'incomplete' },
+]) {
+  test(`pre-publication ${interruption.failureStage} failure preserves authority`, () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'pumas-launcher-persist-'));
+
+    try {
+      const oldRoot = join(fixtureRoot, 'old-root');
+      const newRoot = join(fixtureRoot, 'new-root');
+      const userDataPath = join(fixtureRoot, 'user-data');
+      createLauncherRoot(oldRoot);
+      createLauncherRoot(newRoot);
+      mkdirSync(userDataPath, { recursive: true });
+      const authorityPath = launcherRootOverrideConfigPath(userDataPath);
+      const oldBytes = `${JSON.stringify({ launcherRoot: oldRoot, updatedAt: 'old' })}\n`;
+      writeFileSync(authorityPath, oldBytes, 'utf8');
+
+      assert.throws(
+        () => persistLauncherRootOverride(
+          userDataPath,
+          newRoot,
+          createPersistenceAdapter({ failureStage: interruption.failureStage })
+        ),
+        (error) => {
+          assert.ok(error instanceof LauncherRootPersistenceError);
+          assert.equal(error.code, 'launcher_root_persistence_unavailable');
+          assert.equal(error.stage, interruption.expectedStage);
+          assert.equal(error.authorityState, 'unchanged');
+          assert.equal(error.cleanupState, interruption.cleanupState);
+          assert.equal(error.message, 'Unable to persist launcher root selection.');
+          return true;
+        }
+      );
+
+      assert.equal(readFileSync(authorityPath, 'utf8'), oldBytes);
+      assertPersistedRoot(userDataPath, oldRoot);
+      assert.deepEqual(launcherRootTemporaryFiles(userDataPath), []);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+test('rename failure preserves old bytes but reports replacement visibility unknown', () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'pumas-launcher-persist-'));
+
+  try {
+    const oldRoot = join(fixtureRoot, 'old-root');
+    const newRoot = join(fixtureRoot, 'new-root');
+    const userDataPath = join(fixtureRoot, 'user-data');
+    createLauncherRoot(oldRoot);
+    createLauncherRoot(newRoot);
+    mkdirSync(userDataPath, { recursive: true });
+    const authorityPath = launcherRootOverrideConfigPath(userDataPath);
+    const oldBytes = `${JSON.stringify({ launcherRoot: oldRoot, updatedAt: 'old' })}\n`;
+    writeFileSync(authorityPath, oldBytes, 'utf8');
+
+    assert.throws(
+      () => persistLauncherRootOverride(
+        userDataPath,
+        newRoot,
+        createPersistenceAdapter({ failureStage: 'replace' })
+      ),
+      (error) => {
+        assert.ok(error instanceof LauncherRootPersistenceError);
+        assert.equal(error.stage, 'replace');
+        assert.equal(error.authorityState, 'replacement-visibility-unknown');
+        assert.equal(error.cleanupState, 'complete');
+        assert.equal(error.cause.code, 'EXDEV');
+        return true;
+      }
+    );
+
+    assert.equal(readFileSync(authorityPath, 'utf8'), oldBytes);
+    assertPersistedRoot(userDataPath, oldRoot);
+    assert.deepEqual(launcherRootTemporaryFiles(userDataPath), []);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+for (const failureStage of ['parent-sync', 'parent-close']) {
+  test(`${failureStage} failure reports published authority with unavailable durability`, () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'pumas-launcher-persist-'));
+
+    try {
+      const oldRoot = join(fixtureRoot, 'old-root');
+      const newRoot = join(fixtureRoot, 'new-root');
+      const userDataPath = join(fixtureRoot, 'user-data');
+      createLauncherRoot(oldRoot);
+      createLauncherRoot(newRoot);
+      mkdirSync(userDataPath, { recursive: true });
+      const authorityPath = launcherRootOverrideConfigPath(userDataPath);
+      writeFileSync(
+        authorityPath,
+        `${JSON.stringify({ launcherRoot: oldRoot, updatedAt: 'old' })}\n`,
+        'utf8'
+      );
+
+      assert.throws(
+        () => persistLauncherRootOverride(
+          userDataPath,
+          newRoot,
+          createPersistenceAdapter({ failureStage })
+        ),
+        (error) => {
+          assert.ok(error instanceof LauncherRootPersistenceError);
+          assert.equal(error.stage, failureStage);
+          assert.equal(error.authorityState, 'published-durability-unavailable');
+          assert.equal(
+            error.cleanupState,
+            failureStage === 'parent-close' ? 'incomplete' : 'complete'
+          );
+          return true;
+        }
+      );
+
+      const published = JSON.parse(readFileSync(authorityPath, 'utf8'));
+      assert.equal(published.launcherRoot, newRoot);
+      assertPersistedRoot(userDataPath, newRoot);
+      assert.deepEqual(launcherRootTemporaryFiles(userDataPath), []);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+test('cleanup failure preserves the primary pre-publication cause and old authority', () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'pumas-launcher-persist-'));
+
+  try {
+    const oldRoot = join(fixtureRoot, 'old-root');
+    const newRoot = join(fixtureRoot, 'new-root');
+    const userDataPath = join(fixtureRoot, 'user-data');
+    createLauncherRoot(oldRoot);
+    createLauncherRoot(newRoot);
+    mkdirSync(userDataPath, { recursive: true });
+    const authorityPath = launcherRootOverrideConfigPath(userDataPath);
+    const oldBytes = `${JSON.stringify({ launcherRoot: oldRoot, updatedAt: 'old' })}\n`;
+    writeFileSync(authorityPath, oldBytes, 'utf8');
+    const adapter = createPersistenceAdapter({ failureStage: 'partial-write' });
+    adapter.removeTemporaryFile = () => {
+      const legalNonErrorThrow = null;
+      throw legalNonErrorThrow;
+    };
+
+    assert.throws(
+      () => persistLauncherRootOverride(userDataPath, newRoot, adapter),
+      (error) => {
+        assert.ok(error instanceof LauncherRootPersistenceError);
+        assert.equal(error.stage, 'temporary-write');
+        assert.equal(error.authorityState, 'unchanged');
+        assert.equal(error.cleanupState, 'incomplete');
+        assert.match(String(error.cause), /partial-write/);
+        return true;
+      }
+    );
+
+    assert.equal(readFileSync(authorityPath, 'utf8'), oldBytes);
+    assertPersistedRoot(userDataPath, oldRoot);
+    assert.equal(launcherRootTemporaryFiles(userDataPath).length, 1);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('successful persistence follows the selected publication order on local Linux', {
+  skip: process.platform !== 'linux',
+}, () => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'pumas-launcher-persist-'));
+
+  try {
+    const newRoot = join(fixtureRoot, 'new-root');
+    const defaultAdapterRoot = join(fixtureRoot, 'default-adapter-root');
+    const userDataPath = join(fixtureRoot, 'user-data');
+    const events = [];
+    createLauncherRoot(newRoot);
+    createLauncherRoot(defaultAdapterRoot);
+    mkdirSync(userDataPath, { recursive: true });
+
+    const config = persistLauncherRootOverride(
+      userDataPath,
+      newRoot,
+      createPersistenceAdapter({ events })
+    );
+    const authorityPath = launcherRootOverrideConfigPath(userDataPath);
+
+    assert.deepEqual(events, [
+      'ensure-directory',
+      'open-parent',
+      'create-temporary-name',
+      'open-temporary',
+      'write-temporary',
+      'sync-temporary',
+      'close-temporary',
+      'replace-authority',
+      'sync-parent',
+      'close-parent',
+    ]);
+    assert.deepEqual(JSON.parse(readFileSync(authorityPath, 'utf8')), config);
+    assert.equal(statSync(authorityPath).mode & 0o777, 0o600);
+    assertPersistedRoot(userDataPath, newRoot);
+    assert.deepEqual(launcherRootTemporaryFiles(userDataPath), []);
+
+    const defaultConfig = persistLauncherRootOverride(userDataPath, defaultAdapterRoot);
+    assert.deepEqual(JSON.parse(readFileSync(authorityPath, 'utf8')), defaultConfig);
+    assert.equal(statSync(authorityPath).mode & 0o777, 0o600);
+    assertPersistedRoot(userDataPath, defaultAdapterRoot);
+    assert.deepEqual(launcherRootTemporaryFiles(userDataPath), []);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+async function interruptPersistenceAtBarrier(barrier, userDataPath, selectedPath) {
+  const moduleUrl = new URL('../dist/launcher-root.js', import.meta.url).href;
+  const childSource = `
+    import * as fs from 'node:fs';
+    const { persistLauncherRootOverride } = await import(${JSON.stringify(moduleUrl)});
+    const barrier = ${JSON.stringify(barrier)};
+    const adapter = {
+      ensureDirectory: (value) => fs.mkdirSync(value, { recursive: true }),
+      openParentDirectory: (value) => fs.openSync(value, 'r'),
+      createTemporaryName: (value) => value + '.tmp-child-' + process.pid,
+      openTemporaryFile: (value) => fs.openSync(value, 'wx', 0o600),
+      writeTemporaryFile: (fd, value) => fs.writeFileSync(fd, value, 'utf8'),
+      syncTemporaryFile: (fd) => fs.fsyncSync(fd),
+      closeTemporaryFile: (fd) => fs.closeSync(fd),
+      replaceAuthority: (from, to) => {
+        if (barrier === 'before-replace') {
+          fs.writeSync(1, 'barrier\\n');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        }
+        fs.renameSync(from, to);
+      },
+      syncParentDirectory: (fd) => {
+        if (barrier === 'after-replace') {
+          fs.writeSync(1, 'barrier\\n');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        }
+        fs.fsyncSync(fd);
+      },
+      closeParentDirectory: (fd) => fs.closeSync(fd),
+      removeTemporaryFile: (value) => fs.unlinkSync(value),
+    };
+    persistLauncherRootOverride(
+      ${JSON.stringify(userDataPath)},
+      ${JSON.stringify(selectedPath)},
+      adapter
+    );
+  `;
+
+  await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', childSource], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    let interrupted = false;
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`persistence child did not reach ${barrier}: ${stderr}`));
+    }, 5_000);
+
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      if (!interrupted && chunk.includes('barrier')) {
+        interrupted = true;
+        child.kill('SIGKILL');
+      }
+    });
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on('exit', (_code, signal) => {
+      clearTimeout(timeout);
+      if (!interrupted || signal !== 'SIGKILL') {
+        reject(new Error(`unexpected persistence child exit at ${barrier}: ${stderr}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+for (const interruption of [
+  { barrier: 'before-replace', expected: 'old' },
+  { barrier: 'after-replace', expected: 'new' },
+]) {
+  test(`SIGKILL ${interruption.barrier} leaves complete ${interruption.expected} authority`, {
+    skip: process.platform !== 'linux',
+  }, async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'pumas-launcher-persist-'));
+
+    try {
+      const oldRoot = join(fixtureRoot, 'old-root');
+      const newRoot = join(fixtureRoot, 'new-root');
+      const userDataPath = join(fixtureRoot, 'user-data');
+      createLauncherRoot(oldRoot);
+      createLauncherRoot(newRoot);
+      mkdirSync(userDataPath, { recursive: true });
+      const authorityPath = launcherRootOverrideConfigPath(userDataPath);
+      writeFileSync(
+        authorityPath,
+        `${JSON.stringify({ launcherRoot: oldRoot, updatedAt: 'old' })}\n`,
+        'utf8'
+      );
+
+      await interruptPersistenceAtBarrier(interruption.barrier, userDataPath, newRoot);
+
+      const expectedRoot = interruption.expected === 'old' ? oldRoot : newRoot;
+      const persisted = JSON.parse(readFileSync(authorityPath, 'utf8'));
+      assert.equal(persisted.launcherRoot, expectedRoot);
+      assertPersistedRoot(userDataPath, expectedRoot);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
 }
 
 test('backend initialization rejection is observed while window creation is delayed', async () => {

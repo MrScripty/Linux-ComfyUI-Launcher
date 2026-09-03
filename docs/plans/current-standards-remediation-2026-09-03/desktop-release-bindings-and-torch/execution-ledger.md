@@ -23,8 +23,8 @@
 - Milestone 3 has one accepted request-contract slice but remains
   `Active`/pending; runtime scheduling and deployment are blocked on a real
   tuple and fixture.
-- Current slice: Milestone 2 persisted launcher-root authority states and
-  discovery prevention. Atomic persistence and streams remain held.
+- Current slice: Milestone 2 same-directory atomic launcher-root persistence.
+  Renderer recovery and streams remain held.
 
 ## Entries
 
@@ -490,6 +490,88 @@
   build plus all six test files, lint, and `tsc --noEmit` pass.
 - Review status: the corrected boundary is frozen for final cross-review. The
   remaining DRBT-A3/DRBT-A4 and required-real evidence gates are unchanged.
+
+### 2026-09-03 — Admit M2 atomic-persistence slice
+
+- Operation: `continue`; the prior persisted-authority/startup-observation
+  boundary was accepted and integrated as `1964760d`.
+- Investigation result: the writer validates the selection and then directly
+  truncates `launcher-root.json`. It has no exclusive adjacent temporary file,
+  file synchronization, atomic namespace replacement, parent-directory
+  synchronization, owned-temp cleanup, or typed partial-publication result.
+- Selected contract: under the Electron single-instance writer, validate and
+  serialize once; create one unpredictable same-directory temporary file with
+  exclusive `wx` and mode `0600`; write, synchronize, and close it; rename it
+  over the authority; synchronize and close the already-open parent directory;
+  report success only then. There is no retry, copy, unlink-target, rollback,
+  or alternate publication mechanism.
+- Failure contract: all pre-rename failures preserve prior authority bytes and
+  clean only this operation's owned unpublished temp. Rename failure is
+  `replacement-visibility-unknown`. Any parent sync/close failure after rename
+  is `published-durability-unavailable`: the complete new destination remains
+  visible, no success/relaunch occurs, and the writer does not retry or roll
+  back. Cleanup incompleteness is bounded metadata and never replaces the
+  primary stage/cause.
+- Evidence boundary: real local Linux reopen/bytes/mode and subprocess
+  termination barriers may prove old-or-new namespace publication on that
+  filesystem. They do not prove power-loss behavior, every Linux filesystem,
+  Windows/macOS parent flushing, remote/removable filesystems, concurrent
+  writers, or orphan garbage collection. Those claims remain unavailable.
+- Exact write set:
+  - `electron/src/launcher-root.ts`
+  - `electron/tests/launcher-root.test.mjs`
+  - this plan, ledger, issues, and `reports/desktop-lifecycle-evidence.md`
+- Held files/claims: `main.ts` retains its accepted call shape and path-free
+  error projection; preload, PythonBridge, package/manifests, renderer,
+  streams, Rust/RPC/generated source, frontend, CI, and shared docs are excluded.
+- TDD order: named injected failures for parent open, partial/full temp write,
+  temp sync/close, rename, parent sync/close, and cleanup; then real Linux
+  success and subprocess termination before/after publication.
+
+### 2026-09-03 — Reach focused M2 atomic-persistence review boundary
+
+- TDD red: the focused test module could not import the selected typed
+  persistence error because the atomic writer Interface did not exist. At the
+  baseline public Interface, the persistence Adapter was absent and writes
+  directly truncated the authority.
+- Module result: `persistLauncherRootOverride` retains its existing success
+  shape and main-process consumer. Its narrow stage-named Adapter owns only the
+  filesystem mechanics needed to prove exclusive temp preparation, publication,
+  parent synchronization, cleanup, and partial failure without exposing a
+  general filesystem facade.
+- Publication sequence: ensure the data directory, open its directory handle,
+  create an unpredictable typed temporary name, exclusively open that adjacent
+  temp at `0600`, write and fsync all bytes, close the temp, rename it over the
+  authority, fsync the directory, and close that directory handle. Success is
+  returned only after the complete sequence.
+- Failure result: `LauncherRootPersistenceError` has one stable path-free
+  message plus the failed stage, authority state, cleanup state, and preserved
+  cause. Pre-publication failures are `unchanged`; rename failure is
+  `replacement-visibility-unknown`; post-rename parent sync/close failures are
+  `published-durability-unavailable`. Cleanup never removes the authority,
+  retries publication, rolls back a visible replacement, or replaces the
+  primary cause.
+- Injected green evidence: directory ensure, parent open, temporary-name
+  creation, temp open, partial write, full write, temp sync, temp close, rename,
+  parent sync, parent close, and secondary cleanup failures all reach their
+  selected outcome. Cleanup may legally throw a non-Error value without masking
+  the primary typed stage/cause. Public resolver reopen proves the old authority
+  through pre-publication failures and the complete new authority after publication.
+- Real local Linux evidence: the successful default Adapter writes readable
+  JSON with mode `0600`, follows the exact nine-stage order, leaves no owned
+  temp, and reopens through the public resolver. Separate subprocesses killed by
+  `SIGKILL` immediately before and after rename leave complete old and new
+  authority respectively, never partial target bytes.
+- Verification: all 30 focused launcher-root/startup cases pass, including 15
+  new persistence cases; the full Electron build plus all six test files, lint,
+  and `tsc --noEmit` pass.
+- Claim boundary: this is local process-interruption and namespace-publication
+  evidence on the exercised Linux temporary filesystem. It does not prove
+  power-loss durability, every Linux filesystem, Windows/macOS parent flushing,
+  remote/removable filesystems, concurrent writers, or orphan cleanup. DRBT-A3
+  and Milestone 2 remain open. The existing main-process consumer fails closed
+  without success/relaunch/retry, but renderer projection of replacement-unknown
+  and published-durability-unavailable states remains future recovery work.
 
 ## Reports
 

@@ -2,7 +2,7 @@
 
 **Milestone:** 2 — Preserve Desktop Authority and Stream Lifecycle
 
-**Status:** `active; corrected persisted-authority slice green pending review`
+**Status:** `active; atomic-persistence slice green pending review`
 
 ## Investigation Boundary
 
@@ -46,6 +46,48 @@ write exclusively, synchronize the file, atomically replace the record,
 synchronize the parent directory where supported, or prove interruption
 behavior. Those mechanics require their own cross-platform contract and are
 not bundled into the state-classification slice.
+
+### Atomic-persistence contract
+
+The accepted next slice retains one writer through Electron's instance lock and
+keeps `persistLauncherRootOverride` as the public Interface. It prepares one
+unpredictable adjacent temporary file with exclusive `wx` creation and mode
+`0600`, writes and synchronizes the complete serialized record, closes the temp,
+renames it over the authority, then synchronizes and closes an already-open
+parent directory. The [official Node filesystem API](https://nodejs.org/api/fs.html)
+provides these mechanisms but does not by itself prove their semantics on every
+supported filesystem or OS.
+
+Pre-publication failure preserves the prior authority and cleans only the temp
+owned by that attempt. A rename failure has unknown replacement visibility.
+After rename, parent sync or close failure reports the complete new destination
+as published with unavailable durability; it never rolls back, deletes, retries,
+or reports relaunch success. Cleanup failure is secondary bounded state and does
+not replace the primary phase/cause.
+
+The admitted evidence uses stage-named injected failures plus local Linux
+reopen/byte/mode checks and real subprocess termination immediately before and
+after publication. It can prove namespace old-or-new behavior only for that
+local filesystem. Power-loss guarantees, every Linux filesystem, Windows and
+macOS directory flushing, remote/removable filesystems, orphan cleanup, and
+concurrent-writer policy remain explicitly open.
+
+The implemented Module preserves the existing success result and main-process
+consumer. Its typed failure has one path-free message and correlated stage,
+authority, and cleanup states:
+
+| Failure phase | Authority state | Cleanup/consumer result |
+| --- | --- | --- |
+| parent or temp preparation through temp close | `unchanged` | Close owned descriptors and unlink only the owned unpublished temp; cleanup incompleteness is secondary |
+| rename | `replacement-visibility-unknown` | Never unlink the destination, copy, retry, or select a fallback |
+| parent sync or close after rename | `published-durability-unavailable` | Complete new destination remains visible; caller receives failure and does not relaunch as success |
+
+The default Adapter executes ten ordered stages: ensure directory, open parent,
+create the typed unpredictable temporary name, open that temp exclusively, write
+temp, sync temp, close temp, rename, sync parent, and close parent. Temporary-
+name generation is inside the typed operation boundary. Its successful local
+Linux result has mode `0600`, parses as the exact returned config, leaves no
+operation-owned temp, and resolves through the public reader as the new authority.
 
 ## Stream Lifecycle Inventory
 
@@ -170,6 +212,12 @@ Fourteen public resolver cases pass against real temporary Linux filesystem
 layouts and the narrow deterministic failure Adapter. One additional public
 startup-task case passes for immediate rejection with delayed window
 consumption.
+Fifteen persistence cases cover every selected injected phase, primary-cause
+preservation when cleanup throws a legal non-Error value, successful default
+publication, and real subprocess `SIGKILL` barriers immediately before and after
+rename. The focused module therefore has 30 passing cases total. The main
+consumer remains fail-closed and path-free, but explicit renderer recovery for
+replacement-unknown and published-durability-unavailable remains open.
 The Electron TypeScript build and the six-file Electron test command pass. This
 is local unit/build evidence, not required-real packaged Linux, Windows, or
 macOS filesystem evidence.

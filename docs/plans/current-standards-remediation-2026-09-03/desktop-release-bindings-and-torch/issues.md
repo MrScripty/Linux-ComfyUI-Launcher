@@ -36,7 +36,17 @@
   invalid classification, arbitrary-descendant rejection, and an immediate
   recovery rejection while window creation is delayed. Required-real target
   filesystem evidence remains pending.
-- Revisit trigger: accepted focused state slice, then atomic persistence slice.
+- Atomic-persistence status: focused boundary green and pending review. Direct
+  truncation is replaced by an exclusive adjacent temp, synchronized close,
+  namespace replacement, and parent synchronization with explicit pre/post-
+  publication failure states. Local Linux old-or-new evidence cannot stand in
+  for power-loss or required-real Windows/macOS filesystem evidence.
+- Recovery projection remains open: the existing main consumer maps persistence
+  failure to one stable generic IPC failure and does not report success,
+  relaunch, retry, or fallback. It does not yet expose replacement-visibility-
+  unknown or published-durability-unavailable to the renderer.
+- Revisit trigger: accepted atomic persistence slice, then renderer recovery or
+  stream ownership under separately admitted write sets.
 
 ### DRBT-I11 — Desktop stream transitions lack one terminal owner
 
