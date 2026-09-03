@@ -8,7 +8,10 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
-import { persistLauncherRootOverride, resolveLauncherRoot } from './launcher-root';
+import {
+  persistLauncherRootOverride,
+  resolveLauncherRoot,
+} from './launcher-root';
 import {
   sanitizeOpenDialogOptions,
   validateApiCallPayload,
@@ -16,6 +19,11 @@ import {
 } from './ipc-validation';
 import { resolveBackendBinaryPath } from './backend-path';
 import { PythonBridge } from './python-bridge';
+import {
+  LauncherRootRecoveryRequiredError,
+  observeBackendInitialization,
+  projectBackendInitializationFailure,
+} from './startup-task';
 import log from 'electron-log';
 
 // Configure logging
@@ -50,6 +58,16 @@ let modelDownloadRendererSubscriptions = 0;
 let runtimeProfileRendererSubscriptions = 0;
 let servingStatusRendererSubscriptions = 0;
 let statusTelemetryRendererSubscriptions = 0;
+
+function logBackendInitializationFailure(message: string, error: unknown): void {
+  const diagnostic = projectBackendInitializationFailure(message, error);
+
+  if ('error' in diagnostic) {
+    log.error(diagnostic.message, diagnostic.error);
+  } else {
+    log.error(diagnostic.message);
+  }
+}
 
 function focusExistingWindow(): void {
   if (!mainWindow || mainWindow.isDestroyed()) {
@@ -286,7 +304,7 @@ function registerIPCHandlers(): void {
       const selectedPath = result.filePaths[0]!;
       const config = persistLauncherRootOverride(app.getPath('userData'), selectedPath);
 
-      log.info(`Persisted launcher root override: ${config.launcherRoot}`);
+      log.info('Persisted launcher root override');
 
       setTimeout(() => {
         app.relaunch();
@@ -300,9 +318,9 @@ function registerIPCHandlers(): void {
         selectedPath: config.selectedPath ?? selectedPath,
         launcherRoot: config.launcherRoot,
       };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log.error(`Failed to persist launcher root override: ${message}`);
+    } catch {
+      const message = 'Failed to persist launcher root selection.';
+      log.error(message);
       return { success: false, cancelled: false, error: message };
     }
   });
@@ -487,14 +505,18 @@ async function initializeBackend(): Promise<void> {
       sourceRoot: path.join(__dirname, '..', '..'),
     });
 
-    const launcherRoot = resolveLauncherRoot({
+    const launcherRootResolution = resolveLauncherRoot({
       appImagePath: process.env.APPIMAGE,
       devRoot: path.join(__dirname, '..', '..'),
       execPath: process.execPath,
       isPackaged: app.isPackaged,
       userDataPath: app.getPath('userData'),
     });
-    log.info(`Resolved launcher root: ${launcherRoot}`);
+    if (launcherRootResolution.status === 'recovery-required') {
+      throw new LauncherRootRecoveryRequiredError(launcherRootResolution);
+    }
+    const launcherRoot = launcherRootResolution.launcherRoot;
+    log.info(`Resolved launcher root from ${launcherRootResolution.source}`);
 
     pythonBridge = new PythonBridge({
       port: 0,
@@ -563,13 +585,17 @@ if (!hasSingleInstanceLock) {
       // Register IPC handlers
       registerIPCHandlers();
 
-      const backendInitialization = initializeBackend();
+      // Attach rejection handling before window creation can delay consumption.
+      const backendInitialization = observeBackendInitialization(initializeBackend());
 
       // Show the window immediately; backend warmup continues in parallel.
       await createWindow();
 
       if (releaseSmokeMode) {
-        await backendInitialization;
+        const outcome = await backendInitialization;
+        if (outcome.status === 'rejected') {
+          throw outcome.error;
+        }
 
         const exitDelayMs = getReleaseSmokeExitDelayMs();
         log.info(`Release smoke startup succeeded; exiting in ${exitDelayMs}ms`);
@@ -579,12 +605,14 @@ if (!hasSingleInstanceLock) {
         return;
       }
 
-      void backendInitialization.catch((error) => {
-        log.error('Failed to initialize backend bridge:', error);
-        app.quit();
+      void backendInitialization.then((outcome) => {
+        if (outcome.status === 'rejected') {
+          logBackendInitializationFailure('Failed to initialize backend bridge', outcome.error);
+          app.quit();
+        }
       });
     } catch (error) {
-      log.error('Failed to initialize app:', error);
+      logBackendInitializationFailure('Failed to initialize app', error);
       app.quit();
     }
   });

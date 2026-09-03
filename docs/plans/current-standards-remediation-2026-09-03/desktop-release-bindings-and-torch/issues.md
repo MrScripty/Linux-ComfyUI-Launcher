@@ -10,6 +10,58 @@
 
 ## Active Issues
 
+### DRBT-I10 — Launcher-root authority failures collapse into discovery
+
+- Severity: High; blocks DRBT-A3 and safe desktop startup.
+- Evidence: persisted absence, read failure, malformed JSON/shape, and an
+  unusable configured root all become `null`; the resolver then selects a
+  portable, discovered, packaged-default, or development-default path. Explicit
+  environment and argument roots also bypass the existing-root validator.
+- Relationship: a startup that appears healthy can display or mutate a library
+  other than the persisted owner; an invalid explicit path can be created by
+  backend startup and become new authority.
+- Owner/boundary: Milestone 2 launcher-root Module; the resolver is its public
+  Interface and filesystem inspection is hidden implementation.
+- Disposition: focused state/provenance slice is green and pending review.
+  Invalid, unavailable, and present-but-empty explicit authority no longer
+  reaches discovery or backend startup. Authoritative selection accepts only
+  an exact root or its two declared chooser forms; ancestor walking is
+  discovery-only. Backend initialization is observed before window creation can
+  delay failure consumption, and typed recovery diagnostics stay path-free.
+  Atomic replacement remains open.
+- Verification: real temporary-filesystem public resolver tests with a valid
+  discovery decoy plus invalid/unavailable persisted and invalid explicit
+  authorities; marker-file rejection; and deterministic injected I/O failure
+  across all authoritative sources. Include malformed-path/oversized-name
+  invalid classification, arbitrary-descendant rejection, and an immediate
+  recovery rejection while window creation is delayed. Required-real target
+  filesystem evidence remains pending.
+- Revisit trigger: accepted focused state slice, then atomic persistence slice.
+
+### DRBT-I11 — Desktop stream transitions lack one terminal owner
+
+- Severity: High for DRBT-A4 lifecycle acceptance.
+- Evidence: five bridge stream owners coexist with process-global renderer
+  counters; the model-library stream has no renderer subscription owner;
+  window close omits model-download/model-library cleanup; most preload
+  subscription and all unsubscription promises are unobserved; request destroy
+  is not joined to terminal socket close; and a stale request callback can
+  overwrite newer stream state.
+- Relationship: renderer close, backend restart, transport failure, and app
+  shutdown can produce silent failure, duplicate transitions, retained work,
+  or a false-clean terminal result.
+- Owner/boundary: Milestone 2 main-process stream Module and preload Interface;
+  Milestone 1 remains the event-decoder authority.
+- Disposition: inventory complete, implementation held. Define per-renderer
+  subscribe/delivery/unsubscribe/close/shutdown outcomes without re-owning the
+  still-changing Rust event schema.
+- Verification: Electron lifecycle harness with duplicate subscribe/unsubscribe,
+  renderer destruction, late transport callbacks, delivery failure, backend
+  restart, and shutdown oracles; required-real Electron evidence remains
+  pending.
+- Revisit trigger: accepted persisted-authority slice and an admitted exact
+  stream-ownership write set.
+
 ### DRBT-I7 — No accepted Torch runtime/model/device tuple
 
 - Severity: High; blocks DRBT-A5 and any shipped Torch promise.

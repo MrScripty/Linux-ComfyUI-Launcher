@@ -2,15 +2,15 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestone 3 Torch request-contract boundary accepted;
-runtime/deployment evidence unavailable.
+**Current phase:** Milestone 2 persisted launcher-root authority at focused
+review boundary.
 
-**Next slice:** No further Torch source slice is admitted. Resolve a production
-dependency set, a managed sidecar deployment path, and one real local
-model/device fixture before selecting or implementing the inference work owner,
-usage, cancellation, overload, failure, health, or shutdown contract. Milestone
-1 remains blocked on the complete Rust producer projection, and Milestone 4
-remains pending required-real Windows/macOS evidence.
+**Next slice:** Cross-review the corrected closed launcher-root resolution and
+startup-observation Interfaces plus Linux real-filesystem unit evidence. No further source slice is admitted;
+same-directory atomic replacement and stream ownership remain separate later
+slices. Milestone 1 remains blocked on the complete Rust producer projection,
+Milestone 3 runtime/deployment remains unavailable, and Milestone 4 remains
+pending required-real Windows/macOS evidence.
 
 **Acceptance status:** `pending`
 
@@ -175,7 +175,7 @@ artifact, dependency, license, version, and target promises.
 | Each accepted release uses `scripts/release/artifact-plan.json` as the exact artifact-plan authority consumed through the `scripts/release/artifacts.mjs` Interface by validation, assembly, SBOM/checksum production, and release review. | Milestones 0 and 6 | P-03, current Node toolchain, multiple real release consumers, and release artifact-plan rule | Narrative/workflow disagreement |
 | A binding package contains generated host material and native binaries only from one recorded build cohort, and every advertised tuple requires real-host load/call evidence. | Milestone 5 | P-04 and Rust Language Binding profile | Source-generation or native-only evidence as host support |
 | Torch exposes an explicitly selected subset rather than accepting and ignoring fields. Its work owner must keep ASGI control traffic schedulable and observe admission, completion, cancellation, failure, and shutdown. | Milestone 3 | P-06 and Concurrency/Resilience standards | Silent field dropping and synchronous event-loop inference |
-| Launcher-root states distinguish absent, valid, invalid, and unavailable authority; only the accepted recovery path may replace a bad persisted owner. | Milestone 2 | P-08 and persistence/resilience rules | Corrupt/unreadable state mapped to absence |
+| Launcher-root states distinguish absent, valid, invalid, and unavailable authority; environment override precedes argument override, and either explicit source must name only an exact root, `shared-resources`, or `shared-resources/models`; only the accepted recovery path may replace a bad persisted owner. | Milestone 2 | P-08, current invocation precedence, and persistence/resilience rules | Corrupt/unreadable state mapped to absence or arbitrary descendant discovery |
 | Launcher wrappers delegate the same validated actions to one process-execution Module; target and termination behavior remain explicit per accepted OS. | Milestone 4 | P-09 and Launcher/Cross-Platform standards | Unknown-to-Linux fallback and wrapper-specific release path |
 | Obsolete release documents, snapshots, and notice inventories stay deleted. Current evidence is derived from accepted inputs and final shipped artifacts. | Milestone 6 | Planning baseline `d84e2b35` and P-05 | Restoring stale checked-in evidence |
 | Pumas has one lockstep product version projected by root, frontend, Electron, and Cargo manifests; the source-level Rust contract is consumed by exact Git revision and is not a standalone GitHub `.crate` artifact. | Product/release owner plus Milestones 0 and 6 | Accepted 2026-09-03 decision and real Pantograph consumer inventory | Unused `.crate` release asset and independently inferred workspace versions |
@@ -391,6 +391,7 @@ plan consumes but does not redefine recovery and stream outcomes.
 
 - `electron/src/launcher-root.ts`
 - `electron/src/main.ts`
+- `electron/src/startup-task.ts`
 - `electron/src/preload.ts`
 - `electron/src/python-bridge.ts`
 - `electron/tests/launcher-root.test.mjs`
@@ -422,7 +423,7 @@ plan consumes but does not redefine recovery and stream outcomes.
 switches library authority and no selected stream task can outlive shutdown
 without an observed typed result.
 
-**Status:** `Planned`
+**Status:** `Active`
 
 ### Milestone 3: Make the Torch Surface Truthful and Schedulable
 

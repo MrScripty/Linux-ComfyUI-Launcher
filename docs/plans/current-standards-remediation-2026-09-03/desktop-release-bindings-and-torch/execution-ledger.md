@@ -20,8 +20,11 @@
   operations and handler-owned event shapes.
 - Milestone 4 is locally green but remains `Active`/pending until required-real
   Windows x64 and macOS arm64 launcher evidence exists.
-- Current slice: Milestone 3 bounded Torch request-contract narrowing; runtime
-  scheduling and deployment remain blocked on a real tuple and fixture.
+- Milestone 3 has one accepted request-contract slice but remains
+  `Active`/pending; runtime scheduling and deployment are blocked on a real
+  tuple and fixture.
+- Current slice: Milestone 2 persisted launcher-root authority states and
+  discovery prevention. Atomic persistence and streams remain held.
 
 ## Entries
 
@@ -353,13 +356,148 @@
   required-real model/device tuple remain unresolved under DRBT-I7 through
   DRBT-I9. Milestone 3 and DRBT-A5 therefore remain open.
 
+### 2026-09-03 — Start M2 persisted-authority slice
+
+- Operation: `continue`; plan remains `Active`, and Milestone 2 moves from
+  `Planned` to `Active` while Milestones 1, 3, and 4 retain their recorded
+  blockers.
+- Investigation result: the launcher-root resolver returns a bare path and
+  collapses missing, malformed, unreadable, and invalid persisted records to
+  `null`. Every collapsed result then permits portable/discovery/default
+  selection, so corrupted authority can silently select a different library.
+- Explicit-authority result: environment and argument overrides bypass the
+  canonical existing-root validator. The backend can then create the selected
+  working directory, turning an invalid override into new authority.
+- Persistence result: selection writes directly to the authoritative file
+  after creating its parent. There is no same-directory temporary file,
+  exclusive preparation, file synchronization, atomic rename, directory
+  synchronization, or interruption oracle. This is held for a later slice.
+- Stream result: five bridge stream owners exist, but the model-library stream
+  is always-on; four others use process-global renderer counters; window close
+  omits model-download and model-library cleanup; most preload subscribe and
+  every unsubscribe promise are unobserved; stream destroy/close is not joined;
+  and malformed events remain log-and-drop. Cursor/event schema repair stays
+  blocked on Milestone 1, while ownership can be sliced independently later.
+- Confirmed public seam: `resolveLauncherRoot` is the caller/test Interface.
+  It will return a closed discriminated resolution carrying persisted-state
+  provenance. Only `absent` may discover or initialize; `valid` identifies the
+  accepted root; `invalid` and `unavailable` return stable path-free recovery-
+  required results; `not-consulted` records explicit override precedence.
+- Exact write set:
+  - `electron/src/launcher-root.ts`
+  - `electron/src/main.ts`
+  - `electron/src/startup-task.ts` (admitted by focused re-plan after startup-order review)
+  - `electron/tests/launcher-root.test.mjs`
+  - this plan, ledger, issues, and `reports/desktop-lifecycle-evidence.md`
+- TDD oracle order: first malformed persisted state with a valid discovery
+  decoy; then unavailable persisted state with the same decoy; then invalid
+  argument and environment overrides. Each red is captured through the public
+  resolver before its minimal implementation. Successful absent/valid and
+  override-precedence states are asserted at the same Interface.
+- Held files and claims: preload, PythonBridge, Electron package/manifests,
+  generated output, frontend, Rust/RPC projection, atomic persistence, and
+  stream ownership are excluded. This slice is incremental DRBT-A3 evidence,
+  not required-real cross-platform or Milestone 2 acceptance.
+
+### 2026-09-03 — Reach focused M2 persisted-authority review boundary
+
+- First red: with a valid discovery decoy present, malformed persisted JSON
+  resolved to that decoy instead of an authority failure. The new result shape
+  also exposed absence and valid persisted selection through the same public
+  Interface.
+- Second red: making the user-data path a regular file caused the prior
+  existence probe to report absence and select the discovery decoy instead of
+  reporting unavailable persisted authority.
+- Explicit-authority reds: a nonexistent `--launcher-root` and a nonexistent
+  `PUMAS_LAUNCHER_ROOT` were each returned as resolved. After validating those
+  paths, four presence edge cases remained red: missing argument value, next
+  token another flag, blank inline value, and blank/whitespace environment
+  value all collapsed to absence and discovery.
+- Filesystem-validation reds: a regular file at the canonical
+  `shared-resources/models` marker was accepted as a launcher root, and an
+  injected deterministic `EIO` during validation was ignored because the
+  resolver used `existsSync` rather than a typed filesystem result.
+- Final contract reds: NUL-bearing explicit and persisted paths were classified
+  as unavailable rather than invalid, and arbitrary/nonexistent descendants of
+  a valid launcher root climbed to that ancestor for argument, environment, and
+  persisted authority. Startup also logged the resolved absolute path and
+  logged the typed recovery Error object with its stack; selection persistence
+  logged the absolute root or raw filesystem message.
+- Implementation: `resolveLauncherRoot` now returns one correlated
+  discriminated result. Explicit roots are normalized by the canonical
+  existing-root validator and record persisted state as `not-consulted`;
+  persisted records are `valid`, `invalid`, or `unavailable`; only `absent`
+  permits portable/discovery/default selection. Main-process composition throws
+  only the stable code/message and never starts the backend on a recovery-
+  required result.
+- Filesystem Adapter: authoritative validation uses a narrow injected
+  `readFileSync`/`statSync` seam, requires marker directories, classifies only
+  known missing or malformed path-domain codes as invalid, and projects access
+  or I/O failures as path-free unavailable results for environment, argument,
+  and persisted authority. Best-effort discovery does not weaken that
+  authoritative proof.
+- Selection boundary: authoritative normalization checks only the exact root,
+  exact `root/shared-resources`, or exact
+  `root/shared-resources/models`. Ancestor walking is reserved for discovery
+  after persisted absence. `ERR_INVALID_ARG_VALUE`, `EINVAL`, and
+  `ENAMETOOLONG` join `ENOENT`/`ENOTDIR` as invalid path-domain outcomes;
+  access and I/O failures such as `EACCES`/`EIO` remain unavailable.
+- Precedence and diagnostics: a present environment override precedes and
+  suppresses argument/persisted discovery. Main-process startup logs only the
+  resolved source or the typed recovery code/source/message; it does not log
+  the absolute root or raw recovery Error. Selection persistence emits one
+  stable path-free success/failure diagnostic.
+- Persisted JSON policy: the top-level JSON value must be a runtime-checked
+  record, not a TypeScript assertion. `launcherRoot` is the sole authority-
+  bearing field and must be a string resolving to an existing launcher root.
+  `selectedPath`, `updatedAt`, and unknown fields are non-authoritative metadata
+  and are ignored by resolution, so they cannot change the selected owner.
+- Green focused evidence: fourteen public resolver cases pass on the real local
+  Linux temporary filesystem, including absence/discovery, valid persisted
+  precedence, malformed and unavailable records with a discovery decoy,
+  invalid and valid explicit overrides, explicit precedence/normalization, and
+  every present-but-empty form. They also prove marker-directory type and the
+  deterministic I/O-failure Adapter outcome, malformed-path classification,
+  and descendant rejection for all three authoritative sources.
+- Review status: focused source/test boundary is green and pending independent
+  acceptance. Atomic replacement, interruption/durability behavior, explicit
+  renderer recovery, and required-real Windows/macOS evidence remain open;
+  stream/RPC/package/shared-doc files did not enter the slice.
+
+### 2026-09-03 — Correct immediate backend-initialization observation
+
+- Review red: `initializeBackend()` was started before `createWindow()`, but its
+  rejection handler was attached only after window creation completed. An
+  immediate launcher-root recovery rejection could therefore reach the global
+  `unhandledRejection` handler first and log the raw typed Error/stack.
+- Focused re-plan: root admitted only `electron/src/startup-task.ts` beyond the
+  recorded write set. The seam is domain-specific to backend initialization;
+  it does not introduce a generic task framework.
+- TDD red: the delayed-window/immediate-rejection public regression failed at
+  module resolution because no owned observation seam existed.
+- Implementation: startup now converts backend initialization immediately into
+  one never-rejecting `fulfilled` or `rejected` outcome before awaiting window
+  creation. The original error remains the typed terminal value. Normal startup
+  projects one failure diagnostic and quits; release-smoke rethrows that same
+  failure instead of reporting startup success.
+- Diagnostic boundary: launcher-root recovery failures project only the stable
+  code, authority source, and message. Unexpected backend failures retain their
+  Error for the existing general diagnostic path; this slice does not claim
+  repository-wide raw-error removal.
+- Green evidence: the new regression rejects before a delayed window turn,
+  observes no process-level `unhandledRejection`, preserves the exact typed
+  failure, and projects a diagnostic with no raw Error field. The full Electron
+  build plus all six test files, lint, and `tsc --noEmit` pass.
+- Review status: the corrected boundary is frozen for final cross-review. The
+  remaining DRBT-A3/DRBT-A4 and required-real evidence gates are unchanged.
+
 ## Reports
 
 | Planned report | Milestone | Status |
 | --- | --- | --- |
 | `reports/release-and-host-contract-decision.md` | 0 | `accepted` |
 | `reports/rpc-contract-conformance.md` | 1 | `pending` |
-| `reports/desktop-lifecycle-evidence.md` | 2 | `pending` |
+| `reports/desktop-lifecycle-evidence.md` | 2 | `active` |
 | `reports/torch-runtime-evidence.md` | 3 | `active` |
 | `reports/launcher-platform-evidence.md` | 4 | `pending` |
 | `reports/binding-host-matrix.md` | 5 | `pending` |
