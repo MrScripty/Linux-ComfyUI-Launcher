@@ -27,6 +27,15 @@ available through Git history rather than in the working tree.
 Audits describe the named repository and standards commits. They are evidence
 and remediation inputs, not current operating instructions.
 
+## Active Plans
+
+- [2026-09-03 current-standards remediation program](plans/current-standards-remediation-2026-09-03/plan.md)
+
+An implementation invocation must name the exact focused `plan.md` and an
+explicit `start`, `continue`, or `verify` operation. Plans remain temporary
+execution authority; durable accepted decisions move to the appropriate guide
+or ADR when the program finishes.
+
 ## Subsystem Guides
 
 - [Frontend](../frontend/README.md)
