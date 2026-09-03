@@ -6,8 +6,8 @@ Custom React hooks for backend polling, process status, version/model workflows,
 ## Contents
 | File/Folder | Description |
 | ----------- | ----------- |
-| `useModels.ts` | Model list fetching, backend-pushed model-library refreshes, shared-storage rescans, and stale-while-revalidate FTS search state. |
-| `useModels.test.ts` | Hook coverage for initial fetch, rescan refresh, backend-pushed refreshes, cached FTS revalidation, stale response suppression, and new-results notifications. |
+| `useModels.ts` | Immediate startup hydration from the last validated model snapshot, reconciled model list fetching, backend-pushed model-library refreshes, shared-storage rescans, and stale-while-revalidate FTS search state. |
+| `useModels.test.ts` | Hook coverage for immediate startup snapshot hydration, initial fetch, rescan refresh, backend-pushed refreshes, cached FTS revalidation, stale response suppression, and new-results notifications. |
 | `useModelLibraryUpdateSubscription.ts` | Electron preload subscription adapter for debounced backend-owned model-library update notifications. |
 | `useRuntimeProfiles.ts` | Runtime profile snapshot hook and backend-pushed runtime/profile update subscription adapter. |
 | `useDownloadCompletionRefresh.ts` | Delayed model-list refresh scheduling when tracked downloads complete or leave active state. |

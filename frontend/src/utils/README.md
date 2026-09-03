@@ -12,6 +12,7 @@ Utility functions for formatting, logging, drag math, network status helpers, an
 | `runtimeProviderDescriptors.ts` | Frontend runtime-provider descriptors for labels, profile modes, device modes, model compatibility, default placement values, and serve-dialog capability flags. |
 | `dragAnimations.ts` | Drag animation helper utilities. |
 | `networkStatusMonitor.ts` | Connectivity/status monitor helpers. |
+| `modelLibrarySnapshot.ts` | Validated, versioned local snapshot persistence for immediate model-library startup rendering. |
 
 ## Design Decisions
 - Keep utilities pure and side-effect light where practical.

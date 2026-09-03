@@ -2,6 +2,7 @@ import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ModelCategory } from '../types/apps';
 import type { ModelLibraryUpdateNotification, ModelRecord } from '../types/api';
+import { MODEL_LIBRARY_SNAPSHOT_KEY } from '../utils/modelLibrarySnapshot';
 
 const {
   getModelsMock,
@@ -87,6 +88,7 @@ describe('useModels', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    localStorage.clear();
     getElectronAPIMock.mockReturnValue(null);
     isApiAvailableMock.mockReturnValue(true);
     getModelsMock.mockResolvedValue({
@@ -124,6 +126,44 @@ describe('useModels', () => {
     expect(getModelsMock).toHaveBeenCalledTimes(1);
     expect(groupModelRecordsMock).toHaveBeenCalledWith([makeRecord('alpha')]);
     expect(result.current.modelGroups).toEqual(grouped(['alpha']));
+    expect(JSON.parse(localStorage.getItem(MODEL_LIBRARY_SNAPSHOT_KEY) ?? 'null')).toEqual({
+      modelGroups: grouped(['alpha']),
+    });
+  });
+
+  it('shows the last model snapshot immediately while startup revalidation is pending', () => {
+    const pendingModels = createDeferred<{
+      success: boolean;
+      models: Record<string, ModelRecord>;
+    }>();
+    localStorage.setItem(
+      MODEL_LIBRARY_SNAPSHOT_KEY,
+      JSON.stringify({ modelGroups: grouped(['cached-model']) })
+    );
+    getModelsMock.mockReturnValueOnce(pendingModels.promise);
+
+    const { result } = renderHook(() => useModels());
+
+    expect(getModelsMock).toHaveBeenCalledTimes(1);
+    expect(result.current.modelGroups).toEqual(grouped(['cached-model']));
+  });
+
+  it('ignores malformed startup snapshots while revalidation is pending', () => {
+    const pendingModels = createDeferred<{
+      success: boolean;
+      models: Record<string, ModelRecord>;
+    }>();
+    localStorage.setItem(
+      MODEL_LIBRARY_SNAPSHOT_KEY,
+      JSON.stringify({
+        modelGroups: [{ category: 'grouped', models: [{ name: 'missing-id' }] }],
+      })
+    );
+    getModelsMock.mockReturnValueOnce(pendingModels.promise);
+
+    const { result } = renderHook(() => useModels());
+
+    expect(result.current.modelGroups).toEqual([]);
   });
 
   it('rescans shared storage and refreshes grouped models after a successful scan', async () => {

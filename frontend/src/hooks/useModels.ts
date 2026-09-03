@@ -14,6 +14,10 @@ import type { ModelRecord } from '../types/api';
 import { getLogger } from '../utils/logger';
 import { APIError } from '../errors';
 import { groupModelRecords } from '../utils/libraryModels';
+import {
+  readModelLibrarySnapshot,
+  writeModelLibrarySnapshot,
+} from '../utils/modelLibrarySnapshot';
 import { useModelLibraryUpdateSubscription } from './useModelLibraryUpdateSubscription';
 
 const logger = getLogger('useModels');
@@ -35,7 +39,7 @@ interface CacheEntry {
 }
 
 export function useModels() {
-  const [modelGroups, setModelGroups] = useState<ModelCategory[]>([]);
+  const [modelGroups, setModelGroups] = useState<ModelCategory[]>(readModelLibrarySnapshot);
   const [isSearching, setIsSearching] = useState(false);
   const [isRevalidating, setIsRevalidating] = useState(false);
   const [searchQueryTime, setSearchQueryTime] = useState<number | null>(null);
@@ -71,7 +75,11 @@ export function useModels() {
       }
 
       if (result.success) {
-        setModelGroups(groupModelRecords(Object.values(result.models)));
+        const freshModelGroups = groupModelRecords(Object.values(result.models));
+        setModelGroups(freshModelGroups);
+        if (!writeModelLibrarySnapshot(freshModelGroups)) {
+          logger.debug('Model library startup snapshot could not be persisted');
+        }
       }
     } catch (error) {
       if (error instanceof APIError) {
