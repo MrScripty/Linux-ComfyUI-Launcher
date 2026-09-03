@@ -3,296 +3,135 @@
 ![License](https://img.shields.io/badge/license-MIT-purple.svg)
 ![Rust](https://img.shields.io/badge/rust-1.92.0-orange.svg)
 ![Electron](https://img.shields.io/badge/electron-39-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-green.svg)
-![Bindings](https://img.shields.io/badge/bindings-Python%20%7C%20C%23%20%7C%20Kotlin%20%7C%20Swift%20%7C%20Ruby%20%7C%20Elixir-violet.svg)
 
-![banner](https://github.com/user-attachments/assets/be18cffc-b4fe-418b-a3b4-034ee0b35060)
+![Pumas Library](https://github.com/user-attachments/assets/be18cffc-b4fe-418b-a3b4-034ee0b35060)
 
-Pumas Library is a shared AI asset library for people and applications that need one dependable place to store model files, track metadata, and manage downloads. It is available both as a desktop application and as a headless Rust library with cross-language bindings.
+Pumas Library is a desktop and Rust library for keeping AI model files,
+metadata, downloads, and local-runtime configuration in one place.
 
-The core idea is simple: stop treating model storage as app-by-app glue code. Pumas gives you a single library that can be searched, repaired, linked into downstream tools, and embedded into other software without rebuilding the same filesystem, networking, and metadata logic over and over.
+Its main capabilities are:
 
-## Why Pumas
+- an SQLite-indexed local model library with full-text search;
+- Hugging Face search, metadata lookup, and resumable downloads;
+- local import, integrity reconciliation, and repair;
+- typed resolution of model artifacts and runtime requirements; and
+- optional local inference integrations for Ollama, llama.cpp, ONNX Runtime,
+  and Torch.
 
-- Centralize model weights and metadata instead of duplicating them across tools
-- Keep downloads resumable and library state repairable after interruptions
-- Search and inspect a large local library with structured metadata and full-text indexing
-- Embed the same core behavior into desktop apps, services, and language bindings
-- Package a desktop experience and a reusable backend from the same codebase
+## Repository Layout
 
-## What This Repository Contains
+| Path | Responsibility |
+| --- | --- |
+| `rust/crates/pumas-core` | Model library, persistence, downloads, runtime profiles, and public Rust API |
+| `rust/crates/pumas-rpc` | Local HTTP/JSON-RPC sidecar used by the desktop app |
+| `rust/crates/pumas-app-manager` | Optional runtime installation and process integration |
+| `rust/crates/pumas-uniffi` | Experimental UniFFI adapter and generators |
+| `frontend` | React renderer |
+| `electron` | Desktop main process, preload boundary, and packaging |
+| `torch-server` | Optional Python Torch inference sidecar |
 
-- `rust/crates/pumas-core`: the core headless library
-- `rust/crates/pumas-rpc`: the Rust sidecar/backend used by the desktop shell
-- `rust/crates/pumas-uniffi`: UniFFI bindings surface
-- `rust/crates/pumas-rustler`: Rustler bindings for Elixir/Erlang
-- `frontend/`: the React UI
-- `electron/`: the desktop shell and packaging configuration
-- `bindings/`: generated binding artifacts and packaging outputs
+See [Architecture](docs/ARCHITECTURE.md) for process and ownership details.
 
-Standards adoption is tracked in [docs/STANDARDS_ADOPTION.md](docs/STANDARDS_ADOPTION.md).
+## Desktop Quick Start
 
-## Core Capabilities
-
-- Shared model library with SQLite-backed metadata and FTS5 search
-- Hugging Face search, metadata fetch, and resumable download support
-- Model import with hashing and type detection
-- Library reconciliation and repair flows for drifted on-disk state
-- Link and mapping support so consumer tools can reference a central library
-- Cross-process discovery and primary/client coordination over local IPC
-- Network resilience with caching, retries, and circuit breaking
-- Cross-language access through Rust, Python, C#, Kotlin, Swift, Ruby, and Elixir/Erlang
-
-Supported model families include text, diffusion, embedding, audio, and vision workloads, with metadata and indexing designed for mixed libraries rather than a single runtime.
-
-## Architecture At A Glance
-
-Pumas currently enforces a single primary process per launcher root through a
-local registry and IPC. The legacy Rust `PumasApi` facade can still converge
-automatically: it owns the library when it wins the primary claim, or it
-attaches to the existing primary when another process already owns that root.
-
-That transparent behavior is transitional compatibility behavior. New Rust API
-work is moving to explicit roles:
-
-- `PumasLibraryInstance`: owns local state, writes, background work, and local
-  service publication.
-- `PumasLocalClient`: explicitly connects to a same-device running instance.
-- `PumasReadOnlyLibrary`: reads indexed snapshots without owning lifecycle
-  work.
-
-Key implementation pieces:
-
-- SQLite for metadata storage and full-text search
-- Local JSON-RPC over TCP for cross-process API access
-- A global registry for instance and library discovery
-- Best-effort startup behavior so registry or IPC failures do not block initialization
-
-## Quick Start
-
-### Desktop App
-
-The desktop launcher has one shared CLI contract with thin platform wrappers:
+The root launchers share one Node implementation.
 
 ```bash
-# Linux / macOS
 ./launcher.sh --install
-./launcher.sh --build-release
+./launcher.sh --build
 ./launcher.sh --run
 ```
 
-```powershell
-# Windows PowerShell
-./launcher.ps1 --install
-./launcher.ps1 --build-release
-./launcher.ps1 --run
-```
-
-If PowerShell blocks local scripts on Windows, use:
+On Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\launcher.ps1 --help
+.\launcher.ps1 --install
+.\launcher.ps1 --build
+.\launcher.ps1 --run
 ```
 
-Use the same lifecycle flags on both wrappers:
+Release-mode local builds use `--build-release` followed by `--run-release`.
+Run either launcher with `--help` for the complete command and exit-code
+contract.
 
-| Flag | Purpose |
-| ---- | ------- |
-| `--install` | Install workspace dependencies |
-| `--build` | Build debug artifacts |
-| `--build-release` | Build release artifacts |
-| `--run` | Run the desktop app in development mode |
-| `--run-release` | Run the built desktop runtime |
-| `--test` | Run the canonical launcher-facing verification flow |
-| `--release-smoke` | Launch the release runtime briefly and fail if startup is not healthy |
-| `--help` | Show launcher usage |
-
-Note: `--run` expects the debug backend binary from `--build`. Use
-`--build-release` before `--run-release` or `--release-smoke`.
-
-Inference plugins for Ollama, llama.cpp, ONNX Runtime, and Torch are included
-by default. To build the desktop app as a model-library-only application, set
-the capability at build time:
+Inference integrations are included in the default desktop build. Build the
+model-library-only variant with:
 
 ```bash
 PUMAS_INFERENCE_PLUGINS=false ./launcher.sh --build-release
 ```
 
-The corresponding direct commands are `cargo build -p pumas-rpc
---no-default-features` and `npm run build:library-only` in `frontend/`.
+`PUMAS_LAUNCHER_ROOT=/path/to/root` selects a specific library root. A launcher
+root contains `launcher-data/` and `shared-resources/`; the model library itself
+lives under `shared-resources/models/`.
 
-Packaged desktop builds try to reuse an existing launcher root by walking up
-from the packaged binary location. If you need to pin a specific existing
-library root, set `PUMAS_LAUNCHER_ROOT=/path/to/root` before launching the app.
+## Rust Usage
 
-### Rust Crate
+`PumasApi` is the owning API. Construction fails when another process already
+owns the same launcher root. Use `PumasLocalClient` to connect to a running
+owner, or `PumasReadOnlyLibrary` for indexed read-only access.
 
-Add the core crate:
+```rust
+use pumas_library::{PumasApi, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let api = PumasApi::builder("/path/to/pumas")
+        .auto_create_dirs(true)
+        .build()
+        .await?;
+
+    for model in api.list_models().await? {
+        println!("{}", model.official_name);
+    }
+
+    Ok(())
+}
+```
+
+The crate is currently consumed from this workspace:
 
 ```toml
 [dependencies]
 pumas-library = { path = "rust/crates/pumas-core" }
 ```
 
-Minimal example:
-
-```rust
-use pumas_library::PumasApi;
-
-#[tokio::main]
-async fn main() -> pumas_library::Result<()> {
-    let api = PumasApi::new("/path/to/pumas").await?;
-
-    let models = api.list_models().await?;
-    println!("Found {} models", models.len());
-
-    let search = api.search_models("llama", 10, 0).await?;
-    println!("Search found {} results", search.total_count);
-
-    Ok(())
-}
-```
-
-`PumasApi`, `PumasApi::builder(...)`, and `PumasApi::discover()` are the current
-legacy construction surfaces. New integrations should choose the explicit
-owner, local-client, or read-only role once those APIs are available instead of
-depending on hidden primary/client convergence.
-
-## Repairing a Drifted Library
-
-When the filesystem and SQLite metadata drift apart, run the integrity repair example:
+## Verification
 
 ```bash
-cd rust
-cargo run --package pumas-library --example repair_library_integrity -- /path/to/shared-resources/models
-```
-
-This flow is intended for recovery scenarios such as interrupted downloads, stale index rows, and partial content that needs to be reconciled back into canonical library state.
-
-## Language Bindings
-
-Two binding paths are supported:
-
-- `UniFFI` for Python, C#, Kotlin, Swift, and Ruby
-- `Rustler` for Elixir/Erlang
-
-Generate bindings with:
-
-```bash
-./scripts/generate-bindings.sh python
-./scripts/generate-bindings.sh csharp
-./scripts/generate-bindings.sh elixir
-./scripts/generate-bindings.sh all
-```
-
-Useful binding validation and packaging helpers:
-
-```bash
-./scripts/check-uniffi-csharp-smoke.sh
-./scripts/package-uniffi-csharp-artifacts.sh
-```
-
-Generated outputs are written under `bindings/`.
-
-## Build and Package
-
-### Build From Source
-
-```bash
-corepack pnpm install --frozen-lockfile
-
-cd rust
-cargo build --release
-
-cd ..
-corepack pnpm --filter ./frontend build
-corepack pnpm --filter ./electron build
-```
-
-### Package Desktop Releases
-
-Desktop packages need the frontend build output plus a staged `pumas-rpc`
-sidecar under `electron/resources/bin/`. The CI workflow stages the binary from
-the Rust build artifact before invoking Electron Builder. For a local package
-from source:
-
-```bash
-./launcher.sh --build-release
-mkdir -p electron/resources/bin
-cp rust/target/release/pumas-rpc electron/resources/bin/pumas-rpc
-chmod +x electron/resources/bin/pumas-rpc
-```
-
-On Windows, stage `rust\target\release\pumas-rpc.exe` as
-`electron\resources\bin\pumas-rpc.exe`.
-
-Then package with:
-
-| Command | Output |
-| ------- | ------ |
-| `corepack pnpm --filter ./electron exec electron-builder --linux --publish never` | AppImage and `.deb` |
-| `corepack pnpm --filter ./electron exec electron-builder --win --publish never` | Windows installer and portable executable |
-| `corepack pnpm --filter ./electron exec electron-builder --mac --publish never` | DMG |
-
-## Supported Platforms
-
-| Platform | Status | Notes |
-| -------- | ------ | ----- |
-| Linux (x64) | Full support | Primary packaging target |
-| Windows (x64) | Full support | Installer and portable outputs |
-| macOS (ARM) | Best-effort | Build support exists, regular testing is lighter |
-
-## Release Validation
-
-Before cutting a release, run:
-
-```bash
-corepack pnpm install --frozen-lockfile
-./launcher.sh --test
-./launcher.sh --release-smoke
-
 ./scripts/rust/check.sh
-npm run -w frontend test:run
 npm run -w frontend lint
-npm run -w frontend check:size
 npm run -w frontend check:types
-npm run -w frontend build
+npm run -w frontend test:run
 npm run -w electron lint
 npm run -w electron test
-npm run -w electron validate
-npm run -w electron build
+npm run test:launcher
+python3 -m unittest discover -s torch-server/tests
 ```
 
-Use the same launcher flags with `./launcher.ps1` on Windows. The underlying
-`cargo` and `npm` validation commands are the same there.
+Use `./launcher.sh --test` for the launcher-owned aggregate flow. A passing
+build or startup smoke is not evidence for every runtime or release contract;
+see [Development](docs/DEVELOPMENT.md) and [Releasing](RELEASING.md).
 
-For `pumas_rustler`, run its checks on a machine with Erlang/OTP installed.
+## Platform and Binding Status
 
-## Development Notes
+Linux x64 is the primary development and runtime target. CI also compiles and
+packages Windows x64 and macOS arm64 artifacts, but runtime evidence on those
+platforms is narrower.
 
-- Rust, Node, and the workspace package manager are pinned in `rust-toolchain.toml`, `.node-version`, and the root `package.json`
-- The desktop app is built from the React frontend plus the Electron shell plus the Rust `pumas-rpc` sidecar
-- The canonical desktop workflow is the shared launcher contract exposed by
-  `launcher.sh` on Unix and `launcher.ps1` on Windows
-- The repository contains both reusable library code and end-user application packaging
+Binding generators exist for Python, Kotlin, Swift, Ruby, and C#, with a local
+C# smoke harness. These surfaces are not yet backed by a complete host/runtime
+support matrix. The Rustler crate is experimental and does not currently expose
+the core library API. See [Native bindings](docs/native-bindings.md).
 
-## Repository Layout
+## Documentation
 
-```text
-Pumas-Library/
-├── rust/
-│   └── crates/
-│       ├── pumas-core/
-│       ├── pumas-rpc/
-│       ├── pumas-uniffi/
-│       └── pumas-rustler/
-├── frontend/
-├── electron/
-├── bindings/
-├── scripts/
-└── .github/workflows/
-```
+- [Documentation index](docs/README.md)
+- [Contributing](CONTRIBUTING.md)
+- [Releasing](RELEASING.md)
+- [Security](docs/SECURITY.md)
+- [Current standards audit](docs/audits/current-standards-2026-09-03/README.md)
 
 ## License
 
-MIT
+Pumas Library is licensed under the [MIT License](LICENSE).

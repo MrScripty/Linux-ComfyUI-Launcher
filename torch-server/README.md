@@ -1,30 +1,47 @@
-# Torch Server
+# Torch Inference Sidecar
 
-## Purpose
-This directory contains the Python FastAPI sidecar that exposes Torch-backed model loading and OpenAI-compatible inference routes.
+The Torch sidecar is an optional Python service for loading compatible model
+artifacts and exposing Torch inference through Pumas.
 
-## Ownership
-`serve.py` owns application construction and process entrypoints. `control_api.py` and `openai_api.py` own HTTP route registration. `model_manager.py` owns in-process model slot state. `device_manager.py` owns device discovery. `loaders/` owns format-specific model loading.
+## HTTP Surface
 
-## Producer Contract
-All request models that accept paths, network binding, model identifiers, or slot changes must validate those values at the API boundary before mutating manager state.
+- `/v1/*`: OpenAI-compatible inference routes
+- `/api/*`: Pumas load, unload, status, and device controls
+- `/health`: process health
 
-## Consumer Contract
-The launcher and Rust app-manager clients should treat this service as a local sidecar with explicit bind-host and port policy. LAN exposure requires a documented auth or trusted-network policy.
+`ModelManager` owns loaded model slots and eviction. `DeviceManager` owns
+device discovery and selection. Loader modules own framework-specific loading;
+route handlers must not duplicate those policies.
 
-## Boundary Validation
-`validation.py` owns shared validation for model paths, model names, device selectors, listener host, API ports, and model-slot limits.
+## Install and Run
 
-- `PUMAS_TORCH_MODEL_ROOTS` may contain an `os.pathsep`-separated list of approved model roots. When set, `/api/load` rejects model paths outside those roots.
-- `PUMAS_TORCH_ALLOW_LAN=1` and `PUMAS_TORCH_API_TOKEN=<token>` are required before the service accepts a non-loopback bind host or `lan_access=true`.
-- When `PUMAS_TORCH_API_TOKEN` is set, sidecar API routes require either `X-Pumas-Torch-Token: <token>` or `Authorization: Bearer <token>`. `/health` remains unauthenticated for process health checks.
-- API ports must be unprivileged ports in the range `1024..65535`.
-- `max_loaded_models` is bounded to `1..16`.
+Use the Python version pinned at the repository root. From the repository root:
 
-## Testing Contract
-Tests should create a fresh app instance per test and avoid sharing model manager state unless the test explicitly verifies concurrency behavior.
+```bash
+python3 -m venv torch-server/.venv
+torch-server/.venv/bin/pip install -r torch-server/requirements.txt
+torch-server/.venv/bin/pip install -r torch-server/requirements-dev.txt
+torch-server/.venv/bin/python torch-server/serve.py --host 127.0.0.1 --port 8400 --max-models 4
+```
 
-Run the focused sidecar suite from the repository root:
+The managed Pumas runtime normally creates and launches its own environment;
+the commands above are for direct development.
+
+## Network Safety
+
+Loopback is the default. Binding to a non-loopback address requires both:
+
+```bash
+PUMAS_TORCH_ALLOW_LAN=1
+PUMAS_TORCH_API_TOKEN=<secret>
+```
+
+All non-health routes then require the token through
+`X-Pumas-Torch-Token` or a bearer authorization header. Do not expose a local
+model server to an untrusted network merely because it has a token; also apply
+host firewall and network controls.
+
+## Verification
 
 ```bash
 python3 -m ruff check torch-server
@@ -32,16 +49,12 @@ python3 -m ruff format --check torch-server
 python3 -m unittest discover -s torch-server/tests
 ```
 
-The root launcher includes this suite in `launcher.sh --test`.
+The unit suite can install local fakes for missing Torch/runtime dependencies.
+That is useful for control logic but does not prove ASGI middleware, production
+dependency resolution, device discovery, model loading, or inference. Use the
+real resolved environment for claims at those boundaries.
 
-Install Python development tooling with:
-
-```bash
-python3 -m pip install -r torch-server/requirements-dev.txt
-```
-
-## Concurrency Contract
-`model_manager.py` owns a manager-level async registry lock for slot reservations, unload transitions, and `max_loaded_models` updates. Expensive model loading still runs outside the registry lock and is serialized per resolved device.
-
-## Non-Goals
-Frontend UI behavior is out of scope. Reason: this directory owns the Python service boundary only. Revisit trigger: add an end-to-end sidecar smoke harness.
+The production requirements currently use ranges rather than a reproducible
+lock. Capture the exact resolved set for release, vulnerability, and license
+evidence. See [Releasing](../RELEASING.md), [Security](../docs/SECURITY.md), and
+the [current standards audit](../docs/audits/current-standards-2026-09-03/README.md).

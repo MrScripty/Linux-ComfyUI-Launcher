@@ -1,56 +1,42 @@
-# Documentation Index
+# Documentation
 
-This directory contains project documentation for the current Rust/Electron implementation.
+The documentation set is intentionally small. Current behavior belongs in the
+nearest authoritative document; completed plans and obsolete audits remain
+available through Git history rather than in the working tree.
 
-## Core Docs
+## Current Guides
 
-- [../README.md](../README.md) - Project overview, install/use flows, and release validation commands
-- [../CONTRIBUTING.md](../CONTRIBUTING.md) - Contribution workflow and coding expectations
-- [../frontend/README.md](../frontend/README.md) - Frontend-focused implementation notes
+| Document | Purpose |
+| --- | --- |
+| [Project README](../README.md) | Product overview and quick start |
+| [Architecture](ARCHITECTURE.md) | Process, state, storage, and contract ownership |
+| [Development](DEVELOPMENT.md) | Setup, standards routing, and verification |
+| [Contributing](../CONTRIBUTING.md) | Change, planning, documentation, and commit expectations |
+| [Releasing](../RELEASING.md) | Current release flow, required evidence, and known gaps |
+| [Security](SECURITY.md) | Reporting and current trust-boundary guidance |
+| [Native bindings](native-bindings.md) | Binding status, generation, and packaging |
 
-## Standards and Practices
+## Durable Decisions
 
-- [CODING_STANDARDS.md](CODING_STANDARDS.md) - General coding conventions
-- [audits/current-standards-2026-09-03/README.md](audits/current-standards-2026-09-03/README.md) - Current full-codebase standards audit and focused follow-up audits
-- [REACT_ARIA_ENFORCEMENT.md](REACT_ARIA_ENFORCEMENT.md) - Frontend interaction/accessibility guardrails
-- [TESTING.md](TESTING.md) - Test/build validation workflows
-- [SECURITY.md](SECURITY.md) - Security process and scanning guidance
-- [MODEL_RUNTIME_RESEARCH_AGENT.md](MODEL_RUNTIME_RESEARCH_AGENT.md) - Agent workflow for model runtime dependency and inference-settings research/persistence
+- [ADR 0001: ONNX Runtime provider model](adr/0001-onnx-runtime-provider-model.md)
 
-## Architecture
+## Point-in-Time Audits
 
-- [architecture/README.md](architecture/README.md) - Architecture docs index
-- [architecture/SYSTEM_ARCHITECTURE.md](architecture/SYSTEM_ARCHITECTURE.md) - Runtime/process architecture
-- [architecture/MODEL_LIBRARY_ARCHITECTURE.md](architecture/MODEL_LIBRARY_ARCHITECTURE.md) - Model library and dependency contract architecture
+- [2026-09-03 current-standards audit](audits/current-standards-2026-09-03/README.md)
 
-## Plans
+Audits describe the named repository and standards commits. They are evidence
+and remediation inputs, not current operating instructions.
 
-- [plans/README.md](plans/README.md) - Implementation plans for cross-module changes
-- [plans/external-reference-diffusers-implementation-plan.md](plans/external-reference-diffusers-implementation-plan.md) - Plan for external-reference diffusers bundle support integrated with the current model-library systems
-- [plans/directory-import-disambiguation-implementation-plan.md](plans/directory-import-disambiguation-implementation-plan.md) - Plan for distinguishing bundle-root directories from multi-model containers during GUI import
+## Subsystem Guides
 
-## Legal and Compliance
+- [Frontend](../frontend/README.md)
+- [Electron desktop shell](../electron/README.md)
+- [Rust workspace](../rust/README.md)
+- [Core Rust crate](../rust/crates/pumas-core/README.md)
+- [Torch sidecar](../torch-server/README.md)
+- [Developer scripts](../scripts/README.md)
+- [Generated bindings](../bindings/README.md)
+- [Plugin manifests](../launcher-data/plugins/README.md)
 
-- [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) - Third-party license notices
-- [../LICENSE](../LICENSE) - Project license
-
-## Directory Layout
-
-```text
-docs/
-├── README.md
-├── CODING_STANDARDS.md
-├── REACT_ARIA_ENFORCEMENT.md
-├── TESTING.md
-├── SECURITY.md
-├── THIRD-PARTY-NOTICES.md
-├── plans/
-│   ├── README.md
-│   ├── directory-import-disambiguation-implementation-plan.md
-│   └── external-reference-diffusers-implementation-plan.md
-├── sbom/
-└── architecture/
-    ├── README.md
-    ├── SYSTEM_ARCHITECTURE.md
-    └── MODEL_LIBRARY_ARCHITECTURE.md
-```
+When guidance conflicts with executable configuration or code, treat that as
+documentation drift and fix the document and owning behavior together.

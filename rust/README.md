@@ -1,91 +1,74 @@
 # Rust Workspace
 
-Cargo workspace for Pumas Library's native domain crates, RPC server, app manager, and host-language binding crates.
+The Rust workspace owns the model library, local RPC service, optional runtime
+integration, and experimental host-language adapters.
 
-## Purpose
-This directory owns the Rust build boundary for Pumas Library. It keeps workspace membership, shared dependency versions, lockfile state, lint policy, and release profiles together so native crates can be verified with one Cargo contract.
+## Crates
 
-## Contents
-| File/Folder | Description |
-| ----------- | ----------- |
-| `Cargo.toml` | Workspace manifest that defines members, default test members, shared package metadata, workspace lints, shared dependency versions, and release profile policy. |
-| `Cargo.lock` | Committed application lockfile used by CI and release builds to keep native dependency resolution reproducible. |
-| `crates/` | Workspace members for the core library, app manager, RPC server, UniFFI bindings, and Rustler bindings. |
-| `target/` | Local Cargo build output. This is generated state and must stay out of standards audits and commits. |
+| Crate | Responsibility |
+| --- | --- |
+| `pumas-library` (`crates/pumas-core`) | Library state, metadata, SQLite index, imports, downloads, reconciliation, runtime profiles, and serving contracts |
+| `pumas-app-manager` | External runtime installation, version selection, processes, and service clients |
+| `pumas-rpc` | Desktop sidecar, HTTP/JSON-RPC dispatch, events, and `/v1` gateway |
+| `pumas-uniffi` | Experimental UniFFI adapter and binding generation surface |
+| `pumas-rustler` | Experimental Rustler/NIF conversion surface |
 
-## Problem
-The desktop app, bindings, and launcher all depend on native Rust behavior, but those consumers need a single place to discover which crates are supported by default, which crate is responsible for each boundary, and which verification commands apply.
+`pumas-rustler` is excluded from the default workspace test set because it
+requires an Erlang/OTP host. It does not currently expose the core library API.
 
-## Constraints
-- `pumas_rustler` links through the BEAM runtime, so default Cargo test/check flows exclude it until a host-aware CI job exists.
-- `Cargo.lock` is committed because this repository builds an application and release artifacts, not only reusable crates.
-- Workspace lint policy must ratchet gradually because legacy OS and FFI unsafe blocks still need isolation.
-- Generated build output under `target/` can be large and must never drive source audits.
+## Ownership Model
 
-## Decision
-Keep shared Rust ownership at the workspace root and crate-specific ownership under `crates/`. The workspace root defines membership, defaults, shared versions, and broad lint policy; each crate remains responsible for its own README, feature surface, tests, and host-facing contracts.
+One `PumasApi`/`PumasLibraryInstance` owns a launcher root and its lifecycle.
+`PumasLocalClient` connects to an existing owner, while
+`PumasReadOnlyLibrary` provides indexed read-only access. Do not silently fall
+back from owner construction to client or read-only behavior.
 
-## Alternatives Rejected
-- **Per-crate dependency version ownership only:** Rejected because common dependencies would drift across crates and make release builds harder to reproduce.
-- **Including `pumas_rustler` in default workspace checks:** Rejected until CI has an Erlang/OTP environment that can link and exercise the NIF boundary reliably.
+The core crate owns durable state. RPC owns transport and decoding. App manager
+owns external tools and processes. Binding crates own conversion at their host
+boundary rather than duplicating core policy.
 
-## Invariants
-- `Cargo.lock` stays committed and changes in the same commit as dependency manifest changes.
-- Default workspace verification excludes only crates that require unavailable host runtimes.
-- Workspace lints apply to every member crate unless a crate has a documented standards exception.
-- `target/` remains generated local state and is excluded from commits and audit file lists.
+## Provider Model
 
-## Revisit Triggers
-- A new Rust crate is added or a crate changes its host-facing support tier.
-- A dedicated BEAM-aware Rustler job is added to CI.
-- Workspace dependency policy changes, such as moving to `cargo deny` or another duplicate-dependency gate.
-- Unsafe isolation completes and the workspace can ratchet additional lint levels.
+Inference behavior is provider-scoped. Ollama and llama.cpp use managed
+external processes, ONNX Runtime runs in the Rust process, and Torch uses a
+Python sidecar. Runtime profiles, model routes, served-instance identity, and
+gateway capability checks remain separate contracts. See
+[ADR 0001](../docs/adr/0001-onnx-runtime-provider-model.md).
 
-## Dependencies
-### Internal
-- `crates/` - Implements all workspace member crates and owns crate-level contracts.
-- `../scripts/rust/` - Provides the shared Rust verification command used by local development and CI.
-- `../docs/contracts/` - Defines release artifact, native binding, and desktop RPC contracts that Rust crates must satisfy.
+## Features and Variants
 
-### External
-- `cargo` - Resolves, builds, tests, lints, and documents the Rust workspace.
-- `rustfmt` - Formats Rust code through Cargo.
-- `clippy` - Enforces Rust lint checks through Cargo.
-
-## Related ADRs
-- `None identified as of 2026-04-22.`
-- `Reason: The current workspace shape is documented through standards adoption and contract docs rather than an ADR.`
-- `Revisit trigger: Add an ADR before introducing a new native runtime boundary or splitting the workspace into multiple independent release units.`
-
-## Usage Examples
-Run the default standards-aligned Rust verification contract:
+`pumas-rpc` enables `inference-plugins` by default. Its verified library-only
+variant is:
 
 ```bash
-../scripts/rust/check.sh
+cargo build --manifest-path rust/Cargo.toml -p pumas-rpc --no-default-features
 ```
 
-Inspect workspace metadata without building dependencies:
+The `pumas-core` `hf-client`, `process-manager`, and `gpu-monitor` feature names
+currently do not remove their dependencies or public modules. Only the optional
+`uniffi` dependency has a direct feature gate. Do not describe
+`pumas-library --no-default-features` as a minimal build until that contract is
+corrected and tested.
+
+## Verification
+
+From the repository root:
 
 ```bash
-cargo metadata --manifest-path Cargo.toml --no-deps --format-version 1
+./scripts/rust/check.sh
+cargo test --manifest-path rust/Cargo.toml -p pumas-library <test-filter>
+cargo test --manifest-path rust/Cargo.toml -p pumas-rpc <test-filter>
 ```
 
-## API Consumer Contract
-- `None identified as of 2026-04-22.`
-- `Reason: This directory is a Cargo workspace boundary, not a directly imported API surface. Host-facing API contracts live under the owning crates and `docs/contracts/`.`
-- `Revisit trigger: Add a root-level API contract if external consumers begin depending on workspace-level generated artifacts or command wrappers from this directory.`
+The aggregate check runs formatting, all-target/all-feature compilation,
+Clippy, default-member tests and docs, and no-default compilation. Keep tests
+isolated from the user's launcher root, database, processes, ports, and
+environment.
 
-## Structured Producer Contract
-- `Cargo.toml` is the stable workspace manifest. Consumers may rely on workspace members, default members, shared package metadata, workspace lints, shared dependency versions, and release profile settings.
-- `Cargo.lock` is the reproducible dependency resolution snapshot for application and release builds.
-- Changes to workspace members, dependency versions, lint levels, or release profile settings must be committed with any required code, documentation, and lockfile updates.
-- `target/` is intentionally volatile generated state. Consumers must not persist references to paths inside it.
+Workspace lint policy denies unsafe code by default. A module that owns an OS
+or FFI boundary may opt down locally, but every unsafe block requires a
+boundary-specific safety argument.
 
-## Testing
-Use the shared Rust check script for the default CI-equivalent path:
-
-```bash
-../scripts/rust/check.sh
-```
-
-Crate-specific tests may be run from this directory with `cargo test -p <crate>`, except for host-runtime crates that document separate requirements.
+See [Architecture](../docs/ARCHITECTURE.md),
+[Development](../docs/DEVELOPMENT.md), and the
+[current standards audit](../docs/audits/current-standards-2026-09-03/README.md).

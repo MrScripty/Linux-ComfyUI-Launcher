@@ -1,22 +1,27 @@
-# Launcher Plugin Manifests
+# Inference Plugin Manifests
 
-## Purpose
-This directory contains machine-consumed plugin manifest JSON files used by launcher and application-management flows.
+These source-controlled JSON descriptors define the inference integrations
+shipped with Pumas: Ollama, llama.cpp, ONNX Runtime, and Torch. They are
+machine-consumed configuration, not user-installed desktop-app plugins.
 
-## Producer Contract
-Each manifest must describe one plugin by stable identifier, display name, executable or service behavior, version policy, and any managed filesystem locations. Schema changes require a migration or compatibility note.
+The manifest separates presentation metadata, runtime installation strategy,
+capabilities, connection details, model compatibility, and panel layout.
+`installationType` is behavioral:
 
-## Consumer Contract
-Consumers must parse manifests as structured data and reject missing required fields instead of applying ad hoc defaults.
+- `binary`: managed external executable;
+- `python-venv`: managed Python environment and sidecar; and
+- `in-process`: compiled into the Pumas Rust process, with no install/version
+  workflow.
 
-`installationType: "in-process"` means the runtime is supplied by Pumas itself
-and must not be routed through binary, Python, Docker, or version-manager
-installation flows. ONNX Runtime uses this shape because embedding sessions are
-owned by the Rust process and exposed through backend runtime profiles plus the
-Pumas `/v1` gateway.
+These files are source defaults. A launcher root may contain copied or migrated
+runtime state; changing the source descriptor does not by itself migrate every
+existing installation.
 
-## Validation Contract
-Manifest validation should run in launcher or app-manager tests before manifests are packaged for release.
+When changing a descriptor, update and verify all consumers of its IDs,
+provider names, capability fields, installation strategy, and panel types.
+Test both the default inference-enabled build and the library-only build. A new
+provider also requires coordinated core, RPC, frontend, packaging, and security
+work; a manifest alone cannot establish support.
 
-## Non-Goals
-Runtime plugin cache data is out of scope. Reason: this directory should contain source-controlled manifests, not generated plugin state. Revisit trigger: add user-installed plugin support.
+See [Architecture](../../docs/ARCHITECTURE.md) and
+[ADR 0001](../../docs/adr/0001-onnx-runtime-provider-model.md).

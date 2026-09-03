@@ -1,89 +1,82 @@
 # pumas-library
 
-Headless library for AI model management, search, and HuggingFace integration.
+`pumas-library` is the headless Rust API for the Pumas model library. It owns
+launcher-root lifecycle, model packages, metadata, indexing, downloads,
+imports, integrity reconciliation, runtime profiles, and serving state.
 
-## Quick Start
+## Choose the Correct Access Role
 
-```toml
-[dependencies]
-pumas-library = "0.1"
-```
+| API | Use when |
+| --- | --- |
+| `PumasApi` / `PumasLibraryInstance` | This process owns the launcher root and may mutate it |
+| `PumasLocalClient` | Another process owns the root and exposes the local RPC service |
+| `PumasReadOnlyLibrary` | The caller needs indexed reads without lifecycle ownership |
 
-## Usage
+Owner construction fails when another live owner has claimed the same root.
+That result must remain distinct from connection, read-only, and recovery
+outcomes.
 
 ```rust
 use pumas_library::{PumasApi, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api = PumasApi::builder("./my-models")
+    let api = PumasApi::builder("/path/to/pumas")
         .auto_create_dirs(true)
         .build()
         .await?;
 
-    let models = api.list_models().await?;
-    println!("Found {} models", models.len());
+    for model in api.list_models().await? {
+        println!("{}", model.official_name);
+    }
+
     Ok(())
 }
 ```
 
-## Builder Options
+## Model and Storage Rules
 
-The builder pattern provides fine-grained control over initialization:
+The launcher root contains the canonical model filesystem and SQLite index.
+Model identity includes repository/source and artifact information; repository
+name alone is insufficient because a repository can contain several files or
+quantizations. Equivalent content published in a different repository remains
+a separate source model.
 
-```rust
-let api = PumasApi::builder("/path/to/root")
-    .auto_create_dirs(true)   // Create directories if missing
-    .with_hf_client(true)     // Enable HuggingFace integration
-    .with_process_manager(true) // Enable process management
-    .build()
-    .await?;
-```
+Import, resumable download, finalization, repair, migration, and deletion must
+coordinate filesystem state, metadata, index rows, and update events. A
+recoverable partial file, an automatically finalized download, and a complete
+model are different transitions even when the final UI presentation is simple.
 
-`PumasApi` and its builder are the current legacy construction surfaces. They
-may own the launcher root or attach to an existing local primary depending on
-registry state. New API work is splitting that behavior into explicit
-`PumasLibraryInstance`, `PumasLocalClient`, and `PumasReadOnlyLibrary` roles so
-callers choose ownership and transport behavior directly.
+## Public Boundary
 
-`PumasReadOnlyLibrary` is available for snapshot-style consumers that only need
-indexed state from an existing model library:
+Prefer the facade and typed domain records exported by `src/lib.rs`. Internal
+modules own persistence, network, process, provider, and conversion details.
+Do not make a new internal module public to avoid designing a stable operation.
 
-```rust
-use pumas_library::{models::ModelLibrarySelectorSnapshotRequest, PumasReadOnlyLibrary, Result};
+Untrusted JSON, paths, URLs, metadata, and persisted rows must be decoded and
+validated at entry. Preserve invalid, absent, unsupported, stale, partial, and
+failed outcomes instead of collapsing them into defaults.
 
-fn list_selector_rows() -> Result<()> {
-    let library = PumasReadOnlyLibrary::open("/path/to/pumas/shared-resources/models")?;
-    let snapshot = library.model_library_selector_snapshot(
-        ModelLibrarySelectorSnapshotRequest::default(),
-    )?;
-    println!("Indexed rows: {}", snapshot.rows.len());
-    Ok(())
-}
-```
+## Features
 
-## Feature Flags
+The default `full` feature enables the named `hf-client`, `process-manager`, and
+`gpu-monitor` markers. Those markers currently do not remove their dependencies
+or module surfaces when disabled. The `uniffi` feature does gate the optional
+UniFFI dependency.
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `full` | ✓ | Enable all features |
-| `hf-client` | ✓ | HuggingFace model search & download |
-| `process-manager` | ✓ | Inference runtime process management |
-| `gpu-monitor` | ✓ | GPU monitoring |
+## Verification
 
-Minimal build:
+From the repository root:
+
 ```bash
-cargo add pumas-library --no-default-features
+cargo test --manifest-path rust/Cargo.toml -p pumas-library
+cargo check --manifest-path rust/Cargo.toml -p pumas-library --all-targets --all-features
+cargo clippy --manifest-path rust/Cargo.toml -p pumas-library --all-targets --all-features -- -D warnings
+cargo doc --manifest-path rust/Cargo.toml -p pumas-library --no-deps
 ```
 
-## Core Features
+Use `./scripts/rust/check.sh` for the workspace evidence set. Tests must use
+temporary roots and must not discover or mutate a developer's real library.
 
-- **Model Library**: Index, search, and manage local AI models
-- **HuggingFace Integration**: Search and download models from HuggingFace Hub
-- **Model Mapping**: Link models to application directories with symlinks
-- **Process Management**: Launch and monitor supported inference runtimes
-- **System Utilities**: GPU monitoring, disk space, system resources
-
-## License
-
-MIT
+See the workspace [Rust guide](../../README.md) and
+[architecture](../../../docs/ARCHITECTURE.md).

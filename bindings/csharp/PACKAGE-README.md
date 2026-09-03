@@ -1,34 +1,15 @@
-# Pumas C# Bindings
+# Pumas C# Binding Package
 
-This package contains generated C# bindings for the Pumas native shared
-library.
+This archive contains generated C# sources for `pumas_uniffi`. Its
+`manifest.json` names the required native library and the separately packaged
+native archive for the same platform and Cargo profile.
 
-## Contents
+Keep the generated sources and native library from the same Pumas version,
+commit, target, and build profile. Place the native library beside the host
+executable or on the platform's native-library search path before loading the
+binding.
 
-| Path | Purpose |
-| ---- | ------- |
-| `bindings/csharp/pumas_uniffi.cs` | Primary generated C# binding surface for `pumas-uniffi`. |
-| `bindings/csharp/pumas_library.cs` | Generated support types required by the C# surface. |
-| `docs/native-bindings.md` | Native binding contract, compatibility notes, and loader guidance. |
-| `manifest.json` | Machine-readable package summary. |
-
-## Required Native Library
-
-This package does not bundle the native Pumas shared library by default.
-Download the matching `pumas-library-native-<platform>.zip` package from the
-same build or release and place the platform library next to your application
-binary or on the platform's native-library search path.
-
-Do not mix generated C# files from one build with a native library from
-another build.
-
-## Minimal Usage
-
-```csharp
-using uniffi.pumas_uniffi;
-
-Console.WriteLine(PumasUniffiMethods.Version());
-```
-
-For artifact layout and native-library loading guidance, see
-`docs/native-bindings.md`.
+These bindings are experimental. The current smoke evidence covers native
+loading and a synchronous version call, not the full async or model-library API.
+See `docs/native-bindings.md` in the archive for integration constraints and
+the evidence required before claiming host support.
