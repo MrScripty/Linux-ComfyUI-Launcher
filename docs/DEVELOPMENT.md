@@ -52,9 +52,6 @@ npm run -w frontend build
 npm run -w frontend build:library-only
 ```
 
-`check:size` and `check:errors` are legacy policies under review. Neither is a
-substitute for an ownership/design review or a typed error-contract check.
-
 ### Electron and Launcher
 
 ```bash
@@ -105,6 +102,60 @@ known overlap, and enough marginal value to justify its maintenance. Examples:
 
 Choose targeted evidence first, then broaden where the changed boundary or
 release risk requires it.
+
+## Permanent Verification Inventory
+
+Repository hooks provide optional early local feedback when a contributor
+installs them. They can block that local Git operation, but Git bypass remains
+operator authority and the hooks do not establish repository acceptance. CI
+runs on pull requests targeting `main`, pushes to `main`, and version-tag
+pushes. A failing step blocks its workflow and dependants; whether a workflow
+is required to merge is external branch-protection state and is not asserted
+here.
+
+Setup, cache, download, upload, and artifact-transport steps are prerequisites,
+not independent evidence claims. The table lists the semantic gates that are
+intended to decide a property.
+
+| Gate and schedule | Claim and deciding oracle | Overlap and marginal value | Blocking authority and environment |
+| --- | --- | --- | --- |
+| `check-commit-message` at installed `commit-msg` | The first non-comment subject follows the project conventional-commit grammar in `CONTRIBUTING.md`; the repository shell matcher is the executable oracle. | Earlier feedback than review/CI; it does not prove change quality. | Blocks the local commit unless bypassed; representative local Bash/Git environment. |
+| `trailing-whitespace` and `end-of-file-fixer` at installed `pre-commit` | Selected text files contain no trailing whitespace and end with the tool's normalized final newline; the post-transform bytes are the oracle. | Covers docs/config formats outside language formatters; mutation is exposed for restaging. | Blocks the local commit until changes are restaged unless bypassed; supported local pre-commit environment. |
+| `check-yaml` at installed `pre-commit` | Selected YAML parses as YAML; the pinned hook parser is the oracle. | Actionlint is deeper for GitHub workflows, while this covers other YAML syntax only. | Local/bypassable; supported local pre-commit environment. |
+| `check-merge-conflict` at installed `pre-commit` | Selected text has no unresolved merge-marker pattern; the pinned scanner is the oracle. | Git already rejects unresolved index entries; this catches accidentally staged marker text. | Local/bypassable; supported local pre-commit environment. |
+| `check-json` at installed `pre-commit` | Selected strict-JSON files outside the declared frontend/`.vscode` exclusions parse; the pinned parser is the oracle. | Package/tool consumers also parse files they read; this supplies earlier staged-file diagnosis for the remaining scope. | Local/bypassable; supported local pre-commit environment. |
+| `detect-private-key` at installed `pre-commit` | Selected staged text has no key signature recognized by the pinned detector. | Low-cost defense for known signatures; it does not prove secret absence or safe diagnostics. | Local/bypassable; supported local pre-commit environment. |
+| Actionlint in `lint-workflows` | GitHub workflow structure and expressions satisfy Actionlint's model; Actionlint is the independent parser/static oracle. | Deeper than generic YAML parsing for `.github/workflows`; does not execute jobs. | Workflow-blocking on Linux CI for every CI trigger. |
+| `check:dependency-ownership` in `lint-workflows` | Root owns no runtime/dev packages and each workspace declares the tool set the repository policy assigns it; manifests are inputs and the repository checker owns the mapping. | Package installation proves resolution, not declaration ownership. | Workflow-blocking, deterministic Node check on Linux CI; local on demand. |
+| `check:release-versions` in `lint-workflows` and release preparation | Root, frontend, Electron, and Rust workspace release versions are identical; their manifest values are the authoritative inputs. | Packaging may expose a mismatch later; this provides direct causal diagnosis before builds. | Workflow-blocking, deterministic Node check on Linux CI; locally required before release. |
+| Cross-target Rust release build in `build-rust` | The non-Rustler workspace compiles in release mode for each declared target and produces the named native/RPC files; Cargo and file production are the oracle. | Rust quality checks debug/all-feature contracts; target builds uniquely prove target compilation/artifact creation, not runtime support. | Workflow-blocking on Linux x64, Windows x64, and macOS arm64 CI runners. |
+| Cross-platform Rust release tests in `build-rust` | The non-Rustler workspace tests pass in release mode on each runner OS; test assertions are the behavior oracles. | Linux debug tests overlap intentionally; runner-specific execution can expose OS/path/process behavior. | Workflow-blocking on the three target CI runners. |
+| `scripts/rust/check.sh` in `rust-quality` | Formatting, all-target/all-feature compilation, Clippy warnings, workspace tests, doctests, and no-default compilation each satisfy their named tool/assertion contract. | Complements release target builds with static, debug, docs, and feature evidence; excludes the separately owned Rustler host claim. | Workflow-blocking on representative Linux CI; local aggregate command. |
+| Frontend ESLint in `build-frontend` | Type-aware and frontend lint rules accept the configured source scope; ESLint's AST/type analysis is the oracle for only those rules. | TypeScript overlaps type facts, not lint-specific source/interaction policy. | Workflow-blocking on representative Linux CI; local on demand. |
+| Frontend `check:types` in `build-frontend` | The configured renderer TypeScript program type-checks without emit; the compiler is authoritative for static consistency. | Build also type-checks while emitting; the no-emit command gives direct diagnosis before tests/build. | Workflow-blocking on representative Linux CI; local on demand. |
+| Frontend `test:run` in `build-frontend` | Vitest component/unit assertions pass in jsdom or their selected simulation. | Decides local renderer behavior only; representative browser/Electron workflows remain separately owned. | Workflow-blocking on representative Linux CI; local on demand. |
+| Frontend default build in `build-frontend` | Vite emits the default renderer bundle consumed by Electron; build completion and output production are the oracle. | Does not prove renderer behavior or library-only mode. | Workflow-blocking on Linux CI; output is an input to all Electron package jobs. |
+| `test:launcher` in `verify-launcher` | Shared CLI parsing, action delegation, package-manager invocation, and shell/PowerShell wrapper parity satisfy their Node test assertions. | Release smoke traverses a real startup path; these tests provide focused failure diagnosis. | Workflow-blocking on representative Linux CI; local on demand. |
+| Torch Ruff lint and format checks in `verify-launcher` | Python source satisfies the selected Ruff diagnostics and formatting projection. | Static support only; unit and real-runtime claims remain distinct. | Workflow-blocking on representative Linux CI; local on demand. |
+| Torch unit suite in `verify-launcher` | Sidecar unit assertions pass with their declared local fakes/substitutes. | Does not prove ASGI, middleware, model loading, GPU, or inference in a resolved Torch environment. | Workflow-blocking on representative Linux CI; local on demand. |
+| `launcher.sh --build-release` plus `--release-smoke` in `verify-launcher` | The Linux release layout builds and the Electron process starts under the recorded Xvfb smoke conditions for its bounded observation. | Build/startup only; no user workflow or non-Linux runtime claim. | Workflow-blocking on Linux Xvfb CI. |
+| Crate packaging and binding-source generation in `generate-bindings` | Cargo can package `pumas-library` and the selected generators emit five host-language source projections from the Linux UniFFI library. | Generation proves production/freshness from that input, not host load, call, native selection, or package usability. | Workflow-blocking on Linux CI after target Rust builds. |
+| Electron ESLint in `build-electron` | Electron TypeScript/JavaScript satisfies the configured lint rules. | Deterministic lint runs once; platform tests retain target-specific value. | Workflow-blocking on the Linux Electron matrix member. |
+| Electron `test` in `build-electron` | TypeScript emits and Node tests prove the current IPC allowlist/request, launcher, and process-boundary assertions on each packaging OS. | Its build is the package input, so a second unchanged compile had no marginal value and was removed. | Workflow-blocking on Linux x64, Windows x64, and macOS arm64 CI runners. |
+| Electron-builder package step in `build-electron` | Each runner produces an installer/archive accepted by electron-builder for its configured target. | Does not prove installation, startup, contents, signing, or user behavior; those remain platform/release claims. | Workflow-blocking on the three packaging runners; artifact absence is reported by upload policy. |
+| Tagged release assembly, checksum generation, and draft creation | All downloaded outputs can be assembled, at least one release artifact exists, SHA-256 entries are generated for every assembled file, and the provider accepts a draft release. | Packaging jobs own production; this proves assembly/checksum coverage/provider draft creation, not artifact behavior or publication approval. | Runs only for version tags after all declared dependencies; workflow-blocking on Linux CI with release write permission. |
+
+### Pending Higher-Fidelity Claims
+
+| Claim gap | Implementation owner |
+| --- | --- |
+| RPC DTO/error compatibility, hostile inputs, transport authorization, persistence interruption, and model-index lifecycle | [Rust library and RPC plan](plans/current-standards-remediation-2026-09-03/rust-library-and-rpc/plan.md) |
+| Representative renderer workflows, accessibility interaction, decoded outcomes, cache provenance, and default/library-only behavior | [Frontend and UI plan](plans/current-standards-remediation-2026-09-03/frontend-and-ui/plan.md) |
+| Generated decoder projection, host-language load/call, target runtime support, installer contents/startup, SBOM/provenance, and final release artifacts | [Desktop, release, bindings, and Torch plan](plans/current-standards-remediation-2026-09-03/desktop-release-bindings-and-torch/plan.md) |
+
+These gaps remain pending until their focused plans record the required
+contract, system, user-workflow, required-real, or release-artifact evidence.
+A lower-fidelity row above cannot close them.
 
 ## Documentation Lifecycle
 

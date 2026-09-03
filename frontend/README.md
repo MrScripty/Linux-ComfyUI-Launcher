@@ -82,8 +82,7 @@ npm run -w frontend build:library-only
 ```
 
 The default build includes inference integrations. `build:library-only`
-removes their UI. `check:size` and `check:errors` are legacy diagnostic scripts,
-not architectural or typed error-contract proof.
+removes their UI.
 
 For representative desktop behavior, build and run through the root launcher.
 See [Development](../docs/DEVELOPMENT.md) and the

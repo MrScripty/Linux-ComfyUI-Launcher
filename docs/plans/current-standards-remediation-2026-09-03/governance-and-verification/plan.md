@@ -1,18 +1,20 @@
 # Plan: Current Standards Governance and Verification
 
-**Plan status:** `Planned`
+**Plan status:** `Accepted`
 
-**Current phase:** Governance authority is current; remediation awaits an explicit `start`.
+**Current phase:** All governance milestones and objective acceptance claims
+are accepted.
 
-**Next slice:** On explicit `start`, Milestone 1 — retire the remaining count-based frontend gates and their command/CI registrations.
+**Next slice:** `none`
 
-**Acceptance status:** `partial`
+**Acceptance status:** `satisfied`
 
 **Execution ledger:** [execution-ledger.md](execution-ledger.md)
 
 **Issues:** [issues.md](issues.md)
 
-**Reports:** Initial report slots are listed in the [ledger](execution-ledger.md#reports).
+**Reports:** [Error-contract gate disposition](reports/error-contract-gate-disposition.md)
+and [final governance evidence](reports/final-governance-evidence.md).
 
 **Audit source:** [Standards governance and verification](../../../audits/current-standards-2026-09-03/governance-and-verification.md)
 
@@ -38,10 +40,10 @@ regex-based proxy authority.
 | ID | Observable criterion | Kind | Environment | Mode | Status | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
 | GOV-A1 | Contributor and documentation entry points route through current Core and Router owners, and active plans have explicit lifecycle authority. | `focused` | `not-applicable` | `either` | `satisfied` | `d84e2b35`; [current guidance](../../../../CONTRIBUTING.md) |
-| GOV-A2 | No blocking frontend or repository gate treats line, complexity, file, or directory counts as architecture/documentation acceptance. | `contract` | `representative` (Linux, pinned Node/pnpm) | `automated` | `pending` | Pending Milestone 1 |
-| GOV-A3 | The legacy regex error checker has an evidence-backed retain, replace, or remove disposition; any retained check has an adequate oracle and one schedule. | `focused` | `representative` (Linux, pinned Node/pnpm) | `either` | `pending` | Pending Milestone 2 |
-| GOV-A4 | Every retained permanent gate has one documented claim, proof boundary, oracle, overlap disposition, blocking authority, and schedule. | `contract` | `not-applicable` | `manual` | `pending` | Pending Milestone 3 |
-| GOV-A5 | The affected contributor, frontend, CI, and launcher verification commands pass after obsolete mechanisms are removed. | `integration` | `representative` (Linux development environment) | `automated` | `pending` | Pending Milestone 4 |
+| GOV-A2 | No blocking frontend or repository gate treats line, complexity, file, or directory counts as architecture/documentation acceptance. | `contract` | `representative` (Linux, pinned Node/pnpm) | `automated` | `satisfied` | Milestone 1 evidence in the [ledger](execution-ledger.md#2026-09-03--milestone-1-accepted-retire-count-based-blocking-gates) |
+| GOV-A3 | The legacy regex error checker has an evidence-backed retain, replace, or remove disposition; any retained check has an adequate oracle and one schedule. | `focused` | `representative` (Linux, pinned Node/pnpm) | `either` | `satisfied` | [Disposition report](reports/error-contract-gate-disposition.md) and Milestone 2 evidence in the [ledger](execution-ledger.md#2026-09-03--milestone-2-accepted-remove-the-regex-error-checker) |
+| GOV-A4 | Every retained permanent gate has one documented claim, proof boundary, oracle, overlap disposition, blocking authority, and schedule. | `contract` | `not-applicable` | `manual` | `satisfied` | [Permanent verification inventory](../../../DEVELOPMENT.md#permanent-verification-inventory) and Milestone 3 cross-review in the [ledger](execution-ledger.md#2026-09-03--milestone-3-accepted-publish-the-verification-inventory) |
+| GOV-A5 | The affected contributor, frontend, CI, and launcher verification commands pass after obsolete mechanisms are removed. | `integration` | `representative` (Linux development environment) | `automated` | `satisfied` | [Final governance evidence](reports/final-governance-evidence.md) |
 
 ## Scope
 
@@ -200,21 +202,22 @@ registrations while preserving useful lint, type, and test evidence.
 - `frontend/scripts/check-file-size.js`
 - `frontend/scripts/file-size-baseline.json`
 - `frontend/package.json`
+- `frontend/README.md`
 - `.github/workflows/build.yml`
 - `docs/DEVELOPMENT.md`
 - this plan, ledger, and issues files
 
 **Tasks:**
 
-- [ ] Remove blocking `max-lines`, `max-lines-per-function`, and `complexity`
+- [x] Remove blocking `max-lines`, `max-lines-per-function`, and `complexity`
   rules whose thresholds claim architecture authority.
-- [ ] Remove `check:size`, its script/baseline, and CI/precommit registrations.
-- [ ] Verify no current command or guide still invokes the removed mechanism.
-- [ ] Run frontend lint, typecheck, and tests to prove retained gates still run.
+- [x] Remove `check:size`, its script/baseline, and CI/precommit registrations.
+- [x] Verify no current command or guide still invokes the removed mechanism.
+- [x] Run frontend lint, typecheck, and tests to prove retained gates still run.
 
 **Acceptance gate:** GOV-A2 plus affected frontend static/test evidence.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 2: Decide the Error-Contract Mechanism
 
@@ -226,6 +229,7 @@ disposition and route any real defects to their owning boundary.
 - `frontend/scripts/check-error-handling.js`
 - `frontend/package.json`
 - `frontend/eslint.config.js`
+- `frontend/README.md`
 - `.pre-commit-config.yaml`
 - `.github/workflows/build.yml`
 - `docs/DEVELOPMENT.md`
@@ -234,18 +238,18 @@ disposition and route any real defects to their owning boundary.
 
 **Tasks:**
 
-- [ ] Classify every current regex report by reachable failure, contract owner,
+- [x] Classify every current regex report by reachable failure, contract owner,
   existing proof, and disposition.
-- [ ] Choose retain, replace, or remove for each intended invariant; prefer
+- [x] Choose retain, replace, or remove for each intended invariant; prefer
   existing type-aware lint or focused behavior tests where adequate.
-- [ ] If a new implementation mechanism would be required, re-plan with its
+- [x] If a new implementation mechanism would be required, re-plan with its
   precise oracle and cost before adding it.
-- [ ] Give real defects outside this write set an owner in `issues.md` rather
+- [x] Give real defects outside this write set an owner in `issues.md` rather
   than silently broadening this milestone.
 
 **Acceptance gate:** GOV-A3 and reviewed disposition report.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 3: Publish the Claim-to-Evidence Inventory
 
@@ -260,21 +264,22 @@ and assign uncovered high-fidelity claims to their implementation plans.
 - `electron/package.json`
 - `package.json`
 - `.pre-commit-config.yaml`
+- `.pre-commit-hooks/check_hardcoded_colors.py`
 - `.github/workflows/build.yml`
 - this plan, ledger, and issues files
 
 **Tasks:**
 
-- [ ] Inventory every retained hook, package check, and CI gate.
-- [ ] Record claim, boundary, oracle, overlap/marginal value, blocking authority,
+- [x] Inventory every retained hook, package check, and CI gate.
+- [x] Record claim, boundary, oracle, overlap/marginal value, blocking authority,
   environment, and schedule in the existing development guide.
-- [ ] Reconcile duplicated, absent, or misleading registrations without adding
+- [x] Reconcile duplicated, absent, or misleading registrations without adding
   missing system/release tests owned by other plans.
-- [ ] Link every pending high-fidelity claim to one focused plan owner.
+- [x] Link every pending high-fidelity claim to one focused plan owner.
 
 **Acceptance gate:** GOV-A4 and configuration/documentation cross-review.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 4: Governance Acceptance
 
@@ -288,15 +293,15 @@ evidence gaps without claiming the broader remediation program is complete.
 
 **Tasks:**
 
-- [ ] Run every affected retained command in its available Linux environment.
-- [ ] Verify removed commands and files have no live consumers.
-- [ ] Review the plan-level acceptance claims and link final evidence.
-- [ ] Record pending cross-platform, system, and release claims under their
+- [x] Run every affected retained command in its available Linux environment.
+- [x] Verify removed commands and files have no live consumers.
+- [x] Review the plan-level acceptance claims and link final evidence.
+- [x] Record pending cross-platform, system, and release claims under their
   focused plan owners.
 
 **Acceptance gate:** GOV-A1 through GOV-A5 are satisfied.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ## Blockers
 
@@ -314,7 +319,7 @@ evidence gaps without claiming the broader remediation program is complete.
 
 ## Final Acceptance
 
-- Acceptance status: `partial`
+- Acceptance status: `satisfied`
 - Deferred follow-ups: system, user-workflow, cross-platform, binding-host, and
   release-artifact evidence remain owned by their focused plans.
-- Final status: `Planned`
+- Final status: `Accepted`

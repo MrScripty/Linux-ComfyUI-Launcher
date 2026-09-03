@@ -80,25 +80,6 @@ export default tseslint.config(
       '@typescript-eslint/require-await': 'off',
       '@typescript-eslint/no-unnecessary-type-conversion': 'off',
 
-      'max-lines': [
-        'error',
-        {
-          max: 300,
-          skipBlankLines: true,
-          skipComments: true,
-        },
-      ],
-      // Coarse F07 ratchet; lower this as long functions are decomposed.
-      'max-lines-per-function': [
-        'error',
-        {
-          max: 500,
-          skipBlankLines: true,
-          skipComments: true,
-        },
-      ],
-      complexity: ['error', 20],
-
       // Prevent generic Error usage and enforce React Aria patterns
       'no-restricted-syntax': [
         'error',
@@ -133,12 +114,6 @@ export default tseslint.config(
       // Accessibility rules from jsx-a11y
       'jsx-a11y/mouse-events-have-key-events': 'error',
       'jsx-a11y/no-static-element-interactions': 'error',
-    },
-  },
-  {
-    files: ['src/**/*.test.{ts,tsx}'],
-    rules: {
-      'max-lines': 'off',
     },
   }
 );

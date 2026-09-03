@@ -83,13 +83,14 @@ Run the smallest evidence set that proves the change. Common baselines are:
 | Torch | Ruff checks plus `python3 -m unittest discover -s torch-server/tests` |
 | Release startup | `./launcher.sh --build-release` and `--release-smoke` |
 
+[Development](docs/DEVELOPMENT.md#permanent-verification-inventory) owns the
+exact claims, proof limits, blocking authority, environments, and schedules of
+the retained permanent gates.
+
 Tests must isolate filesystem, database, process, port, and environment state.
 For cross-process changes, include producer and consumer evidence. For UI
 changes, verify the interaction in a representative Electron/browser runtime;
 jsdom alone does not prove focus, layout, or assistive-technology behavior.
-
-The legacy frontend line-count and regex error scripts are under standards
-review and are not architectural or error-contract proof by themselves.
 
 ## Documentation
 

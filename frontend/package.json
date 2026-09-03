@@ -14,10 +14,7 @@
     "test:ui": "vitest --ui",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "check:errors": "node scripts/check-error-handling.js",
-    "check:size": "node scripts/check-file-size.js",
-    "check:types": "tsc --noEmit",
-    "precommit": "npm run lint && npm run check:errors && npm run check:size && npm run check:types"
+    "check:types": "tsc --noEmit"
   },
   "dependencies": {
     "@react-aria/interactions": "^3.26.0",
