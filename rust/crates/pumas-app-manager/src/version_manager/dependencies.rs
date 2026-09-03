@@ -454,7 +454,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manager = DependencyManager::new(
             temp_dir.path().to_path_buf(),
-            AppId::ComfyUI,
+            AppId::Torch,
             temp_dir.path().join("pip-cache"),
         );
         (manager, temp_dir)

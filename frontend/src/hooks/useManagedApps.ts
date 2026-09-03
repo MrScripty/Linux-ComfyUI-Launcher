@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Box } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { DEFAULT_APPS } from '../config/apps';
 import type { SystemResources, AppConfig, AppIconState } from '../types/apps';
 
@@ -15,7 +14,6 @@ interface ManagedAppVisualState {
 
 interface UseManagedAppsOptions {
   systemResources?: SystemResources;
-  comfyui: ManagedAppVisualState;
   llamaCpp: ManagedAppVisualState;
   ollama: ManagedAppVisualState;
   torch: ManagedAppVisualState;
@@ -45,19 +43,9 @@ function deriveIconState({
 
 export function decorateManagedApps(
   apps: AppConfig[],
-  { systemResources, comfyui, llamaCpp, ollama, torch }: UseManagedAppsOptions
+  { systemResources, llamaCpp, ollama, torch }: UseManagedAppsOptions
 ): AppConfig[] {
   return apps.map((app) => {
-    if (app.id === 'comfyui') {
-      return {
-        ...app,
-        status: comfyui.isRunning ? 'running' : 'idle',
-        ramUsage: calculateUsagePercent(comfyui.ramMemory, systemResources?.ram.total),
-        gpuUsage: calculateUsagePercent(comfyui.gpuMemory, systemResources?.gpu.memory_total),
-        iconState: deriveIconState(comfyui),
-      };
-    }
-
     if (app.id === 'ollama') {
       return {
         ...app,
@@ -97,38 +85,7 @@ export function useManagedApps(options: UseManagedAppsOptions) {
     setApps((prevApps) => decorateManagedApps(prevApps, options));
   }, [options]);
 
-  const deleteApp = useCallback((appId: string) => {
-    setApps((prevApps) => prevApps.filter((app) => app.id !== appId));
-  }, []);
-
-  const reorderApps = useCallback((reorderedApps: AppConfig[]) => {
-    setApps(reorderedApps);
-  }, []);
-
-  const addApp = useCallback((insertAtIndex: number) => {
-    setApps((prevApps) => {
-      const newAppNumber = prevApps.length + 1;
-      const newApp: AppConfig = {
-        id: `app-${Date.now()}`,
-        name: `new-app-${newAppNumber}`,
-        displayName: `New App ${newAppNumber}`,
-        icon: Box,
-        status: 'idle',
-        iconState: 'uninstalled',
-        ramUsage: 0,
-        gpuUsage: 0,
-      };
-
-      const nextApps = [...prevApps];
-      nextApps.splice(insertAtIndex, 0, newApp);
-      return nextApps;
-    });
-  }, []);
-
   return {
     apps,
-    deleteApp,
-    reorderApps,
-    addApp,
   };
 }

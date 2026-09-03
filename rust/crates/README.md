@@ -7,7 +7,7 @@ This directory contains the Rust workspace members that provide Pumas Library's 
 | Crate | Role | Primary Consumers | Boundary |
 | --- | --- | --- | --- |
 | `pumas-library` | Headless domain library for models, metadata, indexing, process management, and filesystem-backed state. | `pumas-rpc`, `pumas-app-manager`, `pumas-uniffi`, `pumas-rustler`, Rust tests. | Owns durable data and domain invariants. |
-| `pumas-app-manager` | Application version and plugin-adjacent service clients for ComfyUI, Ollama, and Torch. | `pumas-rpc`, integration tests. | Owns external app lifecycle coordination, not model-library storage. |
+| `pumas-app-manager` | Inference-runtime version and service clients for Ollama, llama.cpp, ONNX Runtime, and Torch. | `pumas-rpc`, integration tests. | Owns external runtime lifecycle coordination, not model-library storage. |
 | `pumas-rpc` | JSON-RPC server process used by Electron. | Electron main process, launcher smoke checks. | Owns network ingress, request parsing, and trust-boundary validation. |
 | `pumas-uniffi` | UniFFI cdylib and binding generator entrypoint. | C#, future host languages. | Owns supported FFI DTOs and compatibility tiers. |
 | `pumas_rustler` | Rustler cdylib for BEAM hosts. | Elixir/Erlang hosts. | Owns NIF-safe wrappers around core operations. |

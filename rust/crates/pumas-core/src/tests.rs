@@ -128,9 +128,7 @@ async fn test_api_paths() {
 
     assert!(api.launcher_data_dir().ends_with("launcher-data"));
     assert!(api.metadata_dir().ends_with("metadata"));
-    assert!(api
-        .versions_dir(AppId::ComfyUI)
-        .ends_with("comfyui-versions"));
+    assert!(api.versions_dir(AppId::Ollama).ends_with("ollama-versions"));
 }
 
 #[tokio::test]

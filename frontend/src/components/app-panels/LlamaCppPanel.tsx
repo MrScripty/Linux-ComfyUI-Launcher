@@ -11,7 +11,6 @@ export interface LlamaCppPanelProps {
   versions: AppVersionState;
   showVersionManager: boolean;
   onShowVersionManager: (show: boolean) => void;
-  activeShortcutState?: { menu: boolean; desktop: boolean };
   diskSpacePercent: number;
   modelManagerProps: ModelManagerProps;
 }
@@ -22,7 +21,6 @@ export function LlamaCppPanel({
   versions,
   showVersionManager,
   onShowVersionManager,
-  activeShortcutState,
   diskSpacePercent,
   modelManagerProps,
 }: LlamaCppPanelProps) {
@@ -36,7 +34,6 @@ export function LlamaCppPanel({
           versions={versions}
           showManager={showVersionManager}
           onShowManager={onShowVersionManager}
-          activeShortcutState={activeShortcutState}
           diskSpacePercent={diskSpacePercent}
         />
         {!isManagerOpen && connectionUrl && (

@@ -1776,7 +1776,7 @@ mod tests {
             RuntimeProviderId::Ollama
         );
         assert_eq!(snapshot.snapshot.routes[0].model_id, "llm/test/model");
-        assert_eq!(snapshot.snapshot.routes[0].auto_load, false);
+        assert!(!snapshot.snapshot.routes[0].auto_load);
 
         let persisted: Value =
             serde_json::from_slice(&std::fs::read(config_path).unwrap()).unwrap();

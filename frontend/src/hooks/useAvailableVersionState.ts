@@ -186,7 +186,6 @@ export function useAvailableVersionState({
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
     let waitTimeout: NodeJS.Timeout | null = null;
-    const supportsBackgroundFetch = resolvedAppId === 'comfyui';
 
     if (!isEnabled || !trackAvailableVersions) {
       return () => {};
@@ -204,17 +203,6 @@ export function useAvailableVersionState({
           logger.info('Background GitHub fetch in progress (refreshing cache)');
         }
 
-        if (!isAPIAvailable()) return;
-        if (
-          supportsBackgroundFetch
-          && !status.is_fetching
-          && status.has_cache
-          && await api.should_update_ui_from_background_fetch()
-        ) {
-          logger.info('Background fetch completed - refreshing UI with new data');
-          await api.reset_background_fetch_flag();
-          await fetchAvailableVersionsRef.current(false);
-        }
       } catch (error) {
         if (error instanceof APIError) {
           logger.error('API error checking background fetch', {

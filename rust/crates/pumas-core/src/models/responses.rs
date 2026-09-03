@@ -116,8 +116,6 @@ pub struct AppResourceUsage {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct AppResources {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub comfyui: Option<AppResourceUsage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama: Option<AppResourceUsage>,
 }
 
@@ -129,14 +127,7 @@ pub struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub version: String,
-    pub deps_ready: bool,
-    pub patched: bool,
-    pub menu_shortcut: bool,
-    pub desktop_shortcut: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub shortcut_version: Option<String>,
     pub message: String,
-    pub comfyui_running: bool,
     pub ollama_running: bool,
     pub torch_running: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,38 +310,6 @@ pub struct FileTypeValidationResponse {
     pub detected_type: String,
 }
 
-/// Sync-with-resolutions response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SyncWithResolutionsResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub links_created: usize,
-    pub links_skipped: usize,
-    pub links_renamed: usize,
-    pub overwrites: usize,
-    pub errors: Vec<String>,
-}
-
-/// Cross-filesystem warning response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct CrossFilesystemWarningResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub cross_filesystem: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub library_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recommendation: Option<String>,
-}
-
 /// Deep scan progress.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -451,73 +410,6 @@ pub struct DeleteModelResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-/// Serialisable mapping action for preview responses.
-///
-/// Note: Not FFI-compatible due to `PathBuf` fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct MappingActionInfo {
-    pub model_id: String,
-    pub model_name: String,
-    pub source_path: String,
-    pub target_path: String,
-    pub reason: String,
-}
-
-/// Broken-link entry for preview responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct BrokenLinkEntry {
-    pub target_path: String,
-    pub existing_target: String,
-    pub reason: String,
-}
-
-/// Mapping preview response matching the frontend `MappingPreviewResponse`.
-///
-/// Note: Not FFI-compatible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct MappingPreviewResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub to_create: Vec<MappingActionInfo>,
-    pub to_skip_exists: Vec<MappingActionInfo>,
-    pub conflicts: Vec<MappingActionInfo>,
-    pub broken_to_remove: Vec<BrokenLinkEntry>,
-    pub total_actions: usize,
-    pub warnings: Vec<String>,
-    pub errors: Vec<String>,
-}
-
-/// Mapping apply response matching the frontend `ApplyModelMappingResponse`.
-///
-/// Note: Not FFI-compatible due to `usize` fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct MappingApplyResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub links_created: usize,
-    pub links_removed: usize,
-    pub total_links: usize,
-}
-
-/// Sync models response.
-///
-/// Note: Not FFI-compatible due to `usize` fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SyncModelsResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub synced: usize,
-    pub errors: Vec<String>,
 }
 
 /// Response for getting excluded model IDs.
@@ -638,13 +530,7 @@ mod tests {
             success: true,
             error: None,
             version: "v1.0.0".into(),
-            deps_ready: true,
-            patched: false,
-            menu_shortcut: true,
-            desktop_shortcut: false,
-            shortcut_version: Some("v1.0.0".into()),
             message: "Ready".into(),
-            comfyui_running: false,
             ollama_running: false,
             torch_running: false,
             last_launch_error: None,
@@ -654,6 +540,6 @@ mod tests {
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"success\":true"));
-        assert!(json.contains("\"deps_ready\":true"));
+        assert!(json.contains("\"message\":\"Ready\""));
     }
 }

@@ -73,12 +73,14 @@ impl VersionInstaller {
                 self.install_llama_cpp_binary(tag, release, progress_tx)
                     .await
             }
-            AppId::ComfyUI => self.install_python_app(tag, release, progress_tx).await,
-            _ => self.install_python_app(tag, release, progress_tx).await,
+            AppId::Torch => self.install_python_app(tag, release, progress_tx).await,
+            AppId::OnnxRuntime => Err(PumasError::Other(
+                "ONNX Runtime is embedded and cannot be installed as a version".to_string(),
+            )),
         }
     }
 
-    /// Install a Python-based app (ComfyUI) from source with venv and dependencies.
+    /// Install a Python-based inference runtime from source with a virtual environment.
     async fn install_python_app(
         &self,
         tag: &str,
@@ -882,7 +884,7 @@ impl VersionInstaller {
                 final_path.display(),
                 source.display()
             );
-            return Ok(final_path);
+            Ok(final_path)
         }
 
         #[cfg(not(unix))]
@@ -1987,7 +1989,7 @@ mod tests {
 
         let installer = VersionInstaller::new(
             temp_dir.path().to_path_buf(),
-            AppId::ComfyUI,
+            AppId::Torch,
             metadata_manager,
             progress_tracker,
             Arc::new(AtomicBool::new(false)),

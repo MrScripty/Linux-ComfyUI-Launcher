@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useVersionShortcutState } from '../hooks/useVersionShortcutState';
 import type { InstallationProgress } from '../hooks/useVersions';
 import { getLogger } from '../utils/logger';
 import { VersionSelectorDropdown } from './VersionSelectorDropdown';
@@ -20,7 +19,6 @@ interface VersionSelectorProps {
   switchVersion: (tag: string) => Promise<boolean>;
   openActiveInstall: () => Promise<boolean>;
   onOpenVersionManager: () => void;
-  activeShortcutState?: { menu: boolean; desktop: boolean };
   installingVersion?: string | null;
   installationProgress?: InstallationProgress | null;
   installNetworkStatus?: 'idle' | 'downloading' | 'stalled' | 'failed';
@@ -29,7 +27,6 @@ interface VersionSelectorProps {
   diskSpacePercent?: number;
   hasNewVersion?: boolean;
   latestVersion?: string | null;
-  supportsShortcuts?: boolean;
 }
 
 export function VersionSelector({
@@ -39,7 +36,6 @@ export function VersionSelector({
   switchVersion,
   openActiveInstall,
   onOpenVersionManager,
-  activeShortcutState,
   installingVersion,
   installationProgress,
   installNetworkStatus = 'idle',
@@ -48,7 +44,6 @@ export function VersionSelector({
   diskSpacePercent = 0,
   hasNewVersion = false,
   latestVersion = null,
-  supportsShortcuts = true,
 }: VersionSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [isSwitching, setIsSwitching] = useState(false);
@@ -56,12 +51,6 @@ export function VersionSelector({
   const [showOpenedIndicator, setShowOpenedIndicator] = useState(false);
   const openedIndicatorTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const { shortcutState, toggleShortcuts } = useVersionShortcutState({
-    activeShortcutState,
-    activeVersion,
-    installedVersions,
-    supportsShortcuts,
-  });
 
   const handleVersionSwitch = async (tag: string) => {
     if (tag === activeVersion) {
@@ -238,8 +227,6 @@ export function VersionSelector({
         hasVersionsToShow={hasVersionsToShow}
         combinedVersions={combinedVersions}
         activeVersion={activeVersion}
-        shortcutState={shortcutState}
-        supportsShortcuts={supportsShortcuts}
         installingVersion={installingVersion}
         installedVersions={installedVersions}
         isInstallComplete={isInstallComplete}
@@ -248,7 +235,6 @@ export function VersionSelector({
         isLoading={isLoading}
         onMakeDefault={onMakeDefault}
         onSwitchVersion={handleVersionSwitch}
-        onToggleShortcuts={toggleShortcuts}
       />
     </div>
   );

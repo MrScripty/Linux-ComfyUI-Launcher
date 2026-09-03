@@ -1,13 +1,12 @@
 # pumas-app-manager src
 
 ## Purpose
-Application-manager layer for installed app versions, dependency checks, process adapters, and app-specific operations (ComfyUI/Ollama/Torch).
+Application-manager layer for inference runtime versions, dependency checks, and process adapters.
 
 ## Contents
 | File/Folder | Description |
 | ----------- | ----------- |
 | `version_manager/` | Version install/remove/switch/progress and dependency checks. |
-| `custom_nodes/` | Custom node lifecycle for supported app runtimes. |
 | `ollama_client/` | Focused Ollama client helper modules (for example naming logic). |
 | `process/` | Process factory/wrappers used by app managers. |
 | `ollama_client.rs` | Ollama RPC/HTTP client integrations. |

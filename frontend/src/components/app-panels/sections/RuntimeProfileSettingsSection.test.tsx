@@ -262,7 +262,7 @@ describe('RuntimeProfileSettingsSection', () => {
         device: expect.objectContaining({
           mode: 'gpu',
           gpu_layers: -1,
-        }),
+        }) as RuntimeProfileConfig['device'],
       })
     );
   });

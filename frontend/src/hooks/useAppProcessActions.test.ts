@@ -4,11 +4,6 @@ import { useAppProcessActions } from './useAppProcessActions';
 
 function createOptions() {
   return {
-    comfyUIRunning: false,
-    launchComfyUI: vi.fn().mockResolvedValue(undefined),
-    stopComfyUI: vi.fn().mockResolvedValue(undefined),
-    launchLogPath: '/logs/comfyui.log',
-    openLogPath: vi.fn().mockResolvedValue(undefined),
     ollamaRunning: false,
     launchOllama: vi.fn().mockResolvedValue(undefined),
     stopOllama: vi.fn().mockResolvedValue(undefined),
@@ -38,11 +33,11 @@ describe('useAppProcessActions', () => {
     const { result } = renderHook(() => useAppProcessActions(options));
 
     await act(async () => {
-      await result.current.handleLaunchApp('comfyui');
+      await result.current.handleLaunchApp('ollama');
     });
 
-    expect(options.launchComfyUI).toHaveBeenCalledTimes(1);
-    expect(options.stopComfyUI).not.toHaveBeenCalled();
+    expect(options.launchOllama).toHaveBeenCalledTimes(1);
+    expect(options.stopOllama).not.toHaveBeenCalled();
     expect(options.refetchStatus).toHaveBeenCalledWith(false, true);
 
     await act(async () => {
@@ -65,6 +60,5 @@ describe('useAppProcessActions', () => {
     expect(options.stopOllama).toHaveBeenCalledTimes(1);
     expect(options.launchOllama).not.toHaveBeenCalled();
     expect(options.openTorchLogPath).toHaveBeenCalledWith('/logs/torch.log');
-    expect(options.openLogPath).not.toHaveBeenCalled();
   });
 });

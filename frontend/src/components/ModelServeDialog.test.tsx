@@ -27,8 +27,7 @@ vi.mock('../hooks/useServingStatus', () => ({
   useServingStatus: useServingStatusMock,
 }));
 
-describe('ModelServeDialog', () => {
-  const snapshot: RuntimeProfilesSnapshot = {
+const snapshot: RuntimeProfilesSnapshot = {
     schema_version: 1,
     cursor: 'runtime-profiles:1',
     profiles: [
@@ -86,7 +85,7 @@ describe('ModelServeDialog', () => {
     default_profile_id: 'ollama-default',
   };
 
-  beforeEach(() => {
+beforeEach(() => {
     vi.clearAllMocks();
     useRuntimeProfilesMock.mockReturnValue({
       snapshot,
@@ -120,6 +119,7 @@ describe('ModelServeDialog', () => {
     });
   });
 
+describe('ModelServeDialog configuration', () => {
   it('uses the route editor selected profile when opening the dialog', async () => {
     render(
       <ModelServeDialog
@@ -386,7 +386,9 @@ describe('ModelServeDialog', () => {
     expect(screen.getByText('Provider')).toBeInTheDocument();
     expect(screen.getAllByText('none').length).toBeGreaterThan(0);
   });
+});
 
+describe('ModelServeDialog actions', () => {
   it('calls serve_model when start serving is clicked', async () => {
     const validateModelServingConfig = vi.fn<
       (_request: ServeModelRequest) => Promise<ModelServeValidationResponse>

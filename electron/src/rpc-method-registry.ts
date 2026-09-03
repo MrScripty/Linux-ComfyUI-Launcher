@@ -20,8 +20,6 @@ export const RPC_METHOD_REGISTRY = {
     'restart_launcher',
     'get_sandbox_info',
     'check_git',
-    'check_brave',
-    'check_setproctitle',
     'get_network_status',
     'get_library_status',
     'get_app_status',
@@ -61,11 +59,8 @@ export const RPC_METHOD_REGISTRY = {
     'check_version_dependencies',
     'install_version_dependencies',
     'get_release_dependencies',
-    'is_patched',
-    'toggle_patch',
     'get_models',
     'refresh_model_index',
-    'refresh_model_mappings',
     'import_model',
     'download_model_from_hf',
     'start_model_download_from_hf',
@@ -117,9 +112,6 @@ export const RPC_METHOD_REGISTRY = {
     'set_hf_token',
     'clear_hf_token',
     'get_hf_auth_status',
-    'is_comfyui_running',
-    'stop_comfyui',
-    'launch_comfyui',
     'launch_ollama',
     'stop_ollama',
     'is_ollama_running',
@@ -151,26 +143,10 @@ export const RPC_METHOD_REGISTRY = {
     'remove_orphaned_links',
     'get_links_for_model',
     'delete_model_with_cascade',
-    'preview_model_mapping',
-    'apply_model_mapping',
-    'sync_models_incremental',
-    'sync_with_resolutions',
-    'get_cross_filesystem_warning',
     'get_file_link_count',
     'check_files_writable',
     'set_model_link_exclusion',
     'get_link_exclusions',
-    'get_version_shortcuts',
-    'get_all_shortcut_states',
-    'toggle_menu',
-    'toggle_desktop',
-    'menu_exists',
-    'desktop_exists',
-    'install_icon',
-    'create_menu_shortcut',
-    'create_desktop_shortcut',
-    'remove_menu_shortcut',
-    'remove_desktop_shortcut',
     'start_model_conversion',
     'get_conversion_progress',
     'cancel_model_conversion',
@@ -184,10 +160,6 @@ export const RPC_METHOD_REGISTRY = {
     'get_plugin',
     'call_plugin_endpoint',
     'check_plugin_health',
-    'get_custom_nodes',
-    'install_custom_node',
-    'update_custom_node',
-    'remove_custom_node',
   ] as const,
 } as const;
 
@@ -216,7 +188,6 @@ export const RPC_METHOD_PARAM_VALIDATION = {
   get_status_telemetry_snapshot: 'empty-record',
   get_disk_space: 'empty-record',
   get_system_resources: 'empty-record',
-  get_all_shortcut_states: 'empty-record',
   has_background_fetch_completed: 'empty-record',
   reset_background_fetch_flag: 'empty-record',
   get_models: 'empty-record',
@@ -225,8 +196,6 @@ export const RPC_METHOD_PARAM_VALIDATION = {
   list_model_downloads: 'empty-record',
   list_interrupted_downloads: 'empty-record',
   get_hf_auth_status: 'empty-record',
-  launch_comfyui: 'empty-record',
-  stop_comfyui: 'empty-record',
   launch_ollama: 'empty-record',
   stop_ollama: 'empty-record',
   launch_torch: 'empty-record',
@@ -288,21 +257,6 @@ export const RPC_METHOD_REQUEST_SCHEMAS = {
       app_id: 'string',
     },
     nullable: {
-      tag: 'string',
-    },
-  },
-  get_version_shortcuts: {
-    required: {
-      tag: 'string',
-    },
-  },
-  toggle_menu: {
-    optional: {
-      tag: 'string',
-    },
-  },
-  toggle_desktop: {
-    optional: {
       tag: 'string',
     },
   },
@@ -488,32 +442,6 @@ export const RPC_METHOD_REQUEST_SCHEMAS = {
   get_app_status: {
     required: {
       app_id: 'string',
-    },
-  },
-  get_custom_nodes: {
-    required: {
-      version_tag: 'string',
-    },
-  },
-  install_custom_node: {
-    required: {
-      git_url: 'string',
-      version_tag: 'string',
-    },
-    optional: {
-      node_name: 'string',
-    },
-  },
-  update_custom_node: {
-    required: {
-      node_name: 'string',
-      version_tag: 'string',
-    },
-  },
-  remove_custom_node: {
-    required: {
-      node_name: 'string',
-      version_tag: 'string',
     },
   },
 } as const satisfies Partial<Record<RpcMethodName, RpcRequestSchema>>;

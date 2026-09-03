@@ -10,7 +10,6 @@ pub struct AppConfig;
 
 impl AppConfig {
     pub const APP_NAME: &'static str = "Pumas Library";
-    pub const GITHUB_REPO: &'static str = "comfyanonymous/ComfyUI";
     pub const LOG_FILE_MAX_BYTES: u64 = 10_485_760; // 10MB
     pub const LOG_FILE_BACKUP_COUNT: u32 = 5;
 }
@@ -156,29 +155,21 @@ impl RegistryConfig {
     pub const MAX_IPC_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 }
 
-/// App-specific configurations for multi-app support.
+/// Identifiers for supported inference runtimes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AppId {
     #[default]
-    ComfyUI,
     Ollama,
-    OpenWebUI,
-    InvokeAI,
-    KritaDiffusion,
     LlamaCpp,
     Torch,
     OnnxRuntime,
 }
 
 impl AppId {
-    /// Return the lowercase string identifier for this app (e.g. `"comfyui"`, `"ollama"`).
+    /// Return the lowercase string identifier for this runtime.
     pub fn as_str(&self) -> &'static str {
         match self {
-            AppId::ComfyUI => "comfyui",
             AppId::Ollama => "ollama",
-            AppId::OpenWebUI => "openwebui",
-            AppId::InvokeAI => "invokeai",
-            AppId::KritaDiffusion => "kritadiffusion",
             AppId::LlamaCpp => "llama-cpp",
             AppId::Torch => "torch",
             AppId::OnnxRuntime => "onnx-runtime",
@@ -196,11 +187,7 @@ impl AppId {
     /// Return the GitHub `owner/repo` path for this app's upstream repository.
     pub fn github_repo(&self) -> &'static str {
         match self {
-            AppId::ComfyUI => "comfyanonymous/ComfyUI",
             AppId::Ollama => "ollama/ollama",
-            AppId::OpenWebUI => "open-webui/open-webui",
-            AppId::InvokeAI => "invoke-ai/InvokeAI",
-            AppId::KritaDiffusion => "Acly/krita-ai-diffusion",
             AppId::LlamaCpp => "ggml-org/llama.cpp",
             AppId::Torch => "pytorch/pytorch",
             AppId::OnnxRuntime => "",
@@ -210,11 +197,7 @@ impl AppId {
     /// Return the directory name used to store installed versions of this app.
     pub fn versions_dir_name(&self) -> &'static str {
         match self {
-            AppId::ComfyUI => "comfyui-versions",
             AppId::Ollama => "ollama-versions",
-            AppId::OpenWebUI => "openwebui-versions",
-            AppId::InvokeAI => "invokeai-versions",
-            AppId::KritaDiffusion => "kritadiffusion-versions",
             AppId::LlamaCpp => "llama-cpp-versions",
             AppId::Torch => "torch-versions",
             AppId::OnnxRuntime => "onnx-runtime",
@@ -224,24 +207,20 @@ impl AppId {
     /// Default network port for this app's local server, or 0 if none.
     pub fn default_port(&self) -> u16 {
         match self {
-            AppId::ComfyUI => 8188,
             AppId::Ollama => 11434,
             AppId::LlamaCpp => 18080,
             AppId::Torch => 8400,
             AppId::OnnxRuntime => 0,
-            _ => 0, // No default port
         }
     }
 
     /// Default base URL for this app's local server API, or empty if none.
     pub fn default_base_url(&self) -> &'static str {
         match self {
-            AppId::ComfyUI => "http://127.0.0.1:8188",
             AppId::Ollama => "http://127.0.0.1:11434",
             AppId::LlamaCpp => "http://127.0.0.1:18080",
             AppId::Torch => "http://127.0.0.1:8400",
             AppId::OnnxRuntime => "",
-            _ => "",
         }
     }
 
@@ -249,11 +228,7 @@ impl AppId {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "comfyui" => Some(AppId::ComfyUI),
             "ollama" => Some(AppId::Ollama),
-            "openwebui" => Some(AppId::OpenWebUI),
-            "invokeai" => Some(AppId::InvokeAI),
-            "kritadiffusion" => Some(AppId::KritaDiffusion),
             "llama-cpp" | "llamacpp" | "llama.cpp" => Some(AppId::LlamaCpp),
             "torch" => Some(AppId::Torch),
             "onnx-runtime" | "onnxruntime" | "onnx_runtime" => Some(AppId::OnnxRuntime),
@@ -275,11 +250,7 @@ mod tests {
     #[test]
     fn test_app_id_roundtrip() {
         for app_id in [
-            AppId::ComfyUI,
             AppId::Ollama,
-            AppId::OpenWebUI,
-            AppId::InvokeAI,
-            AppId::KritaDiffusion,
             AppId::LlamaCpp,
             AppId::Torch,
             AppId::OnnxRuntime,

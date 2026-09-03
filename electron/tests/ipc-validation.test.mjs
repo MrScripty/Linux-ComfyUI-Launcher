@@ -28,9 +28,9 @@ test('validateApiCallPayload rejects unknown methods and non-record params', () 
     method: 'get_status',
     params: {},
   });
-  assert.deepEqual(validateApiCallPayload('get_installed_versions', { app_id: 'comfyui' }), {
+  assert.deepEqual(validateApiCallPayload('get_installed_versions', { app_id: 'ollama' }), {
     method: 'get_installed_versions',
-    params: { app_id: 'comfyui' },
+    params: { app_id: 'ollama' },
   });
 
   assert.throws(
@@ -50,12 +50,12 @@ test('validateApiCallPayload rejects unknown methods and non-record params', () 
 test('validateApiCallPayload enforces method request schemas', () => {
   assert.deepEqual(validateApiCallPayload('install_version', {
     tag: 'v1.2.3',
-    app_id: 'comfyui',
+    app_id: 'ollama',
   }), {
     method: 'install_version',
     params: {
       tag: 'v1.2.3',
-      app_id: 'comfyui',
+      app_id: 'ollama',
     },
   });
   assert.deepEqual(validateApiCallPayload('set_default_version', {
@@ -122,7 +122,7 @@ test('validateApiCallPayload enforces method request schemas', () => {
   });
 
   assert.throws(
-    () => validateApiCallPayload('install_version', { app_id: 'comfyui' }),
+    () => validateApiCallPayload('install_version', { app_id: 'ollama' }),
     /Missing required API param/
   );
   assert.throws(
@@ -147,7 +147,7 @@ test('validateApiCallPayload enforces method request schemas', () => {
   );
   assert.throws(
     () => validateApiCallPayload('get_installed_versions', {
-      app_id: 'comfyui',
+      app_id: 'ollama',
       extra: true,
     }),
     /Unexpected API param/

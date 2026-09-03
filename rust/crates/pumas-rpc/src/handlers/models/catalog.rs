@@ -1,6 +1,6 @@
 //! Model catalog and mapping handlers.
 
-use crate::handlers::{get_str_param, get_version_manager, require_str_param};
+use crate::handlers::require_str_param;
 use crate::server::AppState;
 use serde_json::{json, Value};
 
@@ -23,52 +23,6 @@ pub async fn refresh_model_index(
         "success": true,
         "indexed_count": count
     }))
-}
-
-pub async fn refresh_model_mappings(
-    state: &AppState,
-    params: &Value,
-) -> pumas_library::Result<Value> {
-    let app_id = get_str_param(params, "app_id", "appId").unwrap_or("comfyui");
-    if app_id != "comfyui" {
-        return Ok(json!({
-            "success": false,
-            "error": format!("Model mapping refresh currently supports only comfyui, got: {}", app_id),
-        }));
-    }
-
-    if let Some(vm) = get_version_manager(state, "comfyui").await {
-        let active = vm.get_active_version().await?;
-        if let Some(version_tag) = active {
-            let version_path = vm.version_path(&version_tag);
-            let models_path = version_path.join("models");
-
-            let response = state
-                .api
-                .apply_model_mapping(&version_tag, &models_path)
-                .await?;
-
-            Ok(json!({
-                "success": response.success,
-                "error": response.error,
-                "app_id": "comfyui",
-                "version_tag": version_tag,
-                "links_created": response.links_created,
-                "links_removed": response.links_removed,
-                "total_links": response.total_links,
-            }))
-        } else {
-            Ok(json!({
-                "success": false,
-                "error": "No active version set for comfyui",
-            }))
-        }
-    } else {
-        Ok(json!({
-            "success": false,
-            "error": "Version manager not initialized for comfyui",
-        }))
-    }
 }
 
 pub async fn scan_shared_storage(

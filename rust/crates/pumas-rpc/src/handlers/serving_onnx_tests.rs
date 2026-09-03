@@ -1,6 +1,6 @@
 use super::*;
 use crate::provider_clients::{LlamaCppRouterClient, OllamaClientFactory};
-use pumas_app_manager::{CustomNodesManager, SizeCalculator};
+use pumas_app_manager::SizeCalculator;
 use pumas_library::models::{ModelServingConfig, RuntimeDeviceMode};
 use pumas_library::{OnnxEmbeddingBackendKind, OnnxSessionManager, PluginLoader};
 use std::{collections::HashMap, sync::Arc};
@@ -21,13 +21,9 @@ async fn serving_test_state() -> (TempDir, AppState) {
         AppState {
             api,
             version_managers: Arc::new(RwLock::new(HashMap::new())),
-            custom_nodes_manager: Arc::new(CustomNodesManager::new(
-                launcher_root.join("comfyui-versions"),
-            )),
             size_calculator: Arc::new(Mutex::new(
                 SizeCalculator::new_with_cache(launcher_root.join("launcher-data/cache")).await,
             )),
-            shortcut_manager: Arc::new(RwLock::new(None)),
             plugin_loader: Arc::new(plugin_loader),
             gateway_http_client: reqwest::Client::new(),
             gateway_base_url: pumas_library::models::RuntimeEndpointUrl::parse(

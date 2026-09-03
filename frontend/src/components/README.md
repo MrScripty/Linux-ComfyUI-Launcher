@@ -23,9 +23,8 @@ bridge.
 | `HeaderControls.tsx` | Header update, status badge, and window-control button groups. |
 | `HeaderResourceStrip.tsx` | Header CPU/GPU/RAM/VRAM metric derivation and compact resource strip rendering. |
 | `HeaderStatus.ts` | Header status projection for install progress, model downloads, network, and library states. |
-| `AppSidebar.tsx` | Sidebar drag/order state owner and app-selection toolbar container. |
-| `SidebarAppIcon.tsx` | Motion-wrapped app icon renderer for drag previews, delete-zone overlays, and launch/stop/log controls. |
-| `AppIcon.tsx`, `ComfyUIIcon.tsx`, `AppIndicator.tsx` | Launcher icon controls with sibling native buttons for app selection and launch/stop/status actions. |
+| `AppSidebar.tsx` | Fixed inference-plugin app-selection toolbar. |
+| `AppIcon.tsx`, `AppIndicator.tsx` | Inference-plugin icons and launch/stop/status controls. |
 | `ConfirmationDialog.tsx` | Accessible confirmation dialog for destructive or state-changing operator actions. |
 | `ConfirmationDialog.test.tsx` | Interaction coverage for confirmation, cancellation, and Escape handling. |
 | `InstallDialog.tsx` | Version installation dialog orchestration and async install controls. |
@@ -41,10 +40,6 @@ bridge.
 | `VersionListItemInfo.tsx` | Install-version title, release/log links, prerelease badge, date, and error presentation. |
 | `VersionListItemState.ts` | Derived install-version display state for sizes, progress rings, package labels, and network indicators. |
 | `VersionListItem.test.tsx` | Interaction coverage for installable, installed, and in-progress version row behaviors. |
-| `ConflictResolutionDialog.tsx` | Accessible conflict-resolution modal for model mapping collisions. |
-| `ConflictResolutionDialog.test.tsx` | Interaction coverage for default and bulk conflict-resolution choices in the mapping workflow. |
-| `ConflictResolutionItem.tsx` | Presentational conflict row with resolution selector, path details, and per-action descriptions. |
-| `ConflictResolutionItem.test.tsx` | Rendering and interaction coverage for conflict rows and expanded details. |
 | `LocalModelsList.tsx` | Grouped local-library list with model actions, related-model disclosure wiring, metadata-modal access, and model serving dialog ownership. |
 | `LocalModelsList.test.tsx` | Interaction coverage for local-library formatting, ctrl-click metadata access, and related-model actions. |
 | `LocalModelGroupHeader.tsx` | Presentational category header and count for local model groups. |
@@ -82,20 +77,8 @@ bridge.
 | `VersionSelectorTrigger.tsx` | Presentational trigger shell for the active-version selector and action buttons. |
 | `VersionSelectorTriggerControls.tsx` | Extracted trigger buttons and status-icon presentation for version install/open/default actions. |
 | `VersionSelectorDropdown.tsx` | Presentational dropdown menu and row items for installed/selectable versions. |
-| `VersionSelectorDropdown.test.tsx` | Interaction coverage for native version switch, default, and shortcut controls. |
+| `VersionSelectorDropdown.test.tsx` | Interaction coverage for native version switching and default selection. |
 | `ModelImportDialog.tsx` | Import flow for local and remote model files. |
-| `MappingPreview.tsx` | Mapping preview and conflict-resolution workflow. |
-| `MappingPreview.test.tsx` | Loading, expansion, apply, and retry coverage for the mapping preview workflow. |
-| `MappingPreviewHeader.tsx` | Header, status badge, action-count, and expansion control for mapping previews. |
-| `MappingPreviewState.ts` | Derived count, issue, and status helpers for mapping preview presentation state. |
-| `MappingPreviewUnavailableState.tsx` | Error and retry state for unavailable mapping preview loads. |
-| `MappingPreviewDetails.tsx` | Mapping preview details coordinator for counts, warnings, action sections, and apply controls. |
-| `MappingPreviewDetailsFeedback.tsx` | Apply-result, refresh/apply control, and all-linked notice rendering for mapping preview details. |
-| `MappingPreviewDetailsSections.tsx` | Cross-filesystem, summary, warning, and action-list sections for mapping preview details. |
-| `MappingPreviewDetailsTypes.ts` | Shared presentation types for mapping preview detail subcomponents. |
-| `MappingPreviewDetails.test.tsx` | Rendering and interaction coverage for mapping preview detail sections and controls. |
-| `MappingPreviewDialog.tsx` | Accessible modal wrapper for previewing and applying model-library mappings. |
-| `MappingPreviewDialog.test.tsx` | Dialog naming and dismissal coverage for mapping-preview modal interactions. |
 | `RemoteModelListItem.tsx` | Presentational row for one Hugging Face search result and its download controls. |
 | `RemoteModelListItemActions.tsx` | Remote model row action buttons, progress rings, and download-menu wiring. |
 | `RemoteModelListItemState.ts` | Derived download flags, options, labels, retry hints, and selected-file totals for remote rows. |

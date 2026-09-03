@@ -18,6 +18,7 @@ Composable section components used by app panels to render status, selectors, de
 | `OnnxRuntimeModelLibrarySection.tsx` | Focused ONNX Runtime local model library panel that lists compatible `.onnx` models and saves or clears per-row ONNX Runtime profile routes through provider-scoped route APIs. |
 | `OnnxRuntimeModelLibraryList.tsx` | Presentational ONNX Runtime compatible-model list shell with search, empty states, route errors, and per-row action wiring. |
 | `OnnxRuntimeModelRow.tsx` | Presentational ONNX Runtime compatible-model row with route profile selection, backend-confirmed loaded/failed badges, missing-profile badge, quick serve, options, link, and star controls. |
+| `RuntimeModelRowActions.tsx` | Shared provider-profile selector and route, serve, options, and link actions for compatible-model rows. |
 | `RuntimeProfileSettingsSection.tsx` | Backend-confirmed runtime profile settings section for Ollama and llama.cpp profile lifecycle. |
 | `RuntimeProfileSettingsEditor.tsx` | Runtime profile editor shell that composes field and action subcomponents. |
 | `RuntimeProfileSettingsFields.tsx` | Runtime profile identity, endpoint, mode, and device setting fields. |
@@ -53,9 +54,8 @@ Composable section components used by app panels to render status, selectors, de
 - Provider-specific compatible-model rows stay below the component size
   threshold so ONNX can add a sibling row/panel without expanding the existing
   llama.cpp section.
-- ONNX Runtime rows own only provider-scoped route selection in the first
-  frontend slice. Quick serve, serving options, and loaded-state display must
-  consume backend serving snapshots when those controls are added.
+- ONNX Runtime quick serve, serving options, and loaded-state display consume
+  backend serving snapshots rather than optimistic row state.
 
 ## Timer Ownership
 | Section | Current Reason | Required Guardrail |

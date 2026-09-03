@@ -1,6 +1,6 @@
 //! Ollama-specific version management.
 //!
-//! Handles Ollama binary downloads and installation - simpler than ComfyUI
+//! Handles Ollama binary downloads and installation.
 //! since Ollama is a pre-built binary with no Python dependencies.
 
 use crate::version_manager::progress::ProgressUpdate;

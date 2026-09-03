@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ModelCategory } from '../../../types/apps';
-import type { ServedModelStatus } from '../../../types/api-serving';
+import type { ModelServingConfig, ServedModelStatus } from '../../../types/api-serving';
 import type {
   ModelRuntimeRoute,
   RuntimeProfileConfig,
@@ -365,14 +365,14 @@ describe('LlamaCppModelLibrarySection', () => {
           context_size: 4096,
           keep_loaded: true,
           model_alias: null,
-        }),
+        }) as ModelServingConfig,
       });
     });
     expect(serveModelMock).toHaveBeenCalledWith({
       model_id: 'models/llama-gguf',
       config: expect.objectContaining({
         profile_id: 'llama-gpu',
-      }),
+      }) as ModelServingConfig,
     });
     expect(screen.getByText('Loaded')).toBeInTheDocument();
     expect(serveDialogMock).not.toHaveBeenCalled();
@@ -426,13 +426,13 @@ describe('LlamaCppModelLibrarySection', () => {
       config: expect.objectContaining({
         profile_id: 'llama-cpu',
         device_mode: 'cpu',
-      }),
+      }) as ModelServingConfig,
     });
     expect(serveModelMock).toHaveBeenCalledWith({
       model_id: 'models/llama-gguf',
       config: expect.objectContaining({
         profile_id: 'llama-cpu',
-      }),
+      }) as ModelServingConfig,
     });
   });
 

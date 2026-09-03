@@ -13,5 +13,5 @@ interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
 
-/** Build-time feature flag: multi-app sidebar enabled (Linux only) */
-declare const __FEATURE_MULTI_APP__: boolean;
+/** Build-time capability: inference plugin UI and integrations are compiled in. */
+declare const __FEATURE_INFERENCE_PLUGINS__: boolean;

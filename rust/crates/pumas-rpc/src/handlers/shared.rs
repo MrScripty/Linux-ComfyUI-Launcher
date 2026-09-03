@@ -1,10 +1,11 @@
 //! Shared handler utilities used across RPC domains.
 
+#[cfg(feature = "inference-plugins")]
 use crate::server::AppState;
+#[cfg(feature = "inference-plugins")]
 use pumas_app_manager::VersionManager;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -236,15 +237,21 @@ pub(crate) fn get_i64_param(params: &Value, snake: &str, camel: &str) -> Option<
         .and_then(|v| v.as_i64())
 }
 
-pub(crate) async fn get_version_manager(state: &AppState, app_id: &str) -> Option<VersionManager> {
+#[cfg(feature = "inference-plugins")]
+pub(crate) async fn get_version_manager(
+    state: &AppState,
+    app_id: impl AsRef<str>,
+) -> Option<VersionManager> {
     let managers = state.version_managers.read().await;
-    managers.get(app_id).cloned()
+    managers.get(app_id.as_ref()).cloned()
 }
 
+#[cfg(feature = "inference-plugins")]
 pub(crate) async fn require_version_manager(
     state: &AppState,
-    app_id: &str,
+    app_id: impl AsRef<str>,
 ) -> pumas_library::Result<VersionManager> {
+    let app_id = app_id.as_ref();
     get_version_manager(state, app_id)
         .await
         .ok_or_else(|| pumas_library::PumasError::Config {
@@ -262,6 +269,7 @@ pub(crate) async fn path_exists(path: &Path) -> pumas_library::Result<bool> {
         })
 }
 
+#[cfg(feature = "inference-plugins")]
 pub(crate) async fn read_utf8_file(path: &Path) -> pumas_library::Result<String> {
     tokio::fs::read_to_string(path)
         .await
@@ -310,26 +318,6 @@ pub(crate) async fn extract_safetensors_header(path: &str) -> std::result::Resul
     } else {
         // Return tensor info as metadata
         Ok(header)
-    }
-}
-
-/// Synchronize version paths from ComfyUI version_manager to process_manager.
-///
-/// This ensures the process manager knows about all installed version directories
-/// so it can properly detect and clean up PID files.
-pub(crate) async fn sync_version_paths_to_process_manager(state: &AppState) {
-    if let Some(vm) = get_version_manager(state, "comfyui").await {
-        if let Ok(installed) = vm.get_installed_versions().await {
-            let version_paths: HashMap<String, PathBuf> = installed
-                .into_iter()
-                .map(|tag| {
-                    let path = vm.version_path(&tag);
-                    (tag, path)
-                })
-                .collect();
-
-            state.api.set_process_version_paths(version_paths).await;
-        }
     }
 }
 

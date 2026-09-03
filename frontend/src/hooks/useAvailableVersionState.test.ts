@@ -71,7 +71,7 @@ describe('useAvailableVersionState', () => {
     const { result } = renderHook(() => useAvailableVersionState({
       isEnabled: true,
       onInstallingTagUpdate,
-      resolvedAppId: 'comfyui',
+      resolvedAppId: 'ollama',
       trackAvailableVersions: true,
     }));
 
@@ -79,7 +79,7 @@ describe('useAvailableVersionState', () => {
       await result.current.fetchAvailableVersions(true);
     });
 
-    expect(getAvailableVersionsMock).toHaveBeenCalledWith(true, 'comfyui');
+    expect(getAvailableVersionsMock).toHaveBeenCalledWith(true, 'ollama');
     expect(result.current.availableVersions).toEqual([
       expect.objectContaining({
         tagName: 'v1.2.3',
@@ -94,7 +94,7 @@ describe('useAvailableVersionState', () => {
       vi.advanceTimersByTime(1500);
     });
 
-    expect(getAvailableVersionsMock).toHaveBeenNthCalledWith(2, false, 'comfyui');
+    expect(getAvailableVersionsMock).toHaveBeenNthCalledWith(2, false, 'ollama');
   });
 
   it('tracks rate-limit state when version fetching is throttled', async () => {
@@ -107,7 +107,7 @@ describe('useAvailableVersionState', () => {
 
     const { result } = renderHook(() => useAvailableVersionState({
       isEnabled: true,
-      resolvedAppId: 'comfyui',
+      resolvedAppId: 'ollama',
       trackAvailableVersions: true,
     }));
 
@@ -119,14 +119,14 @@ describe('useAvailableVersionState', () => {
     expect(result.current.rateLimitRetryAfter).toBe(120);
   });
 
-  it('refreshes cached versions when background fetch completion is signaled', async () => {
+  it('does not run the discontinued native-app background refresh path', async () => {
     shouldUpdateUiFromBackgroundFetchMock
       .mockResolvedValueOnce(true)
       .mockResolvedValue(false);
 
     renderHook(() => useAvailableVersionState({
       isEnabled: true,
-      resolvedAppId: 'comfyui',
+      resolvedAppId: 'ollama',
       trackAvailableVersions: true,
     }));
 
@@ -134,11 +134,9 @@ describe('useAvailableVersionState', () => {
       vi.advanceTimersByTime(2000);
     });
 
-    expect(getGithubCacheStatusMock).toHaveBeenCalledWith('comfyui');
-    expect(shouldUpdateUiFromBackgroundFetchMock).toHaveBeenCalledTimes(2);
-    expect(resetBackgroundFetchFlagMock).toHaveBeenCalledTimes(1);
-    expect(getAvailableVersionsMock).toHaveBeenCalledTimes(1);
-    expect(getAvailableVersionsMock).toHaveBeenCalledWith(false, 'comfyui');
+    expect(getGithubCacheStatusMock).toHaveBeenCalledWith('ollama');
+    expect(shouldUpdateUiFromBackgroundFetchMock).not.toHaveBeenCalled();
+    expect(resetBackgroundFetchFlagMock).not.toHaveBeenCalled();
   });
 
   it('normalizes mixed release payload field names and skips malformed rows', async () => {
@@ -205,7 +203,7 @@ describe('useAvailableVersionState', () => {
   it('does not poll background cache state when available-version tracking is disabled', async () => {
     renderHook(() => useAvailableVersionState({
       isEnabled: true,
-      resolvedAppId: 'comfyui',
+      resolvedAppId: 'ollama',
       trackAvailableVersions: false,
     }));
 

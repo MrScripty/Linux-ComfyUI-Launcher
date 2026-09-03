@@ -1,33 +1,11 @@
-import { Zap, MessageSquare, Palette, Image, Cpu, Flame, CircuitBoard } from 'lucide-react';
+import { Cpu, Flame, CircuitBoard } from 'lucide-react';
 import type { AppConfig } from '../types/apps';
 
 /**
  * Default app configurations
  * This is the central registry for all supported applications
  */
-export const DEFAULT_APPS: AppConfig[] = [
-  {
-    id: 'comfyui',
-    name: 'comfyui',
-    displayName: 'ComfyUI',
-    icon: Zap,
-    status: 'idle',
-    iconState: 'offline',
-    description: 'Powerful and modular stable diffusion GUI',
-    starred: false,
-    linked: false,
-  },
-  {
-    id: 'openwebui',
-    name: 'openwebui',
-    displayName: 'Open WebUI',
-    icon: MessageSquare,
-    status: 'idle',
-    iconState: 'uninstalled',
-    description: 'User-friendly WebUI for LLMs',
-    starred: false,
-    linked: false,
-  },
+export const INFERENCE_PLUGIN_APPS: AppConfig[] = [
   {
     id: 'ollama',
     name: 'ollama',
@@ -74,29 +52,11 @@ export const DEFAULT_APPS: AppConfig[] = [
     starred: false,
     linked: false,
   },
-  {
-    id: 'invoke',
-    name: 'invoke',
-    displayName: 'InvokeAI',
-    icon: Palette,
-    status: 'idle',
-    iconState: 'uninstalled',
-    description: 'Professional AI image generation',
-    starred: false,
-    linked: false,
-  },
-  {
-    id: 'krita-diffusion',
-    name: 'krita-diffusion',
-    displayName: 'Krita Diffusion',
-    icon: Image,
-    status: 'idle',
-    iconState: 'uninstalled',
-    description: 'Stable Diffusion plugin for Krita',
-    starred: false,
-    linked: false,
-  },
 ];
+
+export const DEFAULT_APPS: AppConfig[] = __FEATURE_INFERENCE_PLUGINS__
+  ? INFERENCE_PLUGIN_APPS
+  : [];
 
 /**
  * Get app configuration by ID
@@ -106,7 +66,7 @@ export function getAppById(id: string): AppConfig | undefined {
 }
 
 /**
- * Get default app (ComfyUI for now)
+ * Get the first compiled-in inference plugin.
  */
 export function getDefaultApp(): AppConfig {
   const defaultApp = DEFAULT_APPS[0];

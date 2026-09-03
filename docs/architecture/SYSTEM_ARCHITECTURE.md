@@ -10,7 +10,7 @@ Describe the current runtime architecture for the desktop app and shared Rust li
 2. `electron` (main process + preload bridge)
 3. `pumas-rpc` (Rust JSON-RPC server sidecar)
 4. `pumas-library` / `pumas-core` (model/system API)
-5. `pumas-app-manager` (app version + dependency + launcher management)
+5. `pumas-app-manager` (optional inference-plugin version and lifecycle management)
 
 ## Runtime Boundary
 
@@ -37,10 +37,12 @@ Renderer code does not access Node APIs directly.
 - Axum server with:
   - `GET /health`
   - `POST /rpc`
-- Initializes:
-  - `PumasApi` (`auto_create_dirs(true)`)
-  - per-app `VersionManager` instances (currently `comfyui`, `ollama`, `torch`)
-  - `CustomNodesManager`, `SizeCalculator`, and `PluginLoader`
+- Always initializes `PumasApi` (`auto_create_dirs(true)`) for the model library.
+- With the default `inference-plugins` feature, also initializes version
+  managers for Ollama, llama.cpp, and Torch plus runtime routing, size, and
+  plugin-descriptor services.
+- With `--no-default-features`, exposes only model-library, download, status,
+  and system RPC surfaces.
 
 ### Core API (`pumas-core`)
 
@@ -65,20 +67,17 @@ Key paths used by the current implementation:
 
 - `launcher-data/metadata/` - persisted metadata
 - `launcher-data/cache/` - runtime cache and download persistence
-- `launcher-data/mapping-configs/` - mapping configuration
 - `launcher-data/plugins/` - plugin app descriptors
 - `shared-resources/models/` - canonical model library root
 - `shared-resources/models/models.db` - SQLite model index
 - `shared-resources/cache/search.sqlite` - HuggingFace search cache
-- `<app>-versions/` directories for managed app version installs (`comfyui-versions`, `ollama-versions`, `torch-versions`)
+- `<app>-versions/` directories for managed inference runtime installs
 
 ## Managed Applications
 
-The `AppId` enum supports multiple app identifiers, while the current sidecar initialization path actively starts managers for:
-
-- ComfyUI
-- Ollama
-- Torch
+The supported inference plugins are Ollama, llama.cpp, ONNX Runtime, and
+Torch. Ollama, llama.cpp, and Torch have external version managers; ONNX
+Runtime is embedded in process.
 
 Plugin descriptors under `launcher-data/plugins/*.json` drive UI capability surfaces and app-specific behavior.
 
@@ -96,13 +95,16 @@ Plugin descriptors under `launcher-data/plugins/*.json` drive UI capability surf
   - model library
   - version management
   - dependency requirement resolution
-  - mapping/import/download flows
+  - import/download flows
   - utility and migration/report operations
 
 ## Build and Packaging Architecture
 
 - Rust crates built in `rust` workspace.
 - Electron packaging bundles renderer assets and the `pumas-rpc` binary as extra resources.
+- Inference plugins are enabled by default. Set
+  `PUMAS_INFERENCE_PLUGINS=false` for launcher/frontend builds and compile
+  `pumas-rpc --no-default-features` for a matching library-only app.
 - CI runs cross-platform build/test/package jobs for Linux, Windows, and macOS runners.
 
 ## Non-Goals of This Document

@@ -1,11 +1,6 @@
 import { useCallback } from 'react';
 
 interface UseAppProcessActionsOptions {
-  comfyUIRunning: boolean;
-  launchComfyUI: () => Promise<void>;
-  stopComfyUI: () => Promise<void>;
-  launchLogPath?: string | null;
-  openLogPath: (path: string) => Promise<void>;
   ollamaRunning: boolean;
   launchOllama: () => Promise<void>;
   stopOllama: () => Promise<void>;
@@ -20,11 +15,6 @@ interface UseAppProcessActionsOptions {
 }
 
 export function useAppProcessActions({
-  comfyUIRunning,
-  launchComfyUI,
-  stopComfyUI,
-  launchLogPath,
-  openLogPath,
   ollamaRunning,
   launchOllama,
   stopOllama,
@@ -42,16 +32,6 @@ export function useAppProcessActions({
       void refetchStatus(false, true);
     }, 1200);
   }, [refetchStatus]);
-
-  const toggleComfyUI = useCallback(async () => {
-    if (comfyUIRunning) {
-      await stopComfyUI();
-    } else {
-      await launchComfyUI();
-    }
-    await refetchStatus(false, true);
-    scheduleStatusRefresh();
-  }, [comfyUIRunning, launchComfyUI, refetchStatus, scheduleStatusRefresh, stopComfyUI]);
 
   const toggleOllama = useCallback(async () => {
     if (ollamaRunning) {
@@ -74,37 +54,29 @@ export function useAppProcessActions({
   }, [launchTorch, refetchStatus, scheduleStatusRefresh, stopTorch, torchRunning]);
 
   const handleLaunchApp = useCallback(async (appId: string) => {
-    if (appId === 'comfyui' && !comfyUIRunning) {
-      await toggleComfyUI();
-    } else if (appId === 'ollama' && !ollamaRunning) {
+    if (appId === 'ollama' && !ollamaRunning) {
       await toggleOllama();
     } else if (appId === 'torch' && !torchRunning) {
       await toggleTorch();
     }
-  }, [comfyUIRunning, ollamaRunning, toggleComfyUI, toggleOllama, toggleTorch, torchRunning]);
+  }, [ollamaRunning, toggleOllama, toggleTorch, torchRunning]);
 
   const handleStopApp = useCallback(async (appId: string) => {
-    if (appId === 'comfyui' && comfyUIRunning) {
-      await toggleComfyUI();
-    } else if (appId === 'ollama' && ollamaRunning) {
+    if (appId === 'ollama' && ollamaRunning) {
       await toggleOllama();
     } else if (appId === 'torch' && torchRunning) {
       await toggleTorch();
     }
-  }, [comfyUIRunning, ollamaRunning, toggleComfyUI, toggleOllama, toggleTorch, torchRunning]);
+  }, [ollamaRunning, toggleOllama, toggleTorch, torchRunning]);
 
   const handleOpenLog = useCallback(async (appId: string) => {
-    if (appId === 'comfyui' && launchLogPath) {
-      await openLogPath(launchLogPath);
-    } else if (appId === 'ollama' && ollamaLaunchLogPath) {
+    if (appId === 'ollama' && ollamaLaunchLogPath) {
       await openOllamaLogPath(ollamaLaunchLogPath);
     } else if (appId === 'torch' && torchLaunchLogPath) {
       await openTorchLogPath(torchLaunchLogPath);
     }
   }, [
-    launchLogPath,
     ollamaLaunchLogPath,
-    openLogPath,
     openOllamaLogPath,
     openTorchLogPath,
     torchLaunchLogPath,

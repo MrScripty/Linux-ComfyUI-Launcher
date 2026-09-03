@@ -2,14 +2,6 @@
 
 This project uses third-party software and assets. The following notices are provided in accordance with their respective licenses:
 
-## ComfyUI Logo/Icon
-
-The ComfyUI icon (`launcher-data/icons/comfyui_logo_2025.png`) is property of the ComfyUI project:
-- **Source**: [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-- **License**: GPL-3.0
-- **Usage**: The icon is used solely to represent and launch the ComfyUI application
-- **Modifications**: Converted to various PNG sizes for desktop integration
-
 ## Python Dependencies
 
 ### setproctitle
@@ -57,7 +49,3 @@ The ComfyUI icon (`launcher-data/icons/comfyui_logo_2025.png`) is property of th
 ## System Tools
 
 This launcher uses standard Linux utilities (wmctrl, pgrep, pkill, git) which are typically installed on most Linux distributions. These tools are used in accordance with their respective licenses.
-
----
-
-**Note**: This launcher is a setup and management tool for ComfyUI and is not affiliated with or endorsed by the ComfyUI project. ComfyUI itself is licensed under GPL-3.0 and can be found at https://github.com/comfyanonymous/ComfyUI.

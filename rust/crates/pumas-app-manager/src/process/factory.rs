@@ -262,7 +262,7 @@ impl AppProcessManager for BinaryProcessManager {
     }
 }
 
-/// Process manager for Python venv-based apps (ComfyUI, etc.).
+/// Process manager for Python virtual-environment inference runtimes.
 struct PythonProcessManager {
     launcher_root: PathBuf,
     plugin: PluginConfig,

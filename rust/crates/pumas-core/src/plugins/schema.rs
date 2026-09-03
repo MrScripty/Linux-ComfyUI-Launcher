@@ -13,7 +13,7 @@ pub enum InstallationType {
     Binary,
     /// Runtime is provided in-process by Pumas and has no version manager.
     InProcess,
-    /// Python virtual environment (ComfyUI, etc.)
+    /// Python virtual environment (for example, Torch)
     PythonVenv,
     /// Docker container
     Docker,
@@ -151,7 +151,7 @@ pub struct PanelSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginConfig {
-    /// Unique app identifier (e.g., "comfyui", "ollama").
+    /// Unique runtime identifier (e.g., "ollama", "llama-cpp").
     pub id: String,
     /// Display name for the UI.
     pub display_name: String,

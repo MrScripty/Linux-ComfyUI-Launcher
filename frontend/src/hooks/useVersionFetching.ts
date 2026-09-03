@@ -49,7 +49,7 @@ export function useVersionFetching({
   trackAvailableVersions = true,
   onInstallingTagUpdate,
 }: UseVersionFetchingOptions = {}): UseVersionFetchingResult {
-  const resolvedAppId = appId ?? 'comfyui';
+  const resolvedAppId = appId ?? 'ollama';
   const isEnabled = enabled;
   const [installedVersions, setInstalledVersions] = useState<string[]>([]);
   const [activeVersion, setActiveVersion] = useState<string | null>(null);

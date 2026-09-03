@@ -3,80 +3,6 @@ import type { BaseResponse } from './api-common';
 // ============================================================================
 
 /**
- * A single mapping action to be performed
- */
-export interface MappingAction {
-  model_id: string;
-  model_name: string;
-  source_path: string;
-  target_path: string;
-  link_type?: string;
-  reason: string;
-  existing_target?: string;
-}
-
-/**
- * Broken link to be removed
- */
-export interface BrokenLinkToRemove {
-  target_path: string;
-  existing_target: string;
-  reason: string;
-}
-
-/**
- * Mapping preview response
- */
-export interface MappingPreviewResponse extends BaseResponse {
-  to_create: MappingAction[];
-  to_skip_exists: MappingAction[];
-  conflicts: MappingAction[];
-  broken_to_remove: BrokenLinkToRemove[];
-  total_actions: number;
-  warnings: string[];
-  errors: string[];
-}
-
-/**
- * Incremental sync response
- */
-export interface IncrementalSyncResponse extends BaseResponse {
-  links_created: number;
-  links_updated: number;
-  links_skipped: number;
-}
-
-/**
- * Conflict resolution action types
- */
-export type ConflictResolutionAction = 'skip' | 'overwrite' | 'rename';
-
-/**
- * Conflict resolutions map
- */
-export type ConflictResolutions = Record<string, ConflictResolutionAction>;
-
-/**
- * Sync with resolutions response
- */
-export interface SyncWithResolutionsResponse extends BaseResponse {
-  links_created: number;
-  links_skipped: number;
-  links_renamed: number;
-  overwrites: number;
-  errors: string[];
-}
-
-/**
- * Apply model mapping response
- */
-export interface ApplyModelMappingResponse extends BaseResponse {
-  links_created: number;
-  links_removed: number;
-  total_links: number;
-}
-
-/**
  * Sandbox type enumeration
  */
 export type SandboxType = 'flatpak' | 'snap' | 'docker' | 'appimage' | 'none' | 'unknown';
@@ -95,17 +21,6 @@ export interface SandboxInfoResponse extends BaseResponse {
  */
 export interface LinkExclusionsResponse extends BaseResponse {
   excluded_model_ids: string[];
-}
-
-/**
- * Cross-filesystem warning response
- */
-export interface CrossFilesystemWarningResponse extends BaseResponse {
-  cross_filesystem: boolean;
-  library_path?: string;
-  app_path?: string;
-  warning?: string;
-  recommendation?: string;
 }
 
 /**

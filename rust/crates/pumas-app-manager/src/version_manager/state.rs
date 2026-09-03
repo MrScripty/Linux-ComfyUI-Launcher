@@ -486,7 +486,7 @@ impl VersionState {
         // Check metadata entries against filesystem
         let metadata = self.load_versions_metadata().await?;
         for (tag, info) in &metadata.installed {
-            // Handle both old format (full path like "comfyui-versions/v0.4.0")
+            // Handle both old full-path metadata and the current tag-relative format.
             // and new format (just tag like "v0.4.0")
             let version_path = if info.path.contains('/') || info.path.contains('\\') {
                 // Old format: path includes directory, use just the last component
@@ -594,11 +594,6 @@ impl VersionState {
 
         // Required files/directories for a complete installation
         let required = match self.app_id {
-            AppId::ComfyUI => vec![
-                version_path.join("main.py"),
-                version_path.join("venv"),
-                version_path.join("venv").join("bin").join("python"),
-            ],
             AppId::Ollama => {
                 // Ollama binary could be at root or in bin/ subdirectory (from tar extraction)
                 // Check both locations - if either exists, consider it complete
@@ -742,7 +737,7 @@ mod tests {
     }
 
     async fn create_test_state() -> (VersionState, TempDir) {
-        create_test_state_for_app(AppId::ComfyUI).await
+        create_test_state_for_app(AppId::Torch).await
     }
 
     #[tokio::test]
@@ -758,7 +753,7 @@ mod tests {
         let (mut state, temp) = create_test_state().await;
 
         // Create version directory with required files
-        let version_dir = temp.path().join("comfyui-versions/v1.0.0");
+        let version_dir = temp.path().join("torch-versions/v1.0.0");
         std::fs::create_dir_all(&version_dir).unwrap();
         std::fs::write(version_dir.join("main.py"), "# main").unwrap();
         std::fs::create_dir_all(version_dir.join("venv/bin")).unwrap();
@@ -782,7 +777,7 @@ mod tests {
         let (mut state, temp) = create_test_state().await;
 
         // Create version directory
-        let version_dir = temp.path().join("comfyui-versions/v1.0.0");
+        let version_dir = temp.path().join("torch-versions/v1.0.0");
         std::fs::create_dir_all(&version_dir).unwrap();
         std::fs::write(version_dir.join("main.py"), "# main").unwrap();
         std::fs::create_dir_all(version_dir.join("venv/bin")).unwrap();
@@ -819,7 +814,7 @@ mod tests {
         let (mut state, temp) = create_test_state().await;
 
         // Create version directory
-        let version_dir = temp.path().join("comfyui-versions/v1.0.0");
+        let version_dir = temp.path().join("torch-versions/v1.0.0");
         std::fs::create_dir_all(&version_dir).unwrap();
         std::fs::write(version_dir.join("main.py"), "# main").unwrap();
         std::fs::create_dir_all(version_dir.join("venv/bin")).unwrap();
@@ -847,7 +842,7 @@ mod tests {
         let (mut state, temp) = create_test_state().await;
 
         // Create version directory
-        let version_dir = temp.path().join("comfyui-versions/v1.0.0");
+        let version_dir = temp.path().join("torch-versions/v1.0.0");
         std::fs::create_dir_all(&version_dir).unwrap();
         std::fs::write(version_dir.join("main.py"), "# main").unwrap();
         std::fs::create_dir_all(version_dir.join("venv/bin")).unwrap();

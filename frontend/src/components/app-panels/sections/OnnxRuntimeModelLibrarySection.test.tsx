@@ -6,7 +6,11 @@ import type {
   ModelRuntimeRoute,
   RuntimeProfileConfig,
 } from '../../../types/api-runtime-profiles';
-import type { ServedModelStatus, ServingEndpointStatus } from '../../../types/api-serving';
+import type {
+  ModelServingConfig,
+  ServedModelStatus,
+  ServingEndpointStatus,
+} from '../../../types/api-serving';
 import { OnnxRuntimeModelLibrarySection } from './OnnxRuntimeModelLibrarySection';
 
 const {
@@ -350,14 +354,14 @@ describe('OnnxRuntimeModelLibrarySection', () => {
           device_mode: 'cpu',
           keep_loaded: true,
           model_alias: null,
-        }),
+        }) as ModelServingConfig,
       });
     });
     expect(serveModelMock).toHaveBeenCalledWith({
       model_id: 'models/nomic',
       config: expect.objectContaining({
         profile_id: 'onnx-cpu',
-      }),
+      }) as ModelServingConfig,
     });
     expect(screen.getByText('Loaded')).toBeInTheDocument();
     expect(serveDialogMock).not.toHaveBeenCalled();
@@ -414,13 +418,13 @@ describe('OnnxRuntimeModelLibrarySection', () => {
         provider: 'onnx_runtime',
         profile_id: 'onnx-cpu',
         device_mode: 'cpu',
-      }),
+      }) as ModelServingConfig,
     });
     expect(serveModelMock).toHaveBeenCalledWith({
       model_id: 'models/nomic',
       config: expect.objectContaining({
         profile_id: 'onnx-cpu',
-      }),
+      }) as ModelServingConfig,
     });
   });
 

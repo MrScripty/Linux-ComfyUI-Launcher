@@ -1,5 +1,7 @@
 import { useState, useMemo } from 'react';
 import { AppShell } from './components/AppShell';
+import { ModelServeDialog } from './components/ModelServeDialog';
+import type { ModelInfo } from './types/apps';
 import { buildAppShellPanels } from './components/AppShellPanels';
 import {
   buildAppShellHeader,
@@ -9,13 +11,9 @@ import {
   getAppRunningState,
   getLauncherLatestVersion,
   getSelectedAppShellState,
-  getSetupDisplayState,
 } from './components/AppShellState';
-import type { AppConfig } from './types/apps';
 import { useStatus } from './hooks/useStatus';
 import { useDiskSpace } from './hooks/useDiskSpace';
-import { useComfyUIProcess } from './hooks/useComfyUIProcess';
-import { useDependencyInstaller } from './hooks/useDependencyInstaller';
 import { useOllamaProcess } from './hooks/useOllamaProcess';
 import { useTorchProcess } from './hooks/useTorchProcess';
 import { useModels } from './hooks/useModels';
@@ -32,27 +30,18 @@ import { useModelPreferences } from './hooks/useModelPreferences';
 import { useRuntimeProfiles } from './hooks/useRuntimeProfiles';
 import { useSelectedAppVersions } from './hooks/useSelectedAppVersions';
 import { useServingStatus } from './hooks/useServingStatus';
-import { getLogger } from './utils/logger';
-
-const logger = getLogger('App');
-
-export default function App() {
-  const [selectedAppId, setSelectedAppId] = useState<string | null>(
-    __FEATURE_MULTI_APP__ ? null : 'comfyui'
-  );
+export default function InferencePluginsApp() {
+  const [selectedAppId, setSelectedAppId] = useState<string | null>(null);
+  const [servingModel, setServingModel] = useState<ModelInfo | null>(null);
 
   const {
     status,
     systemResources,
     networkAvailable,
     modelLibraryLoaded,
-    isCheckingDeps,
     refetch: refetchStatus
   } = useStatus();
   const { diskSpacePercent, fetchDiskSpace } = useDiskSpace();
-  const { installDependencies: handleInstallDeps, isInstallingDeps } = useDependencyInstaller({
-    refetchStatus,
-  });
   const {
     checkLauncherUpdates,
     checkLauncherVersion,
@@ -62,7 +51,6 @@ export default function App() {
     openLauncherUpdate,
   } = useLauncherUpdates();
   const runningState = useMemo(() => getAppRunningState(status), [status]);
-  const { launchError, launchLogPath, isStarting, isStopping, launchComfyUI, stopComfyUI, openLogPath } = useComfyUIProcess(runningState.comfyUIRunning);
   const { launchError: ollamaLaunchError, launchLogPath: ollamaLaunchLogPath, isStarting: ollamaIsStarting, isStopping: ollamaIsStopping, ...ollamaActions } =
     useOllamaProcess(runningState.ollamaRunning);
   const { launchError: torchLaunchError, launchLogPath: torchLaunchLogPath, isStarting: torchIsStarting, isStopping: torchIsStopping, ...torchActions } =
@@ -74,8 +62,6 @@ export default function App() {
 
   const {
     appVersions,
-    comfyActiveVersion,
-    comfyInstalledVersions,
     installationProgress,
     llamaCppInstalledVersions,
     ollamaInstalledVersions,
@@ -93,12 +79,6 @@ export default function App() {
     running: runningState,
     status,
     systemResources,
-    comfyui: {
-      isStarting,
-      isStopping,
-      launchError,
-      installedVersions: comfyInstalledVersions,
-    },
     ollama: {
       isStarting: ollamaIsStarting,
       isStopping: ollamaIsStopping,
@@ -119,12 +99,8 @@ export default function App() {
       installedVersions: torchInstalledVersions,
     },
   }), [
-    comfyInstalledVersions,
-    isStarting,
-    isStopping,
     llamaCppRuntimeState,
     llamaCppInstalledVersions,
-    launchError,
     ollamaInstalledVersions,
     ollamaIsStarting,
     ollamaIsStopping,
@@ -137,16 +113,12 @@ export default function App() {
     torchIsStopping,
     torchLaunchError,
   ]);
-  const { apps, deleteApp, reorderApps, addApp } = useManagedApps(managedAppsState);
+  const { apps } = useManagedApps(managedAppsState);
   const appIds = useMemo(() => apps.map((app) => app.id), [apps]);
   const { getPanelState, setShowVersionManager } = useAppPanelState(appIds);
   const selectedAppShellState = useMemo(
     () => getSelectedAppShellState(apps, selectedAppId),
     [apps, selectedAppId]
-  );
-  const setupDisplayState = useMemo(
-    () => getSetupDisplayState(status, selectedAppId),
-    [status, selectedAppId]
   );
   const panelState = getPanelState(selectedAppId);
   const {
@@ -166,11 +138,6 @@ export default function App() {
     onImportComplete: fetchModels,
   });
   const { handleLaunchApp, handleOpenLog, handleStopApp } = useAppProcessActions({
-    comfyUIRunning: runningState.comfyUIRunning,
-    launchComfyUI,
-    stopComfyUI,
-    launchLogPath,
-    openLogPath,
     ollamaRunning: runningState.ollamaRunning,
     launchOllama: ollamaActions.launchOllama,
     stopOllama: ollamaActions.stopOllama,
@@ -185,28 +152,11 @@ export default function App() {
   });
 
   useAppStartupChecks({
-    activeVersion: comfyActiveVersion,
+    activeVersion: appVersions.activeVersion,
     checkLauncherVersion,
     fetchDiskSpace,
     refetchStatus,
   });
-
-  const handleDeleteApp = (appId: string) => {
-    if (appId === 'comfyui') {
-      logger.warn('Attempt to delete ComfyUI app prevented', { appId });
-      return;
-    }
-    logger.info('Deleting app', { appId });
-    deleteApp(appId);
-  };
-
-  const handleReorderApps = (reorderedApps: AppConfig[]) => {
-    reorderApps(reorderedApps);
-  };
-
-  const handleAddApp = (insertAtIndex: number) => {
-    addApp(insertAtIndex);
-  };
 
   const handleShowVersionManager = (show: boolean) => {
     if (!selectedAppId) {
@@ -224,6 +174,7 @@ export default function App() {
     selectedAppId,
     onAddModels: scanModels,
     onOpenModelsRoot: openModelsRoot,
+    onServeModel: setServingModel,
     onModelsImported: fetchModels,
     activeVersion: appVersions.activeVersion,
     onChooseExistingLibrary: chooseLibraryRoot,
@@ -231,35 +182,28 @@ export default function App() {
     servedModels: servingStatus.servedModels,
   });
   const panels = buildAppShellPanels({
-    activeShortcutState: setupDisplayState.activeShortcutState,
     appDisplayName: selectedAppShellState.appDisplayName,
     appVersions,
-    comfyUIRunning: runningState.comfyUIRunning,
     connectionUrl:
       selectedAppId === 'llama-cpp'
         ? llamaCppConnectionUrl
         : selectedAppShellState.connectionUrl,
-    depsInstalled: setupDisplayState.depsInstalled,
     diskSpacePercent,
-    displayStatus: setupDisplayState.displayStatus,
-    isCheckingDeps,
-    isInstallingDeps,
     isOllamaRunning: runningState.ollamaRunning,
-    isSetupComplete: setupDisplayState.isSetupComplete,
     isTorchRunning: runningState.torchRunning,
     modelGroups,
     modelManagerProps,
     panelState,
     selectedAppId,
-    onInstallDeps: handleInstallDeps,
     onShowVersionManager: handleShowVersionManager,
   });
 
   return (
-    <AppShell
+    <>
+      <AppShell
       importPaths={importPaths}
       showImportDialog={showImportDialog}
-      showSidebar={__FEATURE_MULTI_APP__}
+      showSidebar={true}
       onImportComplete={handleImportComplete}
       onImportDialogClose={handleImportDialogClose}
       onPathsDropped={handlePathsDropped}
@@ -286,11 +230,12 @@ export default function App() {
         onLaunchApp: handleLaunchApp,
         onStopApp: handleStopApp,
         onOpenLog: handleOpenLog,
-        onDeleteApp: handleDeleteApp,
-        onReorderApps: handleReorderApps,
-        onAddApp: handleAddApp,
       })}
-      panels={panels}
-    />
+        panels={panels}
+      />
+      {servingModel && (
+        <ModelServeDialog model={servingModel} onClose={() => setServingModel(null)} />
+      )}
+    </>
   );
 }

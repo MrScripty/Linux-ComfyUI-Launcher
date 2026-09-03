@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { useHover } from '@react-aria/interactions';
-import { Check, Link2 } from 'lucide-react';
+import { Check } from 'lucide-react';
 import { VersionSelectorDefaultButton } from './VersionSelectorDefaultButton';
 
 interface VersionDropdownItemProps {
@@ -10,11 +10,8 @@ interface VersionDropdownItemProps {
   isSwitching: boolean;
   isLoading: boolean;
   isDefault: boolean;
-  isEnabled: boolean;
-  supportsShortcuts: boolean;
   onMakeDefault?: (tag: string | null) => Promise<boolean>;
   onSwitchVersion: (tag: string) => void;
-  onToggleShortcuts?: (version: string, enabled: boolean) => Promise<void>;
 }
 
 function VersionDropdownItem({
@@ -24,11 +21,8 @@ function VersionDropdownItem({
   isSwitching,
   isLoading,
   isDefault,
-  isEnabled,
-  supportsShortcuts,
   onMakeDefault,
   onSwitchVersion,
-  onToggleShortcuts,
 }: VersionDropdownItemProps) {
   const { hoverProps: rowHoverProps, isHovered: isRowHovered } = useHover({});
 
@@ -74,27 +68,6 @@ function VersionDropdownItem({
         </button>
       </div>
       <div className="flex items-center gap-2 pr-12">
-        {supportsShortcuts && !isInstalling && (isRowHovered || isEnabled) && onToggleShortcuts && (
-          <button
-            type="button"
-            onClick={async (event) => {
-              event.stopPropagation();
-              const next = !isEnabled;
-              await onToggleShortcuts(version, next);
-            }}
-            disabled={isSwitching || isLoading}
-            className="absolute right-8 top-1/2 flex -translate-y-1/2 items-center justify-center transition-colors"
-            aria-label={isEnabled ? `Disable shortcuts for ${version}` : `Enable shortcuts for ${version}`}
-            title={isEnabled ? 'Shortcuts enabled (click to disable)' : 'Shortcuts disabled (click to enable)'}
-          >
-            <Link2
-              size={14}
-              className={isEnabled ? 'text-[hsl(var(--accent-link))]' : 'text-[hsl(var(--text-tertiary))]'}
-              style={{ opacity: 1 }}
-              aria-hidden
-            />
-          </button>
-        )}
         {isActive && (
           <span className="absolute right-2 top-1/2 -translate-y-1/2">
             <Check size={14} className="text-[hsl(var(--accent-success))]" />
@@ -110,8 +83,6 @@ interface VersionSelectorDropdownProps {
   hasVersionsToShow: boolean;
   combinedVersions: string[];
   activeVersion: string | null;
-  shortcutState: Record<string, { menu: boolean; desktop: boolean }>;
-  supportsShortcuts: boolean;
   installingVersion: string | null | undefined;
   installedVersions: string[];
   isInstallComplete: boolean;
@@ -120,7 +91,6 @@ interface VersionSelectorDropdownProps {
   isLoading: boolean;
   onMakeDefault?: (tag: string | null) => Promise<boolean>;
   onSwitchVersion: (tag: string) => void;
-  onToggleShortcuts: (version: string, enabled: boolean) => Promise<void>;
 }
 
 export function VersionSelectorDropdown({
@@ -128,8 +98,6 @@ export function VersionSelectorDropdown({
   hasVersionsToShow,
   combinedVersions,
   activeVersion,
-  shortcutState,
-  supportsShortcuts,
   installingVersion,
   installedVersions,
   isInstallComplete,
@@ -138,7 +106,6 @@ export function VersionSelectorDropdown({
   isLoading,
   onMakeDefault,
   onSwitchVersion,
-  onToggleShortcuts,
 }: VersionSelectorDropdownProps) {
   return (
     <AnimatePresence>
@@ -153,8 +120,6 @@ export function VersionSelectorDropdown({
           <div className="max-h-64 overflow-y-auto">
             {combinedVersions.map((version) => {
               const isActive = version === activeVersion;
-              const toggles = shortcutState[version] || { menu: false, desktop: false };
-              const isEnabled = supportsShortcuts && toggles.menu && toggles.desktop;
               const isInstalling =
                 installingVersion === version &&
                 !installedVersions.includes(version) &&
@@ -169,11 +134,8 @@ export function VersionSelectorDropdown({
                   isSwitching={isSwitching}
                   isLoading={isLoading}
                   isDefault={isDefault}
-                  isEnabled={isEnabled}
-                  supportsShortcuts={supportsShortcuts}
                   onMakeDefault={onMakeDefault}
                   onSwitchVersion={onSwitchVersion}
-                  onToggleShortcuts={onToggleShortcuts}
                 />
               );
             })}

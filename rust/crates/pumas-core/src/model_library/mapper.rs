@@ -203,55 +203,6 @@ impl ModelMapper {
             .map_err(|e| PumasError::Other(format!("Failed to join save_config task: {}", e)))?
     }
 
-    /// Create and persist a default ComfyUI mapping configuration.
-    ///
-    /// Generates rules for standard ComfyUI model directories (checkpoints, loras,
-    /// vae, controlnet, clip, embeddings, upscale_models) and saves the config to disk.
-    pub fn create_default_comfyui_config(
-        &self,
-        version: &str,
-        _comfyui_models_path: &Path,
-    ) -> Result<MappingConfig> {
-        let config = MappingConfig {
-            app: "comfyui".to_string(),
-            version: version.to_string(),
-            variant: Some("default".to_string()),
-            mappings: vec![MappingRule {
-                target_dir: ".".to_string(),
-                model_types: None,
-                subtypes: None,
-                families: None,
-                tags: None,
-                exclude_tags: None,
-            }],
-        };
-
-        self.save_config(&config)?;
-        Ok(config)
-    }
-
-    /// Create and persist a default ComfyUI mapping configuration without
-    /// blocking the async runtime.
-    pub async fn create_default_comfyui_config_async(
-        &self,
-        version: &str,
-        comfyui_models_path: &Path,
-    ) -> Result<MappingConfig> {
-        let mapper = self.clone();
-        let version = version.to_string();
-        let comfyui_models_path = comfyui_models_path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            mapper.create_default_comfyui_config(&version, &comfyui_models_path)
-        })
-        .await
-        .map_err(|e| {
-            PumasError::Other(format!(
-                "Failed to join create_default_comfyui_config task: {}",
-                e
-            ))
-        })?
-    }
-
     // ========================================
     // Mapping Operations
     // ========================================
@@ -967,7 +918,7 @@ mod tests {
         let (_temp, _library, mapper) = setup().await;
 
         let config = MappingConfig {
-            app: "comfyui".to_string(),
+            app: "test-runtime".to_string(),
             version: "0.6.0".to_string(),
             variant: Some("custom".to_string()),
             mappings: vec![MappingRule {
@@ -983,10 +934,10 @@ mod tests {
         mapper.save_config_async(config).await.unwrap();
 
         let loaded = mapper
-            .load_config("comfyui", Some("0.6.0"))
+            .load_config("test-runtime", Some("0.6.0"))
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.app, "comfyui");
+        assert_eq!(loaded.app, "test-runtime");
         assert_eq!(loaded.mappings.len(), 1);
     }
 
@@ -1020,7 +971,7 @@ mod tests {
 
         mapper
             .save_config(&MappingConfig {
-                app: "comfyui".to_string(),
+                app: "test-runtime".to_string(),
                 version: "0.1.0".to_string(),
                 variant: None,
                 mappings: vec![MappingRule {
@@ -1036,7 +987,7 @@ mod tests {
 
         let preview = mapper
             .preview_mapping(
-                "comfyui",
+                "test-runtime",
                 Some("0.1.0"),
                 &temp_dir.path().join("app-models"),
             )

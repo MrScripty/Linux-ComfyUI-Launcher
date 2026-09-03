@@ -242,7 +242,7 @@ fn openai_model_id(model: &ServedModelStatus) -> &str {
 
 #[derive(Debug, Clone, PartialEq)]
 enum OpenAiServedModelLookup {
-    Found(ServedModelStatus),
+    Found(Box<ServedModelStatus>),
     NotFound,
     Ambiguous {
         code: ModelServeErrorCode,
@@ -274,7 +274,7 @@ fn resolve_openai_served_model(
         .collect();
 
     if alias_matches.len() == 1 {
-        return OpenAiServedModelLookup::Found(alias_matches.into_iter().next().unwrap());
+        return OpenAiServedModelLookup::Found(Box::new(alias_matches.into_iter().next().unwrap()));
     }
     if alias_matches.len() > 1 {
         return OpenAiServedModelLookup::Ambiguous {
@@ -290,7 +290,9 @@ fn resolve_openai_served_model(
         .filter(|model| model.model_id == requested_model)
         .collect();
     if model_id_matches.len() == 1 {
-        return OpenAiServedModelLookup::Found(model_id_matches.into_iter().next().unwrap());
+        return OpenAiServedModelLookup::Found(Box::new(
+            model_id_matches.into_iter().next().unwrap(),
+        ));
     }
     if model_id_matches.len() > 1 {
         return OpenAiServedModelLookup::Ambiguous {

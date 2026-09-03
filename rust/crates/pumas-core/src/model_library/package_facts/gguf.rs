@@ -211,13 +211,13 @@ fn skip_value<R: Read + Seek>(
     match value_type {
         0 | 1 | 7 => cursor.skip_bytes(1),
         2 | 3 => cursor.skip_bytes(2),
-        4 | 5 | 6 => cursor.skip_bytes(4),
+        4..=6 => cursor.skip_bytes(4),
         8 => {
             let len = cursor.read_u64()?;
             cursor.skip_string_bytes(len)
         }
         9 => skip_array(cursor, depth),
-        10 | 11 | 12 => cursor.skip_bytes(8),
+        10..=12 => cursor.skip_bytes(8),
         _ => Err(PumasError::Other(format!(
             "Unsupported GGUF metadata value type {value_type}"
         ))),

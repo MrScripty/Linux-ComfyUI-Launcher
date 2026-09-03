@@ -39,7 +39,6 @@ describe('DEFAULT_APPS', () => {
     expect(isVersionSupportedAppId(onnxPlugin.id)).toBe(false);
 
     const decorated = decorateManagedApps(DEFAULT_APPS, {
-      comfyui: lifecycleState(),
       llamaCpp: lifecycleState(),
       ollama: lifecycleState(),
       torch: lifecycleState(),
@@ -57,25 +56,27 @@ describe('DEFAULT_APPS', () => {
     const panels = buildAppShellPanels({
       appDisplayName: 'ONNX Runtime',
       appVersions: UNSUPPORTED_VERSION_STATE,
-      comfyUIRunning: false,
-      depsInstalled: null,
       diskSpacePercent: 0,
-      displayStatus: 'Idle',
-      isCheckingDeps: false,
-      isInstallingDeps: false,
       isOllamaRunning: false,
-      isSetupComplete: true,
       isTorchRunning: false,
       modelGroups: [],
       modelManagerProps,
       panelState: { showVersionManager: false },
       selectedAppId: onnxPlugin.id,
-      onInstallDeps: () => {},
       onShowVersionManager: () => {},
     });
 
     expect(panels.selectedAppId).toBe(onnxPlugin.id);
     expect(panels.onnxRuntime.modelManagerProps).toBe(modelManagerProps);
+  });
+
+  it('does not register discontinued native applications', () => {
+    expect(DEFAULT_APPS.map((app) => app.id)).toEqual([
+      'ollama',
+      'llama-cpp',
+      'onnx-runtime',
+      'torch',
+    ]);
   });
 });
 

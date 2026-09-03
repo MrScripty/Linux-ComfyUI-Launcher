@@ -20,7 +20,6 @@ fn create_test_env() -> TempDir {
     std::fs::create_dir_all(temp_dir.path().join("launcher-data")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("launcher-data/metadata")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("launcher-data/cache")).unwrap();
-    std::fs::create_dir_all(temp_dir.path().join("comfyui-versions")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("shared-resources")).unwrap();
 
     temp_dir
@@ -51,6 +50,7 @@ fn create_indexable_test_model(root: &std::path::Path, model_id: &str, official_
     .unwrap();
 }
 
+#[cfg(feature = "inference-plugins")]
 fn create_indexable_gguf_test_model(root: &std::path::Path, model_id: &str, official_name: &str) {
     let model_dir = root.join("shared-resources/models").join(model_id);
     std::fs::create_dir_all(&model_dir).unwrap();
@@ -282,15 +282,7 @@ fn validate_base_response(response: &Value) -> Result<(), String> {
 fn validate_status_response(response: &Value) -> Result<(), String> {
     validate_base_response(response)?;
 
-    let required_fields = [
-        "version",
-        "deps_ready",
-        "patched",
-        "menu_shortcut",
-        "desktop_shortcut",
-        "message",
-        "comfyui_running",
-    ];
+    let required_fields = ["version", "message", "ollama_running", "torch_running"];
 
     for field in required_fields {
         if response.get(field).is_none() {
@@ -508,6 +500,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "inference-plugins")]
     fn missing_serving_request() -> Value {
         json!({
             "request": {
@@ -522,6 +515,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "inference-plugins")]
     #[tokio::test]
     async fn test_serving_rpc_methods_return_non_critical_domain_errors() {
         if !can_bind_local_tcp_for_tests() {
@@ -641,6 +635,7 @@ mod tests {
         server.stop().await;
     }
 
+    #[cfg(feature = "inference-plugins")]
     #[tokio::test]
     async fn test_serving_llama_cpp_missing_runtime_is_non_critical() {
         if !can_bind_local_tcp_for_tests() {
@@ -817,6 +812,7 @@ mod tests {
         server.stop().await;
     }
 
+    #[cfg(feature = "inference-plugins")]
     #[tokio::test]
     async fn test_serving_status_update_event_stream_emits_initial_snapshot_required() {
         if !can_bind_local_tcp_for_tests() {
@@ -1022,78 +1018,6 @@ mod tests {
         server.stop().await;
     }
 
-    #[tokio::test]
-    async fn test_sync_with_resolutions_rejects_invalid_action() {
-        if !can_bind_local_tcp_for_tests() {
-            return;
-        }
-        let env = create_test_env();
-        let server = start_rpc_server(env.path()).await.unwrap();
-        let port = server.port;
-
-        let response = rpc_call(
-            port,
-            "sync_with_resolutions",
-            json!({
-                "versionTag": "v-test",
-                "resolutions": {
-                    "checkpoints/model.safetensors": "invalid_action"
-                }
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            response.get("success").and_then(|v| v.as_bool()),
-            Some(false)
-        );
-        let error = response
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        assert!(error.contains("Invalid conflict resolution action"));
-        assert!(error.contains("skip, overwrite, rename"));
-
-        server.stop().await;
-    }
-
-    #[tokio::test]
-    async fn test_get_cross_filesystem_warning_returns_structured_response() {
-        if !can_bind_local_tcp_for_tests() {
-            return;
-        }
-        let env = create_test_env();
-        // Ensure the version path exists so cross-filesystem check can resolve metadata cleanly.
-        std::fs::create_dir_all(env.path().join("comfyui-versions/v-test/models")).unwrap();
-
-        let server = start_rpc_server(env.path()).await.unwrap();
-        let port = server.port;
-
-        let response = rpc_call(
-            port,
-            "get_cross_filesystem_warning",
-            json!({
-                "versionTag": "v-test"
-            }),
-        )
-        .await
-        .unwrap();
-
-        assert!(response.get("success").and_then(|v| v.as_bool()).is_some());
-        assert!(response
-            .get("cross_filesystem")
-            .and_then(|v| v.as_bool())
-            .is_some());
-        assert!(response
-            .get("library_path")
-            .and_then(|v| v.as_str())
-            .is_some());
-        assert!(response.get("app_path").and_then(|v| v.as_str()).is_some());
-
-        server.stop().await;
-    }
-
     // Note: These tests require the RPC server to be running.
     // In CI, you would start the server as part of the test setup.
     // For local development, run: cargo run --release -- --port <port> --launcher_root <path>
@@ -1213,7 +1137,7 @@ mod tests {
             .is_some());
 
         // get_active_version
-        let response = rpc_call(port, "get_active_version", json!({}))
+        let response = rpc_call(port, "get_active_version", json!({"app_id": "ollama"}))
             .await
             .unwrap();
         assert!(response
@@ -1223,7 +1147,7 @@ mod tests {
         // version can be null or a string
 
         // get_default_version
-        let response = rpc_call(port, "get_default_version", json!({}))
+        let response = rpc_call(port, "get_default_version", json!({"app_id": "ollama"}))
             .await
             .unwrap();
         assert!(response
@@ -1238,27 +1162,10 @@ mod tests {
     async fn test_process_methods() {
         let port = 9999;
 
-        // is_comfyui_running should return a boolean
-        let response = rpc_call(port, "is_comfyui_running", json!({}))
+        let response = rpc_call(port, "is_ollama_running", json!({}))
             .await
             .unwrap();
         assert!(response.is_boolean());
-    }
-
-    /// Test shortcut methods
-    #[tokio::test]
-    #[ignore] // Requires running server
-    async fn test_shortcut_methods() {
-        let port = 9999;
-
-        // get_version_shortcuts needs a tag parameter
-        let response = rpc_call(port, "get_version_shortcuts", json!({"tag": "v0.4.0"}))
-            .await
-            .unwrap();
-        // Should have tag, menu, desktop fields
-        assert!(response.get("tag").is_some());
-        assert!(response.get("menu").is_some());
-        assert!(response.get("desktop").is_some());
     }
 
     /// Test model library methods
@@ -1405,13 +1312,13 @@ async fn run_all_contract_tests() {
         ("get_network_status", json!({})),
         ("get_library_status", json!({})),
         ("get_link_health", json!({})),
-        ("get_available_versions", json!({})),
-        ("get_installed_versions", json!({})),
-        ("get_active_version", json!({})),
-        ("get_default_version", json!({})),
-        ("is_comfyui_running", json!({})),
+        ("get_available_versions", json!({"app_id": "ollama"})),
+        ("get_installed_versions", json!({"app_id": "ollama"})),
+        ("get_active_version", json!({"app_id": "ollama"})),
+        ("get_default_version", json!({"app_id": "ollama"})),
+        ("is_ollama_running", json!({})),
         ("has_background_fetch_completed", json!({})),
-        ("get_github_cache_status", json!({})),
+        ("get_github_cache_status", json!({"app_id": "ollama"})),
     ];
 
     let mut passed = 0;

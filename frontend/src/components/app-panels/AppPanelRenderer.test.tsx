@@ -4,9 +4,6 @@ import type { ModelManagerProps } from '../ModelManager';
 import { UNSUPPORTED_VERSION_STATE } from '../../utils/appVersionState';
 import { AppPanelRenderer } from './AppPanelRenderer';
 
-vi.mock('./ComfyUIPanel', () => ({
-  ComfyUIPanel: () => <div>comfyui-panel</div>,
-}));
 vi.mock('./DefaultAppPanel', () => ({
   DefaultAppPanel: () => <div>default-panel</div>,
 }));
@@ -47,16 +44,6 @@ function renderPanel(selectedAppId: string | null) {
   render(
     <AppPanelRenderer
       selectedAppId={selectedAppId}
-      comfyUI={{
-        ...sharedVersionProps,
-        comfyUIRunning: false,
-        depsInstalled: null,
-        displayStatus: 'Idle',
-        isCheckingDeps: false,
-        isInstallingDeps: false,
-        isSetupComplete: true,
-        onInstallDeps: vi.fn(),
-      }}
       fallback={{
         appDisplayName: 'Fallback',
         modelManagerProps,

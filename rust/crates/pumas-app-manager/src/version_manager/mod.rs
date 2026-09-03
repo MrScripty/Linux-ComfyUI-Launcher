@@ -1,9 +1,9 @@
-//! Version management for ComfyUI, Ollama, and other supported applications.
+//! Version management for supported inference runtimes.
 //!
 //! This module handles:
 //! - Tracking installed, active, and default versions
 //! - Installing new versions from GitHub releases
-//! - Managing Python virtual environments and dependencies (ComfyUI)
+//! - Managing Python virtual environments and dependencies
 //! - Installing pre-built binaries (Ollama)
 //! - Launching application instances
 //! - Installation progress tracking and cancellation
@@ -27,7 +27,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> pumas_library::Result<()> {
-//!     let manager = VersionManager::new("/path/to/pumas", AppId::ComfyUI).await?;
+//!     let manager = VersionManager::new("/path/to/pumas", AppId::Ollama).await?;
 //!
 //!     // Get installed versions
 //!     let installed = manager.get_installed_versions().await?;
@@ -84,7 +84,7 @@ async fn path_exists(path: &Path) -> Result<bool> {
 pub struct VersionManager {
     /// Root directory for launcher data.
     launcher_root: PathBuf,
-    /// Application ID (ComfyUI, Ollama, etc.).
+    /// Inference runtime identifier.
     app_id: AppId,
     /// Metadata manager for JSON persistence.
     metadata_manager: Arc<MetadataManager>,
@@ -668,9 +668,9 @@ mod tests {
         // Create required directories
         std::fs::create_dir_all(temp_dir.path().join("launcher-data/cache")).unwrap();
         std::fs::create_dir_all(temp_dir.path().join("launcher-data/metadata")).unwrap();
-        std::fs::create_dir_all(temp_dir.path().join("comfyui-versions")).unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("ollama-versions")).unwrap();
 
-        let manager = VersionManager::new(temp_dir.path(), AppId::ComfyUI)
+        let manager = VersionManager::new(temp_dir.path(), AppId::Ollama)
             .await
             .unwrap();
         (manager, temp_dir)
@@ -679,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn test_manager_creation() {
         let (manager, _temp) = create_test_manager().await;
-        assert!(manager.versions_dir().ends_with("comfyui-versions"));
+        assert!(manager.versions_dir().ends_with("ollama-versions"));
     }
 
     #[tokio::test]
@@ -751,12 +751,12 @@ mod tests {
     async fn test_path_helpers() {
         let (manager, temp) = create_test_manager().await;
 
-        assert_eq!(manager.versions_dir(), temp.path().join("comfyui-versions"));
+        assert_eq!(manager.versions_dir(), temp.path().join("ollama-versions"));
         assert_eq!(manager.logs_dir(), temp.path().join("launcher-data/logs"));
         assert_eq!(manager.cache_dir(), temp.path().join("launcher-data/cache"));
         assert_eq!(
             manager.version_path("v1.0.0"),
-            temp.path().join("comfyui-versions/v1.0.0")
+            temp.path().join("ollama-versions/v1.0.0")
         );
     }
 }

@@ -12,7 +12,6 @@ export interface VersionManagerSectionProps {
   versions: AppVersionState;
   showManager: boolean;
   onShowManager: (show: boolean) => void;
-  activeShortcutState?: { menu: boolean; desktop: boolean };
   diskSpacePercent?: number;
   backLabel?: string;
 }
@@ -22,7 +21,6 @@ export function VersionManagerSection({
   versions,
   showManager,
   onShowManager,
-  activeShortcutState,
   diskSpacePercent = 0,
   backLabel,
 }: VersionManagerSectionProps) {
@@ -37,7 +35,6 @@ export function VersionManagerSection({
       versions={versions}
       showManager={showManager}
       onShowManager={onShowManager}
-      activeShortcutState={activeShortcutState}
       diskSpacePercent={diskSpacePercent}
     />
   );

@@ -254,14 +254,12 @@ impl From<pumas_library::models::AppResourceUsage> for FfiAppResourceUsage {
 
 #[derive(uniffi::Record)]
 pub struct FfiAppResources {
-    pub comfyui: Option<FfiAppResourceUsage>,
     pub ollama: Option<FfiAppResourceUsage>,
 }
 
 impl From<pumas_library::models::AppResources> for FfiAppResources {
     fn from(r: pumas_library::models::AppResources) -> Self {
         Self {
-            comfyui: r.comfyui.map(FfiAppResourceUsage::from),
             ollama: r.ollama.map(FfiAppResourceUsage::from),
         }
     }
@@ -272,13 +270,7 @@ pub struct FfiStatusResponse {
     pub success: bool,
     pub error: Option<String>,
     pub version: String,
-    pub deps_ready: bool,
-    pub patched: bool,
-    pub menu_shortcut: bool,
-    pub desktop_shortcut: bool,
-    pub shortcut_version: Option<String>,
     pub message: String,
-    pub comfyui_running: bool,
     pub ollama_running: bool,
     pub torch_running: bool,
     pub last_launch_error: Option<String>,
@@ -292,13 +284,7 @@ impl From<pumas_library::models::StatusResponse> for FfiStatusResponse {
             success: r.success,
             error: r.error,
             version: r.version,
-            deps_ready: r.deps_ready,
-            patched: r.patched,
-            menu_shortcut: r.menu_shortcut,
-            desktop_shortcut: r.desktop_shortcut,
-            shortcut_version: r.shortcut_version,
             message: r.message,
-            comfyui_running: r.comfyui_running,
             ollama_running: r.ollama_running,
             torch_running: r.torch_running,
             last_launch_error: r.last_launch_error,

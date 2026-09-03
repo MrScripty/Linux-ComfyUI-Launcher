@@ -1,27 +1,38 @@
 //! JSON-RPC request handlers, split by domain.
 
 mod conversion;
-mod custom_nodes;
 mod links;
 mod models;
+#[cfg(feature = "inference-plugins")]
 mod ollama;
+#[cfg(feature = "inference-plugins")]
 mod openai_gateway;
+#[cfg(feature = "inference-plugins")]
 mod openai_gateway_onnx;
+#[cfg(feature = "inference-plugins")]
 mod plugins;
 mod process;
+#[cfg(feature = "inference-plugins")]
 mod runtime_profiles;
+#[cfg(feature = "inference-plugins")]
 mod serving;
+#[cfg(feature = "inference-plugins")]
 mod serving_llama_cpp;
+#[cfg(feature = "inference-plugins")]
 mod serving_llama_cpp_router;
+#[cfg(feature = "inference-plugins")]
 mod serving_llama_cpp_shared;
+#[cfg(feature = "inference-plugins")]
 mod serving_ollama;
+#[cfg(feature = "inference-plugins")]
 mod serving_onnx;
 mod shared;
-mod shortcuts;
 mod status;
-#[cfg(test)]
+#[cfg(all(test, feature = "inference-plugins"))]
 mod test_support;
+#[cfg(feature = "inference-plugins")]
 mod torch;
+#[cfg(feature = "inference-plugins")]
 mod versions;
 
 use crate::server::AppState;
@@ -40,9 +51,11 @@ use futures::{
     StreamExt,
 };
 use pumas_library::models::{
-    ModelDownloadUpdateNotification, ModelLibraryUpdateNotification, RuntimeProfileUpdateFeed,
-    ServingStatusUpdateFeed, StatusTelemetryUpdateNotification,
+    ModelDownloadUpdateNotification, ModelLibraryUpdateNotification,
+    StatusTelemetryUpdateNotification,
 };
+#[cfg(feature = "inference-plugins")]
+use pumas_library::models::{RuntimeProfileUpdateFeed, ServingStatusUpdateFeed};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -52,16 +65,18 @@ use tracing::{debug, error, warn};
 
 const MODEL_LIBRARY_UPDATE_STREAM_LIMIT: usize = 250;
 
+#[cfg(feature = "inference-plugins")]
 pub use openai_gateway::{handle_openai_models, handle_openai_proxy};
 
 pub(crate) use shared::{
     detect_sandbox_environment, extract_safetensors_header, get_bool_param, get_i64_param,
-    get_str_param, get_version_manager, parse_params, path_exists, read_utf8_file,
-    require_str_param, require_version_manager, sync_version_paths_to_process_manager,
+    get_str_param, parse_params, path_exists, require_str_param,
     validate_existing_local_directory_path, validate_existing_local_file_path,
     validate_existing_local_path, validate_external_url, validate_local_write_target_path,
     validate_non_empty,
 };
+#[cfg(feature = "inference-plugins")]
+pub(crate) use shared::{get_version_manager, read_utf8_file, require_version_manager};
 
 // ============================================================================
 // JSON-RPC types
@@ -166,11 +181,13 @@ pub struct ModelDownloadUpdateStreamQuery {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg(feature = "inference-plugins")]
 pub struct RuntimeProfileUpdateStreamQuery {
     pub cursor: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[cfg(feature = "inference-plugins")]
 pub struct ServingStatusUpdateStreamQuery {
     pub cursor: Option<String>,
 }
@@ -269,6 +286,7 @@ async fn build_model_download_update_stream_state(
 }
 
 /// Server-sent runtime-profile update notification stream.
+#[cfg(feature = "inference-plugins")]
 pub async fn handle_runtime_profile_update_events(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RuntimeProfileUpdateStreamQuery>,
@@ -279,6 +297,7 @@ pub async fn handle_runtime_profile_update_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+#[cfg(feature = "inference-plugins")]
 async fn build_runtime_profile_update_stream_state(
     state: Arc<AppState>,
     cursor: Option<String>,
@@ -315,6 +334,7 @@ async fn build_runtime_profile_update_stream_state(
 }
 
 /// Server-sent serving-status update notification stream.
+#[cfg(feature = "inference-plugins")]
 pub async fn handle_serving_status_update_events(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ServingStatusUpdateStreamQuery>,
@@ -325,6 +345,7 @@ pub async fn handle_serving_status_update_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+#[cfg(feature = "inference-plugins")]
 async fn build_serving_status_update_stream_state(
     state: Arc<AppState>,
     cursor: Option<String>,
@@ -404,6 +425,16 @@ pub async fn handle_rpc(
     }
 
     if method == "shutdown" {
+        #[cfg(not(feature = "inference-plugins"))]
+        return (
+            StatusCode::OK,
+            Json(JsonRpcResponse::success(
+                id,
+                json!({ "status": "shutting_down" }),
+            )),
+        );
+
+        #[cfg(feature = "inference-plugins")]
         let shutdown_summary = match state.api.stop_all_managed_runtime_profiles().await {
             Ok(summary) => summary,
             Err(error) => {
@@ -425,6 +456,7 @@ pub async fn handle_rpc(
                 );
             }
         };
+        #[cfg(feature = "inference-plugins")]
         return (
             StatusCode::OK,
             Json(JsonRpcResponse::success(
@@ -543,11 +575,13 @@ fn model_download_update_sse_event(notification: &ModelDownloadUpdateNotificatio
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 struct RuntimeProfileUpdateStreamState {
     receiver: broadcast::Receiver<RuntimeProfileUpdateFeed>,
     pending_feed: Option<RuntimeProfileUpdateFeed>,
 }
 
+#[cfg(feature = "inference-plugins")]
 struct ServingStatusUpdateStreamState {
     receiver: broadcast::Receiver<ServingStatusUpdateFeed>,
     pending_feed: Option<ServingStatusUpdateFeed>,
@@ -622,6 +656,7 @@ fn status_telemetry_update_sse_event(notification: &StatusTelemetryUpdateNotific
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 async fn next_runtime_profile_update_event(
     mut state: RuntimeProfileUpdateStreamState,
 ) -> Option<(Result<Event, Infallible>, RuntimeProfileUpdateStreamState)> {
@@ -645,6 +680,7 @@ async fn next_runtime_profile_update_event(
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 fn runtime_profile_update_sse_event(feed: &RuntimeProfileUpdateFeed) -> Event {
     match serde_json::to_string(feed) {
         Ok(payload) => Event::default()
@@ -656,6 +692,7 @@ fn runtime_profile_update_sse_event(feed: &RuntimeProfileUpdateFeed) -> Event {
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 async fn next_serving_status_update_event(
     mut state: ServingStatusUpdateStreamState,
 ) -> Option<(Result<Event, Infallible>, ServingStatusUpdateStreamState)> {
@@ -678,6 +715,7 @@ async fn next_serving_status_update_event(
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 fn serving_status_update_sse_event(feed: &ServingStatusUpdateFeed) -> Event {
     match serde_json::to_string(feed) {
         Ok(payload) => Event::default()
@@ -713,74 +751,106 @@ async fn dispatch_method(
         "restart_launcher" => status::restart_launcher(state, params).await,
         "get_sandbox_info" => status::get_sandbox_info(state, params).await,
         "check_git" => status::check_git(state, params).await,
-        "check_brave" => status::check_brave(state, params).await,
-        "check_setproctitle" => status::check_setproctitle(state, params).await,
         "get_network_status" => status::get_network_status(state, params).await,
         "get_library_status" => status::get_library_status(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_app_status" => status::get_app_status(state, params).await,
 
         // Local Runtime Profiles
+        #[cfg(feature = "inference-plugins")]
         "get_runtime_profiles_snapshot" => {
             runtime_profiles::get_runtime_profiles_snapshot(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "list_runtime_profile_updates_since" => {
             runtime_profiles::list_runtime_profile_updates_since(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "upsert_runtime_profile" => runtime_profiles::upsert_runtime_profile(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "delete_runtime_profile" => runtime_profiles::delete_runtime_profile(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "set_model_runtime_route" => runtime_profiles::set_model_runtime_route(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "clear_model_runtime_route" => {
             runtime_profiles::clear_model_runtime_route(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "launch_runtime_profile" => runtime_profiles::launch_runtime_profile(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "stop_runtime_profile" => runtime_profiles::stop_runtime_profile(state, params).await,
 
         // User-Directed Serving
+        #[cfg(feature = "inference-plugins")]
         "get_serving_status" => serving::get_serving_status(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "list_serving_status_updates_since" => {
             serving::list_serving_status_updates_since(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "validate_model_serving_config" => {
             serving::validate_model_serving_config(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "serve_model" => serving::serve_model(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "unserve_model" => serving::unserve_model(state, params).await,
 
         // Version Management
+        #[cfg(feature = "inference-plugins")]
         "get_available_versions" => versions::get_available_versions(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_installed_versions" => versions::get_installed_versions(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_active_version" => versions::get_active_version(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_default_version" => versions::get_default_version(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "set_default_version" => versions::set_default_version(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "switch_version" => versions::switch_version(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "install_version" => versions::install_version(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "remove_version" => versions::remove_version(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "cancel_installation" => versions::cancel_installation(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_installation_progress" => versions::get_installation_progress(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "validate_installations" => versions::validate_installations(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_version_status" => versions::get_version_status(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_version_info" => versions::get_version_info(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_release_size_info" => versions::get_release_size_info(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_release_size_breakdown" => versions::get_release_size_breakdown(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "calculate_release_size" => versions::calculate_release_size(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "calculate_all_release_sizes" => versions::calculate_all_release_sizes(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "has_background_fetch_completed" => {
             versions::has_background_fetch_completed(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "reset_background_fetch_flag" => versions::reset_background_fetch_flag(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_github_cache_status" => versions::get_github_cache_status(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "check_version_dependencies" => versions::check_version_dependencies(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "install_version_dependencies" => {
             versions::install_version_dependencies(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "get_release_dependencies" => versions::get_release_dependencies(state, params).await,
-        "is_patched" => versions::is_patched(state, params).await,
-        "toggle_patch" => versions::toggle_patch(state, params).await,
 
         // Model Library
         "get_models" => models::get_models(state, params).await,
         "refresh_model_index" => models::refresh_model_index(state, params).await,
-        "refresh_model_mappings" => models::refresh_model_mappings(state, params).await,
         "import_model" => models::import_model(state, params).await,
         "download_model_from_hf" => models::download_model_from_hf(state, params).await,
         "start_model_download_from_hf" => models::start_model_download_from_hf(state, params).await,
@@ -863,48 +933,69 @@ async fn dispatch_method(
         "get_hf_auth_status" => models::get_hf_auth_status(state, params).await,
 
         // Process Management
-        "is_comfyui_running" => process::is_comfyui_running(state, params).await,
-        "stop_comfyui" => process::stop_comfyui(state, params).await,
-        "launch_comfyui" => process::launch_comfyui(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "launch_ollama" => process::launch_ollama(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "stop_ollama" => process::stop_ollama(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "is_ollama_running" => process::is_ollama_running(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "launch_torch" => process::launch_torch(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "stop_torch" => process::stop_torch(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "is_torch_running" => process::is_torch_running(state, params).await,
         "open_path" => process::open_path(state, params).await,
         "open_url" => process::open_url(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "open_active_install" => process::open_active_install(state, params).await,
 
         // Ollama Model Management
+        #[cfg(feature = "inference-plugins")]
         "ollama_list_models" => ollama::ollama_list_models(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "ollama_list_models_for_profile" => {
             ollama::ollama_list_models_for_profile(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "ollama_create_model" => ollama::ollama_create_model(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "ollama_create_model_for_profile" => {
             ollama::ollama_create_model_for_profile(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "ollama_delete_model" => ollama::ollama_delete_model(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "ollama_delete_model_for_profile" => {
             ollama::ollama_delete_model_for_profile(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "ollama_load_model" => ollama::ollama_load_model(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "ollama_load_model_for_profile" => {
             ollama::ollama_load_model_for_profile(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "ollama_unload_model" => ollama::ollama_unload_model(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "ollama_unload_model_for_profile" => {
             ollama::ollama_unload_model_for_profile(state, params).await
         }
+        #[cfg(feature = "inference-plugins")]
         "ollama_list_running" => ollama::ollama_list_running(state, params).await,
 
         // Torch Inference Server
+        #[cfg(feature = "inference-plugins")]
         "torch_list_slots" => torch::torch_list_slots(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "torch_load_model" => torch::torch_load_model(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "torch_unload_model" => torch::torch_unload_model(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "torch_get_status" => torch::torch_get_status(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "torch_list_devices" => torch::torch_list_devices(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "torch_configure" => torch::torch_configure(state, params).await,
 
         // Link Management
@@ -913,28 +1004,10 @@ async fn dispatch_method(
         "remove_orphaned_links" => links::remove_orphaned_links(state, params).await,
         "get_links_for_model" => links::get_links_for_model(state, params).await,
         "delete_model_with_cascade" => links::delete_model_with_cascade(state, params).await,
-        "preview_model_mapping" => links::preview_model_mapping(state, params).await,
-        "apply_model_mapping" => links::apply_model_mapping(state, params).await,
-        "sync_models_incremental" => links::sync_models_incremental(state, params).await,
-        "sync_with_resolutions" => links::sync_with_resolutions(state, params).await,
-        "get_cross_filesystem_warning" => links::get_cross_filesystem_warning(state, params).await,
         "get_file_link_count" => links::get_file_link_count(state, params).await,
         "check_files_writable" => links::check_files_writable(state, params).await,
         "set_model_link_exclusion" => links::set_model_link_exclusion(state, params).await,
         "get_link_exclusions" => links::get_link_exclusions(state, params).await,
-
-        // Shortcuts
-        "get_version_shortcuts" => shortcuts::get_version_shortcuts(state, params).await,
-        "get_all_shortcut_states" => shortcuts::get_all_shortcut_states(state, params).await,
-        "toggle_menu" => shortcuts::toggle_menu(state, params).await,
-        "toggle_desktop" => shortcuts::toggle_desktop(state, params).await,
-        "menu_exists" => shortcuts::menu_exists(state, params).await,
-        "desktop_exists" => shortcuts::desktop_exists(state, params).await,
-        "install_icon" => shortcuts::install_icon(state, params).await,
-        "create_menu_shortcut" => shortcuts::create_menu_shortcut(state, params).await,
-        "create_desktop_shortcut" => shortcuts::create_desktop_shortcut(state, params).await,
-        "remove_menu_shortcut" => shortcuts::remove_menu_shortcut(state, params).await,
-        "remove_desktop_shortcut" => shortcuts::remove_desktop_shortcut(state, params).await,
 
         // Conversion
         "start_model_conversion" => conversion::start_model_conversion(state, params).await,
@@ -952,16 +1025,14 @@ async fn dispatch_method(
         "setup_quantization_backend" => conversion::setup_quantization_backend(state, params).await,
 
         // Plugins
+        #[cfg(feature = "inference-plugins")]
         "get_plugins" => plugins::get_plugins(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "get_plugin" => plugins::get_plugin(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "call_plugin_endpoint" => plugins::call_plugin_endpoint(state, params).await,
+        #[cfg(feature = "inference-plugins")]
         "check_plugin_health" => plugins::check_plugin_health(state, params).await,
-
-        // Custom Nodes
-        "get_custom_nodes" => custom_nodes::get_custom_nodes(state, params).await,
-        "install_custom_node" => custom_nodes::install_custom_node(state, params).await,
-        "update_custom_node" => custom_nodes::update_custom_node(state, params).await,
-        "remove_custom_node" => custom_nodes::remove_custom_node(state, params).await,
 
         // Unknown method
         _ => {

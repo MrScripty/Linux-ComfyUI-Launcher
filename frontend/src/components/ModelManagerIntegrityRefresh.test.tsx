@@ -182,7 +182,7 @@ function Harness() {
       excludedModels={new Set()}
       onToggleStar={vi.fn()}
       onToggleLink={vi.fn()}
-      selectedAppId="comfyui"
+      selectedAppId="ollama"
     />
   );
 }

@@ -56,18 +56,14 @@ describe('useSelectedAppVersions', () => {
     const { result } = renderHook(() => useSelectedAppVersions('ollama'));
 
     expect(useVersionsMock).toHaveBeenNthCalledWith(1, {
-      appId: 'comfyui',
-      trackAvailableVersions: false,
-    });
-    expect(useVersionsMock).toHaveBeenNthCalledWith(2, {
       appId: 'ollama',
       trackAvailableVersions: true,
     });
-    expect(useVersionsMock).toHaveBeenNthCalledWith(3, {
+    expect(useVersionsMock).toHaveBeenNthCalledWith(2, {
       appId: 'llama-cpp',
       trackAvailableVersions: false,
     });
-    expect(useVersionsMock).toHaveBeenNthCalledWith(4, {
+    expect(useVersionsMock).toHaveBeenNthCalledWith(3, {
       appId: 'torch',
       trackAvailableVersions: false,
     });
@@ -88,14 +84,13 @@ describe('useSelectedAppVersions', () => {
     const { result } = renderHook(() => useSelectedAppVersions(null));
 
     expect(result.current.appVersions.isSupported).toBe(false);
-    expect(result.current.comfyInstalledVersions).toEqual(['comfyui-installed']);
     expect(result.current.appVersions.installedVersions).toEqual([]);
   });
 
   it('does not query a version manager for in-process ONNX Runtime', () => {
     const { result } = renderHook(() => useSelectedAppVersions('onnx-runtime'));
 
-    expect(useVersionsMock).toHaveBeenCalledTimes(4);
+    expect(useVersionsMock).toHaveBeenCalledTimes(3);
     expect(useVersionsMock).not.toHaveBeenCalledWith(expect.objectContaining({
       appId: 'onnx-runtime',
     }));

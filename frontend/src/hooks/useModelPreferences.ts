@@ -3,7 +3,7 @@ import { api, isAPIAvailable } from '../api/adapter';
 import { getLogger } from '../utils/logger';
 
 const logger = getLogger('useModelPreferences');
-const DEFAULT_APP_ID = 'comfyui';
+const DEFAULT_APP_ID = 'library';
 
 type UseModelPreferencesOptions = {
   selectedAppId: string | null;

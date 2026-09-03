@@ -20,7 +20,7 @@ Model format conversion between GGUF and Safetensors.
 - **Embedded scripts**: Python scripts are compiled into the binary as string constants
   and deployed to disk on first use, with hash-based staleness detection for updates.
 - **Dedicated venv**: A separate virtual environment (`converter-venv/`) isolates
-  conversion dependencies from ComfyUI or other Python environments.
+  conversion dependencies from unrelated Python environments.
 - **Progress via stdout JSON**: The Python scripts emit one JSON object per line on
   stdout, which the Rust side parses to update the `ConversionProgressTracker`.
 - **Spawned task ownership**: Background conversion tasks own `Arc` handles for shared

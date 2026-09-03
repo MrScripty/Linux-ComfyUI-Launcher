@@ -494,7 +494,7 @@ mod tests {
             .stderr(Stdio::null());
         configure_detached_command(&mut command);
 
-        let child = command.spawn().unwrap();
+        let mut child = command.spawn().unwrap();
         let parent_pid = child.id();
 
         wait_until(Duration::from_secs(5), || ready_file.exists());
@@ -508,6 +508,7 @@ mod tests {
         assert!(is_process_alive(worker_pid));
 
         let stopped = terminate_process_tree(parent_pid, 1_000).unwrap();
+        let _ = child.wait();
 
         assert!(stopped);
         wait_until(Duration::from_secs(5), || !is_process_alive(worker_pid));

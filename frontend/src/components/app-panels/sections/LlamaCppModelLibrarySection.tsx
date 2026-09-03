@@ -110,15 +110,6 @@ export function LlamaCppModelLibrarySection({
     profile: RuntimeProfileConfig,
     shouldPersistRoute: boolean
   ) => {
-    if (!profile) {
-      setQuickServeFeedback({
-        kind: 'error',
-        message: 'Select a llama.cpp profile before serving this model.',
-        modelId: row.model.id,
-      });
-      return;
-    }
-
     if (shouldPersistRoute) {
       const saved = await persistRouteSelection(row.model.id, profile.profile_id);
       if (!saved) {
@@ -132,7 +123,7 @@ export function LlamaCppModelLibrarySection({
     }
 
     const api = getElectronAPI();
-    if (!api?.validate_model_serving_config || !api.serve_model) {
+    if (!api) {
       setQuickServeFeedback({
         kind: 'error',
         message: 'Serving API is not available in this app session.',

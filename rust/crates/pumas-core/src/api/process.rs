@@ -2,7 +2,6 @@
 
 use crate::error::{PumasError, Result};
 use crate::models;
-use crate::process;
 use crate::PumasApi;
 use std::path::Path;
 use tokio::fs;
@@ -17,73 +16,6 @@ impl PumasApi {
     // ========================================
     // Process Management Methods
     // ========================================
-
-    /// Check if ComfyUI is currently running.
-    pub async fn is_comfyui_running(&self) -> bool {
-        let process_manager = {
-            let mgr_lock = self.primary().process_manager.read().await;
-            mgr_lock.clone()
-        };
-
-        if let Some(mgr) = process_manager {
-            tokio::task::spawn_blocking(move || mgr.is_running())
-                .await
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    }
-
-    /// Get running processes with resource information.
-    pub async fn get_running_processes(&self) -> Vec<process::ProcessInfo> {
-        let process_manager = {
-            let mgr_lock = self.primary().process_manager.read().await;
-            mgr_lock.clone()
-        };
-
-        if let Some(mgr) = process_manager {
-            tokio::task::spawn_blocking(move || mgr.get_processes_with_resources())
-                .await
-                .unwrap_or_default()
-        } else {
-            vec![]
-        }
-    }
-
-    /// Update the version paths for process detection.
-    ///
-    /// This should be called by the RPC layer after obtaining version information
-    /// from the VersionManager. Without this, PID file detection will only check
-    /// the root-level PID file and may miss version-specific PID files.
-    pub async fn set_process_version_paths(
-        &self,
-        version_paths: std::collections::HashMap<String, std::path::PathBuf>,
-    ) {
-        let mgr_lock = self.primary().process_manager.read().await;
-        if let Some(ref mgr) = *mgr_lock {
-            mgr.set_version_paths(version_paths);
-        } else {
-            tracing::warn!("PumasApi.set_process_version_paths: process manager not initialized");
-        }
-    }
-
-    /// Stop all running ComfyUI processes.
-    pub async fn stop_comfyui(&self) -> Result<bool> {
-        let process_manager = {
-            let mgr_lock = self.primary().process_manager.read().await;
-            mgr_lock.clone()
-        };
-
-        if let Some(mgr) = process_manager {
-            tokio::task::spawn_blocking(move || mgr.stop_all())
-                .await
-                .map_err(|e| {
-                    PumasError::Other(format!("Failed to join stop_comfyui task: {}", e))
-                })?
-        } else {
-            Ok(false)
-        }
-    }
 
     /// Check if Ollama is currently running.
     pub async fn is_ollama_running(&self) -> bool {
@@ -238,59 +170,6 @@ impl PumasApi {
             })
             .await
             .map_err(|e| PumasError::Other(format!("Failed to join launch_torch task: {}", e)))?;
-
-            Ok(models::LaunchResponse {
-                success: result.success,
-                error: result.error,
-                log_path: result.log_path.map(|p| p.to_string_lossy().to_string()),
-                ready: Some(result.ready),
-            })
-        } else {
-            Ok(models::LaunchResponse {
-                success: false,
-                error: Some("Process manager not initialized".to_string()),
-                log_path: None,
-                ready: None,
-            })
-        }
-    }
-
-    /// Launch a specific version from a given directory.
-    ///
-    /// The caller (RPC layer) is responsible for resolving the version tag to a directory
-    /// using pumas-app-manager's VersionManager.
-    pub async fn launch_version(
-        &self,
-        tag: &str,
-        version_dir: &std::path::Path,
-    ) -> Result<models::LaunchResponse> {
-        if !path_exists(version_dir).await? {
-            return Ok(models::LaunchResponse {
-                success: false,
-                error: Some(format!(
-                    "Version directory does not exist: {}",
-                    version_dir.display()
-                )),
-                log_path: None,
-                ready: None,
-            });
-        }
-
-        let process_manager = {
-            let mgr_lock = self.primary().process_manager.read().await;
-            mgr_lock.clone()
-        };
-
-        if let Some(pm) = process_manager {
-            let log_dir = self.launcher_data_dir().join("logs");
-            let tag = tag.to_string();
-            let version_dir = version_dir.to_path_buf();
-
-            let result = tokio::task::spawn_blocking(move || {
-                pm.launch_version(&tag, &version_dir, Some(&log_dir))
-            })
-            .await
-            .map_err(|e| PumasError::Other(format!("Failed to join launch_version task: {}", e)))?;
 
             Ok(models::LaunchResponse {
                 success: result.success,

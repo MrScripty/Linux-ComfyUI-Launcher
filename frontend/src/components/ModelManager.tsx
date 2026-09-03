@@ -6,7 +6,7 @@
  */
 
 import React, { useMemo } from 'react';
-import type { ModelCategory, RemoteModelInfo } from '../types/apps';
+import type { ModelCategory, ModelInfo, RemoteModelInfo } from '../types/apps';
 import type { ServedModelStatus, ServingEndpointStatus } from '../types/api-serving';
 import { useDownloadCompletionRefresh } from '../hooks/useDownloadCompletionRefresh';
 import { useExistingLibraryChooser } from '../hooks/useExistingLibraryChooser';
@@ -45,6 +45,7 @@ export interface ModelManagerProps {
   servingEndpoint?: ServingEndpointStatus | null;
   onAddModels?: () => void;
   onOpenModelsRoot?: () => void;
+  onServeModel?: (model: ModelInfo) => void;
   /** Callback when models are imported to refresh the list */
   onModelsImported?: () => void;
   /** Active version tag for link health check */
@@ -62,6 +63,7 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
   servedModels = [],
   onAddModels,
   onOpenModelsRoot,
+  onServeModel,
   onModelsImported,
   activeVersion,
   onChooseExistingLibrary,
@@ -264,7 +266,7 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
             <>
               {integrityIssueCount > 0 && (
                 <div className="rounded border border-[hsl(var(--accent-warning)/0.35)] bg-[hsl(var(--accent-warning)/0.12)] px-3 py-2 text-xs text-[hsl(var(--accent-warning))]">
-                  Library integrity warning: {integrityIssueCount} model entr{integrityIssueCount === 1 ? 'y' : 'ies'} have duplicate repo records. Reconciliation will keep one visible entry and mark the issue.
+                  Library integrity warning: {integrityIssueCount} model entr{integrityIssueCount === 1 ? 'y' : 'ies'} have duplicate artifact records for the same repository. Reconciliation will keep one visible entry and mark the issue.
                 </div>
               )}
               <LocalModelsList
@@ -290,6 +292,7 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
                 downloadErrors={downloadErrors}
                 onDeleteModel={handleDeleteModel}
                 onConvertModel={handleConvertModel}
+                onServeModel={onServeModel}
                 onChooseExistingLibrary={onChooseExistingLibrary ? chooseExistingLibrary : undefined}
                 isChoosingExistingLibrary={isChoosingExistingLibrary}
               />

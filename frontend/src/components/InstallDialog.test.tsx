@@ -47,7 +47,7 @@ describe('InstallDialog', () => {
       />
     );
 
-    expect(screen.getByRole('dialog', { name: 'Install ComfyUI Version' })).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Install Application Version' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss install dialog' }));
     expect(onClose).toHaveBeenCalledTimes(1);

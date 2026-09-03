@@ -7,10 +7,6 @@ export interface LaunchResponse extends BaseResponse {
   ready?: boolean;
 }
 
-export interface StopComfyUIResponse extends BaseResponse {
-  // Empty body on success
-}
-
 export interface StopOllamaResponse extends BaseResponse {
   // Empty body on success
 }

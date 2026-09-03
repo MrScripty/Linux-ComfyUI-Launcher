@@ -9,7 +9,8 @@ profile selection, placement controls, and serving actions into one oversized co
 | ---- | ----------- |
 | `ModelServeDialogContent.tsx` | Container that assembles the serving header, form, status, and actions. |
 | `ModelServeHeader.tsx` | Title, model identity, back button, and dialog close control. |
-| `ModelServeForm.tsx` | Runtime profile selector, readiness summary, gateway alias prompt, placement controls, and keep-loaded toggle. |
+| `ModelServeForm.tsx` | Runtime profile selector, readiness summary, gateway alias prompt, and keep-loaded toggle. |
+| `ModelServePlacementControls.tsx` | Device and provider-specific advanced placement controls. |
 | `ModelServeActions.tsx` | Start serving, unload, and dialog cancel buttons. |
 | `ModelServeStatusMessage.tsx` | Shared status/error message presentation. |
 | `modelServeHelpers.ts` | Pure helper functions for serving validation state, gateway alias forwarding, and request config construction. |

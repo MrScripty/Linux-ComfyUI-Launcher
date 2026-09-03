@@ -43,8 +43,7 @@ export const UNSUPPORTED_VERSION_STATE: AppVersionState = {
   setDefaultVersion: noopVoid,
 };
 
-const VERSION_SUPPORTED_APP_IDS = new Set(['comfyui', 'ollama', 'llama-cpp', 'torch']);
-const SHORTCUT_SUPPORTED_APP_IDS = new Set(['comfyui']);
+const VERSION_SUPPORTED_APP_IDS = new Set(['ollama', 'llama-cpp', 'torch']);
 
 export function isVersionSupportedAppId(appId: string | null): boolean {
   if (!appId) return false;
@@ -53,7 +52,7 @@ export function isVersionSupportedAppId(appId: string | null): boolean {
 
 export function supportsVersionShortcuts(appId: string | null): boolean {
   if (!appId) return false;
-  return SHORTCUT_SUPPORTED_APP_IDS.has(appId);
+  return false;
 }
 
 export function getAppVersionState(

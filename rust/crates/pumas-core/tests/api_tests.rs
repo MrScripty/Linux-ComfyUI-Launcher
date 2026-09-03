@@ -68,7 +68,7 @@ fn create_test_env() -> TempDir {
     std::fs::create_dir_all(temp_dir.path().join("launcher-data/metadata")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("launcher-data/cache")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("launcher-data/logs")).unwrap();
-    std::fs::create_dir_all(temp_dir.path().join("comfyui-versions")).unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("ollama-versions")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("shared-resources")).unwrap();
     std::fs::create_dir_all(temp_dir.path().join("shared-resources/models")).unwrap();
 
@@ -136,9 +136,6 @@ async fn test_api_paths() {
     assert!(api.launcher_data_dir().ends_with("launcher-data"));
     assert!(api.metadata_dir().ends_with("metadata"));
     assert!(api.cache_dir().ends_with("cache"));
-    assert!(api
-        .versions_dir(AppId::ComfyUI)
-        .ends_with("comfyui-versions"));
     assert!(api.versions_dir(AppId::Ollama).ends_with("ollama-versions"));
 }
 
@@ -470,18 +467,14 @@ async fn test_background_fetch_flag() {
 }
 
 #[tokio::test]
-async fn test_process_methods() {
+async fn test_ollama_process_status() {
     let temp_dir = create_test_env();
     let _registry = RegistryTestGuard::new(temp_dir.path());
     let api = PumasApi::builder(temp_dir.path()).build().await.unwrap();
 
-    // ComfyUI should not be running in test environment
-    let running = api.is_comfyui_running().await;
+    // Ollama should not be running in the isolated test environment.
+    let running = api.is_ollama_running().await;
     assert!(!running);
-
-    // Getting running processes should return empty
-    let processes = api.get_running_processes().await;
-    assert!(processes.is_empty());
 }
 
 #[tokio::test]
@@ -528,10 +521,10 @@ async fn test_launch_version_for_nonexistent_version() {
     let api = PumasApi::builder(temp_dir.path()).build().await.unwrap();
 
     // Create a non-existent version directory path
-    let version_dir = temp_dir.path().join("comfyui-versions/v999.999.999");
+    let version_dir = temp_dir.path().join("ollama-versions/v999.999.999");
 
     // Launching non-installed version should return error response
-    let result = api.launch_version("v999.999.999", &version_dir).await;
+    let result = api.launch_ollama("v999.999.999", &version_dir).await;
     assert!(result.is_ok());
     let launch = result.unwrap();
     assert!(!launch.success);

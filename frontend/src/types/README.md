@@ -15,12 +15,14 @@ one authoritative view of the desktop bridge boundary.
 | `api-models.ts` | Model records, Hugging Face search, inference settings, and download response contracts. |
 | `api-import.ts` | Model-library import, metadata lookup, storage, and validation contracts. |
 | `api-links.ts` | Link registry health and cleanup contracts. |
-| `api-mapping.ts` | Mapping preview, synchronization, sandbox, exclusion, and migration report contracts. |
+| `api-mapping.ts` | Sandbox, exclusion, and migration report contracts. |
 | `api-conversion.ts` | Model conversion state, progress, and environment contracts. |
 | `api-versions.ts` | Version, installation-progress, cache, and background-fetch contracts. |
-| `api-processes.ts` | Process, Ollama, Torch, shortcut, and launcher-update contracts. |
+| `api-processes.ts` | Process, Ollama, Torch, and launcher-update contracts. |
 | `api-runtime-profiles.ts` | Provider-neutral local runtime profile, route, status, and update-feed contracts. |
 | `api-serving.ts` | User-directed model serving request, status, endpoint-mode, update-feed, and non-critical load-error contracts. |
+| `api-package-facts.ts` | Model package and file-fact contracts. |
+| `api-model-library-updates.ts` | Model-library refresh scopes, update events, notifications, and runtime guards. |
 | `api-window.ts` | Renderer utility response contracts for paths, URLs, and window actions. |
 | `api-bridge*.ts` | Domain bridge method interfaces composed into `DesktopBridgeAPI`. |
 | `api-plugins.ts` | Plugin response contracts. |

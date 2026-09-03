@@ -386,6 +386,137 @@ fn append_llama_cpp_model_arg(args: &[String], model_path: &Path) -> Vec<String>
     output
 }
 
+pub(super) async fn stop_runtime_profile(
+    primary: &PrimaryState,
+    profile_id: RuntimeProfileId,
+) -> std::result::Result<bool, PumasError> {
+    let _operation_guard = primary
+        .runtime_profile_service
+        .begin_profile_operation(profile_id.clone())?;
+    let spec = primary
+        .runtime_profile_service
+        .managed_profile_launch_spec(profile_id.clone())
+        .await?;
+
+    stop_runtime_profile_from_spec(primary, spec).await
+}
+
+pub(super) async fn stop_all_managed_runtime_profiles(
+    primary: &PrimaryState,
+) -> std::result::Result<ManagedRuntimeShutdownSummary, PumasError> {
+    let specs = primary
+        .runtime_profile_service
+        .list_managed_profile_launch_specs()
+        .await?;
+    let mut summary = ManagedRuntimeShutdownSummary {
+        profiles_processed: 0,
+        processes_stopped: 0,
+        errors: Vec::new(),
+    };
+
+    for spec in specs {
+        let profile_id = spec.profile_id.clone();
+        summary.profiles_processed += 1;
+        match stop_runtime_profile_from_spec(primary, spec).await {
+            Ok(stopped) => {
+                if stopped {
+                    summary.processes_stopped += 1;
+                }
+            }
+            Err(error) => {
+                let message = format!("{}: {error}", profile_id.as_str());
+                warn!("managed runtime shutdown failed for {message}");
+                summary.errors.push(message);
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+async fn stop_runtime_profile_from_spec(
+    primary: &PrimaryState,
+    spec: RuntimeProfileLaunchSpec,
+) -> std::result::Result<bool, PumasError> {
+    let profile_id = spec.profile_id.clone();
+
+    primary
+        .runtime_profile_service
+        .record_profile_lifecycle_status(RuntimeProfileStatus {
+            profile_id: profile_id.clone(),
+            state: RuntimeLifecycleState::Stopping,
+            endpoint_url: Some(spec.endpoint_url.clone()),
+            pid: None,
+            log_path: Some(spec.log_file.to_string_lossy().to_string()),
+            last_error: None,
+        })?;
+
+    let pid_file = spec.pid_file.clone();
+    let stop_result = tokio::task::spawn_blocking(move || stop_profile_pid_file(&pid_file))
+        .await
+        .map_err(|err| {
+            PumasError::Other(format!("Failed to join runtime profile stop task: {err}"))
+        })?;
+
+    match stop_result {
+        Ok(stopped) => {
+            primary
+                .runtime_profile_service
+                .record_profile_lifecycle_status(RuntimeProfileStatus {
+                    profile_id: profile_id.clone(),
+                    state: RuntimeLifecycleState::Stopped,
+                    endpoint_url: Some(spec.endpoint_url),
+                    pid: None,
+                    log_path: Some(spec.log_file.to_string_lossy().to_string()),
+                    last_error: None,
+                })?;
+            primary
+                .serving_service
+                .record_profile_unavailable(&profile_id)
+                .await;
+            Ok(stopped)
+        }
+        Err(error) => {
+            let error_message = error.to_string();
+            primary
+                .runtime_profile_service
+                .record_profile_lifecycle_status(RuntimeProfileStatus {
+                    profile_id: profile_id.clone(),
+                    state: RuntimeLifecycleState::Failed,
+                    endpoint_url: Some(spec.endpoint_url),
+                    pid: None,
+                    log_path: Some(spec.log_file.to_string_lossy().to_string()),
+                    last_error: Some(error_message),
+                })?;
+            primary
+                .serving_service
+                .record_profile_unavailable(&profile_id)
+                .await;
+            Err(error)
+        }
+    }
+}
+
+fn stop_profile_pid_file(pid_file: &Path) -> std::result::Result<bool, PumasError> {
+    if !pid_file.exists() {
+        return Ok(false);
+    }
+
+    let pid = fs::read_to_string(pid_file)
+        .map_err(|err| PumasError::io_with_path(err, pid_file))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|err| PumasError::InvalidParams {
+            message: format!(
+                "invalid runtime profile PID file {}: {err}",
+                pid_file.display()
+            ),
+        })?;
+    let stopped = ProcessLauncher::stop_process(pid, 5_000)?;
+    ProcessLauncher::remove_pid_file(pid_file)?;
+    Ok(stopped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,135 +690,4 @@ mod tests {
             .windows(2)
             .any(|window| window == ["--n-gpu-layers", "0"]));
     }
-}
-
-pub(super) async fn stop_runtime_profile(
-    primary: &PrimaryState,
-    profile_id: RuntimeProfileId,
-) -> std::result::Result<bool, PumasError> {
-    let _operation_guard = primary
-        .runtime_profile_service
-        .begin_profile_operation(profile_id.clone())?;
-    let spec = primary
-        .runtime_profile_service
-        .managed_profile_launch_spec(profile_id.clone())
-        .await?;
-
-    stop_runtime_profile_from_spec(primary, spec).await
-}
-
-pub(super) async fn stop_all_managed_runtime_profiles(
-    primary: &PrimaryState,
-) -> std::result::Result<ManagedRuntimeShutdownSummary, PumasError> {
-    let specs = primary
-        .runtime_profile_service
-        .list_managed_profile_launch_specs()
-        .await?;
-    let mut summary = ManagedRuntimeShutdownSummary {
-        profiles_processed: 0,
-        processes_stopped: 0,
-        errors: Vec::new(),
-    };
-
-    for spec in specs {
-        let profile_id = spec.profile_id.clone();
-        summary.profiles_processed += 1;
-        match stop_runtime_profile_from_spec(primary, spec).await {
-            Ok(stopped) => {
-                if stopped {
-                    summary.processes_stopped += 1;
-                }
-            }
-            Err(error) => {
-                let message = format!("{}: {error}", profile_id.as_str());
-                warn!("managed runtime shutdown failed for {message}");
-                summary.errors.push(message);
-            }
-        }
-    }
-
-    Ok(summary)
-}
-
-async fn stop_runtime_profile_from_spec(
-    primary: &PrimaryState,
-    spec: RuntimeProfileLaunchSpec,
-) -> std::result::Result<bool, PumasError> {
-    let profile_id = spec.profile_id.clone();
-
-    primary
-        .runtime_profile_service
-        .record_profile_lifecycle_status(RuntimeProfileStatus {
-            profile_id: profile_id.clone(),
-            state: RuntimeLifecycleState::Stopping,
-            endpoint_url: Some(spec.endpoint_url.clone()),
-            pid: None,
-            log_path: Some(spec.log_file.to_string_lossy().to_string()),
-            last_error: None,
-        })?;
-
-    let pid_file = spec.pid_file.clone();
-    let stop_result = tokio::task::spawn_blocking(move || stop_profile_pid_file(&pid_file))
-        .await
-        .map_err(|err| {
-            PumasError::Other(format!("Failed to join runtime profile stop task: {err}"))
-        })?;
-
-    match stop_result {
-        Ok(stopped) => {
-            primary
-                .runtime_profile_service
-                .record_profile_lifecycle_status(RuntimeProfileStatus {
-                    profile_id: profile_id.clone(),
-                    state: RuntimeLifecycleState::Stopped,
-                    endpoint_url: Some(spec.endpoint_url),
-                    pid: None,
-                    log_path: Some(spec.log_file.to_string_lossy().to_string()),
-                    last_error: None,
-                })?;
-            primary
-                .serving_service
-                .record_profile_unavailable(&profile_id)
-                .await;
-            Ok(stopped)
-        }
-        Err(error) => {
-            let error_message = error.to_string();
-            primary
-                .runtime_profile_service
-                .record_profile_lifecycle_status(RuntimeProfileStatus {
-                    profile_id: profile_id.clone(),
-                    state: RuntimeLifecycleState::Failed,
-                    endpoint_url: Some(spec.endpoint_url),
-                    pid: None,
-                    log_path: Some(spec.log_file.to_string_lossy().to_string()),
-                    last_error: Some(error_message),
-                })?;
-            primary
-                .serving_service
-                .record_profile_unavailable(&profile_id)
-                .await;
-            Err(error)
-        }
-    }
-}
-
-fn stop_profile_pid_file(pid_file: &Path) -> std::result::Result<bool, PumasError> {
-    if !pid_file.exists() {
-        return Ok(false);
-    }
-
-    let pid = fs::read_to_string(pid_file)
-        .map_err(|err| PumasError::io_with_path(err, pid_file))?
-        .trim()
-        .parse::<u32>()
-        .map_err(|err| PumasError::InvalidParams {
-            message: format!(
-                "invalid runtime profile PID file {}: {err}",
-                pid_file.display()
-            ),
-        })?;
-    let stopped = ProcessLauncher::stop_process(pid, 5_000)?;
-    ProcessLauncher::remove_pid_file(pid_file)?;
-    Ok(stopped)
 }

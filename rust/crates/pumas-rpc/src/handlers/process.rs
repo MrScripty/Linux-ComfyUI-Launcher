@@ -1,12 +1,12 @@
 //! Process management handlers.
 
-use super::{
-    get_str_param, get_version_manager, parse_params, path_exists,
-    sync_version_paths_to_process_manager, validate_existing_local_path, validate_external_url,
-};
+#[cfg(feature = "inference-plugins")]
+use super::{get_version_manager, path_exists, require_str_param};
+use super::{parse_params, validate_existing_local_path, validate_external_url};
 use crate::server::AppState;
 use serde::Deserialize;
 use serde_json::{json, Value};
+#[cfg(feature = "inference-plugins")]
 use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
@@ -19,44 +19,7 @@ struct OpenUrlParams {
     url: String,
 }
 
-pub async fn is_comfyui_running(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
-    // Ensure process manager has current version paths for accurate detection
-    sync_version_paths_to_process_manager(state).await;
-    let running = state.api.is_comfyui_running().await;
-    Ok(serde_json::to_value(running)?)
-}
-
-pub async fn stop_comfyui(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
-    // Ensure process manager has current version paths for proper PID file cleanup
-    sync_version_paths_to_process_manager(state).await;
-    let result = state.api.stop_comfyui().await?;
-    Ok(json!({ "success": result }))
-}
-
-pub async fn launch_comfyui(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
-    // Ensure process manager has current version paths
-    sync_version_paths_to_process_manager(state).await;
-    // Get the active version from comfyui version_manager and launch it
-    if let Some(vm) = get_version_manager(state, "comfyui").await {
-        let active = vm.get_active_version().await?;
-        if let Some(tag) = active {
-            let version_dir = vm.version_path(&tag);
-            let response = state.api.launch_version(&tag, &version_dir).await?;
-            Ok(serde_json::to_value(response)?)
-        } else {
-            Ok(json!({
-                "success": false,
-                "error": "No active version set"
-            }))
-        }
-    } else {
-        Ok(json!({
-            "success": false,
-            "error": "Version manager not initialized for comfyui"
-        }))
-    }
-}
-
+#[cfg(feature = "inference-plugins")]
 pub async fn launch_ollama(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
     // Get the active version from ollama version_manager and launch it
     info!("launch_ollama: checking for ollama version manager");
@@ -90,16 +53,19 @@ pub async fn launch_ollama(state: &AppState, _params: &Value) -> pumas_library::
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 pub async fn stop_ollama(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
     let result = state.api.stop_ollama().await?;
     Ok(json!({ "success": result }))
 }
 
+#[cfg(feature = "inference-plugins")]
 pub async fn is_ollama_running(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
     let running = state.api.is_ollama_running().await;
     Ok(serde_json::to_value(running)?)
 }
 
+#[cfg(feature = "inference-plugins")]
 pub async fn launch_torch(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
     info!("launch_torch: checking for torch version manager");
     if let Some(vm) = get_version_manager(state, "torch").await {
@@ -127,11 +93,13 @@ pub async fn launch_torch(state: &AppState, _params: &Value) -> pumas_library::R
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 pub async fn stop_torch(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
     let result = state.api.stop_torch().await?;
     Ok(json!({ "success": result }))
 }
 
+#[cfg(feature = "inference-plugins")]
 pub async fn is_torch_running(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
     let running = state.api.is_torch_running().await;
     Ok(serde_json::to_value(running)?)
@@ -156,10 +124,11 @@ pub async fn open_url(state: &AppState, params: &Value) -> pumas_library::Result
     }
 }
 
+#[cfg(feature = "inference-plugins")]
 pub async fn open_active_install(state: &AppState, params: &Value) -> pumas_library::Result<Value> {
-    let app_id_str = get_str_param(params, "app_id", "appId").unwrap_or("comfyui");
+    let app_id_str = require_str_param(params, "app_id", "appId")?;
     // Get the active version from version_manager and open its directory
-    if let Some(vm) = get_version_manager(state, app_id_str).await {
+    if let Some(vm) = get_version_manager(state, &app_id_str).await {
         if let Some(tag) = vm.get_active_version().await? {
             let version_dir = vm.version_path(&tag);
             if path_exists(&version_dir).await? {

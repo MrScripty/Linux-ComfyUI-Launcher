@@ -311,7 +311,7 @@ mod tests {
             "/library/model1/file.gguf",
             "/app/models/file.gguf",
             LinkType::Symlink,
-            "comfyui",
+            "test-runtime",
             Some("0.6.0"),
         );
 
@@ -336,7 +336,7 @@ mod tests {
             "/library/model1/file.gguf",
             "/app/models/file.gguf",
             LinkType::Symlink,
-            "comfyui",
+            "test-runtime",
             None,
         );
 
@@ -358,7 +358,7 @@ mod tests {
                 format!("/library/model1/file{}.gguf", i),
                 format!("/app/models/file{}.gguf", i),
                 LinkType::Symlink,
-                "comfyui",
+                "test-runtime",
                 None,
             );
             registry.register(entry).await.unwrap();
@@ -384,7 +384,7 @@ mod tests {
                 "/library/model1/file.gguf",
                 "/app/models/file.gguf",
                 LinkType::Symlink,
-                "comfyui",
+                "test-runtime",
                 None,
             );
             registry.register(entry).await.unwrap();

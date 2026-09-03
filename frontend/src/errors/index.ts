@@ -1,14 +1,14 @@
 /**
  * Frontend Error Hierarchy
  *
- * Custom error types for the ComfyUI Launcher frontend.
+ * Custom error types for the Pumas Library frontend.
  * Mirrors the backend exception hierarchy from backend/exceptions.py
  */
 
 /**
- * Base error class for all ComfyUI Launcher frontend errors
+ * Base error class for all Pumas Library frontend errors.
  */
-export class ComfyUILauncherError extends Error {
+export class PumasError extends Error {
   constructor(message: string, public override cause?: Error) {
     super(message);
     this.name = this.constructor.name;
@@ -24,7 +24,7 @@ export class ComfyUILauncherError extends Error {
 /**
  * Network-related errors (HTTP, WebSocket, etc.)
  */
-export class NetworkError extends ComfyUILauncherError {
+export class NetworkError extends PumasError {
   constructor(
     message: string,
     public url?: string,
@@ -38,7 +38,7 @@ export class NetworkError extends ComfyUILauncherError {
 /**
  * Desktop bridge API call failures
  */
-export class APIError extends ComfyUILauncherError {
+export class APIError extends PumasError {
   constructor(
     message: string,
     public endpoint?: string,
@@ -51,7 +51,7 @@ export class APIError extends ComfyUILauncherError {
 /**
  * Input validation failures
  */
-export class ValidationError extends ComfyUILauncherError {
+export class ValidationError extends PumasError {
   constructor(
     message: string,
     public field?: string,
@@ -64,7 +64,7 @@ export class ValidationError extends ComfyUILauncherError {
 /**
  * Metadata corruption or parsing errors
  */
-export class MetadataError extends ComfyUILauncherError {
+export class MetadataError extends PumasError {
   constructor(
     message: string,
     public filePath?: string,
@@ -77,7 +77,7 @@ export class MetadataError extends ComfyUILauncherError {
 /**
  * Process management errors (launch, stop, etc.)
  */
-export class ProcessError extends ComfyUILauncherError {
+export class ProcessError extends PumasError {
   constructor(
     message: string,
     public exitCode?: number,
@@ -90,7 +90,7 @@ export class ProcessError extends ComfyUILauncherError {
 /**
  * Resource management errors (disk space, memory, etc.)
  */
-export class ResourceError extends ComfyUILauncherError {
+export class ResourceError extends PumasError {
   constructor(
     message: string,
     public resourceType?: string,
@@ -101,8 +101,8 @@ export class ResourceError extends ComfyUILauncherError {
 }
 
 /**
- * Type guard helper to check if an error is a known ComfyUI error
+ * Type guard helper to check if an error is a known Pumas error.
  */
-export function isKnownError(error: unknown): error is ComfyUILauncherError {
-  return error instanceof ComfyUILauncherError;
+export function isKnownError(error: unknown): error is PumasError {
+  return error instanceof PumasError;
 }

@@ -1,6 +1,5 @@
 //! System utility methods on PumasApi.
 
-use crate::config::AppId;
 use crate::error::{PumasError, Result};
 use crate::launcher;
 use crate::models;
@@ -42,11 +41,9 @@ impl PumasApi {
 
     /// Get overall system status.
     ///
-    /// Note: This returns basic status. Version-specific status (shortcuts, active version)
-    /// should be obtained through pumas-app-manager in the RPC layer.
+    /// Runtime version state is obtained through pumas-app-manager in the RPC layer.
     pub async fn get_status(&self) -> Result<models::StatusResponse> {
         // Get actual running status
-        let comfyui_running = self.is_comfyui_running().await;
         let ollama_running = self.is_ollama_running().await;
         let torch_running = self.is_torch_running().await;
         let last_launch_error = self.get_last_launch_error().await;
@@ -59,17 +56,6 @@ impl PumasApi {
         };
         let app_resources = if let Some(mgr) = process_manager {
             tokio::task::spawn_blocking(move || {
-                let comfyui_resources = if comfyui_running {
-                    mgr.aggregate_app_resources()
-                        .map(|r| models::AppResourceUsage {
-                            // Convert from GB (f32) to bytes (u64) for frontend
-                            gpu_memory: Some((r.gpu_memory * 1024.0 * 1024.0 * 1024.0) as u64),
-                            ram_memory: Some((r.ram_memory * 1024.0 * 1024.0 * 1024.0) as u64),
-                        })
-                } else {
-                    None
-                };
-
                 let ollama_resources = if ollama_running {
                     mgr.aggregate_ollama_resources()
                         .map(|r| models::AppResourceUsage {
@@ -80,9 +66,8 @@ impl PumasApi {
                     None
                 };
 
-                if comfyui_resources.is_some() || ollama_resources.is_some() {
+                if ollama_resources.is_some() {
                     Some(models::AppResources {
-                        comfyui: comfyui_resources,
                         ollama: ollama_resources,
                     })
                 } else {
@@ -98,8 +83,7 @@ impl PumasApi {
         // Debug: log app_resources before returning
         if let Some(ref res) = app_resources {
             tracing::debug!(
-                "get_status: app_resources = comfyui={:?}, ollama={:?}",
-                res.comfyui.as_ref().map(|r| (r.ram_memory, r.gpu_memory)),
+                "get_status: app_resources = ollama={:?}",
                 res.ollama.as_ref().map(|r| (r.ram_memory, r.gpu_memory))
             );
         } else {
@@ -110,21 +94,13 @@ impl PumasApi {
             success: true,
             error: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            deps_ready: true,
-            patched: false,
-            menu_shortcut: false,
-            desktop_shortcut: false,
-            shortcut_version: None,
-            message: if comfyui_running {
-                "ComfyUI running".to_string()
-            } else if ollama_running {
+            message: if ollama_running {
                 "Ollama running".to_string()
             } else if torch_running {
                 "Torch running".to_string()
             } else {
                 "Ready".to_string()
             },
-            comfyui_running,
             ollama_running,
             torch_running,
             last_launch_error,
@@ -314,42 +290,6 @@ impl PumasApi {
     }
 
     // ========================================
-    // Patch Manager Methods
-    // ========================================
-
-    /// Check if ComfyUI main.py is patched with setproctitle.
-    pub async fn is_patched(&self, tag: Option<&str>) -> bool {
-        let comfyui_dir = self.launcher_root.join("ComfyUI");
-        let main_py = comfyui_dir.join("main.py");
-        let versions_dir = Some(self.versions_dir(AppId::ComfyUI));
-        let tag = tag.map(str::to_owned);
-
-        tokio::task::spawn_blocking(move || {
-            let patch_mgr = launcher::PatchManager::new(&comfyui_dir, &main_py, versions_dir);
-            patch_mgr.is_patched(tag.as_deref())
-        })
-        .await
-        .unwrap_or(false)
-    }
-
-    /// Toggle the setproctitle patch for a ComfyUI version.
-    ///
-    /// Returns `true` if now patched, `false` if now unpatched.
-    pub async fn toggle_patch(&self, tag: Option<&str>) -> Result<bool> {
-        let comfyui_dir = self.launcher_root.join("ComfyUI");
-        let main_py = comfyui_dir.join("main.py");
-        let versions_dir = Some(self.versions_dir(AppId::ComfyUI));
-        let tag = tag.map(str::to_owned);
-
-        tokio::task::spawn_blocking(move || {
-            let patch_mgr = launcher::PatchManager::new(&comfyui_dir, &main_py, versions_dir);
-            patch_mgr.toggle_patch(tag.as_deref())
-        })
-        .await
-        .map_err(|e| PumasError::Other(format!("Failed to join toggle_patch task: {}", e)))?
-    }
-
-    // ========================================
     // System Check Methods
     // ========================================
 
@@ -361,28 +301,6 @@ impl PumasApi {
                 available: false,
                 path: None,
                 info: Some("Failed to join check_git task".to_string()),
-            })
-    }
-
-    /// Check if Brave browser is available on the system.
-    pub async fn check_brave(&self) -> system::SystemCheckResult {
-        tokio::task::spawn_blocking(system::check_brave)
-            .await
-            .unwrap_or_else(|_| system::SystemCheckResult {
-                available: false,
-                path: None,
-                info: Some("Failed to join check_brave task".to_string()),
-            })
-    }
-
-    /// Check if setproctitle Python package is available.
-    pub async fn check_setproctitle(&self) -> system::SystemCheckResult {
-        tokio::task::spawn_blocking(system::check_setproctitle)
-            .await
-            .unwrap_or_else(|_| system::SystemCheckResult {
-                available: false,
-                path: None,
-                info: Some("Failed to join check_setproctitle task".to_string()),
             })
     }
 }

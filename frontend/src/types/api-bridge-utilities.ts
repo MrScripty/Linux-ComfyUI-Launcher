@@ -23,22 +23,6 @@ import type {
 
 export interface DesktopBridgeUtilityAPI {
   // ========================================
-  // Custom Nodes
-  // ========================================
-  get_custom_nodes(versionTag: string): Promise<{
-    success: boolean;
-    nodes: string[];
-    error?: string;
-  }>;
-  install_custom_node(
-    gitUrl: string,
-    versionTag: string,
-    nodeName?: string
-  ): Promise<BaseResponse>;
-  update_custom_node(nodeName: string, versionTag: string): Promise<BaseResponse>;
-  remove_custom_node(nodeName: string, versionTag: string): Promise<BaseResponse>;
-
-  // ========================================
   // Size Calculation
   // ========================================
   calculate_release_size(

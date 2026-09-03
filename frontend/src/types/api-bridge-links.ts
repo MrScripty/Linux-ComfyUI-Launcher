@@ -15,19 +15,13 @@ import type {
   RemoveOrphanedLinksResponse,
 } from './api-links';
 import type {
-  ApplyModelMappingResponse,
-  ConflictResolutions,
-  CrossFilesystemWarningResponse,
   DeleteModelMigrationReportResponse,
   ExecuteModelMigrationResponse,
   GenerateModelMigrationDryRunReportResponse,
-  IncrementalSyncResponse,
   LinkExclusionsResponse,
   ListModelMigrationReportsResponse,
-  MappingPreviewResponse,
   PruneModelMigrationReportsResponse,
   SandboxInfoResponse,
-  SyncWithResolutionsResponse,
 } from './api-mapping';
 
 export interface DesktopBridgeLinkMappingAPI {
@@ -58,42 +52,6 @@ export interface DesktopBridgeLinkMappingAPI {
    * Delete a model and all its symlinks
    */
   delete_model_with_cascade(modelId: string): Promise<DeleteModelCascadeResponse>;
-
-  // ========================================
-  // Mapping Preview (Phase 1C)
-  // ========================================
-  /**
-   * Preview model mapping operations without making changes
-   */
-  preview_model_mapping(versionTag: string): Promise<MappingPreviewResponse>;
-
-  /**
-   * Incrementally sync specific models to a version
-   */
-  sync_models_incremental(
-    versionTag: string,
-    modelIds: string[]
-  ): Promise<IncrementalSyncResponse>;
-
-  /**
-   * Check if library and app version are on different filesystems
-   */
-  get_cross_filesystem_warning(versionTag: string): Promise<CrossFilesystemWarningResponse>;
-
-  /**
-   * Apply model mapping for a specific version
-   * Cleans broken links and creates/updates symlinks for all mapped models
-   */
-  apply_model_mapping(versionTag: string): Promise<ApplyModelMappingResponse>;
-
-  /**
-   * Apply model mapping with user-provided conflict resolutions
-   * Allows user to choose skip/overwrite/rename for each conflict
-   */
-  sync_with_resolutions(
-    versionTag: string,
-    resolutions: ConflictResolutions
-  ): Promise<SyncWithResolutionsResponse>;
 
   /**
    * Get sandbox environment information

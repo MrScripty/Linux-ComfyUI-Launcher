@@ -68,7 +68,7 @@ fn list_selector_rows() -> Result<()> {
 |---------|---------|-------------|
 | `full` | ✓ | Enable all features |
 | `hf-client` | ✓ | HuggingFace model search & download |
-| `process-manager` | ✓ | ComfyUI process management |
+| `process-manager` | ✓ | Inference runtime process management |
 | `gpu-monitor` | ✓ | GPU monitoring |
 
 Minimal build:
@@ -81,7 +81,7 @@ cargo add pumas-library --no-default-features
 - **Model Library**: Index, search, and manage local AI models
 - **HuggingFace Integration**: Search and download models from HuggingFace Hub
 - **Model Mapping**: Link models to application directories with symlinks
-- **Process Management**: Launch and monitor ComfyUI processes
+- **Process Management**: Launch and monitor supported inference runtimes
 - **System Utilities**: GPU monitoring, disk space, system resources
 
 ## License

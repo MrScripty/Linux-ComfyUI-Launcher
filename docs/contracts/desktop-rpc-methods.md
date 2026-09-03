@@ -22,12 +22,12 @@ This pass intentionally enforces method-level allowlisting, not full per-method 
 | User-directed serving | `get_serving_status`, `list_serving_status_updates_since`, `validate_model_serving_config`, `serve_model`, `unserve_model` | `rust/crates/pumas-rpc/src/handlers/serving.rs` |
 | Version management | `get_available_versions`, `install_version`, `switch_version`, `get_installation_progress` | `rust/crates/pumas-rpc/src/handlers/versions/` |
 | Model library | `get_models`, `import_model`, `search_hf_models`, `get_library_model_metadata`, `resolve_model_artifact_load_target` | `rust/crates/pumas-rpc/src/handlers/models/` |
-| Process control | `launch_comfyui`, `stop_comfyui`, `open_path`, `open_url` | `rust/crates/pumas-rpc/src/handlers/process.rs` |
-| App integrations | `ollama_list_models`, `ollama_list_models_for_profile`, `ollama_create_model_for_profile`, `ollama_load_model_for_profile`, `ollama_unload_model_for_profile`, `ollama_delete_model_for_profile`, `torch_list_slots`, `torch_configure` | `rust/crates/pumas-rpc/src/handlers/ollama.rs`, `torch.rs` |
+| Process control | `launch_ollama`, `stop_ollama`, `launch_torch`, `stop_torch`, `open_path`, `open_url` | `rust/crates/pumas-rpc/src/handlers/process.rs` |
+| Inference plugins | `ollama_list_models`, `ollama_list_models_for_profile`, `ollama_create_model_for_profile`, `ollama_load_model_for_profile`, `ollama_unload_model_for_profile`, `ollama_delete_model_for_profile`, `torch_list_slots`, `torch_configure` | `rust/crates/pumas-rpc/src/handlers/ollama.rs`, `torch.rs` |
 | Link and mapping | `get_link_health`, `preview_model_mapping`, `sync_with_resolutions` | `rust/crates/pumas-rpc/src/handlers/links.rs` |
 | Shortcuts | `get_version_shortcuts`, `toggle_menu`, `create_desktop_shortcut` | `rust/crates/pumas-rpc/src/handlers/shortcuts.rs` |
 | Conversion | `start_model_conversion`, `get_conversion_progress`, `setup_quantization_backend` | `rust/crates/pumas-rpc/src/handlers/conversion.rs` |
-| Plugins and custom nodes | `get_plugins`, `get_custom_nodes`, `install_custom_node` | `rust/crates/pumas-rpc/src/handlers/plugins.rs`, `custom_nodes.rs` |
+| Plugin extensions | `get_plugins`, `get_plugin`, `call_plugin_endpoint`, `check_plugin_health` | `rust/crates/pumas-rpc/src/handlers/plugins.rs` |
 
 ## Event Channels
 | Channel | Backend SSE Route | Electron Channel | Preload Method |
@@ -152,7 +152,6 @@ Prioritize these methods for typed request schemas:
 - `torch_configure`
 - `upsert_runtime_profile`
 - `set_model_runtime_route`
-- `install_custom_node`
 
 `set_model_runtime_route` and `clear_model_runtime_route` route identity is
 provider-scoped. Consumers must send `provider` plus `model_id`; model id alone

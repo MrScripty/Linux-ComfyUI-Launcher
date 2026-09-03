@@ -18,12 +18,6 @@ function renderDropdown(
     isSwitching: false,
     onMakeDefault: vi.fn().mockResolvedValue(true),
     onSwitchVersion: vi.fn(),
-    onToggleShortcuts: vi.fn().mockResolvedValue(undefined),
-    shortcutState: {
-      'v1.0.0': { menu: true, desktop: true },
-      'v1.1.0': { menu: true, desktop: true },
-    },
-    supportsShortcuts: true,
     ...overrides,
   };
 
@@ -32,7 +26,7 @@ function renderDropdown(
 }
 
 describe('VersionSelectorDropdown', () => {
-  it('uses native controls for switching, defaults, and shortcut toggles', async () => {
+  it('uses native controls for switching and defaults', async () => {
     const props = renderDropdown();
 
     fireEvent.click(screen.getByRole('button', { name: 'Switch to v1.1.0' }));
@@ -42,8 +36,6 @@ describe('VersionSelectorDropdown', () => {
     expect(props.onMakeDefault).toHaveBeenCalledWith('v1.1.0');
     expect(props.onSwitchVersion).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Disable shortcuts for v1.1.0' }));
-    expect(props.onToggleShortcuts).toHaveBeenCalledWith('v1.1.0', false);
-    expect(props.onSwitchVersion).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/shortcut/i)).not.toBeInTheDocument();
   });
 });

@@ -6,7 +6,8 @@ the Pumas Library frontend.
 ## Overview
 
 The frontend is a React-based single-page application (SPA) that provides:
-- Multi-app launcher with visual status indicators
+- An always-available model library
+- Optional inference-plugin controls with visual status indicators
 - Version selection and installation UI
 - Model management interface (search, download, import, mapping)
 - System resource monitoring display
@@ -126,14 +127,14 @@ Custom error hierarchy matches backend pattern:
 
 ```typescript
 // src/errors/index.ts
-export class ComfyUILauncherError extends Error {
+export class PumasError extends Error {
   constructor(message: string, public cause?: Error) {
     super(message);
     this.name = this.constructor.name;
   }
 }
 
-export class NetworkError extends ComfyUILauncherError {
+export class NetworkError extends PumasError {
   constructor(
     message: string,
     public url?: string,
@@ -144,7 +145,7 @@ export class NetworkError extends ComfyUILauncherError {
   }
 }
 
-export class APIError extends ComfyUILauncherError {
+export class APIError extends PumasError {
   constructor(
     message: string,
     public endpoint?: string,
@@ -290,32 +291,32 @@ import { motion } from 'framer-motion';
 - **Performance**: GPU acceleration keeps UI responsive
 - **Accessibility**: Respects `prefers-reduced-motion`
 
-### 8. Multi-App System
+### 8. Inference Plugin System
 
-Extensible app configuration for supporting multiple applications:
+The optional inference build registers its supported runtimes centrally:
 
 ```typescript
 // config/apps.ts
 export const DEFAULT_APPS: AppConfig[] = [
   {
-    id: 'comfyui',
-    name: 'ComfyUI',
-    description: 'Node-based Stable Diffusion GUI',
-    color: '#ff6b6b',
-    defaultPort: 8188,
-    category: 'diffusion'
+    id: 'ollama',
+    name: 'ollama',
+    displayName: 'Ollama',
+    description: 'Local LLM runtime and model server',
+    connectionUrl: 'http://localhost:11434'
   },
   {
-    id: 'open-webui',
-    name: 'Open WebUI',
-    description: 'ChatGPT-style LLM interface',
-    color: '#4ecdc4',
-    defaultPort: 8080,
-    category: 'llm'
+    id: 'llama-cpp',
+    name: 'llama-cpp',
+    displayName: 'llama.cpp',
+    description: 'Native GGUF runtime and model server'
   },
-  // ... more apps
+  // ONNX Runtime and Torch are also registered here.
 ];
 ```
+
+Run `npm run build:library-only` to emit the library-only UI. The shared desktop
+launcher also accepts `PUMAS_INFERENCE_PLUGINS=false`.
 
 **Design Rationale:**
 - **Extensibility**: Easy to add new apps

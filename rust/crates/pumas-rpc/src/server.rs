@@ -2,66 +2,81 @@
 
 use crate::handlers::{
     handle_health, handle_model_download_update_events, handle_model_library_update_events,
-    handle_openai_models, handle_openai_proxy, handle_rpc, handle_runtime_profile_update_events,
-    handle_serving_status_update_events, handle_status_telemetry_update_events,
+    handle_rpc, handle_status_telemetry_update_events,
 };
+#[cfg(feature = "inference-plugins")]
+use crate::handlers::{
+    handle_openai_models, handle_openai_proxy, handle_runtime_profile_update_events,
+    handle_serving_status_update_events,
+};
+#[cfg(feature = "inference-plugins")]
 use crate::provider_clients::{LlamaCppRouterClient, OllamaClientFactory};
-use crate::shortcut::ShortcutManager;
 use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue, Method},
     routing::{get, post},
     Router,
 };
-use pumas_app_manager::{CustomNodesManager, SizeCalculator, VersionManager};
+#[cfg(feature = "inference-plugins")]
+use pumas_app_manager::{SizeCalculator, VersionManager};
+use pumas_library::PumasApi;
+#[cfg(feature = "inference-plugins")]
 use pumas_library::{
     models::RuntimeEndpointUrl, OnnxEmbeddingBackendKind, OnnxSessionManager, PluginLoader,
-    ProviderRegistry, PumasApi,
+    ProviderRegistry,
 };
+#[cfg(feature = "inference-plugins")]
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "inference-plugins")]
 use std::time::Duration;
-use tokio::{
-    sync::{Mutex, RwLock},
-    task::JoinHandle,
-};
+#[cfg(feature = "inference-plugins")]
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
 const MAX_IN_FLIGHT_RPC_REQUESTS: usize = 64;
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "inference-plugins")]
 const GATEWAY_PROXY_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(feature = "inference-plugins")]
 const PROVIDER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "inference-plugins")]
 const ONNX_MAX_CONCURRENT_OPERATIONS: usize = 4;
 
 /// Application state shared across handlers.
 pub struct AppState {
     /// Core API (model library, system utilities)
     pub api: PumasApi,
-    /// Version managers for each supported app (keyed by app_id: "comfyui", "ollama", etc.)
+    /// Version managers for compiled-in inference plugins.
+    #[cfg(feature = "inference-plugins")]
     pub version_managers: Arc<RwLock<HashMap<String, VersionManager>>>,
-    /// Custom nodes manager (from pumas-app-manager)
-    pub custom_nodes_manager: Arc<CustomNodesManager>,
     /// Size calculator for release size estimates
+    #[cfg(feature = "inference-plugins")]
     pub size_calculator: Arc<Mutex<SizeCalculator>>,
-    /// Shortcut manager for desktop/menu shortcuts
-    pub shortcut_manager: Arc<RwLock<Option<ShortcutManager>>>,
     /// Plugin configuration loader
+    #[cfg(feature = "inference-plugins")]
     pub plugin_loader: Arc<PluginLoader>,
     /// Shared HTTP client for OpenAI-compatible gateway proxying.
+    #[cfg(feature = "inference-plugins")]
     pub gateway_http_client: reqwest::Client,
     /// Public loopback base URL for the OpenAI-compatible serving gateway.
+    #[cfg(feature = "inference-plugins")]
     pub gateway_base_url: RuntimeEndpointUrl,
     /// Runtime provider behavior registry for RPC boundary routing.
+    #[cfg(feature = "inference-plugins")]
     pub provider_registry: ProviderRegistry,
     /// Shared llama.cpp router client for provider serving operations.
+    #[cfg(feature = "inference-plugins")]
     pub llama_cpp_router_client: LlamaCppRouterClient,
     /// Shared Ollama client factory for provider serving and app operations.
+    #[cfg(feature = "inference-plugins")]
     pub ollama_client_factory: OllamaClientFactory,
     /// Shared ONNX Runtime session manager for in-process embedding serving.
+    #[cfg(feature = "inference-plugins")]
     pub onnx_session_manager: OnnxSessionManager<OnnxEmbeddingBackendKind>,
 }
 
@@ -104,52 +119,51 @@ impl Drop for ServerHandle {
 #[allow(clippy::too_many_arguments)]
 pub async fn start_server(
     api: PumasApi,
-    version_managers: HashMap<String, VersionManager>,
-    custom_nodes_manager: CustomNodesManager,
-    size_calculator: SizeCalculator,
-    plugin_loader: PluginLoader,
-    launcher_root: PathBuf,
+    #[cfg(feature = "inference-plugins")] version_managers: HashMap<String, VersionManager>,
+    #[cfg(feature = "inference-plugins")] size_calculator: SizeCalculator,
+    #[cfg(feature = "inference-plugins")] plugin_loader: PluginLoader,
     host: &str,
     port: u16,
 ) -> anyhow::Result<ServerHandle> {
-    // Initialize shortcut manager
-    let shortcut_manager = match ShortcutManager::new_async(&launcher_root).await {
-        Ok(mgr) => {
-            info!("Shortcut manager initialized");
-            Some(mgr)
-        }
-        Err(e) => {
-            warn!("Failed to initialize shortcut manager: {}", e);
-            None
-        }
-    };
-
+    #[cfg(feature = "inference-plugins")]
     let gateway_http_client = build_gateway_http_client()?;
+    #[cfg(feature = "inference-plugins")]
     let provider_http_client = build_provider_http_client()?;
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
+    #[cfg(feature = "inference-plugins")]
     let gateway_base_url = RuntimeEndpointUrl::parse(format!("http://{actual_addr}/v1"))
         .map_err(|message| anyhow::anyhow!("invalid gateway base URL: {message}"))?;
+    #[cfg(feature = "inference-plugins")]
     let ollama_client_factory = build_ollama_client_factory()?;
+    #[cfg(feature = "inference-plugins")]
     let onnx_session_manager = OnnxSessionManager::new(
         OnnxEmbeddingBackendKind::real(),
         ONNX_MAX_CONCURRENT_OPERATIONS,
     )
     .map_err(|err| anyhow::anyhow!("failed to build ONNX session manager: {err}"))?;
+    #[cfg(feature = "inference-plugins")]
     let provider_registry = ProviderRegistry::builtin();
     let state = Arc::new(AppState {
         api,
+        #[cfg(feature = "inference-plugins")]
         version_managers: Arc::new(RwLock::new(version_managers)),
-        custom_nodes_manager: Arc::new(custom_nodes_manager),
+        #[cfg(feature = "inference-plugins")]
         size_calculator: Arc::new(Mutex::new(size_calculator)),
-        shortcut_manager: Arc::new(RwLock::new(shortcut_manager)),
+        #[cfg(feature = "inference-plugins")]
         plugin_loader: Arc::new(plugin_loader),
+        #[cfg(feature = "inference-plugins")]
         gateway_http_client,
+        #[cfg(feature = "inference-plugins")]
         gateway_base_url,
+        #[cfg(feature = "inference-plugins")]
         provider_registry,
+        #[cfg(feature = "inference-plugins")]
         llama_cpp_router_client: LlamaCppRouterClient::new(provider_http_client),
+        #[cfg(feature = "inference-plugins")]
         ollama_client_factory,
+        #[cfg(feature = "inference-plugins")]
         onnx_session_manager,
     });
 
@@ -173,6 +187,14 @@ pub async fn start_server(
             get(handle_model_download_update_events),
         )
         .route(
+            "/events/status-telemetry-updates",
+            get(handle_status_telemetry_update_events),
+        )
+        .route("/rpc", post(handle_rpc));
+
+    #[cfg(feature = "inference-plugins")]
+    let app = app
+        .route(
             "/events/runtime-profile-updates",
             get(handle_runtime_profile_update_events),
         )
@@ -180,15 +202,12 @@ pub async fn start_server(
             "/events/serving-status-updates",
             get(handle_serving_status_update_events),
         )
-        .route(
-            "/events/status-telemetry-updates",
-            get(handle_status_telemetry_update_events),
-        )
         .route("/v1/models", get(handle_openai_models))
         .route("/v1/chat/completions", post(handle_openai_proxy))
         .route("/v1/completions", post(handle_openai_proxy))
-        .route("/v1/embeddings", post(handle_openai_proxy))
-        .route("/rpc", post(handle_rpc))
+        .route("/v1/embeddings", post(handle_openai_proxy));
+
+    let app = app
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(ConcurrencyLimitLayer::new(MAX_IN_FLIGHT_RPC_REQUESTS))
         .layer(cors)
@@ -212,12 +231,14 @@ pub async fn start_server(
     })
 }
 
+#[cfg(feature = "inference-plugins")]
 fn build_gateway_http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(GATEWAY_PROXY_TIMEOUT)
         .build()?)
 }
 
+#[cfg(feature = "inference-plugins")]
 fn build_provider_http_client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(PROVIDER_HTTP_CONNECT_TIMEOUT)
@@ -225,6 +246,7 @@ fn build_provider_http_client() -> anyhow::Result<reqwest::Client> {
         .build()?)
 }
 
+#[cfg(feature = "inference-plugins")]
 fn build_ollama_client_factory() -> anyhow::Result<OllamaClientFactory> {
     let http_clients = pumas_app_manager::OllamaHttpClients::new()
         .map_err(|err| anyhow::anyhow!("failed to build Ollama HTTP clients: {err}"))?;
@@ -252,6 +274,7 @@ fn is_allowed_cors_origin(origin: &HeaderValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "inference-plugins")]
     use pumas_library::AppId;
     use std::io::ErrorKind;
     use tempfile::TempDir;
@@ -273,31 +296,31 @@ mod tests {
         let launcher_root = temp_dir.path().to_path_buf();
         let api = PumasApi::new(&launcher_root).await.unwrap();
 
-        // Initialize version managers (may fail if directories don't exist, which is fine for test)
+        #[cfg(feature = "inference-plugins")]
         let mut version_managers = HashMap::new();
-        if let Ok(vm) = VersionManager::new(&launcher_root, AppId::ComfyUI).await {
-            version_managers.insert("comfyui".to_string(), vm);
+        #[cfg(feature = "inference-plugins")]
+        if let Ok(vm) = VersionManager::new(&launcher_root, AppId::Ollama).await {
+            version_managers.insert("ollama".to_string(), vm);
         }
 
-        // Initialize custom nodes manager
-        let versions_dir = launcher_root.join(AppId::ComfyUI.versions_dir_name());
-        let custom_nodes_manager = CustomNodesManager::new(versions_dir);
-
-        // Initialize size calculator
+        #[cfg(feature = "inference-plugins")]
         let cache_dir = launcher_root.join("launcher-data").join("cache");
+        #[cfg(feature = "inference-plugins")]
         let size_calculator = SizeCalculator::new_with_cache(cache_dir).await;
 
-        // Initialize plugin loader
+        #[cfg(feature = "inference-plugins")]
         let plugins_dir = launcher_root.join("launcher-data").join("plugins");
+        #[cfg(feature = "inference-plugins")]
         let plugin_loader = PluginLoader::new_async(plugins_dir).await.unwrap();
 
         let result = start_server(
             api,
+            #[cfg(feature = "inference-plugins")]
             version_managers,
-            custom_nodes_manager,
+            #[cfg(feature = "inference-plugins")]
             size_calculator,
+            #[cfg(feature = "inference-plugins")]
             plugin_loader,
-            launcher_root,
             "127.0.0.1",
             0,
         )
@@ -339,6 +362,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "inference-plugins")]
     #[test]
     fn gateway_http_client_builds_with_configured_policy() {
         build_gateway_http_client().unwrap();

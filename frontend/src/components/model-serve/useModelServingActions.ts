@@ -170,10 +170,8 @@ export function useModelServingActions(
           setMessage(null);
           return;
         }
-        if (result.kind === 'loaded') {
-          setServedStatus(result.status);
-          setMessage('Loaded');
-        }
+        setServedStatus(result.status);
+        setMessage('Loaded');
       } catch (caught) {
         setMessage(caught instanceof Error ? caught.message : 'Serving request failed');
       } finally {

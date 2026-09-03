@@ -12,7 +12,6 @@ export interface OllamaPanelProps {
   versions: AppVersionState;
   showVersionManager: boolean;
   onShowVersionManager: (show: boolean) => void;
-  activeShortcutState?: { menu: boolean; desktop: boolean };
   diskSpacePercent: number;
   modelManagerProps: ModelManagerProps;
   isOllamaRunning: boolean;
@@ -25,7 +24,6 @@ export function OllamaPanel({
   versions,
   showVersionManager,
   onShowVersionManager,
-  activeShortcutState,
   diskSpacePercent,
   modelManagerProps,
   isOllamaRunning,
@@ -41,7 +39,6 @@ export function OllamaPanel({
           versions={versions}
           showManager={showVersionManager}
           onShowManager={onShowVersionManager}
-          activeShortcutState={activeShortcutState}
           diskSpacePercent={diskSpacePercent}
         />
         {!isManagerOpen && connectionUrl && (

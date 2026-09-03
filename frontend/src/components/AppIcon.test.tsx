@@ -175,11 +175,6 @@ describe('AppIcon', () => {
   });
 
   describe('Icon Paths', () => {
-    it('uses correct icon path for openwebui', () => {
-      const { container } = render(<AppIcon {...defaultProps} appId="openwebui" />);
-      expect(container.querySelector('img')?.getAttribute('src')).toBe('./openwebui-icon.png');
-    });
-
     it('uses correct icon path for ollama', () => {
       const { container } = render(<AppIcon {...defaultProps} appId="ollama" />);
       expect(container.querySelector('img')?.getAttribute('src')).toBe('./ollama-icon.png');
@@ -190,17 +185,17 @@ describe('AppIcon', () => {
       expect(container.querySelector('img')?.getAttribute('src')).toBe('./torch-icon.svg');
     });
 
-    it('uses the built-in fallback asset for invoke', () => {
-      const { container } = render(<AppIcon {...defaultProps} appId="invoke" />);
-      expect(container.querySelector('img')?.getAttribute('src')).toBe('./comfyui-icon.png');
+    it('uses the shipped svg path for llama.cpp', () => {
+      const { container } = render(<AppIcon {...defaultProps} appId="llama-cpp" />);
+      expect(container.querySelector('img')?.getAttribute('src')).toBe('./llama-cpp-icon.svg');
     });
 
-    it('uses the built-in fallback asset for krita-diffusion', () => {
-      const { container } = render(<AppIcon {...defaultProps} appId="krita-diffusion" />);
-      expect(container.querySelector('img')?.getAttribute('src')).toBe('./comfyui-icon.png');
+    it('uses the shipped svg path for ONNX Runtime', () => {
+      const { container } = render(<AppIcon {...defaultProps} appId="onnx-runtime" />);
+      expect(container.querySelector('img')?.getAttribute('src')).toBe('./onnx-runtime-icon.svg');
     });
 
-    it('falls back to comfyui icon for unknown appId', () => {
+    it('uses the conventional asset path for an unknown app id', () => {
       const { container } = render(<AppIcon {...defaultProps} appId="unknown-app" />);
       expect(container.querySelector('img')?.getAttribute('src')).toBe('./unknown-app-icon.png');
     });

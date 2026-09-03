@@ -1,123 +1,53 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { AppSidebar } from './AppSidebar';
-import type { AppConfig } from '../types/apps';
-import { LIST_TOP_PADDING, TOTAL_HEIGHT } from '../hooks/usePhysicsDrag';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Box } from 'lucide-react';
+import type { AppConfig } from '../types/apps';
+import { AppSidebar } from './AppSidebar';
 
 const mockApps: AppConfig[] = [
   {
-    id: 'comfyui',
-    name: 'comfyui',
-    displayName: 'ComfyUI',
+    id: 'ollama',
+    name: 'ollama',
+    displayName: 'Ollama',
     icon: Box,
     status: 'running',
     iconState: 'running',
-    ramUsage: 60,
-    gpuUsage: 40,
   },
   {
-    id: 'openwebui',
-    name: 'openwebui',
-    displayName: 'OpenWebUI',
+    id: 'llama-cpp',
+    name: 'llama-cpp',
+    displayName: 'llama.cpp',
     icon: Box,
     status: 'idle',
     iconState: 'offline',
-    ramUsage: 0,
-    gpuUsage: 0,
-  },
-  {
-    id: 'invoke',
-    name: 'invoke',
-    displayName: 'Invoke',
-    icon: Box,
-    status: 'idle',
-    iconState: 'uninstalled',
-    ramUsage: 0,
-    gpuUsage: 0,
   },
 ];
 
-const defaultProps = {
-  apps: mockApps,
-  selectedAppId: null,
-  onSelectApp: vi.fn(),
-};
-
 describe('AppSidebar', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+  beforeEach(() => vi.clearAllMocks());
+
+  it('renders only the supplied compiled plugin icons', () => {
+    render(<AppSidebar apps={mockApps} selectedAppId={null} onSelectApp={vi.fn()} />);
+
+    expect(screen.getByRole('toolbar', { name: 'Inference plugins' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Ollama' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'llama.cpp' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add app' })).not.toBeInTheDocument();
   });
 
-  it('renders all app icons', () => {
-    render(<AppSidebar {...defaultProps} />);
-    const appButtons = mockApps.map(app => screen.getByTitle(app.displayName));
-    expect(appButtons.length).toBe(mockApps.length);
-  });
-
-  it('calls onSelectApp when icon is clicked', async () => {
+  it('selects a plugin and returns home on Escape', async () => {
     const user = userEvent.setup();
     const onSelectApp = vi.fn();
-    render(<AppSidebar {...defaultProps} onSelectApp={onSelectApp} />);
-
-    const firstMockApp = mockApps[0];
-    if (firstMockApp === undefined) {
-      throw new TypeError('Expected at least one mock app');
-    }
-    const firstApp = screen.getByRole('button', { name: firstMockApp.displayName });
-    await user.click(firstApp);
-
-    expect(onSelectApp).toHaveBeenCalled();
-  });
-
-  it('deselects when clicking the sidebar background', async () => {
-    const user = userEvent.setup();
-    const onSelectApp = vi.fn();
-    const { container } = render(<AppSidebar {...defaultProps} onSelectApp={onSelectApp} />);
-
-    const sidebar = container.firstChild;
-    if (sidebar) {
-      await user.click(sidebar as HTMLElement);
-    }
-
-    expect(onSelectApp).toHaveBeenCalledWith(null);
-  });
-
-  it('deselects the active app when Escape is pressed', () => {
-    const onSelectApp = vi.fn();
-    render(
-      <AppSidebar
-        {...defaultProps}
-        selectedAppId="comfyui"
-        onSelectApp={onSelectApp}
-      />
+    const { rerender } = render(
+      <AppSidebar apps={mockApps} selectedAppId={null} onSelectApp={onSelectApp} />
     );
 
+    await user.click(screen.getByRole('button', { name: 'Ollama' }));
+    expect(onSelectApp).toHaveBeenCalledWith('ollama');
+
+    rerender(<AppSidebar apps={mockApps} selectedAppId="ollama" onSelectApp={onSelectApp} />);
     fireEvent.keyDown(window, { key: 'Escape' });
-
     expect(onSelectApp).toHaveBeenCalledWith(null);
-  });
-
-  it('calls onAddApp with nearest index when Plus is clicked', async () => {
-    const onAddApp = vi.fn();
-    const { container } = render(<AppSidebar {...defaultProps} onAddApp={onAddApp} />);
-
-    act(() => {
-      window.dispatchEvent(new MouseEvent('mousemove', {
-        clientX: 10,
-        clientY: LIST_TOP_PADDING + TOTAL_HEIGHT,
-      }));
-    });
-
-    await waitFor(() => {
-      const plusIcon = container.querySelector('svg.lucide-plus');
-      expect(plusIcon).toBeInTheDocument();
-    });
-
-    const plusButton = container.querySelector('button[aria-label="Add app"]') as HTMLElement;
-    fireEvent.click(plusButton);
-
-    expect(onAddApp).toHaveBeenCalledWith(1);
   });
 });

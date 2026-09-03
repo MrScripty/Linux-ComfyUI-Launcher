@@ -73,86 +73,59 @@ pub(super) async fn status_response(
         mgr_lock.clone()
     };
 
-    let (
-        comfyui_running,
-        ollama_running,
-        torch_running,
-        last_launch_error,
-        last_launch_log,
-        app_resources,
-    ) = if let Some(mgr) = process_manager {
-        tokio::task::spawn_blocking(move || {
-            let comfyui_running = mgr.is_running();
-            let ollama_running = mgr.is_ollama_running();
-            let torch_running = mgr.is_torch_running();
-            let last_launch_error = mgr.last_launch_error();
-            let last_launch_log = mgr
-                .last_launch_log()
-                .map(|p| p.to_string_lossy().to_string());
+    let (ollama_running, torch_running, last_launch_error, last_launch_log, app_resources) =
+        if let Some(mgr) = process_manager {
+            tokio::task::spawn_blocking(move || {
+                let ollama_running = mgr.is_ollama_running();
+                let torch_running = mgr.is_torch_running();
+                let last_launch_error = mgr.last_launch_error();
+                let last_launch_log = mgr
+                    .last_launch_log()
+                    .map(|p| p.to_string_lossy().to_string());
 
-            let comfyui_resources = if comfyui_running {
-                mgr.aggregate_app_resources()
-                    .map(|r| models::AppResourceUsage {
-                        gpu_memory: Some((r.gpu_memory * 1024.0 * 1024.0 * 1024.0) as u64),
-                        ram_memory: Some((r.ram_memory * 1024.0 * 1024.0 * 1024.0) as u64),
+                let ollama_resources = if ollama_running {
+                    mgr.aggregate_ollama_resources()
+                        .map(|r| models::AppResourceUsage {
+                            gpu_memory: Some((r.gpu_memory * 1024.0 * 1024.0 * 1024.0) as u64),
+                            ram_memory: Some((r.ram_memory * 1024.0 * 1024.0 * 1024.0) as u64),
+                        })
+                } else {
+                    None
+                };
+
+                let app_resources = if ollama_resources.is_some() {
+                    Some(models::AppResources {
+                        ollama: ollama_resources,
                     })
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
 
-            let ollama_resources = if ollama_running {
-                mgr.aggregate_ollama_resources()
-                    .map(|r| models::AppResourceUsage {
-                        gpu_memory: Some((r.gpu_memory * 1024.0 * 1024.0 * 1024.0) as u64),
-                        ram_memory: Some((r.ram_memory * 1024.0 * 1024.0 * 1024.0) as u64),
-                    })
-            } else {
-                None
-            };
-
-            let app_resources = if comfyui_resources.is_some() || ollama_resources.is_some() {
-                Some(models::AppResources {
-                    comfyui: comfyui_resources,
-                    ollama: ollama_resources,
-                })
-            } else {
-                None
-            };
-
-            (
-                comfyui_running,
-                ollama_running,
-                torch_running,
-                last_launch_error,
-                last_launch_log,
-                app_resources,
-            )
-        })
-        .await
-        .map_err(|e| PumasError::Other(format!("Failed to join status_response task: {}", e)))?
-    } else {
-        (false, false, false, None, None, None)
-    };
+                (
+                    ollama_running,
+                    torch_running,
+                    last_launch_error,
+                    last_launch_log,
+                    app_resources,
+                )
+            })
+            .await
+            .map_err(|e| PumasError::Other(format!("Failed to join status_response task: {}", e)))?
+        } else {
+            (false, false, None, None, None)
+        };
 
     Ok(models::StatusResponse {
         success: true,
         error: None,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        deps_ready: true,
-        patched: false,
-        menu_shortcut: false,
-        desktop_shortcut: false,
-        shortcut_version: None,
-        message: if comfyui_running {
-            "ComfyUI running".to_string()
-        } else if ollama_running {
+        message: if ollama_running {
             "Ollama running".to_string()
         } else if torch_running {
             "Torch running".to_string()
         } else {
             "Ready".to_string()
         },
-        comfyui_running,
         ollama_running,
         torch_running,
         last_launch_error,

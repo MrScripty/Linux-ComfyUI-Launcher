@@ -32,4 +32,4 @@ mod utils;
 
 pub use gpu::{GpuInfo, GpuMonitor, NvidiaSmiMonitor};
 pub use resources::{ProcessResources, ResourceTracker, SystemResourceSnapshot};
-pub use utils::{check_brave, check_git, check_setproctitle, SystemCheckResult, SystemUtils};
+pub use utils::{check_git, SystemCheckResult, SystemUtils};

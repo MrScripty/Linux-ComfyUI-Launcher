@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveReleaseSmokeScript } from './actions.mjs';
+import { areInferencePluginsEnabled, resolveReleaseSmokeScript } from './actions.mjs';
+
+test('inference plugins are enabled by default and can be compiled out', () => {
+  assert.equal(areInferencePluginsEnabled({}), true);
+  assert.equal(areInferencePluginsEnabled({ PUMAS_INFERENCE_PLUGINS: 'true' }), true);
+  assert.equal(areInferencePluginsEnabled({ PUMAS_INFERENCE_PLUGINS: 'false' }), false);
+});
 
 test('resolveReleaseSmokeScript selects the CI-safe Electron entrypoint on Linux CI', () => {
   const previousCi = process.env.CI;

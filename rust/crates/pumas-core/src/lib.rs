@@ -3,8 +3,7 @@
 //! This crate provides the core functionality for managing AI models and system
 //! utilities. It can be used programmatically without any HTTP/RPC layer.
 //!
-//! For version management (ComfyUI versions, custom nodes), see the
-//! `pumas-app-manager` crate.
+//! Inference runtime version management lives in the `pumas-app-manager` crate.
 //!
 //! # Example
 //!
@@ -62,7 +61,7 @@ pub use config::AppId;
 pub use error::{PumasError, Result};
 pub use index::{ModelIndex, ModelRecord, SearchResult};
 pub use ipc::PumasLocalClient;
-pub use launcher::{LauncherUpdater, PatchManager, UpdateApplyResult, UpdateCheckResult};
+pub use launcher::{LauncherUpdater, UpdateApplyResult, UpdateCheckResult};
 pub use metadata::MetadataManager;
 pub use model_library::sharding::{self, ShardValidation};
 pub use model_library::{
@@ -83,7 +82,7 @@ pub use onnx_runtime::{
     RealOnnxEmbeddingBackend,
 };
 pub use plugins::{PluginConfig, PluginLoader};
-pub use process::{ProcessInfo, ProcessManager};
+pub use process::ProcessManager;
 pub use providers::{
     ExecutableArtifactFormat, OpenAiGatewayEndpoint, ProviderBehavior, ProviderBinaryLaunchTarget,
     ProviderGatewayAliasPolicy, ProviderInProcessRuntimeTarget, ProviderLaunchKind,
@@ -96,8 +95,8 @@ pub use runtime_profiles::{
     RuntimeProviderCapabilities,
 };
 pub use system::{
-    check_brave, check_git, check_setproctitle, GpuInfo, GpuMonitor, ProcessResources,
-    ResourceTracker, SystemCheckResult, SystemResourceSnapshot, SystemUtils,
+    check_git, GpuInfo, GpuMonitor, ProcessResources, ResourceTracker, SystemCheckResult,
+    SystemResourceSnapshot, SystemUtils,
 };
 
 // Re-export builder from api module

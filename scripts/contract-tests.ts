@@ -19,13 +19,9 @@ type BaseResponse = { success: boolean; error?: string };
 
 interface StatusResponse extends BaseResponse {
   version: string;
-  deps_ready: boolean;
-  patched: boolean;
-  menu_shortcut: boolean;
-  desktop_shortcut: boolean;
-  shortcut_version: string | null;
   message: string;
-  comfyui_running: boolean;
+  ollama_running: boolean;
+  torch_running: boolean;
   last_launch_error: string | null;
   last_launch_log: string | null;
   app_resources?: unknown;
@@ -195,13 +191,9 @@ async function testGetStatus(port: number): Promise<TestResult> {
     const errors = validate(response, {
       success: isBoolean,
       version: isString,
-      deps_ready: isBoolean,
-      patched: isBoolean,
-      menu_shortcut: isBoolean,
-      desktop_shortcut: isBoolean,
-      shortcut_version: isStringOrNull,
       message: isString,
-      comfyui_running: isBoolean,
+      ollama_running: isBoolean,
+      torch_running: isBoolean,
       last_launch_error: isStringOrNull,
       last_launch_log: isStringOrNull,
     });

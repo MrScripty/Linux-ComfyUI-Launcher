@@ -12,7 +12,6 @@ export interface TorchPanelProps {
   versions: AppVersionState;
   showVersionManager: boolean;
   onShowVersionManager: (show: boolean) => void;
-  activeShortcutState?: { menu: boolean; desktop: boolean };
   diskSpacePercent: number;
   modelManagerProps: ModelManagerProps;
   isTorchRunning: boolean;
@@ -25,7 +24,6 @@ export function TorchPanel({
   versions,
   showVersionManager,
   onShowVersionManager,
-  activeShortcutState,
   diskSpacePercent,
   modelManagerProps,
   isTorchRunning,
@@ -41,7 +39,6 @@ export function TorchPanel({
           versions={versions}
           showManager={showVersionManager}
           onShowManager={onShowVersionManager}
-          activeShortcutState={activeShortcutState}
           diskSpacePercent={diskSpacePercent}
         />
         {!isManagerOpen && connectionUrl && (

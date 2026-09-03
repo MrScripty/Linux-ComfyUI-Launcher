@@ -69,7 +69,7 @@ export function InstallDialog({
   installationProgress,
   installNetworkStatus = 'idle',
   onRefreshProgress,
-  appDisplayName = 'ComfyUI',
+  appDisplayName = 'Application',
   appId,
   isRateLimited = false,
   rateLimitRetryAfter,

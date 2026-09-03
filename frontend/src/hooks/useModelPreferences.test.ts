@@ -53,7 +53,7 @@ describe('useModelPreferences', () => {
   });
 
   it('toggles local starred models without calling the backend', async () => {
-    const { result } = renderHook(() => useModelPreferences({ selectedAppId: 'comfyui' }));
+    const { result } = renderHook(() => useModelPreferences({ selectedAppId: 'ollama' }));
 
     await act(async () => {
       result.current.toggleStar('model-a');
@@ -86,7 +86,7 @@ describe('useModelPreferences', () => {
       rejectPersistence = reject;
     });
     setModelLinkExclusionMock.mockReturnValue(persistence);
-    const { result } = renderHook(() => useModelPreferences({ selectedAppId: 'comfyui' }));
+    const { result } = renderHook(() => useModelPreferences({ selectedAppId: 'ollama' }));
 
     await act(async () => {
       result.current.toggleLink('model-a');

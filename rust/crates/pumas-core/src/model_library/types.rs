@@ -379,7 +379,7 @@ impl From<FileFormat> for DetectedFileType {
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct MappingConfig {
-    /// Application ID (e.g., "comfyui")
+    /// Plugin/application identifier (for example, "ollama")
     pub app: String,
     /// Version pattern (e.g., "0.6.0" or "*")
     pub version: String,

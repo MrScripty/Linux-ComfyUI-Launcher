@@ -24,13 +24,6 @@ pub fn wrap_response(method: &str, result: Value) -> Value {
         // get_available_versions is handled entirely by handler due to rate limit complexity
         "get_available_versions" => result,
 
-        "get_custom_nodes" => {
-            json!({
-                "success": true,
-                "nodes": if result.is_null() { json!([]) } else { result }
-            })
-        }
-
         "get_release_dependencies" => {
             json!({
                 "success": true,
@@ -70,20 +63,6 @@ pub fn wrap_response(method: &str, result: Value) -> Value {
         // get_github_cache_status returns CacheStatusResponse which doesn't need wrapping
         "get_github_cache_status" => result,
 
-        "get_version_shortcuts" => {
-            json!({
-                "success": true,
-                "state": if result.is_null() { json!({}) } else { result }
-            })
-        }
-
-        "get_all_shortcut_states" => {
-            json!({
-                "success": true,
-                "states": if result.is_null() { json!({}) } else { result }
-            })
-        }
-
         // Passthrough methods (already in correct format)
         "get_status"
         | "get_disk_space"
@@ -121,17 +100,11 @@ pub fn wrap_response(method: &str, result: Value) -> Value {
         | "detect_sharded_sets"
         | "validate_file_type"
         | "refresh_model_index"
-        | "refresh_model_mappings"
         | "get_file_link_count"
         | "check_files_writable"
         | "open_path"
         | "open_url"
         | "open_active_install"
-        | "preview_model_mapping"
-        | "apply_model_mapping"
-        | "sync_models_incremental"
-        | "sync_with_resolutions"
-        | "get_cross_filesystem_warning"
         | "clean_broken_links"
         | "remove_orphaned_links"
         | "get_links_for_model"
@@ -175,12 +148,6 @@ pub fn wrap_response(method: &str, result: Value) -> Value {
         | "switch_version"
         | "cancel_installation"
         | "install_version_dependencies"
-        | "install_custom_node"
-        | "update_custom_node"
-        | "remove_custom_node"
-        | "toggle_patch"
-        | "toggle_menu"
-        | "toggle_desktop"
         | "set_default_version" => {
             json!({
                 "success": result.as_bool().unwrap_or(false)
@@ -302,16 +269,6 @@ mod tests {
     fn test_passthrough_method() {
         let data = json!({"success": true, "version": "1.0.0"});
         let wrapped = wrap_response("get_status", data.clone());
-        assert_eq!(wrapped, data);
-    }
-
-    #[test]
-    fn test_refresh_model_mappings_passthrough() {
-        let data = json!({
-            "success": false,
-            "error": "No active version set for comfyui"
-        });
-        let wrapped = wrap_response("refresh_model_mappings", data.clone());
         assert_eq!(wrapped, data);
     }
 

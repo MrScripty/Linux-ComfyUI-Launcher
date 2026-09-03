@@ -366,7 +366,6 @@ impl GitHubClient {
 
     /// Populate archive_size from platform-matched release assets.
     /// For Ollama, this selects the binary for the current platform (e.g., ollama-linux-amd64.tgz).
-    /// For ComfyUI, archive_size remains None (uses zipball which isn't in assets).
     fn populate_archive_sizes(releases: &mut [GitHubRelease], app_id: AppId) {
         match app_id {
             AppId::Ollama => {
@@ -375,10 +374,6 @@ impl GitHubClient {
                         release.archive_size = Some(asset.size);
                     }
                 }
-            }
-            AppId::ComfyUI => {
-                // ComfyUI uses source zipball, which isn't in assets array
-                // Size estimation handled elsewhere
             }
             _ => {
                 // Default: use the largest asset as the archive size

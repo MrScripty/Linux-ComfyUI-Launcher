@@ -1,6 +1,6 @@
 //! Version launching with health checks.
 //!
-//! Handles launching ComfyUI instances and detecting when they're ready.
+//! Handles launching managed inference runtime versions and readiness checks.
 
 use crate::version_manager::LaunchResult;
 use chrono::Utc;
@@ -55,14 +55,6 @@ impl VersionLauncher {
             .join(tag)
     }
 
-    /// Get the venv python path for a version.
-    fn venv_python(&self, tag: &str) -> PathBuf {
-        self.version_path(tag)
-            .join("venv")
-            .join("bin")
-            .join("python")
-    }
-
     /// Launch a version.
     pub async fn launch_version(
         &self,
@@ -73,16 +65,6 @@ impl VersionLauncher {
         if !path_exists(&version_path).await? {
             return Err(PumasError::VersionNotFound {
                 tag: tag.to_string(),
-            });
-        }
-
-        let venv_python = self.venv_python(tag);
-        if !path_exists(&venv_python).await? {
-            return Ok(LaunchResult {
-                success: false,
-                log_file: None,
-                error: Some("Virtual environment not found".to_string()),
-                ready: None,
             });
         }
 
@@ -97,10 +79,6 @@ impl VersionLauncher {
         info!("Launching {} from {}", tag, version_path.display());
 
         match self.app_id {
-            AppId::ComfyUI => {
-                self.launch_comfyui(tag, &version_path, &log_file, extra_args)
-                    .await
-            }
             AppId::Ollama => {
                 self.launch_ollama(tag, &version_path, &log_file, extra_args)
                     .await
@@ -110,84 +88,6 @@ impl VersionLauncher {
                 self.app_id
             ))),
         }
-    }
-
-    /// Launch ComfyUI.
-    async fn launch_comfyui(
-        &self,
-        tag: &str,
-        version_path: &PathBuf,
-        log_file: &PathBuf,
-        extra_args: Option<Vec<String>>,
-    ) -> Result<LaunchResult> {
-        let venv_python = self.venv_python(tag);
-        let main_py = version_path.join("main.py");
-
-        if !path_exists(&main_py).await? {
-            return Ok(LaunchResult {
-                success: false,
-                log_file: Some(log_file.clone()),
-                error: Some("main.py not found".to_string()),
-                ready: None,
-            });
-        }
-
-        // Build command
-        let mut args = vec!["main.py".to_string(), "--enable-manager".to_string()];
-        if let Some(extra) = extra_args {
-            args.extend(extra);
-        }
-
-        // Create log file handle
-        let log_output = fs::File::create(log_file)
-            .await
-            .map_err(|e| PumasError::Io {
-                message: format!("Failed to create log file: {}", e),
-                path: Some(log_file.clone()),
-                source: Some(e),
-            })?
-            .into_std()
-            .await;
-
-        // Spawn process
-        let mut cmd = Command::new(&venv_python);
-        cmd.args(&args)
-            .current_dir(version_path)
-            .env("SKIP_BROWSER", "1")
-            .stdout(Stdio::from(log_output.try_clone().map_err(|e| {
-                PumasError::Io {
-                    message: format!("Failed to clone log handle: {}", e),
-                    path: Some(log_file.clone()),
-                    source: Some(e),
-                }
-            })?))
-            .stderr(Stdio::from(log_output));
-        // Unix: start in new process group for clean termination
-        #[cfg(unix)]
-        cmd.process_group(0);
-        let child = cmd
-            .spawn()
-            .map_err(|e| PumasError::Other(format!("Failed to spawn ComfyUI: {}", e)))?;
-
-        let pid = child.id();
-        info!("ComfyUI started with PID {:?}", pid);
-
-        // Write PID file
-        if let Some(pid) = pid {
-            let pid_file = version_path.join("comfyui.pid");
-            fs::write(&pid_file, pid.to_string()).await.ok();
-        }
-
-        // Wait for server to be ready
-        let server_url = AppId::ComfyUI.default_base_url();
-        let (ready, error) = self.wait_for_server_ready(server_url, child, 90).await;
-
-        Ok(LaunchResult {
-            success: ready,
-            log_file: Some(log_file.clone()),
-            error,
-            ready: Some(ready),
-        })
     }
 
     /// Launch Ollama.
@@ -333,7 +233,7 @@ impl VersionLauncher {
     /// Stop a running version.
     pub async fn stop_version(&self, tag: &str) -> Result<bool> {
         let version_path = self.version_path(tag);
-        let pid_file = version_path.join("comfyui.pid");
+        let pid_file = version_path.join("ollama.pid");
 
         if !path_exists(&pid_file).await? {
             return Ok(false);
@@ -389,7 +289,7 @@ impl VersionLauncher {
     /// Check if a version is running.
     pub async fn is_version_running(&self, tag: &str) -> bool {
         let version_path = self.version_path(tag);
-        let pid_file = version_path.join("comfyui.pid");
+        let pid_file = version_path.join("ollama.pid");
 
         if !path_exists(&pid_file).await.unwrap_or(false) {
             return false;
@@ -416,108 +316,6 @@ impl VersionLauncher {
         }
 
         false
-    }
-
-    /// Generate a run script for a version.
-    pub fn generate_run_script(&self, tag: &str) -> Result<PathBuf> {
-        let version_path = self.version_path(tag);
-        let slug = self.slugify_tag(tag);
-        let script_path = version_path.join(format!("run_{}.sh", slug));
-
-        let venv_python = self.venv_python(tag);
-        let profiles_dir = self
-            .launcher_root
-            .join("launcher-data")
-            .join("profiles")
-            .join(&slug);
-        let server_base_url = AppId::ComfyUI.default_base_url();
-
-        let script_content = format!(
-            r#"#!/bin/bash
-# Run script for {tag}
-# Generated by Pumas Library
-
-SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
-VENV_PYTHON="{venv_python}"
-PID_FILE="$SCRIPT_DIR/comfyui.pid"
-SERVER_URL="{server_base_url}"
-PROFILE_DIR="{profiles_dir}"
-
-# Stop any existing instance
-if [ -f "$PID_FILE" ]; then
-    OLD_PID=$(cat "$PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Stopping existing instance (PID: $OLD_PID)..."
-        kill -TERM "$OLD_PID" 2>/dev/null
-        sleep 1
-        kill -KILL "$OLD_PID" 2>/dev/null || true
-    fi
-    rm -f "$PID_FILE"
-fi
-
-# Close existing browser window if wmctrl is available
-if command -v wmctrl &> /dev/null; then
-    wmctrl -c "ComfyUI" 2>/dev/null || true
-fi
-
-# Start ComfyUI
-cd "$SCRIPT_DIR"
-export SKIP_BROWSER=1
-"$VENV_PYTHON" main.py --enable-manager "$@" &
-echo $! > "$PID_FILE"
-
-# Wait for server and open browser
-echo "Waiting for server to start..."
-for i in {{1..30}}; do
-    if curl -s "$SERVER_URL" > /dev/null 2>&1; then
-        echo "Server ready!"
-
-        # Open in browser
-        if command -v brave-browser &> /dev/null; then
-            brave-browser --app="$SERVER_URL" --new-window --user-data-dir="$PROFILE_DIR" &
-        elif command -v xdg-open &> /dev/null; then
-            xdg-open "$SERVER_URL" &
-        fi
-
-        exit 0
-    fi
-    sleep 1
-done
-
-echo "Warning: Server did not become ready in 30 seconds"
-"#,
-            tag = tag,
-            venv_python = venv_python.display(),
-            profiles_dir = profiles_dir.display(),
-        );
-
-        std::fs::write(&script_path, script_content).map_err(|e| PumasError::Io {
-            message: format!("Failed to write run script: {}", e),
-            path: Some(script_path.clone()),
-            source: Some(e),
-        })?;
-
-        // Make executable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path)
-                .map_err(|e| PumasError::Io {
-                    message: format!("Failed to get script permissions: {}", e),
-                    path: Some(script_path.clone()),
-                    source: Some(e),
-                })?
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).map_err(|e| PumasError::Io {
-                message: format!("Failed to set script permissions: {}", e),
-                path: Some(script_path.clone()),
-                source: Some(e),
-            })?;
-        }
-
-        info!("Generated run script: {}", script_path.display());
-        Ok(script_path)
     }
 
     /// Tail the last N lines from a log file.
@@ -557,7 +355,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let launcher = VersionLauncher::new(
             temp_dir.path().to_path_buf(),
-            AppId::ComfyUI,
+            AppId::Ollama,
             temp_dir.path().join("logs"),
         );
         (launcher, temp_dir)
@@ -577,7 +375,7 @@ mod tests {
         let (launcher, temp) = create_test_launcher();
 
         let path = launcher.version_path("v1.0.0");
-        assert_eq!(path, temp.path().join("comfyui-versions/v1.0.0"));
+        assert_eq!(path, temp.path().join("ollama-versions/v1.0.0"));
     }
 
     #[tokio::test]
@@ -585,7 +383,7 @@ mod tests {
         let (launcher, temp) = create_test_launcher();
 
         // Create version directory but no PID file
-        std::fs::create_dir_all(temp.path().join("comfyui-versions/v1.0.0")).unwrap();
+        std::fs::create_dir_all(temp.path().join("ollama-versions/v1.0.0")).unwrap();
 
         assert!(!launcher.is_version_running("v1.0.0").await);
     }

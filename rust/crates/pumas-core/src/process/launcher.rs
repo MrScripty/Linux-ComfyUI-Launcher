@@ -10,31 +10,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-/// Configuration for launching a process.
-#[derive(Debug, Clone)]
-pub struct LaunchConfig {
-    /// Version tag being launched.
-    pub tag: String,
-    /// Path to the version directory.
-    pub version_dir: PathBuf,
-    /// Path to the Python executable (in venv).
-    pub python_path: PathBuf,
-    /// Path to main.py.
-    pub main_py: PathBuf,
-    /// Additional arguments to pass.
-    pub extra_args: Vec<String>,
-    /// Environment variables to set.
-    pub env_vars: HashMap<String, String>,
-    /// Path to write the PID file.
-    pub pid_file: PathBuf,
-    /// Path to write stdout/stderr logs.
-    pub log_file: Option<PathBuf>,
-    /// Timeout for server readiness check.
-    pub ready_timeout: Duration,
-    /// URL to check for server readiness.
-    pub health_check_url: Option<String>,
-}
-
 /// Configuration for launching a binary application (like Ollama).
 #[derive(Debug, Clone)]
 pub struct BinaryLaunchConfig {
@@ -358,65 +333,6 @@ fn find_named_binary(root: &Path, binary_name: &str) -> Option<PathBuf> {
     None
 }
 
-impl LaunchConfig {
-    /// Create a new launch config with sensible defaults.
-    pub fn new(tag: impl Into<String>, version_dir: impl AsRef<Path>) -> Self {
-        let version_dir = version_dir.as_ref().to_path_buf();
-        let venv_python = version_dir.join("venv").join("bin").join("python");
-        let main_py = version_dir.join("main.py");
-        let pid_file = version_dir.join("comfyui.pid");
-
-        Self {
-            tag: tag.into(),
-            version_dir: version_dir.clone(),
-            python_path: venv_python,
-            main_py,
-            extra_args: vec!["--enable-manager".to_string()],
-            env_vars: HashMap::new(),
-            pid_file,
-            log_file: None,
-            ready_timeout: Duration::from_secs(60),
-            health_check_url: Some(AppId::ComfyUI.default_base_url().to_string()),
-        }
-    }
-
-    /// Set extra arguments.
-    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
-        self.extra_args = args;
-        self
-    }
-
-    /// Add an extra argument.
-    pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
-        self.extra_args.push(arg.into());
-        self
-    }
-
-    /// Set environment variables.
-    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env_vars.insert(key.into(), value.into());
-        self
-    }
-
-    /// Set the log file path.
-    pub fn with_log_file(mut self, path: impl AsRef<Path>) -> Self {
-        self.log_file = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    /// Set the ready timeout.
-    pub fn with_ready_timeout(mut self, timeout: Duration) -> Self {
-        self.ready_timeout = timeout;
-        self
-    }
-
-    /// Set the health check URL.
-    pub fn with_health_check_url(mut self, url: impl Into<String>) -> Self {
-        self.health_check_url = Some(url.into());
-        self
-    }
-}
-
 /// Result of launching a process.
 #[derive(Debug)]
 pub struct LaunchResult {
@@ -436,120 +352,6 @@ pub struct LaunchResult {
 pub struct ProcessLauncher;
 
 impl ProcessLauncher {
-    /// Launch a process with the given configuration.
-    pub fn launch(config: &LaunchConfig) -> Result<LaunchResult> {
-        // Validate prerequisites
-        if !config.python_path.exists() {
-            return Ok(LaunchResult {
-                success: false,
-                process: None,
-                log_path: None,
-                error: Some(format!(
-                    "Python executable not found: {}",
-                    config.python_path.display()
-                )),
-                ready: false,
-            });
-        }
-
-        if !config.main_py.exists() {
-            return Ok(LaunchResult {
-                success: false,
-                process: None,
-                log_path: None,
-                error: Some(format!("main.py not found: {}", config.main_py.display())),
-                ready: false,
-            });
-        }
-
-        // Build command
-        let mut cmd = Command::new(&config.python_path);
-        cmd.arg(&config.main_py);
-        cmd.args(&config.extra_args);
-        cmd.current_dir(&config.version_dir);
-
-        // Set environment variables
-        for (key, value) in &config.env_vars {
-            cmd.env(key, value);
-        }
-
-        // Set up stdio
-        let log_path = config.log_file.clone();
-        if let Some(ref log_file) = log_path {
-            // Ensure parent directory exists
-            if let Some(parent) = log_file.parent() {
-                fs::create_dir_all(parent).ok();
-            }
-
-            // Open log file for writing
-            let file = fs::File::create(log_file).map_err(|e| PumasError::Io {
-                message: "create log file".to_string(),
-                path: Some(log_file.clone()),
-                source: Some(e),
-            })?;
-            let stdout_file = file.try_clone().map_err(|e| PumasError::Io {
-                message: "clone log file handle".to_string(),
-                path: Some(log_file.clone()),
-                source: Some(e),
-            })?;
-            cmd.stdout(Stdio::from(stdout_file));
-            cmd.stderr(Stdio::from(file));
-        } else {
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
-        }
-
-        // Detach the process from Pumas so it runs independently.
-        // This prevents zombie processes when we kill the child - init will reap it instead.
-        // Without this, killed processes become zombies because Pumas doesn't call wait().
-        platform::configure_detached_command(&mut cmd);
-
-        // Spawn the process
-        info!(
-            "Launching {} from {}",
-            config.tag,
-            config.version_dir.display()
-        );
-
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to spawn process: {}", e);
-                return Ok(LaunchResult {
-                    success: false,
-                    process: None,
-                    log_path,
-                    error: Some(format!("Failed to spawn process: {}", e)),
-                    ready: false,
-                });
-            }
-        };
-
-        let pid = child.id();
-
-        // Write PID file
-        if let Err(e) = fs::write(&config.pid_file, pid.to_string()) {
-            warn!("Failed to write PID file: {}", e);
-        }
-
-        info!("Launched process with PID {}", pid);
-
-        // Check for readiness (if health check URL is configured)
-        let ready = if let Some(ref url) = config.health_check_url {
-            Self::wait_for_ready(url, config.ready_timeout)
-        } else {
-            true
-        };
-
-        Ok(LaunchResult {
-            success: true,
-            process: Some(child),
-            log_path,
-            error: None,
-            ready,
-        })
-    }
-
     /// Wait for the server to become ready.
     fn wait_for_ready(url: &str, timeout: Duration) -> bool {
         let start = Instant::now();
@@ -574,15 +376,9 @@ impl ProcessLauncher {
         // Simple TCP connect check
         if let Some(host_port) = url.strip_prefix("http://") {
             let addr = host_port.split('/').next().unwrap_or(host_port);
-            std::net::TcpStream::connect_timeout(
-                &addr.parse().unwrap_or_else(|_| {
-                    format!("127.0.0.1:{}", AppId::ComfyUI.default_port())
-                        .parse()
-                        .unwrap()
-                }),
-                Duration::from_secs(1),
-            )
-            .is_ok()
+            addr.parse().is_ok_and(|addr| {
+                std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+            })
         } else {
             false
         }
@@ -755,39 +551,6 @@ impl ProcessLauncher {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[test]
-    fn test_launch_config_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let version_dir = temp_dir.path().join("v1.0.0");
-
-        let config = LaunchConfig::new("v1.0.0", &version_dir);
-
-        assert_eq!(config.tag, "v1.0.0");
-        assert_eq!(config.version_dir, version_dir);
-        assert!(config.extra_args.contains(&"--enable-manager".to_string()));
-    }
-
-    #[test]
-    fn test_launch_config_builder() {
-        let temp_dir = TempDir::new().unwrap();
-        let version_dir = temp_dir.path().join("v1.0.0");
-        let log_file = temp_dir.path().join("comfyui.log");
-
-        let config = LaunchConfig::new("v1.0.0", &version_dir)
-            .with_arg("--port=8189")
-            .with_env("CUDA_VISIBLE_DEVICES", "0")
-            .with_log_file(&log_file)
-            .with_ready_timeout(Duration::from_secs(30));
-
-        assert!(config.extra_args.contains(&"--port=8189".to_string()));
-        assert_eq!(
-            config.env_vars.get("CUDA_VISIBLE_DEVICES"),
-            Some(&"0".to_string())
-        );
-        assert_eq!(config.log_file, Some(log_file));
-        assert_eq!(config.ready_timeout, Duration::from_secs(30));
-    }
 
     #[test]
     fn test_binary_launch_config_profile_overrides() {
@@ -965,22 +728,5 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|message| message.contains("Process exited before")));
-    }
-
-    #[test]
-    fn test_launch_missing_python() {
-        let temp_dir = TempDir::new().unwrap();
-        let version_dir = temp_dir.path().join("v1.0.0");
-        fs::create_dir_all(&version_dir).unwrap();
-
-        let config = LaunchConfig::new("v1.0.0", &version_dir);
-        let result = ProcessLauncher::launch(&config).unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.is_some());
-        assert!(result
-            .error
-            .unwrap()
-            .contains("Python executable not found"));
     }
 }

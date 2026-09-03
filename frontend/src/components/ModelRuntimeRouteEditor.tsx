@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Play, RotateCcw, Save } from 'lucide-react';
+import { ValidationError } from '../errors';
 import { useRuntimeProfiles } from '../hooks/useRuntimeProfiles';
 import type { ModelInfo } from '../types/apps';
 import { ModelServeDialog } from './ModelServeDialog';
@@ -8,7 +9,7 @@ import {
   saveModelRuntimeRoute,
 } from './model-serve/runtimeRouteMutations';
 
-interface ModelRuntimeRouteEditorProps {
+export interface ModelRuntimeRouteEditorProps {
   modelId: string;
   modelName: string;
   primaryFile: string | null;
@@ -91,7 +92,7 @@ export function ModelRuntimeRouteEditor({
     setSaveError(null);
     try {
       if (!selectedProfile) {
-        throw new Error('Select a runtime profile before saving route');
+        throw new ValidationError('Select a runtime profile before saving route', 'profileId');
       }
       await saveModelRuntimeRoute({
         provider: selectedProfile.provider,
@@ -112,10 +113,13 @@ export function ModelRuntimeRouteEditor({
     setSaveError(null);
     try {
       if (!selectedProfile) {
-        throw new Error('Select a runtime profile before clearing route');
+        throw new ValidationError('Select a runtime profile before clearing route', 'profileId');
       }
       if (!selectedRoute) {
-        throw new Error('No runtime route is saved for this provider and model');
+        throw new ValidationError(
+          'No runtime route is saved for this provider and model',
+          'runtimeRoute'
+        );
       }
       await clearModelRuntimeRoute(selectedProfile.provider, modelId);
       await refreshRuntimeProfiles();

@@ -75,7 +75,7 @@ fn extract_hidden_states_value(
             })?;
             tensor_values_to_hidden_states(
                 shape,
-                values.iter().copied().collect(),
+                values.to_vec(),
                 output_name,
                 expected_batch,
                 expected_tokens,

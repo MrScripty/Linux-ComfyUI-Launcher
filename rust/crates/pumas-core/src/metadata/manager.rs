@@ -231,12 +231,12 @@ impl MetadataManager {
 
     fn versions_path(&self, app_id: Option<AppId>) -> PathBuf {
         match app_id {
-            Some(app) if app != AppId::ComfyUI => {
+            Some(app) => {
                 let app_name = app.to_string().to_lowercase();
                 self.metadata_dir()
                     .join(format!("versions-{}.json", app_name))
             }
-            _ => self.metadata_dir().join("versions.json"),
+            None => self.metadata_dir().join("versions.json"),
         }
     }
 
@@ -648,15 +648,15 @@ mod tests {
     fn test_app_specific_versions() {
         let (manager, _temp) = create_test_manager();
 
-        // Add ComfyUI version
-        let comfy_metadata = InstalledVersionMetadata {
+        // Add a version using the legacy unscoped metadata path.
+        let legacy_metadata = InstalledVersionMetadata {
             path: "v0.1.0".to_string(),
             installed_date: "2024-01-01T00:00:00Z".to_string(),
             release_tag: "v0.1.0".to_string(),
             ..Default::default()
         };
         manager
-            .update_installed_version("v0.1.0", comfy_metadata, None)
+            .update_installed_version("v0.1.0", legacy_metadata, None)
             .unwrap();
 
         // Add Ollama version

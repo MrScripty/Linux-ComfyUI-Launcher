@@ -48,7 +48,7 @@ describe('LocalModelInstalledActions', () => {
           isPartialDownload: true,
           ringDegrees: 144,
         })}
-        selectedAppId="comfyui"
+        selectedAppId="ollama"
         onRecoverPartialDownload={vi.fn()}
         onToggleLink={vi.fn()}
       />
@@ -68,7 +68,7 @@ describe('LocalModelInstalledActions', () => {
           isPartialDownload: true,
           ringDegrees: 360,
         })}
-        selectedAppId="comfyui"
+        selectedAppId="ollama"
         onRecoverPartialDownload={vi.fn()}
         onToggleLink={vi.fn()}
       />
@@ -113,6 +113,6 @@ describe('LocalModelInstalledActions', () => {
       />
     );
 
-    expect(screen.getByRole('button', { name: /loaded with llama.cpp/i })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /unload model/i })).toBeEnabled();
   });
 });

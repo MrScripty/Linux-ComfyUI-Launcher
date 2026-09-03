@@ -1,6 +1,6 @@
 # Frontend Contributing Guidelines
 
-This document outlines the coding standards for the ComfyUI Launcher frontend. These standards mirror the backend requirements to ensure consistency across the codebase.
+This document outlines the coding standards for the Pumas Library frontend. These standards mirror the backend requirements to ensure consistency across the codebase.
 
 ## Table of Contents
 - [Type Safety](#type-safety)
@@ -103,7 +103,7 @@ try {
 
 **Custom Exceptions:**
 All custom exceptions are defined in `frontend/src/errors/index.ts`:
-- `ComfyUILauncherError` - Base exception
+- `PumasError` - Base exception
 - `NetworkError` - Network operations
 - `APIError` - Desktop bridge API failures
 - `ValidationError` - Input validation failures

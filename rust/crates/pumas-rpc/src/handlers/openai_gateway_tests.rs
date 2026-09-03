@@ -4,7 +4,7 @@ use crate::server::AppState;
 use axum::body::{to_bytes, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::StatusCode;
-use pumas_app_manager::{CustomNodesManager, SizeCalculator};
+use pumas_app_manager::SizeCalculator;
 use pumas_library::models::{
     RuntimeDeviceMode, RuntimeEndpointUrl, RuntimeProfileId, RuntimeProviderId,
     ServedModelLoadState, ServingEndpointStatus, ServingStatusSnapshot,
@@ -75,13 +75,9 @@ async fn gateway_test_state_with_clients(
     let state = Arc::new(AppState {
         api,
         version_managers: Arc::new(RwLock::new(HashMap::new())),
-        custom_nodes_manager: Arc::new(CustomNodesManager::new(
-            launcher_root.join("comfyui-versions"),
-        )),
         size_calculator: Arc::new(Mutex::new(
             SizeCalculator::new_with_cache(launcher_root.join("launcher-data/cache")).await,
         )),
-        shortcut_manager: Arc::new(RwLock::new(None)),
         plugin_loader: Arc::new(plugin_loader),
         gateway_http_client,
         gateway_base_url: pumas_library::models::RuntimeEndpointUrl::parse(

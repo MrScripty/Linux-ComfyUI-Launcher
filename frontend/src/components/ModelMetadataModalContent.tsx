@@ -16,7 +16,7 @@ import { ModelInferenceSettingsEditor } from './ModelInferenceSettingsEditor';
 import { ModelMetadataGrid } from './ModelMetadataGrid';
 import { ModelMetadataModalTabs } from './ModelMetadataModalTabs';
 import { ModelNotesEditor } from './ModelNotesEditor';
-import { ModelRuntimeRouteEditor } from './ModelRuntimeRouteEditor';
+import { ModelRuntimeRouteEditor } from '@runtime-route-editor';
 
 interface ModelMetadataModalContentProps {
   activeSource: MetadataSource;
@@ -221,7 +221,7 @@ export function ModelMetadataModalContent({
             No execution facts available
           </div>
         )
-      ) : activeSource === 'runtime' ? (
+      ) : __FEATURE_INFERENCE_PLUGINS__ && activeSource === 'runtime' ? (
         <ModelRuntimeRouteEditor
           modelId={modelId}
           modelName={modelName}

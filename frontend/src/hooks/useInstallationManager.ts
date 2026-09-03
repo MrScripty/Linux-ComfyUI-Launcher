@@ -48,7 +48,7 @@ export function useInstallationManager({
   availableVersions,
   onRefreshVersions,
 }: UseInstallationManagerOptions): UseInstallationManagerResult {
-  const resolvedAppId = appId ?? 'comfyui';
+  const resolvedAppId = appId ?? 'ollama';
   const isEnabled = enabled;
   const [installingTag, setInstallingTag] = useState<string | null>(null);
   const [installationProgress, setInstallationProgress] = useState<InstallationProgress | null>(null);

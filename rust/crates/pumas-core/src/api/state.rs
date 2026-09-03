@@ -12,9 +12,8 @@ use super::state_hf::{
     search_hf_models, search_hf_models_with_hydration, set_hf_token, start_hf_download,
 };
 use super::state_process::{
-    get_last_launch_error, get_last_launch_log, get_running_processes, is_comfyui_running,
-    is_ollama_running, is_torch_running, launch_ollama, launch_torch, launch_version,
-    set_process_version_paths, stop_comfyui, stop_ollama, stop_torch,
+    get_last_launch_error, get_last_launch_log, is_ollama_running, is_torch_running, launch_ollama,
+    launch_torch, stop_ollama, stop_torch,
 };
 use super::state_runtime::{
     disk_space_response, network_status_response, status_response, system_resources_response,
@@ -158,17 +157,6 @@ async fn validate_local_directory_target_path(
     }
 }
 
-async fn validate_process_version_paths(
-    version_paths: std::collections::HashMap<String, String>,
-) -> std::result::Result<std::collections::HashMap<String, PathBuf>, PumasError> {
-    let mut validated = std::collections::HashMap::with_capacity(version_paths.len());
-    for (tag, path) in version_paths {
-        let validated_path = validate_local_directory_target_path(&path, "version_paths").await?;
-        validated.insert(tag, validated_path);
-    }
-    Ok(validated)
-}
-
 async fn load_model_metadata_or_default(
     library: Arc<model_library::ModelLibrary>,
     model_dir: PathBuf,
@@ -240,7 +228,6 @@ pub(crate) struct PrimaryState {
     pub(crate) status_telemetry: Arc<super::status_telemetry::StatusTelemetryService>,
     pub(crate) system_utils: Arc<system::SystemUtils>,
     pub(crate) model_library: Arc<model_library::ModelLibrary>,
-    pub(crate) model_mapper: model_library::ModelMapper,
     pub(crate) hf_client: Option<model_library::HuggingFaceClient>,
     pub(crate) model_importer: model_library::ModelImporter,
     pub(crate) conversion_manager: Arc<conversion::ConversionManager>,
@@ -1037,102 +1024,6 @@ impl ipc::server::IpcDispatch for PrimaryState {
                     excluded_model_ids: excluded,
                 })?)
             }
-            "preview_model_mapping" => {
-                let version_tag =
-                    params["version_tag"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "version_tag is required".to_string(),
-                        })?;
-                let models_path =
-                    params["models_path"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "models_path is required".to_string(),
-                        })?;
-                let models_path =
-                    validate_local_directory_target_path(models_path, "models_path").await?;
-                let response =
-                    preview_model_mapping_response(self, version_tag, models_path.as_path())
-                        .await?;
-                Ok(serde_json::to_value(response)?)
-            }
-            "apply_model_mapping" => {
-                let version_tag =
-                    params["version_tag"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "version_tag is required".to_string(),
-                        })?;
-                let models_path =
-                    params["models_path"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "models_path is required".to_string(),
-                        })?;
-                let models_path =
-                    validate_local_directory_target_path(models_path, "models_path").await?;
-                let response =
-                    apply_model_mapping_response(self, version_tag, models_path.as_path()).await?;
-                Ok(serde_json::to_value(response)?)
-            }
-            "sync_models_incremental" => {
-                let version_tag =
-                    params["version_tag"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "version_tag is required".to_string(),
-                        })?;
-                let models_path =
-                    params["models_path"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "models_path is required".to_string(),
-                        })?;
-                let models_path =
-                    validate_local_directory_target_path(models_path, "models_path").await?;
-                let apply =
-                    apply_model_mapping_response(self, version_tag, models_path.as_path()).await?;
-                let response = models::SyncModelsResponse {
-                    success: apply.success,
-                    error: apply.error,
-                    synced: apply.links_created,
-                    errors: vec![],
-                };
-                Ok(serde_json::to_value(response)?)
-            }
-            "sync_with_resolutions" => {
-                let version_tag =
-                    params["version_tag"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "version_tag is required".to_string(),
-                        })?;
-                let models_path =
-                    params["models_path"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "models_path is required".to_string(),
-                        })?;
-                let models_path =
-                    validate_local_directory_target_path(models_path, "models_path").await?;
-                let resolutions: std::collections::HashMap<
-                    String,
-                    model_library::ConflictResolution,
-                > = serde_json::from_value(params["resolutions"].clone()).map_err(|e| {
-                    PumasError::InvalidParams {
-                        message: format!("Invalid mapping resolutions: {e}"),
-                    }
-                })?;
-                let response = sync_with_resolutions_response(
-                    self,
-                    version_tag,
-                    models_path.as_path(),
-                    resolutions,
-                )
-                .await?;
-                Ok(serde_json::to_value(response)?)
-            }
             "generate_model_migration_dry_run_report" => {
                 let report = super::migration::generate_migration_dry_run_report_with_artifacts(
                     self.model_library.clone(),
@@ -1401,26 +1292,6 @@ impl ipc::server::IpcDispatch for PrimaryState {
                 let response = system_resources_response(self).await?;
                 Ok(serde_json::to_value(response)?)
             }
-            "is_comfyui_running" => Ok(serde_json::to_value(is_comfyui_running(self).await)?),
-            "get_running_processes" => {
-                let processes = get_running_processes(self).await;
-                Ok(serde_json::to_value(processes)?)
-            }
-            "set_process_version_paths" => {
-                let version_paths: std::collections::HashMap<String, String> =
-                    serde_json::from_value(params["version_paths"].clone()).map_err(|e| {
-                        PumasError::InvalidParams {
-                            message: format!("Invalid version_paths: {e}"),
-                        }
-                    })?;
-                let version_paths = validate_process_version_paths(version_paths).await?;
-                set_process_version_paths(self, version_paths).await;
-                Ok(serde_json::json!({ "success": true }))
-            }
-            "stop_comfyui" => {
-                let stopped = stop_comfyui(self).await?;
-                Ok(serde_json::to_value(stopped)?)
-            }
             "is_ollama_running" => Ok(serde_json::to_value(is_ollama_running(self).await)?),
             "stop_ollama" => {
                 let stopped = stop_ollama(self).await?;
@@ -1505,23 +1376,6 @@ impl ipc::server::IpcDispatch for PrimaryState {
                 let version_dir =
                     validate_local_directory_target_path(version_dir, "version_dir").await?;
                 let response = launch_torch(self, tag, version_dir.as_path()).await?;
-                Ok(serde_json::to_value(response)?)
-            }
-            "launch_version" => {
-                let tag = params["tag"]
-                    .as_str()
-                    .ok_or_else(|| PumasError::InvalidParams {
-                        message: "tag is required".to_string(),
-                    })?;
-                let version_dir =
-                    params["version_dir"]
-                        .as_str()
-                        .ok_or_else(|| PumasError::InvalidParams {
-                            message: "version_dir is required".to_string(),
-                        })?;
-                let version_dir =
-                    validate_local_directory_target_path(version_dir, "version_dir").await?;
-                let response = launch_version(self, tag, version_dir.as_path()).await?;
                 Ok(serde_json::to_value(response)?)
             }
             "get_last_launch_log" => {
@@ -1813,163 +1667,6 @@ async fn store_model_notes(
     })
 }
 
-async fn preview_model_mapping_response(
-    primary: &PrimaryState,
-    version_tag: &str,
-    models_path: &Path,
-) -> std::result::Result<models::MappingPreviewResponse, PumasError> {
-    if !path_exists(models_path).await? {
-        return Ok(models::MappingPreviewResponse {
-            success: false,
-            error: Some(format!(
-                "Version models directory not found: {}",
-                models_path.display()
-            )),
-            to_create: vec![],
-            to_skip_exists: vec![],
-            conflicts: vec![],
-            broken_to_remove: vec![],
-            total_actions: 0,
-            warnings: vec![],
-            errors: vec![],
-        });
-    }
-
-    primary
-        .model_mapper
-        .create_default_comfyui_config_async("*", models_path)
-        .await?;
-
-    let preview = primary
-        .model_mapper
-        .preview_mapping("comfyui", Some(version_tag), models_path)
-        .await?;
-
-    let to_action_info = |a: &crate::model_library::MappingAction| models::MappingActionInfo {
-        model_id: a.model_id.clone(),
-        model_name: a.model_name.clone(),
-        source_path: a.source.display().to_string(),
-        target_path: a.target.display().to_string(),
-        reason: a.reason.clone().unwrap_or_default(),
-    };
-
-    let to_create: Vec<_> = preview.creates.iter().map(to_action_info).collect();
-    let to_skip_exists: Vec<_> = preview.skips.iter().map(to_action_info).collect();
-    let conflicts: Vec<_> = preview.conflicts.iter().map(to_action_info).collect();
-    let broken_to_remove: Vec<_> = preview
-        .broken
-        .iter()
-        .map(|a| models::BrokenLinkEntry {
-            target_path: a.target.display().to_string(),
-            existing_target: a.source.display().to_string(),
-            reason: a.reason.clone().unwrap_or_default(),
-        })
-        .collect();
-    let total_actions = to_create.len() + broken_to_remove.len();
-
-    Ok(models::MappingPreviewResponse {
-        success: true,
-        error: None,
-        to_create,
-        to_skip_exists,
-        conflicts,
-        broken_to_remove,
-        total_actions,
-        warnings: vec![],
-        errors: vec![],
-    })
-}
-
-async fn apply_model_mapping_response(
-    primary: &PrimaryState,
-    version_tag: &str,
-    models_path: &Path,
-) -> std::result::Result<models::MappingApplyResponse, PumasError> {
-    if !path_exists(models_path).await? {
-        fs::create_dir_all(models_path)
-            .await
-            .map_err(|err| PumasError::io_with_path(err, models_path))?;
-    }
-
-    primary
-        .model_mapper
-        .create_default_comfyui_config_async("*", models_path)
-        .await?;
-
-    let result = primary
-        .model_mapper
-        .apply_mapping("comfyui", Some(version_tag), models_path)
-        .await?;
-
-    Ok(models::MappingApplyResponse {
-        success: true,
-        error: None,
-        links_created: result.created,
-        links_removed: result.broken_removed,
-        total_links: result.created + result.skipped,
-    })
-}
-
-async fn sync_with_resolutions_response(
-    primary: &PrimaryState,
-    version_tag: &str,
-    models_path: &Path,
-    resolutions: std::collections::HashMap<String, model_library::ConflictResolution>,
-) -> std::result::Result<models::SyncWithResolutionsResponse, PumasError> {
-    if !path_exists(models_path).await? {
-        fs::create_dir_all(models_path)
-            .await
-            .map_err(|err| PumasError::io_with_path(err, models_path))?;
-    }
-
-    primary
-        .model_mapper
-        .create_default_comfyui_config_async("*", models_path)
-        .await?;
-
-    let resolution_count = |kind: model_library::ConflictResolution| {
-        resolutions.values().filter(|value| **value == kind).count()
-    };
-    let overwrite_count = resolution_count(model_library::ConflictResolution::Overwrite);
-    let rename_count = resolution_count(model_library::ConflictResolution::Rename);
-
-    let typed_resolutions =
-        crate::api::mapping::validate_mapping_conflict_resolution_targets(models_path, resolutions)
-            .await?;
-
-    let result = primary
-        .model_mapper
-        .apply_mapping_with_resolutions(
-            "comfyui",
-            Some(version_tag),
-            models_path,
-            &typed_resolutions,
-        )
-        .await?;
-
-    let errors: Vec<String> = result
-        .errors
-        .iter()
-        .map(|(path, err)| format!("{}: {}", path.display(), err))
-        .collect();
-    let success = errors.is_empty();
-    let error = if success {
-        None
-    } else {
-        Some(format!("{} mapping operation(s) failed", errors.len()))
-    };
-
-    Ok(models::SyncWithResolutionsResponse {
-        success,
-        error,
-        links_created: result.created,
-        links_skipped: result.skipped + result.conflicts,
-        links_renamed: rename_count,
-        overwrites: overwrite_count,
-        errors,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::validate_local_directory_target_path;
@@ -2030,31 +1727,6 @@ mod tests {
             error,
             crate::error::PumasError::InvalidParams { message }
                 if message.contains("models_path must reference a directory")
-        ));
-    }
-
-    #[tokio::test]
-    async fn validate_process_version_paths_rejects_file_entries() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let file_path = temp_dir.path().join("version.txt");
-        tokio::fs::write(&file_path, "not a directory")
-            .await
-            .expect("write test file");
-
-        let mut version_paths = std::collections::HashMap::new();
-        version_paths.insert(
-            "comfyui".to_string(),
-            file_path.to_string_lossy().to_string(),
-        );
-
-        let error = super::validate_process_version_paths(version_paths)
-            .await
-            .expect_err("file path should be rejected");
-
-        assert!(matches!(
-            error,
-            crate::error::PumasError::InvalidParams { message }
-                if message.contains("version_paths must reference a directory")
         ));
     }
 }

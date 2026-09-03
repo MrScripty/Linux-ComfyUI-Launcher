@@ -228,7 +228,7 @@ impl PumasApiBuilder {
             launcher_root: launcher_root.into(),
             auto_create_dirs: false,
             enable_hf_client: true,
-            enable_process_manager: true,
+            enable_process_manager: cfg!(feature = "process-manager"),
         }
     }
 
@@ -238,7 +238,6 @@ impl PumasApiBuilder {
     /// - `launcher-data/`
     /// - `launcher-data/metadata/`
     /// - `launcher-data/cache/`
-    /// - `launcher-data/mapping-configs/`
     /// - `shared-resources/models/`
     ///
     /// Default: `false` (directories must exist)
@@ -259,11 +258,11 @@ impl PumasApiBuilder {
 
     /// Enable or disable process manager initialization.
     ///
-    /// When disabled, ComfyUI process management features will not be available.
+    /// When disabled, inference runtime process management is not initialized.
     ///
     /// Default: `true`
     pub fn with_process_manager(mut self, enable: bool) -> Self {
-        self.enable_process_manager = enable;
+        self.enable_process_manager = enable && cfg!(feature = "process-manager");
         self
     }
 
@@ -274,7 +273,6 @@ impl PumasApiBuilder {
             launcher_root.join("launcher-data").join("metadata"),
             launcher_root.join("launcher-data").join("cache"),
             launcher_root.join("launcher-data").join("cache").join("hf"),
-            launcher_root.join("launcher-data").join("mapping-configs"),
             launcher_root.join("launcher-data").join("logs"),
             launcher_root.join("shared-resources"),
             launcher_root.join("shared-resources").join("models"),
@@ -393,10 +391,6 @@ impl PumasApiBuilder {
 
         // Initialize model library for AI model management
         let model_library_dir = self.launcher_root.join("shared-resources").join("models");
-        let mapping_config_dir = self
-            .launcher_root
-            .join("launcher-data")
-            .join("mapping-configs");
 
         // Initialize HuggingFace client (if enabled)
         let mut hf_client = if self.enable_hf_client {
@@ -448,8 +442,6 @@ impl PumasApiBuilder {
                     }
                     // Attach download persistence
                     client.set_persistence(download_persistence);
-                    // Restore persisted downloads from previous session
-                    client.restore_persisted_downloads().await;
                     Some(client)
                 }
                 Ok(Err(e)) => {
@@ -481,8 +473,6 @@ impl PumasApiBuilder {
             let suppressor = watcher_write_suppressor.clone();
             move |path| suppressor.record(path)
         })));
-        let model_mapper =
-            model_library::ModelMapper::new(model_library.clone(), &mapping_config_dir);
         let model_importer = model_library::ModelImporter::new(model_library.clone());
 
         // Wire download completion -> in-place import (metadata + indexing)
@@ -526,6 +516,29 @@ impl PumasApiBuilder {
                     });
                 },
             ));
+
+            // Restore only after completion callbacks are wired so byte-complete
+            // crash recoveries can finalize and flow through the normal importer.
+            let auto_finalized = client.restore_persisted_downloads().await;
+            for info in auto_finalized {
+                match model_importer.finalize_downloaded_directory(&info).await {
+                    Ok(result) if result.success => {
+                        tracing::info!(
+                            "Startup auto-finalization import succeeded: {:?}",
+                            result.model_id
+                        );
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            "Startup auto-finalization import failed: {:?}",
+                            result.error
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!("Startup auto-finalization import error: {}", error);
+                    }
+                }
+            }
         }
 
         // Initialize conversion manager
@@ -573,7 +586,6 @@ impl PumasApiBuilder {
             status_telemetry,
             system_utils,
             model_library,
-            model_mapper,
             hf_client,
             model_importer,
             conversion_manager,

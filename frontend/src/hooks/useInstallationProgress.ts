@@ -34,7 +34,7 @@ export function useInstallationProgress({
   externalProgress,
   onRefreshProgress,
 }: UseInstallationProgressOptions): UseInstallationProgressResult {
-  const resolvedAppId = appId ?? 'comfyui';
+  const resolvedAppId = appId ?? 'ollama';
   const [progress, setProgress] = useState<InstallationProgress | null>(externalProgress || null);
   const [cancellationNotice, setCancellationNotice] = useState<string | null>(null);
   const [failedInstall, setFailedInstall] = useState<{ tag: string; log: string | null } | null>(null);

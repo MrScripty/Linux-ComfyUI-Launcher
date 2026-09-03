@@ -1,8 +1,6 @@
 //! Release metadata, sizing, and cache handlers.
 
-use crate::handlers::{
-    get_bool_param, get_i64_param, get_str_param, get_version_manager, require_str_param,
-};
+use crate::handlers::{get_bool_param, get_i64_param, get_version_manager, require_str_param};
 use crate::server::AppState;
 use serde_json::{json, Value};
 use tracing::warn;
@@ -12,7 +10,7 @@ pub async fn get_available_versions(
     params: &Value,
 ) -> pumas_library::Result<Value> {
     let force_refresh = get_bool_param(params, "force_refresh", "forceRefresh").unwrap_or(false);
-    let app_id_str = get_str_param(params, "app_id", "appId").unwrap_or("comfyui");
+    let app_id_str = require_str_param(params, "app_id", "appId")?;
 
     if let Some(vm) = get_version_manager(state, app_id_str).await {
         // Handle rate limit errors specially to return structured response
@@ -50,7 +48,7 @@ pub async fn get_available_versions(
 }
 
 pub async fn get_version_status(state: &AppState, params: &Value) -> pumas_library::Result<Value> {
-    let app_id_str = get_str_param(params, "app_id", "appId").unwrap_or("comfyui");
+    let app_id_str = require_str_param(params, "app_id", "appId")?;
     if let Some(vm) = get_version_manager(state, app_id_str).await {
         // Return version status combining active/default/installed
         let active = vm.get_active_version().await?;
@@ -94,7 +92,7 @@ pub async fn get_version_status(state: &AppState, params: &Value) -> pumas_libra
 
 pub async fn get_version_info(state: &AppState, params: &Value) -> pumas_library::Result<Value> {
     let tag = require_str_param(params, "tag", "tag")?;
-    let app_id_str = get_str_param(params, "app_id", "appId").unwrap_or("comfyui");
+    let app_id_str = require_str_param(params, "app_id", "appId")?;
     if let Some(vm) = get_version_manager(state, app_id_str).await {
         let installed = vm.get_installed_versions().await?;
         let is_installed = installed.contains(&tag);
@@ -169,7 +167,7 @@ pub async fn calculate_all_release_sizes(
     params: &Value,
 ) -> pumas_library::Result<Value> {
     // Get all available versions and calculate sizes
-    let app_id_str = get_str_param(params, "app_id", "appId").unwrap_or("comfyui");
+    let app_id_str = require_str_param(params, "app_id", "appId")?;
     let versions = if let Some(vm) = get_version_manager(state, app_id_str).await {
         let releases = vm.get_available_releases(false).await?;
         releases
@@ -219,7 +217,7 @@ pub async fn get_github_cache_status(
     state: &AppState,
     params: &Value,
 ) -> pumas_library::Result<Value> {
-    let app_id_str = get_str_param(params, "app_id", "appId").unwrap_or("comfyui");
+    let app_id_str = require_str_param(params, "app_id", "appId")?;
     // Return cache status in format expected by frontend
     if let Some(vm) = get_version_manager(state, app_id_str).await {
         let cache_status = vm.get_github_cache_status().await;

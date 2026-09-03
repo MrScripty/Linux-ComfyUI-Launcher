@@ -2,7 +2,7 @@
 
 ## Overview
 
-The ComfyUI Launcher now has a comprehensive, semantic dark theme system built on CSS custom properties and Tailwind CSS v4. This system makes it easy to maintain consistent colors across the application and enables future theme variants.
+Pumas Library has a comprehensive, semantic dark theme system built on CSS custom properties and Tailwind CSS v4. This system makes it easy to maintain consistent colors across the application and enables future theme variants.
 
 ## Architecture
 

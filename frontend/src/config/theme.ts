@@ -1,5 +1,5 @@
 /**
- * Theme configuration for the ComfyUI Launcher
+ * Theme configuration for Pumas Library.
  *
  * This file provides type-safe access to theme colors throughout the application.
  * Colors are defined as HSL values in CSS custom properties (see index.css).

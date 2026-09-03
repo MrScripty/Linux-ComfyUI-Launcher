@@ -1,16 +1,11 @@
 import type { BaseResponse } from './api-common';
 import type {
-  GetAllShortcutStatesResponse,
-  GetVersionShortcutsResponse,
   LaunchResponse,
   OllamaCreateModelResponse,
   OllamaListModelsResponse,
   OllamaListRunningResponse,
-  SetVersionShortcutsResponse,
-  StopComfyUIResponse,
   StopOllamaResponse,
   StopTorchResponse,
-  ToggleShortcutResponse,
   TorchComputeDevice,
   TorchConfigureResponse,
   TorchGetStatusResponse,
@@ -69,22 +64,6 @@ export interface DesktopBridgeRuntimeAPI {
   get_status_telemetry_snapshot(): Promise<StatusTelemetrySnapshot>;
 
   // ========================================
-  // Dependencies
-  // ========================================
-  install_deps(): Promise<BaseResponse>;
-
-  // ========================================
-  // Shortcuts
-  // ========================================
-  toggle_menu(tag?: string): Promise<BaseResponse>;
-  toggle_desktop(tag?: string): Promise<BaseResponse>;
-  get_version_shortcuts(tag: string): Promise<GetVersionShortcutsResponse>;
-  get_all_shortcut_states(): Promise<GetAllShortcutStatesResponse>;
-  set_version_shortcuts(tag: string, enabled: boolean): Promise<SetVersionShortcutsResponse>;
-  toggle_version_menu(tag: string): Promise<ToggleShortcutResponse>;
-  toggle_version_desktop(tag: string): Promise<ToggleShortcutResponse>;
-
-  // ========================================
   // Version Management
   // ========================================
   get_available_versions(
@@ -121,8 +100,6 @@ export interface DesktopBridgeRuntimeAPI {
   // ========================================
   // Process Management
   // ========================================
-  launch_comfyui(): Promise<LaunchResponse>;
-  stop_comfyui(): Promise<StopComfyUIResponse>;
   launch_ollama(): Promise<LaunchResponse>;
   stop_ollama(): Promise<StopOllamaResponse>;
 

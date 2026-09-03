@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link2, Play, Save, SlidersHorizontal, Star } from 'lucide-react';
+import { Star } from 'lucide-react';
 import type { RuntimeProfileConfig } from '../../../types/api-runtime-profiles';
 import type { ServedModelStatus } from '../../../types/api-serving';
 import type { ModelInfo } from '../../../types/apps';
@@ -10,6 +10,7 @@ import {
   getLlamaCppPlacementLabel,
   type LlamaCppModelRowViewModel,
 } from './llamaCppLibraryViewModels';
+import { RuntimeModelRowActions } from './RuntimeModelRowActions';
 
 function getModelFormatLabel(model: ModelInfo): string | undefined {
   return model.primaryFormat ?? model.format;
@@ -116,7 +117,6 @@ export function LlamaCppModelRow({
   const isDraftProfileLoaded = row.servedStatuses.some(
     (status) => status.profile_id === draftProfileId && status.load_state === 'loaded'
   );
-  const hasRunnableProfile = Boolean(draftProfile);
 
   useEffect(() => {
     setDraftProfileId(row.route?.profile_id ?? '');
@@ -135,6 +135,7 @@ export function LlamaCppModelRow({
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
               <LocalModelNameButton
+                downloadProgress={row.model.downloadProgress}
                 modelId={row.model.id}
                 modelName={row.model.name}
                 isDownloading={false}
@@ -180,67 +181,27 @@ export function LlamaCppModelRow({
             )}
           </div>
         </div>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 pt-0.5">
-          <label className="sr-only" htmlFor={`llamacpp-profile-${row.model.id}`}>
-            llama.cpp profile for {row.model.name}
-          </label>
-          <select
-            id={`llamacpp-profile-${row.model.id}`}
-            value={draftProfileId}
-            onChange={(event) => setDraftProfileId(event.target.value)}
-            disabled={providerProfiles.length === 0}
-            className="h-8 max-w-44 rounded border border-[hsl(var(--border-subtle))] bg-[hsl(var(--surface-high))] px-2 text-xs text-[hsl(var(--text-primary))]"
-            aria-label={`llama.cpp profile for ${row.model.name}`}
-          >
-            <option value="">
-              {providerProfiles.length === 0 ? 'No llama.cpp profiles' : getRouteLabel(row)}
-            </option>
-            {providerProfiles.map((profile) => (
-              <option key={profile.profile_id} value={profile.profile_id}>
-                {getProfileOptionLabel(profile)}
-              </option>
-            ))}
-          </select>
-          <IconButton
-            icon={<Save />}
-            tooltip="Save llama.cpp route"
-            onClick={() => onSaveRoute(row.model.id, draftProfileId)}
-            disabled={!hasDraftChange || isSavingRoute}
-            size="sm"
-          />
-          <IconButton
-            icon={<Play />}
-            tooltip={
-              isDraftProfileLoaded
-                ? 'Already loaded on selected profile'
-                : 'Quick serve with selected llama.cpp profile'
-            }
-            onClick={() => {
-              if (draftProfile) {
-                onQuickServe(row, draftProfile, hasDraftChange);
-              }
-            }}
-            disabled={!hasRunnableProfile || isQuickServing || isSavingRoute || isDraftProfileLoaded}
-            size="sm"
-          />
-          <IconButton
-            icon={<SlidersHorizontal />}
-            tooltip="Serving options"
-            onClick={() => {
-              if (draftProfile) {
-                onOpenServeOptions(row, draftProfile, hasDraftChange);
-              }
-            }}
-            disabled={!hasRunnableProfile || isSavingRoute}
-            size="sm"
-          />
-          <IconButton
-            icon={<Link2 />}
-            tooltip={isLinked ? 'Unlink from llama.cpp' : 'Link to llama.cpp'}
-            onClick={() => onToggleLink(row.model.id)}
-            size="sm"
-          />
-        </div>
+        <RuntimeModelRowActions
+          draftProfileId={draftProfileId}
+          hasDraftChange={hasDraftChange}
+          isDraftProfileLoaded={isDraftProfileLoaded}
+          isLinked={isLinked}
+          isQuickServing={isQuickServing}
+          isSavingRoute={isSavingRoute}
+          modelId={row.model.id}
+          modelName={row.model.name}
+          profileName="llama.cpp"
+          profileSelectId={`llamacpp-profile-${row.model.id}`}
+          providerProfiles={providerProfiles}
+          routeLabel={getRouteLabel(row)}
+          selectedProfile={draftProfile}
+          getProfileOptionLabel={getProfileOptionLabel}
+          onOpenServeOptions={(profile) => onOpenServeOptions(row, profile, hasDraftChange)}
+          onProfileIdChange={setDraftProfileId}
+          onQuickServe={(profile) => onQuickServe(row, profile, hasDraftChange)}
+          onSaveRoute={onSaveRoute}
+          onToggleLink={onToggleLink}
+        />
       </ListItemContent>
     </ListItem>
   );

@@ -49,6 +49,8 @@ export async function executeAction(parsedArgs, runtime) {
 
 async function buildApp(mode, runtime) {
   const { context, platformService } = runtime;
+  const inferencePluginsEnabled = areInferencePluginsEnabled();
+  const featureArgs = inferencePluginsEnabled ? [] : ['--no-default-features'];
 
   ensureRuntimeDependencies(runtime);
 
@@ -57,7 +59,13 @@ async function buildApp(mode, runtime) {
       log(`[build] compiling debug backend binary: ${context.appBin}`);
       await runCommand(
         platformService.cargoCommand,
-        ['build', '--manifest-path', context.rustManifestPath, '-p', 'pumas-rpc', '--bin', context.appBin],
+        [
+          'build',
+          '--manifest-path', context.rustManifestPath,
+          '-p', 'pumas-rpc',
+          '--bin', context.appBin,
+          ...featureArgs,
+        ],
         { cwd: context.repoRoot }
       );
       break;
@@ -74,6 +82,7 @@ async function buildApp(mode, runtime) {
           '--release',
           '--bin',
           context.appBin,
+          ...featureArgs,
         ],
         { cwd: context.repoRoot }
       );
@@ -88,6 +97,9 @@ async function buildApp(mode, runtime) {
   log('[build] compiling frontend assets');
   await runCommand(platformService.corepackCommand, corepackPnpmArgs(workspaceScriptArgs('./frontend', 'build')), {
     cwd: context.repoRoot,
+    env: {
+      PUMAS_INFERENCE_PLUGINS: String(inferencePluginsEnabled),
+    },
   });
 
   log('[build] compiling electron main process');
@@ -96,6 +108,10 @@ async function buildApp(mode, runtime) {
   });
 
   log(`[done] build completed (${mode})`);
+}
+
+export function areInferencePluginsEnabled(env = process.env) {
+  return env.PUMAS_INFERENCE_PLUGINS !== 'false';
 }
 
 async function runDevApp(runArgs, runtime) {

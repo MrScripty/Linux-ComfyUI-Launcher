@@ -19,6 +19,15 @@
     "allowJs": true,
     "jsx": "react-jsx",
     "paths": {
+      "@app-entry": [
+        "./src/App.tsx"
+      ],
+      "@runtime-route-editor": [
+        "./src/components/ModelRuntimeRouteEditor.tsx"
+      ],
+      "@runtime-model-serve-action": [
+        "./src/components/RuntimeModelServeAction.tsx"
+      ],
       "@/*": [
         "./*"
       ]

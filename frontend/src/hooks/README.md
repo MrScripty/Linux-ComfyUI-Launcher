@@ -24,8 +24,6 @@ Custom React hooks for backend polling, process status, version/model workflows,
 | `useModelManagerFilters.test.ts` | Hook coverage for local filters, remote kind filters, mode switching, and developer search. |
 | `useModelImportPicker.ts` | Model manager file-picker import dialog state and selected import paths. |
 | `useModelImportPicker.test.ts` | Hook coverage for import picker success, close/reset behavior, completion callback, and API-unavailable no-op behavior. |
-| `useDependencyInstaller.ts` | Root setup dependency installation action state and post-install status refresh. |
-| `useDependencyInstaller.test.ts` | Hook coverage for dependency install success, pending state, failure reset, and API-unavailable no-ops. |
 | `useRemoteModelSearch.ts` | Debounced Hugging Face search, kind derivation, and follow-up download-detail hydration for remote model discovery. |
 | `useRemoteModelSearch.test.ts` | Hook coverage for debounced search flow, blank-query resets, API-unavailable errors, hydration dedupe, and stale-generation protection. |
 | `useModelLibraryActions.ts` | Related-model expansion, partial-download recovery, delete orchestration, and remote URL handling for the library UI. |
@@ -40,8 +38,6 @@ Custom React hooks for backend polling, process status, version/model workflows,
 | `useStatus.ts` | Launcher/app status selector and refresh behavior backed by shared status telemetry. |
 | `useVersions.ts` | Version list and version operations state flow. |
 | `useVersions.test.ts` | Hook coverage for API-gated refresh startup, installing-tag merge behavior, and install-refresh wiring. |
-| `useVersionShortcutState.ts` | Shortcut-toggle state for installed versions, backend refresh, and active-version shortcut sync. |
-| `useVersionShortcutState.test.ts` | Hook coverage for shortcut-state refresh, support resets, active-version sync, optimistic toggles, and rollback on toggle failure. |
 | `useAvailableVersionState.ts` | Available-version caching, background fetch polling, rate-limit state, and installing-tag discovery. |
 | `useAvailableVersionState.test.ts` | Hook coverage for version mapping, follow-up refresh scheduling, rate-limit handling, and background-fetch refresh. |
 | `useVersionFetching.ts` | Fetches installed, active, default, status, and available version state for one app. |
@@ -56,23 +52,14 @@ Custom React hooks for backend polling, process status, version/model workflows,
 | `useAppWindowActions.test.ts` | Hook coverage for backend/window routing of models-root and window control actions. |
 | `useLauncherUpdates.ts` | Launcher update availability, update-check action state, and update URL opening. |
 | `useLauncherUpdates.test.ts` | Hook coverage for update metadata storage, URL preference, stale-state clearing, and API-unavailable no-ops. |
-| `useSelectedAppVersions.ts` | Selected-app version hook routing for ComfyUI, Ollama, llama.cpp, Torch, and unsupported app fallback state. |
+| `useSelectedAppVersions.ts` | Selected inference-plugin version routing for Ollama, llama.cpp, Torch, and unsupported app fallback state. |
 | `useSelectedAppVersions.test.ts` | Hook coverage for selected-app version tracking and unsupported version state. |
-| `usePhysicsDrag.ts` | Physics-based drag state, frame updates, delete/reorder commits, and public hook output. |
-| `usePhysicsDragDelete.ts` | Drag delete completion, fallback reset, and post-delete cleanup lifecycle. |
-| `usePhysicsDragPointerEvents.ts` | Pointer pending, drag, release, cancel, and blur lifecycle for physics drag. |
-| `usePhysicsDragSettle.ts` | Spring settle animation from current drag position to the resolved anchor. |
-| `usePhysicsDragUndo.ts` | Keyboard undo listener and selection restoration for the last drag reorder/delete snapshot. |
-| `physicsDragUtils.ts` | Shared constants, types, and pure drag math used by `usePhysicsDrag.ts`. |
-| `physicsDragUtils.test.ts` | Unit coverage for drag selection fallback, anchor hysteresis, reorder helpers, and delete-zone math. |
 | `useInstallationProgress.ts` | Installation-progress polling, cancellation notices, and failed-install tracking for the install dialog. |
 | `useInstallationProgress.test.ts` | Hook coverage for external progress sync, local polling, cancellation notices, and completion-stop behavior. |
 | `useReleaseSizeCalculation.ts` | Install-dialog background release-size calculation with one-run-per-open-session guard and version refresh. |
 | `useReleaseSizeCalculation.test.ts` | Hook coverage for size calculation, skipped states, open-session guard, and close/reopen reset behavior. |
 | `useInstallDialogLinks.ts` | Install-dialog log-path and release-link opening through the backend bridge with browser fallback for release URLs. |
 | `useInstallDialogLinks.test.ts` | Hook coverage for log opening, unavailable bridge handling, release URL opening, and browser fallback. |
-| `useConflictResolutions.ts` | Conflict-resolution dialog state for defaults, counts, bulk changes, expansion, and async apply handling. |
-| `useConflictResolutions.test.ts` | Hook coverage for default resolutions, individual and bulk changes, expanded rows, and apply state. |
 | `useInstallationAccess.ts` | Filesystem-open and version-info helpers for installed version management flows. |
 | `useInstallationAccess.test.ts` | Hook coverage for API gating, active-install access, path opening, version-info lookups, and backend failure surfacing. |
 | `useInstallationManager.ts` | Version install, switch, remove, progress polling, and install-access orchestration. |

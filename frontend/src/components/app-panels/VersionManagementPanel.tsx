@@ -11,7 +11,6 @@ interface VersionManagementPanelProps {
   versions: AppVersionState;
   showManager: boolean;
   onShowManager: (show: boolean) => void;
-  activeShortcutState?: { menu: boolean; desktop: boolean };
   diskSpacePercent?: number;
 }
 
@@ -21,7 +20,6 @@ export function VersionManagementPanel({
   versions,
   showManager,
   onShowManager,
-  activeShortcutState,
   diskSpacePercent = 0,
 }: VersionManagementPanelProps) {
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -111,11 +109,9 @@ export function VersionManagementPanel({
         defaultVersion={versions.defaultVersion}
         onMakeDefault={handleMakeDefault}
         installingVersion={versions.installingTag}
-        activeShortcutState={activeShortcutState}
         diskSpacePercent={diskSpacePercent}
         hasNewVersion={hasNewVersion}
         latestVersion={latestVersion}
-        supportsShortcuts={versions.supportsShortcuts}
       />
     </div>
   );

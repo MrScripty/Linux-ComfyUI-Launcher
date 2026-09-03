@@ -121,7 +121,7 @@ export function OnnxRuntimeModelLibrarySection({
     }
 
     const api = getElectronAPI();
-    if (!api?.validate_model_serving_config || !api.serve_model) {
+    if (!api) {
       setQuickServeFeedback({
         kind: 'error',
         message: 'Serving API is not available in this app session.',

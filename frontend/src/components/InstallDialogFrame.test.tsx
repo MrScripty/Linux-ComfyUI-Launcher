@@ -11,13 +11,13 @@ describe('InstallDialogFrame', () => {
         isOpen={true}
         isPageMode={false}
         onClose={onClose}
-        title="Install ComfyUI Version"
+        title="Install Runtime Version"
       >
         <div>Install content</div>
       </InstallDialogFrame>
     );
 
-    expect(screen.getByRole('dialog', { name: 'Install ComfyUI Version' })).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Install Runtime Version' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss install dialog' }));
     expect(onClose).toHaveBeenCalledTimes(1);
@@ -32,7 +32,7 @@ describe('InstallDialogFrame', () => {
         isOpen={true}
         isPageMode={true}
         onClose={vi.fn()}
-        title="Install ComfyUI Version"
+        title="Install Runtime Version"
       >
         <div>Install content</div>
       </InstallDialogFrame>

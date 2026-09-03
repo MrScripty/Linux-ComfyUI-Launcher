@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Internal crates
-pumas-library = { workspace = true }
-pumas-app-manager = { workspace = true }
+pumas-library = { workspace = true, default-features = false, features = ["hf-client"] }
+pumas-app-manager = { workspace = true, optional = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "net", "macros", "signal"] }
@@ -47,6 +47,14 @@ reqwest = { workspace = true }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
+
+[features]
+default = ["inference-plugins"]
+inference-plugins = [
+    "dep:pumas-app-manager",
+    "pumas-library/process-manager",
+    "pumas-library/gpu-monitor",
+]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

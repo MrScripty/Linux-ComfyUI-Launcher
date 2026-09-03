@@ -110,6 +110,17 @@ Use the same lifecycle flags on both wrappers:
 Note: `--run` expects the debug backend binary from `--build`. Use
 `--build-release` before `--run-release` or `--release-smoke`.
 
+Inference plugins for Ollama, llama.cpp, ONNX Runtime, and Torch are included
+by default. To build the desktop app as a model-library-only application, set
+the capability at build time:
+
+```bash
+PUMAS_INFERENCE_PLUGINS=false ./launcher.sh --build-release
+```
+
+The corresponding direct commands are `cargo build -p pumas-rpc
+--no-default-features` and `npm run build:library-only` in `frontend/`.
+
 Packaged desktop builds try to reuse an existing launcher root by walking up
 from the packaged binary location. If you need to pin a specific existing
 library root, set `PUMAS_LAUNCHER_ROOT=/path/to/root` before launching the app.

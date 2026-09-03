@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn test_ffi_error_process_variant() {
         let err = pumas_library::PumasError::ProcessNotRunning {
-            app: "comfyui".to_string(),
+            app: "ollama".to_string(),
         };
         let ffi_err: FfiError = err.into();
         assert!(matches!(ffi_err, FfiError::Process { .. }));

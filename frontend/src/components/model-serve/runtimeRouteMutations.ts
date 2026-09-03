@@ -1,4 +1,5 @@
 import { getElectronAPI } from '../../api/adapter';
+import { APIError } from '../../errors';
 import type { RuntimeProviderId } from '../../types/api-runtime-profiles';
 
 export async function saveModelRuntimeRoute({
@@ -14,7 +15,7 @@ export async function saveModelRuntimeRoute({
 }): Promise<void> {
   const electronAPI = getElectronAPI();
   if (!electronAPI?.set_model_runtime_route) {
-    throw new Error('Runtime route API is unavailable');
+    throw new APIError('Runtime route API is unavailable', 'set_model_runtime_route');
   }
 
   const response = await electronAPI.set_model_runtime_route({
@@ -24,7 +25,10 @@ export async function saveModelRuntimeRoute({
     auto_load: autoLoad,
   });
   if (!response.success) {
-    throw new Error(response.error ?? 'Failed to save runtime route');
+    throw new APIError(
+      response.error ?? 'Failed to save runtime route',
+      'set_model_runtime_route'
+    );
   }
 }
 
@@ -34,11 +38,14 @@ export async function clearModelRuntimeRoute(
 ): Promise<void> {
   const electronAPI = getElectronAPI();
   if (!electronAPI?.clear_model_runtime_route) {
-    throw new Error('Runtime route API is unavailable');
+    throw new APIError('Runtime route API is unavailable', 'clear_model_runtime_route');
   }
 
   const response = await electronAPI.clear_model_runtime_route(provider, modelId);
   if (!response.success) {
-    throw new Error(response.error ?? 'Failed to clear runtime route');
+    throw new APIError(
+      response.error ?? 'Failed to clear runtime route',
+      'clear_model_runtime_route'
+    );
   }
 }

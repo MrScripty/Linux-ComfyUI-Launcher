@@ -64,7 +64,7 @@ export function useVersions({
   enabled = true,
   trackAvailableVersions = true,
 }: UseVersionsOptions = {}): UseVersionsResult {
-  const resolvedAppId = appId ?? 'comfyui';
+  const resolvedAppId = appId ?? 'ollama';
   const isEnabled = enabled;
   const [localInstallingTag, setLocalInstallingTag] = useState<string | null>(null);
 

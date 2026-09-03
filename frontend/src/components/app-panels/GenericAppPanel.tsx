@@ -29,8 +29,6 @@ export interface GenericAppPanelProps {
   onShowVersionManager: (show: boolean) => void;
   /** Whether the app is currently running */
   isRunning: boolean;
-  /** Shortcut state for menu/desktop shortcuts */
-  activeShortcutState?: { menu: boolean; desktop: boolean };
   /** Disk space usage percentage */
   diskSpacePercent?: number;
   /** Dependency status for Python apps */
@@ -62,7 +60,6 @@ function PanelSectionRenderer({
     showVersionManager,
     onShowVersionManager,
     isRunning,
-    activeShortcutState,
     diskSpacePercent,
     dependencyStatus,
     modelManagerProps,
@@ -79,7 +76,6 @@ function PanelSectionRenderer({
           versions={versions}
           showManager={showVersionManager}
           onShowManager={onShowVersionManager}
-          activeShortcutState={activeShortcutState}
           diskSpacePercent={diskSpacePercent}
           backLabel={sectionConfig['backLabel'] as string | undefined}
         />

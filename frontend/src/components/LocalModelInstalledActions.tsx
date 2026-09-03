@@ -1,6 +1,7 @@
-import { ArrowRightLeft, Download, Link2, Play, Square } from 'lucide-react';
+import { ArrowRightLeft, Download, Link2 } from 'lucide-react';
 import type { ModelInfo } from '../types/apps';
 import type { ServedModelStatus } from '../types/api-serving';
+import { RuntimeModelServeAction } from '@runtime-model-serve-action';
 import { LocalModelDownloadProgressRing } from './LocalModelDownloadProgressRing';
 import { HoldToDeleteButton, IconButton } from './ui';
 import type { LocalModelRowState } from './LocalModelRowState';
@@ -22,6 +23,29 @@ function getConvertTooltip(model: ModelInfo): string {
     return 'Convert / Quantize';
   }
   return 'Convert / Re-quantize';
+}
+
+function getRecoveryTooltip(
+  rowState: LocalModelRowState,
+  canRecover: boolean
+): string {
+  if (!canRecover) {
+    return rowState.partialError ?? 'Partial download';
+  }
+  return rowState.isRecoveringPartial
+    ? 'Resuming partial download...'
+    : `Resume partial download (${Math.round(rowState.ringDegrees / 3.6)}%)`;
+}
+
+function getRecoveryAction(
+  model: ModelInfo,
+  rowState: LocalModelRowState,
+  onRecoverPartialDownload?: (model: ModelInfo) => void
+): (() => void) | undefined {
+  if (!rowState.canRecoverPartial || rowState.isRecoveringPartial || !onRecoverPartialDownload) {
+    return undefined;
+  }
+  return () => onRecoverPartialDownload(model);
 }
 
 function RecoverPartialDownloadIcon({ rowState }: { rowState: LocalModelRowState }) {
@@ -47,37 +71,30 @@ export function LocalModelInstalledActions({
   onToggleLink,
 }: LocalModelInstalledActionsProps) {
   const showRetainedDownloadIndicator = rowState.hasRetainedProgressRing;
+  const canRecoverPartial = rowState.canRecoverPartial && Boolean(onRecoverPartialDownload);
 
   return (
     <>
-      <IconButton
-        icon={<Link2 />}
-        tooltip={
-          rowState.isLinked
-            ? `Linked to ${selectedAppId || 'app'}`
-            : `Excluded from ${selectedAppId || 'app'}`
-        }
-        onClick={() => onToggleLink(model.id)}
-        disabled={rowState.isPartialDownload}
-        size="sm"
-        active={rowState.isLinked}
-        className={rowState.isLinked ? 'text-[hsl(var(--accent-success))]' : 'opacity-40'}
-      />
+      {selectedAppId && (
+        <IconButton
+          icon={<Link2 />}
+          tooltip={
+            rowState.isLinked
+              ? `Linked to ${selectedAppId}`
+              : `Excluded from ${selectedAppId}`
+          }
+          onClick={() => onToggleLink(model.id)}
+          disabled={rowState.isPartialDownload}
+          size="sm"
+          active={rowState.isLinked}
+          className={rowState.isLinked ? 'text-[hsl(var(--accent-success))]' : 'opacity-40'}
+        />
+      )}
       {showRetainedDownloadIndicator && (
         <IconButton
           icon={<RecoverPartialDownloadIcon rowState={rowState} />}
-          tooltip={
-            rowState.canRecoverPartial && onRecoverPartialDownload
-              ? rowState.isRecoveringPartial
-                ? 'Resuming partial download...'
-                : 'Resume partial download'
-              : rowState.partialError ?? 'Partial download'
-          }
-          onClick={
-            rowState.canRecoverPartial && onRecoverPartialDownload && !rowState.isRecoveringPartial
-              ? () => onRecoverPartialDownload(model)
-              : undefined
-          }
+          tooltip={getRecoveryTooltip(rowState, canRecoverPartial)}
+          onClick={getRecoveryAction(model, rowState, onRecoverPartialDownload)}
           disabled={!rowState.canRecoverPartial || rowState.isRecoveringPartial}
           size="sm"
         />
@@ -90,25 +107,12 @@ export function LocalModelInstalledActions({
           size="sm"
         />
       )}
-      {onServeModel && (
-        <IconButton
-          icon={servedStatus ? <Square /> : <Play />}
-          tooltip={
-            servedStatus
-              ? `Loaded with ${servedStatus.provider === 'llama_cpp' ? 'llama.cpp' : 'Ollama'}`
-              : 'Serve model'
-          }
-          onClick={() => onServeModel(model)}
-          disabled={rowState.isPartialDownload}
-          size="sm"
-          active={Boolean(servedStatus)}
-          className={
-            servedStatus
-              ? 'text-[hsl(var(--accent-success))] bg-[hsl(var(--accent-success)/0.12)]'
-              : undefined
-          }
-        />
-      )}
+      <RuntimeModelServeAction
+        model={model}
+        rowState={rowState}
+        servedStatus={servedStatus}
+        onServeModel={onServeModel}
+      />
       {onDeleteModel && (
         <HoldToDeleteButton onDelete={() => onDeleteModel(model.id)} />
       )}

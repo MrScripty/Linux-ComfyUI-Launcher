@@ -4,26 +4,33 @@
 //! for communication with the Electron main process.
 
 mod handlers;
+#[cfg(feature = "inference-plugins")]
 mod provider_clients;
 mod server;
-mod shortcut;
 mod wrapper;
 
 use anyhow::Result;
 use clap::Parser;
-use pumas_app_manager::{CustomNodesManager, SizeCalculator, VersionManager};
+#[cfg(feature = "inference-plugins")]
+use pumas_app_manager::{SizeCalculator, VersionManager};
+#[cfg(feature = "inference-plugins")]
 use pumas_library::{AppId, PluginLoader};
+#[cfg(feature = "inference-plugins")]
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "inference-plugins")]
+use std::path::Path;
+use std::path::PathBuf;
 use tokio::runtime::Builder;
-use tracing::{info, warn, Level};
+#[cfg(feature = "inference-plugins")]
+use tracing::warn;
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 const RPC_WORKER_THREADS: usize = 4;
 const RPC_MAX_BLOCKING_THREADS: usize = 16;
-const VERSION_MANAGED_APPS: &[AppId] =
-    &[AppId::ComfyUI, AppId::Ollama, AppId::Torch, AppId::LlamaCpp];
+#[cfg(feature = "inference-plugins")]
+const VERSION_MANAGED_APPS: &[AppId] = &[AppId::Ollama, AppId::Torch, AppId::LlamaCpp];
 
 #[derive(Parser, Debug)]
 #[command(name = "pumas-rpc")]
@@ -114,21 +121,21 @@ async fn run(args: Args) -> Result<()> {
         .build()
         .await?;
 
+    #[cfg(feature = "inference-plugins")]
     let version_managers = initialize_version_managers(&launcher_root).await;
+    #[cfg(feature = "inference-plugins")]
     info!("Initialized {} version manager(s)", version_managers.len());
 
-    // Initialize custom nodes manager
-    let versions_dir = launcher_root.join(AppId::ComfyUI.versions_dir_name());
-    let custom_nodes_manager = CustomNodesManager::new(versions_dir);
-    info!("Custom nodes manager initialized");
-
-    // Initialize size calculator
+    #[cfg(feature = "inference-plugins")]
     let cache_dir = launcher_root.join("launcher-data").join("cache");
+    #[cfg(feature = "inference-plugins")]
     let size_calculator = SizeCalculator::new_with_cache(cache_dir).await;
+    #[cfg(feature = "inference-plugins")]
     info!("Size calculator initialized");
 
-    // Initialize plugin loader
+    #[cfg(feature = "inference-plugins")]
     let plugins_dir = launcher_root.join("launcher-data").join("plugins");
+    #[cfg(feature = "inference-plugins")]
     let plugin_loader = match PluginLoader::new_async(plugins_dir.clone()).await {
         Ok(loader) => {
             info!("Plugin loader initialized ({} plugins)", loader.count());
@@ -148,11 +155,12 @@ async fn run(args: Args) -> Result<()> {
     // Start the server
     let server = server::start_server(
         api,
+        #[cfg(feature = "inference-plugins")]
         version_managers,
-        custom_nodes_manager,
+        #[cfg(feature = "inference-plugins")]
         size_calculator,
+        #[cfg(feature = "inference-plugins")]
         plugin_loader,
-        launcher_root,
         &args.host,
         args.port,
     )
@@ -173,6 +181,7 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "inference-plugins")]
 async fn initialize_version_managers(launcher_root: &Path) -> HashMap<String, VersionManager> {
     let mut version_managers = HashMap::new();
 
@@ -207,7 +216,10 @@ fn validate_rpc_host(host: &str, allow_lan: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_rpc_host, VERSION_MANAGED_APPS};
+    use super::validate_rpc_host;
+    #[cfg(feature = "inference-plugins")]
+    use super::VERSION_MANAGED_APPS;
+    #[cfg(feature = "inference-plugins")]
     use pumas_library::AppId;
 
     #[test]
@@ -227,8 +239,13 @@ mod tests {
         assert!(validate_rpc_host("0.0.0.0", true).is_ok());
     }
 
+    #[cfg(feature = "inference-plugins")]
     #[test]
-    fn version_managed_apps_exclude_in_process_onnx_runtime() {
+    fn version_managed_apps_are_the_installable_inference_runtimes() {
+        assert_eq!(
+            VERSION_MANAGED_APPS,
+            &[AppId::Ollama, AppId::Torch, AppId::LlamaCpp]
+        );
         assert!(!VERSION_MANAGED_APPS.contains(&AppId::OnnxRuntime));
         assert!(VERSION_MANAGED_APPS.iter().all(AppId::has_version_manager));
     }

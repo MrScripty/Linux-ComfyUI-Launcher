@@ -23,8 +23,8 @@
     "lint": "eslint . --report-unused-disable-directives --max-warnings 0",
     "package": "npm run build && electron-builder",
     "package:linux": "npm run build && electron-builder --linux",
-    "package:win": "cd ../frontend && PUMAS_MULTI_APP=false npm run build && cd ../electron && npm run build && electron-builder --win",
-    "package:mac": "cd ../frontend && PUMAS_MULTI_APP=false npm run build && cd ../electron && npm run build && electron-builder --mac"
+    "package:win": "cd ../frontend && npm run build && cd ../electron && npm run build && electron-builder --win",
+    "package:mac": "cd ../frontend && npm run build && cd ../electron && npm run build && electron-builder --mac"
   },
   "dependencies": {
     "electron-log": "^5.0.0"

@@ -1,6 +1,6 @@
 //! Release size calculation and estimation.
 //!
-//! This module provides accurate size estimation for ComfyUI releases,
+//! This module provides size estimates for inference runtime releases,
 //! including archive size and dependency sizes. It uses a combination of:
 //!
 //! - Bundled known package sizes for common ML dependencies
@@ -103,7 +103,7 @@ impl SizeCalculator {
 
     /// Get default known package sizes for common ML dependencies.
     ///
-    /// These are approximate wheel sizes for common packages used by ComfyUI.
+    /// These are approximate wheel sizes for common inference packages.
     /// Sizes are in bytes and represent typical wheel sizes.
     fn default_known_packages() -> HashMap<String, u64> {
         let mut m = HashMap::new();
@@ -148,7 +148,7 @@ impl SizeCalculator {
         m.insert("httpx".into(), 500_000); // ~500KB
         m.insert("websockets".into(), 200_000); // ~200KB
 
-        // Web frameworks (ComfyUI server)
+        // Web frameworks used by local inference servers
         m.insert("flask".into(), 500_000); // ~500KB
         m.insert("werkzeug".into(), 500_000); // ~500KB
         m.insert("jinja2".into(), 500_000); // ~500KB
@@ -219,7 +219,7 @@ impl SizeCalculator {
             let deps_size = self.estimate_dependencies_size(reqs).await;
             (Some(deps_size), true)
         } else {
-            // Use heuristic: typical ComfyUI deps are ~15x archive size
+            // Use a conservative heuristic for Python ML dependencies.
             let estimated = archive_size.saturating_mul(15);
             (Some(estimated), true)
         };

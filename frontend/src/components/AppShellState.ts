@@ -3,7 +3,7 @@ import type { AppShell } from './AppShell';
 import type { ModelManagerProps } from './ModelManager';
 import type { useManagedApps } from '../hooks/useManagedApps';
 import type { LauncherUpdateState } from '../hooks/useLauncherUpdates';
-import type { AppConfig, ModelCategory, SystemResources } from '../types/apps';
+import type { AppConfig, ModelCategory, ModelInfo, SystemResources } from '../types/apps';
 import type { ServedModelStatus, ServingEndpointStatus } from '../types/api-serving';
 import type { StatusResponse } from '../types/api-system';
 
@@ -21,7 +21,6 @@ interface AppProcessVisualState {
 }
 
 export interface AppRunningState {
-  comfyUIRunning: boolean;
   ollamaRunning: boolean;
   torchRunning: boolean;
 }
@@ -31,15 +30,7 @@ export interface SelectedAppShellState {
   connectionUrl?: string | undefined;
 }
 
-export interface SetupDisplayState {
-  activeShortcutState?: { menu: boolean; desktop: boolean } | undefined;
-  depsInstalled: boolean | null;
-  displayStatus: string;
-  isSetupComplete: boolean;
-}
-
 interface BuildManagedAppsStateOptions {
-  comfyui: AppProcessVisualState;
   llamaCpp: AppProcessVisualState;
   ollama: AppProcessVisualState;
   running: AppRunningState;
@@ -60,6 +51,7 @@ interface BuildModelManagerPropsOptions {
   onChooseExistingLibrary: () => void;
   onModelsImported: () => void;
   onOpenModelsRoot: () => void;
+  onServeModel: (model: ModelInfo) => void;
   onToggleLink: (modelId: string) => void;
   onToggleStar: (modelId: string) => void;
 }
@@ -84,21 +76,14 @@ interface BuildAppShellHeaderOptions {
 interface BuildAppShellSidebarOptions {
   apps: AppConfig[];
   selectedAppId: string | null;
-  onAddApp: (insertAtIndex: number) => void;
-  onDeleteApp: (appId: string) => void;
   onLaunchApp: (appId: string) => void;
   onOpenLog: (appId: string) => void;
-  onReorderApps: (reorderedApps: AppConfig[]) => void;
   onSelectApp: (appId: string | null) => void;
   onStopApp: (appId: string) => void;
 }
 
-const COMPLETE_READY_MESSAGE = 'Setup complete \u2013 everything is ready';
-const DEFAULT_READY_STATUS = 'system ready. configure options below';
-
 export function getAppRunningState(status: StatusResponse | null | undefined): AppRunningState {
   return {
-    comfyUIRunning: status?.comfyui_running ?? false,
     ollamaRunning: status?.ollama_running ?? false,
     torchRunning: status?.torch_running ?? false,
   };
@@ -116,24 +101,6 @@ export function getSelectedAppShellState(
   };
 }
 
-export function getSetupDisplayState(
-  status: StatusResponse | null | undefined,
-  selectedAppId: string | null
-): SetupDisplayState {
-  const depsInstalled = status?.deps_ready ?? null;
-  const isPatched = status?.patched ?? false;
-  const menuShortcut = status?.menu_shortcut ?? false;
-  const desktopShortcut = status?.desktop_shortcut ?? false;
-  const isSetupComplete = depsInstalled === true && isPatched && menuShortcut && desktopShortcut;
-
-  return {
-    activeShortcutState: getActiveShortcutState(selectedAppId, menuShortcut, desktopShortcut),
-    depsInstalled,
-    displayStatus: getDisplayStatus(status?.message ?? ''),
-    isSetupComplete,
-  };
-}
-
 export function getLauncherLatestVersion(
   launcherUpdateState: LauncherUpdateState | null
 ): string | null {
@@ -141,7 +108,6 @@ export function getLauncherLatestVersion(
 }
 
 export function buildManagedAppsState({
-  comfyui,
   llamaCpp,
   ollama,
   running,
@@ -153,12 +119,6 @@ export function buildManagedAppsState({
 
   return {
     systemResources,
-    comfyui: {
-      ...comfyui,
-      isRunning: running.comfyUIRunning,
-      ramMemory: appResources?.comfyui?.ram_memory,
-      gpuMemory: appResources?.comfyui?.gpu_memory,
-    },
     ollama: {
       ...ollama,
       isRunning: running.ollamaRunning,
@@ -188,6 +148,7 @@ export function buildModelManagerProps({
   onChooseExistingLibrary,
   onModelsImported,
   onOpenModelsRoot,
+  onServeModel,
   onToggleLink,
   onToggleStar,
 }: BuildModelManagerPropsOptions): ModelManagerProps {
@@ -202,6 +163,7 @@ export function buildModelManagerProps({
     servedModels,
     onAddModels,
     onOpenModelsRoot,
+    onServeModel,
     onModelsImported,
     activeVersion,
     onChooseExistingLibrary,
@@ -226,7 +188,7 @@ export function buildAppShellHeader({
 }: BuildAppShellHeaderOptions): AppHeaderProps {
   return {
     systemResources,
-    appResources: status?.app_resources?.comfyui,
+    appResources: status?.app_resources?.ollama,
     launcherUpdateAvailable,
     launcherLatestVersion,
     isCheckingLauncherUpdates,
@@ -249,11 +211,8 @@ export function buildAppShellHeader({
 export function buildAppShellSidebar({
   apps,
   selectedAppId,
-  onAddApp,
-  onDeleteApp,
   onLaunchApp,
   onOpenLog,
-  onReorderApps,
   onSelectApp,
   onStopApp,
 }: BuildAppShellSidebarOptions): AppSidebarProps {
@@ -264,40 +223,5 @@ export function buildAppShellSidebar({
     onLaunchApp,
     onStopApp,
     onOpenLog,
-    onDeleteApp,
-    onReorderApps,
-    onAddApp,
   };
-}
-
-function getActiveShortcutState(
-  selectedAppId: string | null,
-  menuShortcut: boolean,
-  desktopShortcut: boolean
-): SetupDisplayState['activeShortcutState'] {
-  if (selectedAppId !== 'comfyui') {
-    return undefined;
-  }
-
-  return {
-    menu: menuShortcut,
-    desktop: desktopShortcut,
-  };
-}
-
-function getDisplayStatus(statusMessage: string): string {
-  if (isReadyStatusMessage(statusMessage)) {
-    return '';
-  }
-
-  return statusMessage;
-}
-
-function isReadyStatusMessage(statusMessage: string): boolean {
-  const normalizedStatus = statusMessage.trim().toLowerCase();
-
-  return (
-    statusMessage === COMPLETE_READY_MESSAGE ||
-    normalizedStatus === DEFAULT_READY_STATUS
-  );
 }

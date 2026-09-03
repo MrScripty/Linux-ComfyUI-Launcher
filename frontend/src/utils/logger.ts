@@ -15,7 +15,7 @@
 import log from 'loglevel';
 
 // Configure root logger
-const rootLogger = log.getLogger('ComfyUILauncher');
+const rootLogger = log.getLogger('PumasLibrary');
 
 // Set default log level based on environment
 if (import.meta.env.MODE === 'development') {

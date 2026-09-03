@@ -72,6 +72,7 @@ hosts that invoke the wrappers.
 ```bash
 node scripts/launcher/cli.mjs --help
 node scripts/launcher/cli.mjs --build-release
+PUMAS_INFERENCE_PLUGINS=false node scripts/launcher/cli.mjs --build-release
 node scripts/launcher/cli.mjs --run -- --devtools
 node scripts/launcher/cli.mjs --test
 node scripts/launcher/cli.mjs --release-smoke
@@ -90,6 +91,10 @@ node --test scripts/launcher/*.test.mjs
 - `--run` launches Electron with the debug backend binary created by
   `--build`; release launch and smoke actions use the release backend binary
   created by `--build-release`.
+- Inference plugins are compiled in by default. Setting
+  `PUMAS_INFERENCE_PLUGINS=false` on a build action compiles the Rust RPC
+  binary with `--no-default-features` and emits the matching library-only
+  frontend.
 - Errors return stable exit codes for usage, missing dependencies, missing
   release artifacts, and general operation failure.
 - The CLI contract is preserved even if internal modules are reorganized.

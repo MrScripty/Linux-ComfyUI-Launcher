@@ -56,13 +56,15 @@ export function ModelMetadataModalTabs({
         <ActivitySquare className="w-4 h-4" />
         Execution Facts
       </button>
-      <button
-        onClick={() => onActiveSourceChange('runtime')}
-        className={tabClassName(activeSource === 'runtime')}
-      >
-        <Play className="w-4 h-4" />
-        Serving
-      </button>
+      {__FEATURE_INFERENCE_PLUGINS__ && (
+        <button
+          onClick={() => onActiveSourceChange('runtime')}
+          className={tabClassName(activeSource === 'runtime')}
+        >
+          <Play className="w-4 h-4" />
+          Serving
+        </button>
+      )}
       <button
         onClick={() => onActiveSourceChange('notes')}
         className={tabClassName(activeSource === 'notes')}

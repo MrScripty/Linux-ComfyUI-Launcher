@@ -1,7 +1,9 @@
 # pumas-app-manager
 
 ## Purpose
-`pumas-app-manager` coordinates external application versions and service clients used by Pumas Library, including ComfyUI, Ollama, and Torch integration points.
+`pumas-app-manager` coordinates supported inference-runtime versions and service
+clients used by Pumas Library, including Ollama, llama.cpp, ONNX Runtime, and Torch
+integration points.
 
 ## Ownership
 This crate owns version installation workflows, external API client adapters, and app-specific lifecycle coordination. It does not own model-library catalog storage or RPC transport.

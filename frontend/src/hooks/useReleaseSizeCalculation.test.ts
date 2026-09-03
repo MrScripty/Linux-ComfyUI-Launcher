@@ -45,7 +45,7 @@ describe('useReleaseSizeCalculation', () => {
     const onRefreshAll = vi.fn().mockResolvedValue(undefined);
 
     renderHook(() => useReleaseSizeCalculation({
-      appId: 'comfyui',
+      appId: 'ollama',
       availableVersions: [
         createRelease({ tagName: 'v1.0.0', totalSize: null }),
         createRelease({ tagName: 'v1.1.0', totalSize: 2048 }),
@@ -55,7 +55,7 @@ describe('useReleaseSizeCalculation', () => {
     }));
 
     await waitFor(() => {
-      expect(calculateReleaseSizeMock).toHaveBeenCalledWith('v1.0.0', false, 'comfyui');
+      expect(calculateReleaseSizeMock).toHaveBeenCalledWith('v1.0.0', false, 'ollama');
       expect(onRefreshAll).toHaveBeenCalledWith(false);
     });
     expect(calculateReleaseSizeMock).toHaveBeenCalledTimes(1);

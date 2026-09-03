@@ -20,23 +20,9 @@ type BaseRpcResponse = {
   error?: string;
 };
 
-type ActiveVersionResponse = BaseRpcResponse & {
-  version?: string | null;
-};
-
 type LaunchRpcResponse = BaseRpcResponse & {
   log_path?: string | null;
   ready?: boolean | null;
-};
-
-type VersionShortcutState = {
-  tag?: string;
-  menu: boolean;
-  desktop: boolean;
-};
-
-type VersionShortcutResponse = BaseRpcResponse & {
-  state?: VersionShortcutState;
 };
 
 type ModelLibraryUpdateNotificationPayload = {
@@ -217,69 +203,14 @@ function isStatusTelemetryUpdateNotificationPayload(
   );
 }
 
-async function installActiveVersionDependencies(): Promise<BaseRpcResponse> {
-  const activeVersion = await apiCall<ActiveVersionResponse>('get_active_version', {
-    app_id: 'comfyui',
-  });
-
-  if (!activeVersion.success || !activeVersion.version) {
-    return {
-      success: false,
-      error: activeVersion.error ?? 'No active ComfyUI version set',
-    };
-  }
-
-  return await apiCall('install_version_dependencies', {
-    tag: activeVersion.version,
-    app_id: 'comfyui',
-  });
-}
-
-async function setVersionShortcuts(
-  tag: string,
-  enabled: boolean
-): Promise<VersionShortcutResponse> {
-  const current = await apiCall<VersionShortcutResponse>('get_version_shortcuts', { tag });
-  if (!current.success) {
-    return current;
-  }
-
-  const currentState = current.state ?? { tag, menu: false, desktop: false };
-  if (currentState.menu !== enabled) {
-    const menuResult = await apiCall<BaseRpcResponse>('toggle_menu', { tag });
-    if (!menuResult.success) {
-      return {
-        success: false,
-        state: currentState,
-        error: menuResult.error ?? 'Failed to update menu shortcut',
-      };
-    }
-  }
-
-  if (currentState.desktop !== enabled) {
-    const desktopResult = await apiCall<BaseRpcResponse>('toggle_desktop', { tag });
-    if (!desktopResult.success) {
-      return {
-        success: false,
-        state: currentState,
-        error: desktopResult.error ?? 'Failed to update desktop shortcut',
-      };
-    }
-  }
-
-  const refreshed = await apiCall<VersionShortcutResponse>('get_version_shortcuts', { tag });
-  return {
-    success: refreshed.success,
-    state: refreshed.state ?? { tag, menu: enabled, desktop: enabled },
-    error: refreshed.error,
-  };
-}
-
 async function launchAppVersion(
   appId: string | undefined,
   versionTag: string
 ): Promise<LaunchRpcResponse> {
-  const resolvedAppId = appId ?? 'comfyui';
+  if (!appId) {
+    return { success: false, error: 'An inference plugin app id is required' };
+  }
+  const resolvedAppId = appId;
   const switchResult = await apiCall<BaseRpcResponse>('switch_version', {
     tag: versionTag,
     app_id: resolvedAppId,
@@ -293,8 +224,6 @@ async function launchAppVersion(
   }
 
   switch (resolvedAppId) {
-    case 'comfyui':
-      return await apiCall('launch_comfyui');
     case 'ollama':
       return await apiCall('launch_ollama');
     case 'torch':
@@ -309,8 +238,6 @@ async function launchAppVersion(
 
 async function stopApp(appId: string): Promise<BaseRpcResponse> {
   switch (appId) {
-    case 'comfyui':
-      return await apiCall('stop_comfyui');
     case 'ollama':
       return await apiCall('stop_ollama');
     case 'torch':
@@ -335,23 +262,6 @@ const electronAPI = {
   get_status_telemetry_snapshot: () => apiCall('get_status_telemetry_snapshot'),
   get_disk_space: () => apiCall('get_disk_space'),
   get_system_resources: () => apiCall('get_system_resources'),
-
-  // ========================================
-  // Dependencies
-  // ========================================
-  install_deps: () => installActiveVersionDependencies(),
-
-  // ========================================
-  // Shortcuts
-  // ========================================
-  toggle_menu: (tag?: string) => apiCall('toggle_menu', { tag }),
-  toggle_desktop: (tag?: string) => apiCall('toggle_desktop', { tag }),
-  get_version_shortcuts: (tag: string) => apiCall('get_version_shortcuts', { tag }),
-  get_all_shortcut_states: () => apiCall('get_all_shortcut_states'),
-  set_version_shortcuts: (tag: string, enabled: boolean) =>
-    setVersionShortcuts(tag, enabled),
-  toggle_version_menu: (tag: string) => apiCall('toggle_menu', { tag }),
-  toggle_version_desktop: (tag: string) => apiCall('toggle_desktop', { tag }),
 
   // ========================================
   // Version Management
@@ -404,8 +314,6 @@ const electronAPI = {
   // ========================================
   // Process Management
   // ========================================
-  launch_comfyui: () => apiCall('launch_comfyui'),
-  stop_comfyui: () => apiCall('stop_comfyui'),
   launch_ollama: () => apiCall('launch_ollama'),
   stop_ollama: () => apiCall('stop_ollama'),
   get_runtime_profiles_snapshot: () =>
@@ -515,7 +423,6 @@ const electronAPI = {
   // ========================================
   get_models: () => apiCall('get_models'),
   refresh_model_index: () => apiCall('refresh_model_index'),
-  refresh_model_mappings: (appId?: string) => apiCall('refresh_model_mappings', { app_id: appId }),
   scan_shared_storage: () => apiCall('scan_shared_storage'),
   search_hf_models: (
     query: string,
@@ -677,19 +584,6 @@ const electronAPI = {
   delete_model_with_cascade: (modelId: string) =>
     apiCall('delete_model_with_cascade', { model_id: modelId }),
 
-  // ========================================
-  // Mapping Preview (Phase 1C)
-  // ========================================
-  preview_model_mapping: (versionTag: string) =>
-    apiCall('preview_model_mapping', { version_tag: versionTag }),
-  sync_models_incremental: (versionTag: string, modelIds: string[]) =>
-    apiCall('sync_models_incremental', { version_tag: versionTag, model_ids: modelIds }),
-  get_cross_filesystem_warning: (versionTag: string) =>
-    apiCall('get_cross_filesystem_warning', { version_tag: versionTag }),
-  apply_model_mapping: (versionTag: string) =>
-    apiCall('apply_model_mapping', { version_tag: versionTag }),
-  sync_with_resolutions: (versionTag: string, resolutions: Record<string, string>) =>
-    apiCall('sync_with_resolutions', { version_tag: versionTag, resolutions }),
   get_sandbox_info: () => apiCall('get_sandbox_info'),
   set_model_link_exclusion: (modelId: string, appId: string, excluded: boolean) =>
     apiCall('set_model_link_exclusion', { model_id: modelId, app_id: appId, excluded }),
@@ -703,17 +597,6 @@ const electronAPI = {
     apiCall('delete_model_migration_report', { report_path: reportPath }),
   prune_model_migration_reports: (keepLatest: number) =>
     apiCall('prune_model_migration_reports', { keep_latest: keepLatest }),
-
-  // ========================================
-  // Custom Nodes
-  // ========================================
-  get_custom_nodes: (versionTag: string) => apiCall('get_custom_nodes', { version_tag: versionTag }),
-  install_custom_node: (gitUrl: string, versionTag: string, nodeName?: string) =>
-    apiCall('install_custom_node', { git_url: gitUrl, version_tag: versionTag, node_name: nodeName }),
-  update_custom_node: (nodeName: string, versionTag: string) =>
-    apiCall('update_custom_node', { node_name: nodeName, version_tag: versionTag }),
-  remove_custom_node: (nodeName: string, versionTag: string) =>
-    apiCall('remove_custom_node', { node_name: nodeName, version_tag: versionTag }),
 
   // ========================================
   // Model Format Conversion

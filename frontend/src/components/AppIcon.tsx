@@ -49,25 +49,22 @@ const IconWrapper: React.FC<IconWrapperProps> = ({ isSelected, children }) => {
 };
 
 const BUILTIN_APP_ICON_PATHS: Record<string, string> = {
-  comfyui: './comfyui-icon.png',
-  openwebui: './openwebui-icon.png',
   ollama: './ollama-icon.png',
   torch: './torch-icon.svg',
-  invoke: './comfyui-icon.png',
-  'krita-diffusion': './comfyui-icon.png',
+  'llama-cpp': './llama-cpp-icon.svg',
+  'onnx-runtime': './onnx-runtime-icon.svg',
 };
 
 /**
  * Get the shipped icon path for built-in apps.
  *
- * Unknown app ids still use the conventional `./{appId}-icon.png` path so
- * custom assets can be added without code changes.
+ * Unknown ids use the conventional `./{appId}-icon.png` path.
  */
 const getIconPath = (appId: string): string => BUILTIN_APP_ICON_PATHS[appId] ?? `./${appId}-icon.png`;
 
 /**
  * Handle icon load error by trying alternative extensions.
- * Falls back through: .png -> .svg -> .webp -> comfyui-icon.png (default)
+ * Falls back through: .png -> .svg -> .webp, then hides a missing asset.
  */
 const handleIconError = (e: React.SyntheticEvent<HTMLImageElement>) => {
   const img = e.currentTarget;
@@ -77,7 +74,7 @@ const handleIconError = (e: React.SyntheticEvent<HTMLImageElement>) => {
   } else if (src.endsWith('-icon.svg')) {
     img.src = src.replace('-icon.svg', '-icon.webp');
   } else {
-    img.src = './comfyui-icon.png';
+    img.style.visibility = 'hidden';
   }
 };
 

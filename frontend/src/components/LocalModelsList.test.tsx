@@ -47,13 +47,14 @@ describe('LocalModelsList', () => {
         excludedModels={new Set()}
         onToggleStar={vi.fn()}
         onToggleLink={vi.fn()}
-        selectedAppId="comfyui"
+        selectedAppId="ollama"
         totalModels={1}
         hasFilters={false}
         relatedModelsById={{}}
         expandedRelated={new Set()}
         onToggleRelated={vi.fn()}
         onOpenRelatedUrl={vi.fn()}
+        onServeModel={vi.fn()}
       />
     );
 
@@ -93,12 +94,13 @@ describe('LocalModelsList', () => {
         expandedRelated={new Set()}
         onToggleRelated={vi.fn()}
         onOpenRelatedUrl={vi.fn()}
+        onServeModel={vi.fn()}
       />
     );
 
     expect(screen.getByText('Loaded')).toBeInTheDocument();
-    expect(screen.getByText(/llama.cpp - http:\/\/127.0.0.1:20617\//)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /loaded with llama.cpp/i })).toBeEnabled();
+    expect(screen.getByText(/http:\/\/127.0.0.1:20617\//)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /unload model/i })).toBeEnabled();
   });
 
   it('does not render backend compatibility badges on local model rows', () => {
@@ -124,7 +126,7 @@ describe('LocalModelsList', () => {
         excludedModels={new Set()}
         onToggleStar={vi.fn()}
         onToggleLink={vi.fn()}
-        selectedAppId="comfyui"
+        selectedAppId="ollama"
         totalModels={1}
         hasFilters={false}
         relatedModelsById={{}}
@@ -146,7 +148,7 @@ describe('LocalModelsList', () => {
         excludedModels={new Set()}
         onToggleStar={vi.fn()}
         onToggleLink={vi.fn()}
-        selectedAppId="comfyui"
+        selectedAppId="ollama"
         totalModels={1}
         hasFilters={false}
         relatedModelsById={{}}
@@ -203,7 +205,7 @@ describe('LocalModelsList', () => {
         excludedModels={new Set()}
         onToggleStar={vi.fn()}
         onToggleLink={vi.fn()}
-        selectedAppId="comfyui"
+        selectedAppId="ollama"
         totalModels={1}
         hasFilters={false}
         relatedModelsById={relatedModelsById}
@@ -233,7 +235,7 @@ describe('LocalModelsList', () => {
         excludedModels={new Set()}
         onToggleStar={vi.fn()}
         onToggleLink={vi.fn()}
-        selectedAppId="comfyui"
+        selectedAppId="ollama"
         totalModels={0}
         hasFilters={false}
         relatedModelsById={{}}
