@@ -33,7 +33,7 @@ describe('getLocalModelRowState', () => {
     expect(rowState.ringDegrees).toBe(151);
   });
 
-  it('falls back to a full retained ring when indexed partial downloads have no numeric progress', () => {
+  it('does not show a complete ring when indexed partial downloads have no numeric progress', () => {
     const rowState = getLocalModelRowState({
       excludedModels: new Set(),
       expandedRelated: new Set(),
@@ -50,7 +50,7 @@ describe('getLocalModelRowState', () => {
     });
 
     expect(rowState.hasRetainedProgressRing).toBe(true);
-    expect(rowState.ringDegrees).toBe(360);
+    expect(rowState.ringDegrees).toBe(0);
   });
 
   it('surfaces missing repository metadata for non-resumable partial downloads', () => {

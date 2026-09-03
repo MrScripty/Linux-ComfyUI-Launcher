@@ -13,6 +13,7 @@ function makeModelRecord(overrides: Partial<ModelRecord> = {}): ModelRecord {
     hashes: {},
     metadata: {
       size_bytes: 1234,
+      download_progress: 0.42,
       added_date: '2026-03-06T00:00:00Z',
       repo_id: 'example/test-model',
       primary_format: 'gguf',
@@ -40,6 +41,7 @@ describe('mapModelRecordToInfo', () => {
     expect(info.format).toBe('gguf');
     expect(info.quant).toBe('Q4_K_M');
     expect(info.size).toBe(1234);
+    expect(info.downloadProgress).toBe(0.42);
     expect(info.date).toBe('2026-03-06T00:00:00Z');
     expect(info.repoId).toBe('example/test-model');
     expect(info.hasDependencies).toBe(true);

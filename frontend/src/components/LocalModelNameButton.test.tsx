@@ -36,6 +36,7 @@ describe('LocalModelNameButton', () => {
         isDownloading={false}
         isLinked={true}
         isPartialDownload={true}
+        downloadProgress={0.42}
         onOpenMetadata={vi.fn()}
         wasDequantized={true}
       />
@@ -49,9 +50,29 @@ describe('LocalModelNameButton', () => {
       'title',
       'Missing expected shard.'
     );
-    expect(screen.getByText('PARTIAL')).toHaveAttribute(
+    expect(screen.getByText('PARTIAL 42%')).toHaveAttribute(
       'title',
-      'Partial download detected - some expected files are missing'
+      'Partial download detected - 42% of selected artifact bytes are present'
+    );
+  });
+
+  it('never presents an incomplete model as ready for manual finalization', () => {
+    render(
+      <LocalModelNameButton
+        modelId="llm/test"
+        modelName="Test Model"
+        hasIntegrityIssue={false}
+        isDownloading={false}
+        isLinked={true}
+        isPartialDownload={true}
+        downloadProgress={1}
+        onOpenMetadata={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText('PARTIAL 99%')).toHaveAttribute(
+      'title',
+      'Partial download detected - 99% of selected artifact bytes are present'
     );
   });
 });

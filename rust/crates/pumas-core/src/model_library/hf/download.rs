@@ -10,6 +10,10 @@ use super::types::{
 use super::HuggingFaceClient;
 use crate::error::{PumasError, Result};
 use crate::model_library::download_store::{DownloadPersistence, PersistedDownload};
+use crate::model_library::partial_download::{
+    download_artifact_paths, finalize_download_artifact_if_complete,
+    infer_expected_sizes_from_total,
+};
 use crate::model_library::sharding;
 use crate::model_library::types::{DownloadRequest, DownloadStatus, ModelDownloadProgress};
 use crate::model_library::SelectedArtifactIdentity;
@@ -379,78 +383,214 @@ impl HuggingFaceClient {
     /// Restore persisted downloads from disk.
     ///
     /// Called during startup to recover paused/errored downloads from a previous session.
-    /// Only restores entries whose `.part` file still exists on disk.
-    pub async fn restore_persisted_downloads(&self) {
+    /// Byte-complete entries are finalized immediately instead of being restored as errors.
+    pub async fn restore_persisted_downloads(&self) -> Vec<DownloadCompletionInfo> {
         let persistence = match &self.persistence {
             Some(p) => p.clone(),
-            None => return,
+            None => return Vec::new(),
         };
 
-        let restored_entries = match tokio::task::spawn_blocking(move || {
-            let entries = persistence.load_all();
-            let mut restored = Vec::new();
-
-            for entry in entries {
-                let all_filenames = if entry.filenames.is_empty() {
-                    vec![entry.filename.clone()]
-                } else {
-                    entry.filenames.clone()
-                };
-
-                let has_any_file = all_filenames.iter().any(|f| {
-                    let part = entry.dest_dir.join(format!(
-                        "{}{}",
-                        f,
-                        crate::config::NetworkConfig::DOWNLOAD_TEMP_SUFFIX
-                    ));
-                    let completed = entry.dest_dir.join(f);
-                    part.exists() || completed.exists()
-                });
-
-                if !has_any_file {
-                    info!(
-                        "Removing stale persisted download {} (no files on disk)",
-                        entry.download_id
-                    );
-                    let _ = persistence.remove(&entry.download_id);
-                    continue;
-                }
-
-                let downloaded_bytes: u64 = all_filenames
-                    .iter()
-                    .map(|f| {
-                        let completed = entry.dest_dir.join(f);
-                        let part = entry.dest_dir.join(format!(
-                            "{}{}",
-                            f,
-                            crate::config::NetworkConfig::DOWNLOAD_TEMP_SUFFIX
-                        ));
-                        if completed.exists() {
-                            std::fs::metadata(&completed).map(|m| m.len()).unwrap_or(0)
-                        } else if part.exists() {
-                            std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0)
-                        } else {
-                            0
-                        }
-                    })
-                    .sum();
-
-                restored.push((entry, downloaded_bytes));
-            }
-
-            restored
+        let entries = match tokio::task::spawn_blocking({
+            let persistence = persistence.clone();
+            move || persistence.load_all()
         })
         .await
         {
             Ok(entries) => entries,
             Err(err) => {
                 error!("Failed to join persisted download restore task: {}", err);
-                return;
+                return Vec::new();
             }
         };
 
+        let mut restored_entries = Vec::new();
+        let mut completed_entries = Vec::new();
+
+        for entry in entries {
+            let all_filenames = if entry.filenames.is_empty() {
+                vec![entry.filename.clone()]
+            } else {
+                entry.filenames.clone()
+            };
+            let mut expected_sizes = match tokio::task::spawn_blocking({
+                let dest_dir = entry.dest_dir.clone();
+                let filenames = all_filenames.clone();
+                let total_size = entry.total_bytes;
+                move || infer_expected_sizes_from_total(&dest_dir, &filenames, total_size)
+            })
+            .await
+            {
+                Ok(Ok(sizes)) => sizes,
+                Ok(Err(error)) => {
+                    warn!(
+                        "Failed to inspect persisted download {} for finalization: {}",
+                        entry.download_id, error
+                    );
+                    HashMap::new()
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to join persisted download inspection for {}: {}",
+                        entry.download_id, error
+                    );
+                    HashMap::new()
+                }
+            };
+            if all_filenames.len() > 1 {
+                let has_unfinalized_part = tokio::task::spawn_blocking({
+                    let dest_dir = entry.dest_dir.clone();
+                    let filenames = all_filenames.clone();
+                    move || {
+                        filenames.iter().any(|filename| {
+                            let Some((final_path, part_path)) =
+                                download_artifact_paths(&dest_dir, filename)
+                            else {
+                                return false;
+                            };
+                            !final_path.is_file() && part_path.is_file()
+                        })
+                    }
+                })
+                .await
+                .unwrap_or(false);
+                if has_unfinalized_part {
+                    match self.get_repo_files(&entry.repo_id).await {
+                        Ok(tree) => {
+                            expected_sizes.extend(
+                                tree.lfs_files
+                                    .into_iter()
+                                    .map(|file| (file.filename, file.size)),
+                            );
+                        }
+                        Err(error) => {
+                            debug!(
+                                "Could not resolve per-file sizes while restoring {}: {}",
+                                entry.download_id, error
+                            );
+                        }
+                    }
+                }
+            }
+
+            let finalization = match tokio::task::spawn_blocking({
+                let dest_dir = entry.dest_dir.clone();
+                let filenames = all_filenames.clone();
+                move || {
+                    finalize_download_artifact_if_complete(&dest_dir, &filenames, &expected_sizes)
+                }
+            })
+            .await
+            {
+                Ok(Ok(finalization)) => finalization,
+                Ok(Err(error)) => {
+                    warn!(
+                        "Failed to auto-finalize persisted download {}: {}",
+                        entry.download_id, error
+                    );
+                    Default::default()
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to join persisted download finalization task for {}: {}",
+                        entry.download_id, error
+                    );
+                    Default::default()
+                }
+            };
+
+            if finalization.complete {
+                info!(
+                    "Auto-finalized persisted download {} ({} promoted file{})",
+                    entry.download_id,
+                    finalization.promoted_files,
+                    if finalization.promoted_files == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
+                Self::remove_persisted_download(persistence.clone(), entry.download_id.clone())
+                    .await;
+                completed_entries.push(entry);
+                continue;
+            }
+
+            let disk_state = tokio::task::spawn_blocking({
+                let dest_dir = entry.dest_dir.clone();
+                let filenames = all_filenames.clone();
+                move || {
+                    filenames.iter().fold(
+                        (false, 0_u64),
+                        |(has_any_file, downloaded_bytes), filename| {
+                            let Some((completed, part)) =
+                                download_artifact_paths(&dest_dir, filename)
+                            else {
+                                return (has_any_file, downloaded_bytes);
+                            };
+                            if completed.is_file() {
+                                (
+                                    true,
+                                    downloaded_bytes.saturating_add(
+                                        std::fs::metadata(completed).map(|m| m.len()).unwrap_or(0),
+                                    ),
+                                )
+                            } else if part.is_file() {
+                                (
+                                    true,
+                                    downloaded_bytes.saturating_add(
+                                        std::fs::metadata(part).map(|m| m.len()).unwrap_or(0),
+                                    ),
+                                )
+                            } else {
+                                (has_any_file, downloaded_bytes)
+                            }
+                        },
+                    )
+                }
+            })
+            .await;
+
+            let Ok((has_any_file, downloaded_bytes)) = disk_state else {
+                warn!(
+                    "Failed to inspect persisted download files for {}",
+                    entry.download_id
+                );
+                continue;
+            };
+            if !has_any_file {
+                info!(
+                    "Removing stale persisted download {} (no files on disk)",
+                    entry.download_id
+                );
+                Self::remove_persisted_download(persistence.clone(), entry.download_id.clone())
+                    .await;
+                continue;
+            }
+            restored_entries.push((entry, downloaded_bytes));
+        }
+
+        let completion_infos = completed_entries
+            .into_iter()
+            .map(|entry| {
+                let filenames = if entry.filenames.is_empty() {
+                    vec![entry.filename.clone()]
+                } else {
+                    entry.filenames.clone()
+                };
+                DownloadCompletionInfo {
+                    download_id: entry.download_id,
+                    dest_dir: entry.dest_dir,
+                    filename: entry.filename,
+                    filenames,
+                    download_request: entry.download_request,
+                    known_sha256: entry.known_sha256,
+                    huggingface_evidence: entry.huggingface_evidence,
+                }
+            })
+            .collect::<Vec<_>>();
+
         if restored_entries.is_empty() {
-            return;
+            return completion_infos;
         }
 
         info!("Restoring {} persisted downloads", restored_entries.len());
@@ -479,6 +619,7 @@ impl HuggingFaceClient {
         }
         drop(downloads);
         self.publish_download_snapshot().await;
+        completion_infos
     }
 
     /// Start a model download (supports multi-file models).
@@ -887,6 +1028,35 @@ impl HuggingFaceClient {
         }
     }
 
+    async fn finalize_complete_part_file(
+        dest_path: &Path,
+        part_path: &Path,
+        expected_size: Option<u64>,
+    ) -> Result<bool> {
+        let Some(expected_size) = expected_size else {
+            return Ok(false);
+        };
+        let Ok(metadata) = tokio::fs::metadata(part_path).await else {
+            return Ok(false);
+        };
+        if !metadata.is_file() || metadata.len() != expected_size {
+            return Ok(false);
+        }
+
+        tokio::fs::rename(part_path, dest_path)
+            .await
+            .map_err(|error| PumasError::DownloadFailed {
+                url: part_path.display().to_string(),
+                message: format!("Failed to finalize fully downloaded temp file: {error}"),
+            })?;
+        info!(
+            "Finalized fully downloaded partial file {} ({} bytes)",
+            dest_path.display(),
+            expected_size
+        );
+        Ok(true)
+    }
+
     async fn remove_download_marker(dest_dir: &Path) {
         let marker_path = dest_dir.join(".pumas_download");
         if let Err(err) = tokio::fs::remove_file(&marker_path).await {
@@ -1108,6 +1278,12 @@ impl HuggingFaceClient {
                     .await
                     .map(|m| m.len())
                     .unwrap_or(0);
+
+                if Self::finalize_complete_part_file(&dest_path, &part_path, file_info.size).await?
+                {
+                    file_completed = true;
+                    break;
+                }
 
                 if attempt > 1 {
                     warn!(
@@ -2394,6 +2570,92 @@ mod tests {
         assert!(tokio::fs::try_exists(&final_path).await.unwrap());
         assert!(!tokio::fs::try_exists(&part_path).await.unwrap());
         assert!(tokio::fs::try_exists(&other_part_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_finalize_complete_part_file_promotes_exact_expected_size() {
+        let tmp = TempDir::new().unwrap();
+        let final_path = tmp.path().join("model.gguf");
+        let part_path = tmp.path().join("model.gguf.part");
+        tokio::fs::write(&part_path, b"done").await.unwrap();
+
+        let finalized =
+            HuggingFaceClient::finalize_complete_part_file(&final_path, &part_path, Some(4))
+                .await
+                .unwrap();
+
+        assert!(finalized);
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"done");
+        assert!(!tokio::fs::try_exists(&part_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_finalize_complete_part_file_keeps_short_partial() {
+        let tmp = TempDir::new().unwrap();
+        let final_path = tmp.path().join("model.gguf");
+        let part_path = tmp.path().join("model.gguf.part");
+        tokio::fs::write(&part_path, b"short").await.unwrap();
+
+        let finalized =
+            HuggingFaceClient::finalize_complete_part_file(&final_path, &part_path, Some(10))
+                .await
+                .unwrap();
+
+        assert!(!finalized);
+        assert!(!tokio::fs::try_exists(&final_path).await.unwrap());
+        assert!(tokio::fs::try_exists(&part_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_restore_auto_finalizes_byte_complete_persisted_download() {
+        let tmp = TempDir::new().unwrap();
+        let dest_dir = tmp.path().join("library").join("llm/test/ready-model");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("model.gguf.part"), b"done").unwrap();
+        std::fs::write(dest_dir.join(".pumas_download"), b"{}").unwrap();
+
+        let persistence = Arc::new(DownloadPersistence::new(tmp.path()));
+        persistence
+            .save(&PersistedDownload {
+                download_id: "ready-download".to_string(),
+                repo_id: "owner/model".to_string(),
+                filename: "model.gguf".to_string(),
+                filenames: vec!["model.gguf".to_string()],
+                dest_dir: dest_dir.clone(),
+                total_bytes: Some(4),
+                status: DownloadStatus::Error,
+                download_request: DownloadRequest {
+                    repo_id: "owner/model".to_string(),
+                    family: "test".to_string(),
+                    official_name: "Ready Model".to_string(),
+                    model_type: Some("llm".to_string()),
+                    quant: None,
+                    filename: Some("model.gguf".to_string()),
+                    filenames: None,
+                    pipeline_tag: Some("text-generation".to_string()),
+                    bundle_format: None,
+                    pipeline_class: None,
+                    release_date: None,
+                    download_url: None,
+                    model_card_json: None,
+                    license_status: None,
+                },
+                created_at: chrono::Utc::now().to_rfc3339(),
+                known_sha256: None,
+                huggingface_evidence: None,
+            })
+            .unwrap();
+
+        let mut client = HuggingFaceClient::new(tmp.path()).unwrap();
+        client.set_persistence(persistence.clone());
+        let completed = client.restore_persisted_downloads().await;
+
+        assert!(client.list_downloads().await.is_empty());
+        assert_eq!(completed.len(), 1);
+        assert!(persistence.load_all().is_empty());
+        assert_eq!(std::fs::read(dest_dir.join("model.gguf")).unwrap(), b"done");
+        assert!(!dest_dir.join("model.gguf.part").exists());
+        assert!(!dest_dir.join(".pumas_download").exists());
     }
 
     #[tokio::test]

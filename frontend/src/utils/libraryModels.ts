@@ -28,7 +28,7 @@ function getIntegrityIssueMessage(metadata: ModelRecordMetadata): string | undef
   }
 
   const count = metadata.integrity_issue_duplicate_repo_id_count ?? 2;
-  return `Duplicate repo entries detected (${count} paths). Run library reconciliation.`;
+  return `Duplicate artifact entries detected (${count} paths). Run library reconciliation.`;
 }
 
 function getConvertibleFormat(format?: string): ModelInfo['primaryFormat'] {
@@ -57,6 +57,7 @@ export function mapModelRecordToInfo(model: ModelRecord): ModelInfo {
     date: asString(metadata.added_date),
     relatedAvailable: asBoolean(metadata.related_available) ?? false,
     isPartialDownload: asBoolean(metadata.download_incomplete) ?? false,
+    downloadProgress: asNumber(metadata.download_progress),
     repoId: asString(metadata.repo_id),
     selectedArtifactId: asString(metadata.selected_artifact_id),
     selectedArtifactFiles: asStringArray(metadata.selected_artifact_files),

@@ -50,23 +50,34 @@ pub(super) fn metadata_to_record(
         .next()
         .map(str::to_string)
         .unwrap_or_else(|| "unknown".to_string());
-    let (download_incomplete, download_has_part_files, download_missing_expected_files) =
-        download_projection_status(model_dir, metadata);
+    let download = download_projection_status(model_dir, metadata);
     let mut metadata_json = serde_json::to_value(metadata).unwrap_or(serde_json::Value::Null);
     if let Some(obj) = metadata_json.as_object_mut() {
         obj.insert(
             "download_incomplete".to_string(),
-            Value::Bool(download_incomplete),
+            Value::Bool(download.incomplete),
         );
         obj.insert(
             "download_has_part_files".to_string(),
-            Value::Bool(download_has_part_files),
+            Value::Bool(download.has_part_files),
         );
         obj.insert(
             "download_missing_expected_files".to_string(),
             Value::Number(serde_json::Number::from(
-                download_missing_expected_files as u64,
+                download.missing_expected_files as u64,
             )),
+        );
+        obj.insert(
+            "downloaded_size_bytes".to_string(),
+            Value::Number(serde_json::Number::from(download.downloaded_size_bytes)),
+        );
+        obj.insert(
+            "download_progress".to_string(),
+            download
+                .progress
+                .and_then(serde_json::Number::from_f64)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
         );
         obj.insert(
             PRIMARY_FORMAT_METADATA_KEY.to_string(),

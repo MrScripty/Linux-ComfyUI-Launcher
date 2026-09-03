@@ -1,6 +1,7 @@
 import type { MouseEvent } from 'react';
 
 interface LocalModelNameButtonProps {
+  downloadProgress?: number | undefined;
   hasIntegrityIssue: boolean;
   integrityIssueMessage?: string | undefined;
   isDownloading: boolean;
@@ -13,6 +14,7 @@ interface LocalModelNameButtonProps {
 }
 
 export function LocalModelNameButton({
+  downloadProgress,
   hasIntegrityIssue,
   integrityIssueMessage,
   isDownloading,
@@ -30,6 +32,16 @@ export function LocalModelNameButton({
       onOpenMetadata(modelId, modelName);
     }
   };
+  const normalizedProgress =
+    typeof downloadProgress === 'number' && Number.isFinite(downloadProgress)
+      ? Math.min(0.99, Math.max(0, downloadProgress))
+      : null;
+  const progressPercent =
+    normalizedProgress === null
+      ? null
+      : normalizedProgress > 0 && normalizedProgress < 0.01
+        ? '<1%'
+        : `${Math.round(normalizedProgress * 100)}%`;
 
   return (
     <button
@@ -72,9 +84,13 @@ export function LocalModelNameButton({
           className="ml-1.5 inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded
             bg-[hsl(var(--launcher-accent-warning)/0.15)]
             text-[hsl(var(--launcher-accent-warning))]"
-          title="Partial download detected - some expected files are missing"
+          title={
+            progressPercent
+              ? `Partial download detected - ${progressPercent} of selected artifact bytes are present`
+              : 'Partial download detected - some expected files are missing'
+          }
         >
-          PARTIAL
+          {`PARTIAL${progressPercent ? ` ${progressPercent}` : ''}`}
         </span>
       )}
     </button>

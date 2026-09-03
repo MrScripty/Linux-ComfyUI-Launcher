@@ -42,11 +42,9 @@ interface PartialDownloadState {
 }
 
 function getRingDegrees(model: ModelInfo, isQueued: boolean): number {
-  const progressValue = Math.min(1, Math.max(0, model.downloadProgress ?? 0));
+  const maximumProgress = model.isPartialDownload ? 0.99 : 1;
+  const progressValue = Math.min(maximumProgress, Math.max(0, model.downloadProgress ?? 0));
   const progressDegrees = Math.round(progressValue * 360);
-  if (!model.isDownloading && model.isPartialDownload && progressDegrees === 0) {
-    return 360;
-  }
   return isQueued ? 60 : Math.min(360, Math.max(0, progressDegrees));
 }
 

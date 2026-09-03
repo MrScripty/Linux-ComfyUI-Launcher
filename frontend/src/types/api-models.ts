@@ -21,6 +21,8 @@ export interface ModelRecordMetadata {
   download_incomplete?: boolean;
   download_has_part_files?: boolean;
   download_missing_expected_files?: number;
+  downloaded_size_bytes?: number;
+  download_progress?: number;
   integrity_issue_duplicate_repo_id?: boolean;
   integrity_issue_duplicate_repo_id_count?: number;
   integrity_issue_duplicate_repo_id_others?: string[];

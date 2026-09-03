@@ -36,6 +36,9 @@ use crate::model_library::package_facts::{
     package_class_references, package_component_facts, package_facts_summary,
     transformers_package_evidence, PackageInspectionContext,
 };
+use crate::model_library::partial_download::{
+    finalize_download_artifact_if_complete, infer_expected_sizes_from_total,
+};
 use crate::model_library::types::{
     HuggingFaceEvidence, ModelMetadata, ModelOverrides, ModelReviewFilter, ModelReviewItem,
     ModelType, SubmitModelReviewResult,
@@ -147,11 +150,11 @@ const PACKAGE_FACTS_CACHE_MIGRATION_CHECKPOINT_FILENAME: &str =
 const MIGRATION_REPORTS_DIR: &str = "migration-reports";
 /// Index file for generated migration report artifacts.
 const MIGRATION_REPORT_INDEX_FILENAME: &str = "index.json";
-/// Indexed metadata key indicating the model is part of a duplicate repo_id set.
+/// Indexed metadata key indicating duplicate artifact records within one repo_id.
 const INTEGRITY_ISSUE_DUPLICATE_REPO_ID: &str = "integrity_issue_duplicate_repo_id";
-/// Indexed metadata key indicating how many total entries shared the same repo_id.
+/// Indexed metadata key indicating how many paths contain the same repository artifact.
 const INTEGRITY_ISSUE_DUPLICATE_REPO_ID_COUNT: &str = "integrity_issue_duplicate_repo_id_count";
-/// Indexed metadata key listing alternate model IDs with the same repo_id.
+/// Indexed metadata key listing alternate paths for the same repository artifact.
 const INTEGRITY_ISSUE_DUPLICATE_REPO_ID_OTHERS: &str = "integrity_issue_duplicate_repo_id_others";
 const MODEL_LIBRARY_REFRESH_EVENT_MODEL_ID: &str = "__library__/model-library-refresh";
 const PRIMARY_FORMAT_METADATA_KEY: &str = "primary_format";
@@ -242,6 +245,16 @@ impl ModelLibrary {
             package_facts_locks: Arc::new(Mutex::new(HashMap::new())),
             metadata_write_notifier: Arc::new(StdMutex::new(None)),
         };
+
+        if let Err(error) = library
+            .auto_finalize_complete_partial_artifacts_on_startup()
+            .await
+        {
+            tracing::warn!(
+                "Failed to auto-finalize byte-complete partial downloads on startup: {}",
+                error
+            );
+        }
 
         // Rebuild index from existing metadata files on disk
         // This ensures models are available immediately on startup
@@ -463,6 +476,81 @@ impl ModelLibrary {
     pub fn load_metadata(&self, model_dir: &Path) -> Result<Option<ModelMetadata>> {
         let path = model_dir.join(METADATA_FILENAME);
         atomic_read_json(&path)
+    }
+
+    async fn auto_finalize_complete_partial_artifacts_on_startup(&self) -> Result<usize> {
+        let model_dirs = collect_model_dirs_async(self.clone()).await?;
+        let mut finalized = 0;
+
+        for model_dir in model_dirs {
+            let Some(mut metadata) =
+                load_model_metadata_async(self.clone(), model_dir.clone()).await?
+            else {
+                continue;
+            };
+            let expected_files = metadata.expected_files.clone().unwrap_or_default();
+            if expected_files.is_empty() {
+                continue;
+            }
+
+            let finalization = tokio::task::spawn_blocking({
+                let model_dir = model_dir.clone();
+                let expected_files = expected_files.clone();
+                let total_size = metadata.size_bytes;
+                move || {
+                    let expected_sizes =
+                        infer_expected_sizes_from_total(&model_dir, &expected_files, total_size)?;
+                    finalize_download_artifact_if_complete(
+                        &model_dir,
+                        &expected_files,
+                        &expected_sizes,
+                    )
+                }
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!(
+                    "Failed to join partial download finalization task: {error}"
+                ))
+            })??;
+
+            let was_partial_metadata = metadata.match_source.as_deref() == Some("download_partial");
+            if !finalization.complete || (!was_partial_metadata && finalization.promoted_files == 0)
+            {
+                continue;
+            }
+
+            metadata.match_source = Some("download".to_string());
+            let mut review_reasons = metadata.review_reasons.take().unwrap_or_default();
+            review_reasons.retain(|reason| reason != "download-partial");
+            let still_needs_review = !review_reasons.is_empty();
+            metadata.review_reasons = Some(review_reasons);
+            metadata.metadata_needs_review = Some(still_needs_review);
+            metadata.review_status = Some(
+                if still_needs_review {
+                    "pending"
+                } else {
+                    "not_required"
+                }
+                .to_string(),
+            );
+            metadata.updated_date = Some(chrono::Utc::now().to_rfc3339());
+            self.save_metadata(&model_dir, &metadata).await?;
+            finalized += 1;
+
+            tracing::info!(
+                "Auto-finalized byte-complete model artifact {} ({} promoted file{})",
+                model_dir.display(),
+                finalization.promoted_files,
+                if finalization.promoted_files == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+
+        Ok(finalized)
     }
 
     /// Save metadata to a model directory.
@@ -1778,7 +1866,7 @@ impl ModelLibrary {
         let mut result = self.index.search(query, model_types, tags, limit, offset)?;
         self.project_dependency_bindings_for_records(&mut result.models)?;
         self.project_display_fields_for_records(&mut result.models);
-        annotate_and_dedupe_records_by_repo_id(&mut result.models);
+        annotate_and_dedupe_records_by_artifact(&mut result.models);
         result.total_count = result.models.len();
         Ok(result)
     }
@@ -3343,7 +3431,7 @@ impl ModelLibrary {
             let payload_file_count = count_payload_files_in_model_dir(&model_dir);
             let payload_size_bytes = payload_size_bytes_in_model_dir(&model_dir);
             let download_incomplete = metadata.match_source.as_deref() == Some("download_partial")
-                || download_projection_status(&model_dir, &metadata).0;
+                || download_projection_status(&model_dir, &metadata).incomplete;
             let artifact_key = duplicate_artifact_key_from_metadata(&metadata);
 
             by_repo
@@ -4149,6 +4237,42 @@ fn normalized_repo_key_from_value(metadata: &Value) -> Option<String> {
         .map(|value| value.to_lowercase())
 }
 
+fn duplicate_artifact_key_from_value(metadata: &Value) -> Option<String> {
+    let obj = metadata.as_object()?;
+    if let Some(artifact_id) = obj
+        .get("selected_artifact_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(artifact_id.to_lowercase());
+    }
+
+    for field in ["expected_files", "selected_artifact_files"] {
+        let mut files = obj
+            .get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        if !files.is_empty() {
+            files.sort();
+            files.dedup();
+            return Some(format!("files:{}", files.join("\x1f")));
+        }
+    }
+
+    obj.get("selected_artifact_quant")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("quant:{}", value.to_lowercase()))
+}
+
 fn kittentts_runtime_binding_id(model_id: &str) -> String {
     format!(
         "kittentts-runtime-{}",
@@ -4589,7 +4713,7 @@ fn merge_partial_payload_files(source_dir: &Path, target_dir: &Path) -> Result<(
     Ok(())
 }
 
-fn annotate_and_dedupe_records_by_repo_id(records: &mut Vec<ModelRecord>) {
+fn annotate_and_dedupe_records_by_artifact(records: &mut Vec<ModelRecord>) {
     let mut by_repo: HashMap<String, Vec<ModelRecord>> = HashMap::new();
     let mut passthrough = Vec::new();
 
@@ -4607,45 +4731,64 @@ fn annotate_and_dedupe_records_by_repo_id(records: &mut Vec<ModelRecord>) {
     }
 
     let mut deduped = passthrough;
-    for group in by_repo.into_values() {
-        if group.len() == 1 {
-            deduped.extend(group);
-            continue;
+    for repo_group in by_repo.into_values() {
+        for group in duplicate_record_groups(repo_group) {
+            if group.len() == 1 {
+                deduped.extend(group);
+                continue;
+            }
+
+            let mut ranked = group;
+            ranked.sort_by(|a, b| {
+                record_duplicate_preference_score(b)
+                    .cmp(&record_duplicate_preference_score(a))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            let mut keep = ranked.remove(0);
+            let duplicate_ids: Vec<String> = ranked.into_iter().map(|item| item.id).collect();
+
+            if !keep.metadata.is_object() {
+                keep.metadata = Value::Object(serde_json::Map::new());
+            }
+            if let Some(metadata_obj) = keep.metadata.as_object_mut() {
+                metadata_obj.insert(
+                    INTEGRITY_ISSUE_DUPLICATE_REPO_ID.to_string(),
+                    Value::Bool(true),
+                );
+                metadata_obj.insert(
+                    INTEGRITY_ISSUE_DUPLICATE_REPO_ID_COUNT.to_string(),
+                    Value::Number(serde_json::Number::from((duplicate_ids.len() + 1) as u64)),
+                );
+                metadata_obj.insert(
+                    INTEGRITY_ISSUE_DUPLICATE_REPO_ID_OTHERS.to_string(),
+                    Value::Array(duplicate_ids.into_iter().map(Value::String).collect()),
+                );
+            }
+
+            deduped.push(keep);
         }
-
-        let mut ranked = group;
-        ranked.sort_by(|a, b| {
-            record_duplicate_preference_score(b)
-                .cmp(&record_duplicate_preference_score(a))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-
-        let mut keep = ranked.remove(0);
-        let duplicate_ids: Vec<String> = ranked.into_iter().map(|item| item.id).collect();
-
-        if !keep.metadata.is_object() {
-            keep.metadata = Value::Object(serde_json::Map::new());
-        }
-        if let Some(metadata_obj) = keep.metadata.as_object_mut() {
-            metadata_obj.insert(
-                INTEGRITY_ISSUE_DUPLICATE_REPO_ID.to_string(),
-                Value::Bool(true),
-            );
-            metadata_obj.insert(
-                INTEGRITY_ISSUE_DUPLICATE_REPO_ID_COUNT.to_string(),
-                Value::Number(serde_json::Number::from((duplicate_ids.len() + 1) as u64)),
-            );
-            metadata_obj.insert(
-                INTEGRITY_ISSUE_DUPLICATE_REPO_ID_OTHERS.to_string(),
-                Value::Array(duplicate_ids.into_iter().map(Value::String).collect()),
-            );
-        }
-
-        deduped.push(keep);
     }
 
     deduped.sort_by(|a, b| a.id.cmp(&b.id));
     *records = deduped;
+}
+
+fn duplicate_record_groups(entries: Vec<ModelRecord>) -> Vec<Vec<ModelRecord>> {
+    if entries
+        .iter()
+        .any(|entry| duplicate_artifact_key_from_value(&entry.metadata).is_none())
+    {
+        return vec![entries];
+    }
+
+    let mut by_artifact: HashMap<String, Vec<ModelRecord>> = HashMap::new();
+    for entry in entries {
+        if let Some(artifact_key) = duplicate_artifact_key_from_value(&entry.metadata) {
+            by_artifact.entry(artifact_key).or_default().push(entry);
+        }
+    }
+    by_artifact.into_values().collect()
 }
 
 fn record_duplicate_preference_score(record: &ModelRecord) -> i64 {
@@ -6048,11 +6191,20 @@ fn verify_model_hash(
     Ok(true)
 }
 
-/// Compute download completeness projection fields for indexed metadata.
-///
-/// These fields are derived from on-disk state and added to indexed metadata so
-/// UI consumers can distinguish complete models from partial downloads.
-fn download_projection_status(model_dir: &Path, metadata: &ModelMetadata) -> (bool, bool, usize) {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DownloadProjectionStatus {
+    incomplete: bool,
+    has_part_files: bool,
+    missing_expected_files: usize,
+    downloaded_size_bytes: u64,
+    progress: Option<f64>,
+}
+
+/// Compute download state from the selected artifact's expected files on disk.
+fn download_projection_status(
+    model_dir: &Path,
+    metadata: &ModelMetadata,
+) -> DownloadProjectionStatus {
     let has_part_files = has_pending_download_artifacts(model_dir);
 
     let expected_files = metadata.expected_files.as_deref().unwrap_or(&[]);
@@ -6068,12 +6220,48 @@ fn download_projection_status(model_dir: &Path, metadata: &ModelMetadata) -> (bo
         == Some("download_partial")
         && has_complete_gguf_payload_outside_expected_files(model_dir, expected_files);
 
-    (
-        (has_part_files || missing_expected_files > 0)
-            && !has_complete_gguf_outside_partial_selection,
+    let incomplete = (has_part_files || missing_expected_files > 0)
+        && !has_complete_gguf_outside_partial_selection;
+    let downloaded_size_bytes = downloaded_artifact_size_bytes(model_dir, expected_files);
+    let progress = metadata.size_bytes.filter(|total| *total > 0).map(|total| {
+        let projected = (downloaded_size_bytes as f64 / total as f64).clamp(0.0, 1.0);
+        if incomplete {
+            projected.min(0.99)
+        } else {
+            projected
+        }
+    });
+
+    DownloadProjectionStatus {
+        incomplete,
         has_part_files,
         missing_expected_files,
-    )
+        downloaded_size_bytes,
+        progress,
+    }
+}
+
+fn downloaded_artifact_size_bytes(model_dir: &Path, expected_files: &[String]) -> u64 {
+    if expected_files.is_empty() {
+        return payload_size_bytes_in_model_dir(model_dir);
+    }
+
+    expected_files
+        .iter()
+        .filter_map(|relative_path| {
+            let complete_path = model_dir.join(relative_path);
+            if complete_path.is_file() {
+                return complete_path.metadata().ok().map(|metadata| metadata.len());
+            }
+
+            model_dir
+                .join(format!("{relative_path}.part"))
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+        })
+        .sum()
 }
 
 fn has_complete_gguf_payload_outside_expected_files(
@@ -6125,8 +6313,14 @@ fn has_pending_download_artifacts(model_dir: &Path) -> bool {
             if !entry.file_type().is_file() {
                 return false;
             }
-            let name = entry.file_name().to_string_lossy();
-            name.ends_with(".part")
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            let Some(complete_name) = name.strip_suffix(".part") else {
+                return false;
+            };
+            !path.with_file_name(complete_name).is_file()
         })
 }
 
@@ -6512,6 +6706,7 @@ mod tests {
             official_name: Some("Partial Model".to_string()),
             cleaned_name: Some("partial-model".to_string()),
             expected_files: Some(vec!["weights.gguf".to_string()]),
+            size_bytes: Some(20),
             ..Default::default()
         };
 
@@ -6532,10 +6727,42 @@ mod tests {
             record.metadata["download_missing_expected_files"].as_u64(),
             Some(1)
         );
+        assert_eq!(record.metadata["downloaded_size_bytes"].as_u64(), Some(7));
+        assert_eq!(record.metadata["download_progress"].as_f64(), Some(0.35));
         assert_eq!(
             record.metadata[PRIMARY_FORMAT_METADATA_KEY].as_str(),
             Some("gguf")
         );
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_projection_never_reports_complete_progress() {
+        let (_, library) = setup_library().await;
+        let model_dir = library.build_model_path("llm", "test", "not-yet-finalized");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("weights.gguf.part"), b"complete").unwrap();
+
+        let metadata = ModelMetadata {
+            model_id: Some("llm/test/not-yet-finalized".to_string()),
+            family: Some("test".to_string()),
+            model_type: Some("llm".to_string()),
+            official_name: Some("Not Yet Finalized".to_string()),
+            cleaned_name: Some("not-yet-finalized".to_string()),
+            expected_files: Some(vec!["weights.gguf".to_string()]),
+            size_bytes: Some(8),
+            ..Default::default()
+        };
+
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        library.index_model_dir(&model_dir).await.unwrap();
+
+        let record = library
+            .get_model("llm/test/not-yet-finalized")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata["download_incomplete"], true);
+        assert_eq!(record.metadata["download_progress"], 0.99);
     }
 
     #[tokio::test]
@@ -6681,11 +6908,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_indexed_metadata_marks_complete_when_expected_files_exist() {
+    async fn test_indexed_metadata_ignores_stale_part_beside_complete_file() {
         let (_, library) = setup_library().await;
         let model_dir = library.build_model_path("llm", "test", "complete-model");
         std::fs::create_dir_all(&model_dir).unwrap();
         std::fs::write(model_dir.join("weights.gguf"), b"complete").unwrap();
+        std::fs::write(model_dir.join("weights.gguf.part"), b"stale").unwrap();
 
         let metadata = ModelMetadata {
             model_id: Some("llm/test/complete-model".to_string()),
@@ -6717,6 +6945,171 @@ mod tests {
             record.metadata["download_missing_expected_files"].as_u64(),
             Some(0)
         );
+    }
+
+    #[tokio::test]
+    async fn test_startup_auto_finalizes_byte_complete_partial_artifact() {
+        let (temp_dir, library) = setup_library().await;
+        let model_dir = library.build_model_path("llm", "test", "ready-model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("weights.gguf.part"), b"complete").unwrap();
+        std::fs::write(model_dir.join(".pumas_download"), b"{}").unwrap();
+
+        let metadata = ModelMetadata {
+            model_id: Some("llm/test/ready-model".to_string()),
+            model_type: Some("llm".to_string()),
+            family: Some("test".to_string()),
+            official_name: Some("Ready Model".to_string()),
+            cleaned_name: Some("ready-model".to_string()),
+            expected_files: Some(vec!["weights.gguf".to_string()]),
+            size_bytes: Some(8),
+            match_source: Some("download_partial".to_string()),
+            review_reasons: Some(vec!["download-partial".to_string()]),
+            metadata_needs_review: Some(true),
+            review_status: Some("pending".to_string()),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        drop(library);
+
+        let reopened = ModelLibrary::new(temp_dir.path()).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(model_dir.join("weights.gguf")).unwrap(),
+            b"complete"
+        );
+        assert!(!model_dir.join("weights.gguf.part").exists());
+        assert!(!model_dir.join(".pumas_download").exists());
+
+        let completed_metadata = reopened.load_metadata(&model_dir).unwrap().unwrap();
+        assert_eq!(completed_metadata.match_source.as_deref(), Some("download"));
+        assert_eq!(completed_metadata.metadata_needs_review, Some(false));
+        assert_eq!(
+            completed_metadata.review_status.as_deref(),
+            Some("not_required")
+        );
+        assert_eq!(completed_metadata.review_reasons, Some(Vec::new()));
+
+        let record = reopened
+            .index()
+            .get("llm/test/ready-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata["download_incomplete"], false);
+        assert_eq!(record.metadata["download_progress"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_startup_auto_finalizes_byte_complete_multi_file_artifact() {
+        let (temp_dir, library) = setup_library().await;
+        let model_dir = library.build_model_path("diffusion", "test", "ready-bundle");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("weights.safetensors"), b"main").unwrap();
+        std::fs::write(model_dir.join("embedding.safetensors.part"), b"done").unwrap();
+
+        let metadata = ModelMetadata {
+            model_id: Some("diffusion/test/ready-bundle".to_string()),
+            model_type: Some("diffusion".to_string()),
+            family: Some("test".to_string()),
+            official_name: Some("Ready Bundle".to_string()),
+            cleaned_name: Some("ready-bundle".to_string()),
+            expected_files: Some(vec![
+                "weights.safetensors".to_string(),
+                "embedding.safetensors".to_string(),
+            ]),
+            size_bytes: Some(8),
+            match_source: Some("download_partial".to_string()),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        drop(library);
+
+        let reopened = ModelLibrary::new(temp_dir.path()).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(model_dir.join("embedding.safetensors")).unwrap(),
+            b"done"
+        );
+        assert!(!model_dir.join("embedding.safetensors.part").exists());
+        let record = reopened
+            .index()
+            .get("diffusion/test/ready-bundle")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata["download_incomplete"], false);
+    }
+
+    #[tokio::test]
+    async fn test_startup_keeps_short_partial_artifact_incomplete() {
+        let (temp_dir, library) = setup_library().await;
+        let model_dir = library.build_model_path("llm", "test", "short-model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("weights.gguf.part"), b"short").unwrap();
+
+        let metadata = ModelMetadata {
+            model_id: Some("llm/test/short-model".to_string()),
+            model_type: Some("llm".to_string()),
+            family: Some("test".to_string()),
+            official_name: Some("Short Model".to_string()),
+            cleaned_name: Some("short-model".to_string()),
+            expected_files: Some(vec!["weights.gguf".to_string()]),
+            size_bytes: Some(10),
+            match_source: Some("download_partial".to_string()),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        drop(library);
+
+        let reopened = ModelLibrary::new(temp_dir.path()).await.unwrap();
+
+        assert!(!model_dir.join("weights.gguf").exists());
+        assert_eq!(
+            std::fs::read(model_dir.join("weights.gguf.part")).unwrap(),
+            b"short"
+        );
+        let record = reopened
+            .index()
+            .get("llm/test/short-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata["download_incomplete"], true);
+        assert_eq!(record.metadata["download_progress"], 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_startup_does_not_infer_partial_size_from_auxiliary_bytes() {
+        let (temp_dir, library) = setup_library().await;
+        let model_dir = library.build_model_path("llm", "test", "auxiliary-model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("config.json"), b"{}").unwrap();
+        std::fs::write(model_dir.join("weights.gguf.part"), b"12345678").unwrap();
+
+        let metadata = ModelMetadata {
+            model_id: Some("llm/test/auxiliary-model".to_string()),
+            model_type: Some("llm".to_string()),
+            family: Some("test".to_string()),
+            official_name: Some("Auxiliary Model".to_string()),
+            cleaned_name: Some("auxiliary-model".to_string()),
+            expected_files: Some(vec!["config.json".to_string(), "weights.gguf".to_string()]),
+            // Download totals contain known LFS bytes, not regular auxiliary bytes.
+            size_bytes: Some(10),
+            match_source: Some("download_partial".to_string()),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        drop(library);
+
+        let reopened = ModelLibrary::new(temp_dir.path()).await.unwrap();
+
+        assert!(!model_dir.join("weights.gguf").exists());
+        assert!(model_dir.join("weights.gguf.part").is_file());
+        let record = reopened
+            .index()
+            .get("llm/test/auxiliary-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.metadata["download_incomplete"], true);
+        assert_eq!(record.metadata["download_progress"], 0.99);
     }
 
     #[tokio::test]
@@ -8546,6 +8939,64 @@ mod tests {
             .get("llm/owner/owner--repo__q4_k_m")
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_keeps_distinct_artifacts_and_repositories_visible() {
+        let (_, library) = setup_library().await;
+
+        let fixtures = [
+            (
+                "llm/owner/repo-q4",
+                "owner/repo",
+                "owner--repo__q4_k_m",
+                "model-Q4_K_M.safetensors",
+            ),
+            (
+                "llm/owner/repo-q8",
+                "owner/repo",
+                "owner--repo__q8_0",
+                "model-Q8_0.safetensors",
+            ),
+            (
+                "llm/mirror/repo-q4",
+                "mirror/repo",
+                "mirror--repo__q4_k_m",
+                "model-Q4_K_M.safetensors",
+            ),
+        ];
+
+        for (model_id, repo_id, artifact_id, filename) in fixtures {
+            let mut parts = model_id.split('/');
+            let model_type = parts.next().unwrap();
+            let family = parts.next().unwrap();
+            let name = parts.next().unwrap();
+            let model_dir = library.build_model_path(model_type, family, name);
+            std::fs::create_dir_all(&model_dir).unwrap();
+            write_min_safetensors(&model_dir.join(filename));
+            let metadata = ModelMetadata {
+                model_id: Some(model_id.to_string()),
+                model_type: Some(model_type.to_string()),
+                family: Some(family.to_string()),
+                cleaned_name: Some("same-model-name".to_string()),
+                repo_id: Some(repo_id.to_string()),
+                selected_artifact_id: Some(artifact_id.to_string()),
+                selected_artifact_files: Some(vec![filename.to_string()]),
+                ..Default::default()
+            };
+            library.save_metadata(&model_dir, &metadata).await.unwrap();
+            library.index_model_dir(&model_dir).await.unwrap();
+        }
+
+        let models = library.list_models().await.unwrap();
+        assert_eq!(models.len(), 3, "{models:?}");
+        assert!(models.iter().all(|model| {
+            model
+                .metadata
+                .get(INTEGRITY_ISSUE_DUPLICATE_REPO_ID)
+                .and_then(Value::as_bool)
+                != Some(true)
+        }));
     }
 
     #[tokio::test]
@@ -12360,7 +12811,7 @@ mod tests {
                 &first_dir,
                 &ModelOverrides {
                     version_ranges: Some(HashMap::from([(
-                        "comfyui".to_string(),
+                        "test-runtime".to_string(),
                         ">=0.0.1".to_string(),
                     )])),
                 },

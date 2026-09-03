@@ -41,6 +41,7 @@ mod metadata_v2;
 mod model_type_resolver;
 mod naming;
 mod package_facts;
+mod partial_download;
 mod read_only;
 pub mod sharding;
 mod task_signature;

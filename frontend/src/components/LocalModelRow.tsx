@@ -82,6 +82,7 @@ export function LocalModelRow({
           />
           <div className="flex-1 min-w-0">
             <LocalModelNameButton
+              downloadProgress={model.downloadProgress}
               modelId={model.id}
               modelName={model.name}
               isDownloading={rowState.isDownloading}
@@ -106,7 +107,6 @@ export function LocalModelRow({
                   Loaded
                 </span>
                 <span className="truncate text-[hsl(var(--launcher-text-muted))]">
-                  {servedStatus.provider === 'llama_cpp' ? 'llama.cpp' : 'Ollama'}
                   {servedStatus.endpoint_url ? ` - ${servedStatus.endpoint_url}` : ''}
                 </span>
               </div>
