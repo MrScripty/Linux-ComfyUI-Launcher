@@ -11,6 +11,7 @@ This directory contains project documentation for the current Rust/Electron impl
 ## Standards and Practices
 
 - [CODING_STANDARDS.md](CODING_STANDARDS.md) - General coding conventions
+- [audits/current-standards-2026-09-03/README.md](audits/current-standards-2026-09-03/README.md) - Current full-codebase standards audit and focused follow-up audits
 - [REACT_ARIA_ENFORCEMENT.md](REACT_ARIA_ENFORCEMENT.md) - Frontend interaction/accessibility guardrails
 - [TESTING.md](TESTING.md) - Test/build validation workflows
 - [SECURITY.md](SECURITY.md) - Security process and scanning guidance
