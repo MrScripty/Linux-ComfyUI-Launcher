@@ -4,6 +4,7 @@ import { useServingStatus } from '../hooks/useServingStatus';
 import type { RuntimeDeviceMode, RuntimeProviderId } from '../types/api-runtime-profiles';
 import type { ModelInfo } from '../types/apps';
 import { ModelServeDialogContent } from './model-serve/ModelServeDialogContent';
+import { ModalDialog } from './ui';
 import {
   buildModelServingConfig,
   buildServeBlockReason,
@@ -13,7 +14,6 @@ import {
   profileCanLaunchOnServe,
   type ModelServeFormState,
 } from './model-serve/modelServeHelpers';
-import { useDialogFocusTrap } from './model-serve/useDialogFocusTrap';
 import { useModelServingActions } from './model-serve/useModelServingActions';
 import {
   getRuntimeProviderDescriptor,
@@ -54,17 +54,9 @@ export function ModelServeDialog({
   const [contextSize, setContextSize] = useState('');
   const [keepLoaded, setKeepLoaded] = useState(true);
   const [modelAlias, setModelAlias] = useState('');
-  const dialogRef = useRef<HTMLDivElement | null>(null);
   const profileSelectRef = useRef<HTMLSelectElement | null>(null);
   const isDialogMode = displayMode === 'dialog';
   const servingActions = useModelServingActions(model.id, { profileId }, servingStatus.servedModels);
-
-  useDialogFocusTrap({
-    dialogRef,
-    initialFocusRef: profileSelectRef,
-    isEnabled: isDialogMode,
-    onClose,
-  });
 
   useEffect(() => {
     if (profileId) {
@@ -152,7 +144,6 @@ export function ModelServeDialog({
   const content = (
     <ModelServeDialogContent
       controls={controls}
-      dialogRef={dialogRef}
       formState={formState}
       isDialogMode={isDialogMode}
       isSubmitting={servingActions.isSubmitting}
@@ -193,14 +184,18 @@ export function ModelServeDialog({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-[hsl(0_0%_0%/0.78)] px-4 backdrop-blur-sm"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="model-serve-title"
+    <ModalDialog
+      ariaLabel={`Serve ${model.name}`}
+      backdropClassName="bg-[hsl(0_0%_0%/0.78)] backdrop-blur-sm"
+      contentClassName="w-full max-w-xl"
+      initialFocusRef={profileSelectRef}
+      isOpen={true}
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-50 flex items-center justify-center px-4"
+      shouldCloseOnBackdrop={false}
     >
       {content}
-    </div>
+    </ModalDialog>
   );
 }
 

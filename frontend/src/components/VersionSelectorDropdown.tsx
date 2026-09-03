@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from 'framer-motion';
+import type { RefObject } from 'react';
 import { useHover } from '@react-aria/interactions';
 import { Check } from 'lucide-react';
 import { VersionSelectorDefaultButton } from './VersionSelectorDefaultButton';
@@ -12,6 +12,7 @@ interface VersionDropdownItemProps {
   isDefault: boolean;
   onMakeDefault?: (tag: string | null) => Promise<boolean>;
   onSwitchVersion: (tag: string) => void;
+  switchButtonRef?: RefObject<HTMLButtonElement | null>;
 }
 
 function VersionDropdownItem({
@@ -23,6 +24,7 @@ function VersionDropdownItem({
   isDefault,
   onMakeDefault,
   onSwitchVersion,
+  switchButtonRef,
 }: VersionDropdownItemProps) {
   const { hoverProps: rowHoverProps, isHovered: isRowHovered } = useHover({});
 
@@ -53,6 +55,7 @@ function VersionDropdownItem({
           )}
         </div>
         <button
+          ref={switchButtonRef}
           type="button"
           onClick={() => onSwitchVersion(version)}
           disabled={isInstalling}
@@ -79,8 +82,6 @@ function VersionDropdownItem({
 }
 
 interface VersionSelectorDropdownProps {
-  isOpen: boolean;
-  hasVersionsToShow: boolean;
   combinedVersions: string[];
   activeVersion: string | null;
   installingVersion: string | null | undefined;
@@ -89,13 +90,12 @@ interface VersionSelectorDropdownProps {
   defaultVersion: string | null;
   isSwitching: boolean;
   isLoading: boolean;
+  initialFocusRef: RefObject<HTMLButtonElement | null>;
   onMakeDefault?: (tag: string | null) => Promise<boolean>;
   onSwitchVersion: (tag: string) => void;
 }
 
 export function VersionSelectorDropdown({
-  isOpen,
-  hasVersionsToShow,
   combinedVersions,
   activeVersion,
   installingVersion,
@@ -104,50 +104,44 @@ export function VersionSelectorDropdown({
   defaultVersion,
   isSwitching,
   isLoading,
+  initialFocusRef,
   onMakeDefault,
   onSwitchVersion,
 }: VersionSelectorDropdownProps) {
   return (
-    <AnimatePresence>
-      {isOpen && hasVersionsToShow && (
-        <motion.div
-          initial={{ opacity: 0, y: -10 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -10 }}
-          transition={{ duration: 0.2 }}
-          className="absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded bg-[hsl(var(--surface-overlay))]/80 backdrop-blur-sm"
-        >
-          <div className="max-h-64 overflow-y-auto">
-            {combinedVersions.map((version) => {
-              const isActive = version === activeVersion;
-              const isInstalling =
-                installingVersion === version &&
-                !installedVersions.includes(version) &&
-                !isInstallComplete;
-              const isDefault = defaultVersion === version;
-              return (
-                <VersionDropdownItem
-                  key={version}
-                  version={version}
-                  isActive={isActive}
-                  isInstalling={isInstalling}
-                  isSwitching={isSwitching}
-                  isLoading={isLoading}
-                  isDefault={isDefault}
-                  onMakeDefault={onMakeDefault}
-                  onSwitchVersion={onSwitchVersion}
-                />
-              );
-            })}
-          </div>
+    <>
+      <div className="max-h-64 overflow-y-auto">
+        {combinedVersions.map((version, index) => {
+          const isActive = version === activeVersion;
+          const isInstalling =
+            installingVersion === version &&
+            !installedVersions.includes(version) &&
+            !isInstallComplete;
+          const isDefault = defaultVersion === version;
+          const receivesInitialFocus =
+            !isInstalling && (isActive || (!activeVersion && index === 0));
+          return (
+            <VersionDropdownItem
+              key={version}
+              version={version}
+              isActive={isActive}
+              isInstalling={isInstalling}
+              isSwitching={isSwitching}
+              isLoading={isLoading}
+              isDefault={isDefault}
+              onMakeDefault={onMakeDefault}
+              onSwitchVersion={onSwitchVersion}
+              switchButtonRef={receivesInitialFocus ? initialFocusRef : undefined}
+            />
+          );
+        })}
+      </div>
 
-          {installedVersions.length === 0 && (
-            <div className="px-3 py-4 text-center text-sm text-[hsl(var(--text-tertiary))]">
-              No versions installed
-            </div>
-          )}
-        </motion.div>
+      {installedVersions.length === 0 && (
+        <div className="px-3 py-4 text-center text-sm text-[hsl(var(--text-tertiary))]">
+          No versions installed
+        </div>
       )}
-    </AnimatePresence>
+    </>
   );
 }

@@ -73,14 +73,12 @@ export function normalizeVersionReleaseInfo(version: unknown): VersionRelease | 
 
 interface UseAvailableVersionStateOptions {
   isEnabled: boolean;
-  onInstallingTagUpdate?: (tag: string | null) => void;
   resolvedAppId: string;
   trackAvailableVersions: boolean;
 }
 
 export function useAvailableVersionState({
   isEnabled,
-  onInstallingTagUpdate,
   resolvedAppId,
   trackAvailableVersions,
 }: UseAvailableVersionStateOptions) {
@@ -140,11 +138,6 @@ export function useAvailableVersionState({
         setRateLimitRetryAfter(null);
         logger.debug('Set available versions', { count: mapped.length });
 
-        const installingRelease = mapped.find((release) => release.installing);
-        if (installingRelease?.tagName && onInstallingTagUpdate) {
-          onInstallingTagUpdate(installingRelease.tagName);
-        }
-
         if (forceRefresh) {
           if (followupRefreshRef.current) {
             clearTimeout(followupRefreshRef.current);
@@ -179,7 +172,7 @@ export function useAvailableVersionState({
       logger.error('Unknown error fetching available versions', { error });
       throw new APIError(String(error), 'get_available_versions');
     }
-  }, [isEnabled, onInstallingTagUpdate, resolvedAppId]);
+  }, [isEnabled, resolvedAppId]);
 
   fetchAvailableVersionsRef.current = fetchAvailableVersions;
 

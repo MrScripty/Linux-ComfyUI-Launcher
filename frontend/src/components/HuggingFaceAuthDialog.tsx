@@ -5,11 +5,11 @@
  * Supports setting, clearing, and validating tokens against the HF API.
  */
 
-import { useState, useEffect, useCallback, type KeyboardEvent } from 'react';
-import { AnimatePresence, motion } from 'framer-motion';
+import { useState, useEffect, useCallback, useId, useRef, type KeyboardEvent } from 'react';
 import { Key, CheckCircle, XCircle, ExternalLink, Loader2, X } from 'lucide-react';
 import { api, isAPIAvailable } from '../api/adapter';
 import { getLogger } from '../utils/logger';
+import { ModalDialog } from './ui';
 
 const logger = getLogger('HuggingFaceAuthDialog');
 
@@ -25,6 +25,8 @@ interface AuthState {
 }
 
 export function HuggingFaceAuthDialog({ isOpen, onClose }: HuggingFaceAuthDialogProps) {
+  const titleId = useId();
+  const tokenInputRef = useRef<HTMLInputElement>(null);
   const [authState, setAuthState] = useState<AuthState | null>(null);
   const [tokenInput, setTokenInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -108,43 +110,27 @@ export function HuggingFaceAuthDialog({ isOpen, onClose }: HuggingFaceAuthDialog
     }
   };
 
-  if (!isOpen) return null;
-
   return (
-    <AnimatePresence>
-      <motion.div
-        className="fixed inset-0 z-50 flex items-center justify-center"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-      >
-          {/* Backdrop */}
-          <button
-            type="button"
-            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            onClick={onClose}
-            aria-label="Close dialog"
-          />
-
-          {/* Dialog */}
-          <motion.div
-            className="relative w-full max-w-md mx-4 rounded-xl bg-[hsl(var(--launcher-bg-primary))] border border-[hsl(var(--launcher-border)/0.5)] shadow-2xl overflow-hidden"
-            initial={{ scale: 0.95, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            exit={{ scale: 0.95, opacity: 0 }}
-            transition={{ type: 'spring', duration: 0.3 }}
-          >
+    <ModalDialog
+      ariaLabelledBy={titleId}
+      contentClassName="w-full max-w-md mx-4 rounded-xl bg-[hsl(var(--launcher-bg-primary))] border border-[hsl(var(--launcher-border)/0.5)] shadow-2xl overflow-hidden"
+      initialFocusRef={tokenInputRef}
+      isOpen={isOpen}
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-50 flex items-center justify-center"
+    >
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-[hsl(var(--launcher-border)/0.3)]">
               <div className="flex items-center gap-2.5">
                 <Key className="w-4.5 h-4.5 text-[hsl(var(--accent-primary))]" />
-                <h2 className="text-sm font-semibold text-[hsl(var(--launcher-text-primary))]">
+                <h2 id={titleId} className="text-sm font-semibold text-[hsl(var(--launcher-text-primary))]">
                   HuggingFace Authentication
                 </h2>
               </div>
               <button
                 onClick={onClose}
                 className="p-1 rounded-md text-[hsl(var(--launcher-text-muted))] hover:text-[hsl(var(--launcher-text-primary))] hover:bg-[hsl(var(--launcher-bg-secondary))] transition-colors"
+                aria-label="Close HuggingFace authentication"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -204,6 +190,7 @@ export function HuggingFaceAuthDialog({ isOpen, onClose }: HuggingFaceAuthDialog
                       Access Token
                     </label>
                     <input
+                      ref={tokenInputRef}
                       id="hf-token"
                       type="password"
                       value={tokenInput}
@@ -248,8 +235,6 @@ export function HuggingFaceAuthDialog({ isOpen, onClose }: HuggingFaceAuthDialog
                 <p className="text-xs text-[hsl(var(--accent-error))]">{error}</p>
               )}
             </div>
-          </motion.div>
-      </motion.div>
-    </AnimatePresence>
+    </ModalDialog>
   );
 }

@@ -40,6 +40,54 @@ const STAGE_ICONS = {
   setup: CheckCircle2
 };
 
+type InstallationOutcome = {
+  kind: 'cancelled' | 'failed' | 'succeeded';
+  message: string;
+  title: string;
+};
+
+function clampProgress(value: number): number {
+  return Math.min(100, Math.max(0, value));
+}
+
+function getInstallationOutcome(
+  progress: InstallationProgress,
+  installingVersion: string | null
+): InstallationOutcome | null {
+  if (progress.error) {
+    if (progress.error.toLowerCase().includes('cancel')) {
+      return {
+        kind: 'cancelled',
+        title: 'Installation Cancelled',
+        message: 'The installation was stopped and incomplete files have been removed',
+      };
+    }
+    return {
+      kind: 'failed',
+      title: 'Installation Failed',
+      message: progress.error,
+    };
+  }
+
+  if (progress.completed_at && progress.success) {
+    return {
+      kind: 'succeeded',
+      title: 'Installation Complete!',
+      message: `${installingVersion ?? progress.tag} has been successfully installed`,
+    };
+  }
+
+  if (progress.completed_at && progress.success === false) {
+    return {
+      kind: 'failed',
+      title: 'Installation Failed',
+      message: 'The installation did not complete successfully',
+    };
+  }
+
+  return null;
+}
+
 interface ProgressDetailsViewProps {
   progress: InstallationProgress;
   installingVersion: string | null;
@@ -58,6 +106,20 @@ export function ProgressDetailsView({
   onOpenLogPath,
 }: ProgressDetailsViewProps) {
   const CurrentStageIcon = STAGE_ICONS[progress.stage];
+  const overallProgress = clampProgress(progress.overall_progress);
+  const stageProgress = clampProgress(progress.stage_progress);
+  const outcome = getInstallationOutcome(progress, installingVersion);
+  const OutcomeIcon = outcome?.kind === 'succeeded' ? CheckCircle2 : AlertCircle;
+  const outcomeContainerClass = outcome?.kind === 'succeeded'
+    ? 'bg-[hsl(var(--accent-success))]/10 border-[hsl(var(--accent-success))]/30'
+    : outcome?.kind === 'cancelled'
+      ? 'bg-[hsl(var(--accent-warning))]/10 border-[hsl(var(--accent-warning))]/30'
+      : 'bg-[hsl(var(--accent-error))]/10 border-[hsl(var(--accent-error))]/30';
+  const outcomeTextClass = outcome?.kind === 'succeeded'
+    ? 'text-[hsl(var(--accent-success))]'
+    : outcome?.kind === 'cancelled'
+      ? 'text-[hsl(var(--accent-warning))]'
+      : 'text-[hsl(var(--accent-error))]';
 
   return (
     <div className="space-y-3 px-3">
@@ -78,13 +140,20 @@ export function ProgressDetailsView({
       <div>
         <div className="flex items-center justify-between mb-2">
           <span className="text-sm font-medium text-[hsl(var(--text-secondary))]">Overall Progress</span>
-          <span className="text-sm font-semibold text-[hsl(var(--text-primary))]">{progress.overall_progress}%</span>
+          <span className="text-sm font-semibold text-[hsl(var(--text-primary))]">{overallProgress}%</span>
         </div>
-        <div className="w-full h-2 bg-[hsl(var(--surface-low))] rounded-full overflow-hidden">
+        <div
+          role="progressbar"
+          aria-label="Overall installation progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={overallProgress}
+          className="w-full h-2 bg-[hsl(var(--surface-low))] rounded-full overflow-hidden"
+        >
           <motion.div
             className="h-full bg-[hsl(var(--accent-success))] rounded-full"
             initial={{ width: 0 }}
-            animate={{ width: `${progress.overall_progress}%` }}
+            animate={{ width: `${overallProgress}%` }}
             transition={{ duration: 0.3 }}
           />
         </div>
@@ -102,7 +171,7 @@ export function ProgressDetailsView({
                 {STAGE_LABELS[progress.stage]}
               </h3>
               <span className="text-sm text-[hsl(var(--text-muted))]">
-                {progress.stage_progress}%
+                {stageProgress}%
               </span>
             </div>
             {progress.current_item && (
@@ -110,11 +179,18 @@ export function ProgressDetailsView({
                 {progress.current_item}
               </p>
             )}
-            <div className="w-full h-1.5 bg-[hsl(var(--surface-lowest))] rounded-full overflow-hidden mt-2">
+            <div
+              role="progressbar"
+              aria-label={`${STAGE_LABELS[progress.stage]} progress`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={stageProgress}
+              className="w-full h-1.5 bg-[hsl(var(--surface-lowest))] rounded-full overflow-hidden mt-2"
+            >
               <motion.div
                 className="h-full bg-[hsl(var(--accent-success))]/50 rounded-full"
                 initial={{ width: 0 }}
-                animate={{ width: `${progress.stage_progress}%` }}
+                animate={{ width: `${stageProgress}%` }}
                 transition={{ duration: 0.3 }}
               />
             </div>
@@ -203,51 +279,28 @@ export function ProgressDetailsView({
         </div>
       )}
 
-      {/* Error or Cancellation Message */}
-      {progress.error && (
-        <>
-          {progress.error.toLowerCase().includes('cancel') ? (
-            /* Cancellation Message */
-            <div className="bg-[hsl(var(--accent-warning))]/10 border border-[hsl(var(--accent-warning))]/30 rounded-lg p-3 flex items-center gap-3">
-              <AlertCircle size={20} className="text-[hsl(var(--accent-warning))]" />
-              <div>
-                <p className="text-[hsl(var(--accent-warning))] font-medium text-sm">Installation Cancelled</p>
-                <p className="text-xs text-[hsl(var(--text-muted))] mt-1">
-                  The installation was stopped and incomplete files have been removed
-                </p>
-              </div>
-            </div>
-          ) : (
-            /* Error Message */
-            <div className="bg-[hsl(var(--accent-error))]/10 border border-[hsl(var(--accent-error))]/30 rounded-lg p-3 flex items-center gap-3">
-              <AlertCircle size={20} className="text-[hsl(var(--accent-error))]" />
-              <div>
-                <p className="text-[hsl(var(--accent-error))] font-medium text-sm">Installation Failed</p>
-                <p className="text-xs text-[hsl(var(--text-muted))] mt-1">{progress.error}</p>
-                {progress.log_path && (
-                  <button
-                    onClick={() => onOpenLogPath(progress.log_path)}
-                    className="mt-2 inline-flex items-center gap-2 px-2 py-1 rounded border border-[hsl(var(--accent-error))]/40 text-xs text-[hsl(var(--accent-error))] hover:bg-[hsl(var(--accent-error))]/10"
-                  >
-                    <FileText size={12} />
-                    <span>Open log</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-        </>
-      )}
-
-      {/* Success Message */}
-      {progress.completed_at && progress.success && (
-        <div className="bg-[hsl(var(--accent-success))]/10 border border-[hsl(var(--accent-success))]/30 rounded-lg p-3 flex items-center gap-3">
-          <CheckCircle2 size={20} className="text-[hsl(var(--accent-success))]" />
+      {/* Terminal outcome only; progress updates stay outside the live region. */}
+      {outcome && (
+        <div
+          role={outcome.kind === 'failed' ? 'alert' : 'status'}
+          aria-live={outcome.kind === 'failed' ? 'assertive' : 'polite'}
+          aria-atomic="true"
+          className={`${outcomeContainerClass} flex items-center gap-3 rounded-lg border p-3`}
+        >
+          <OutcomeIcon size={20} className={outcomeTextClass} />
           <div>
-            <p className="text-[hsl(var(--accent-success))] font-medium text-sm">Installation Complete!</p>
-            <p className="text-xs text-[hsl(var(--text-muted))] mt-1">
-              {installingVersion} has been successfully installed
-            </p>
+            <p className={`${outcomeTextClass} text-sm font-medium`}>{outcome.title}</p>
+            <p className="mt-1 text-xs text-[hsl(var(--text-muted))]">{outcome.message}</p>
+            {outcome.kind === 'failed' && progress.log_path && (
+              <button
+                type="button"
+                onClick={() => onOpenLogPath(progress.log_path)}
+                className="mt-2 inline-flex items-center gap-2 px-2 py-1 rounded border border-[hsl(var(--accent-error))]/40 text-xs text-[hsl(var(--accent-error))] hover:bg-[hsl(var(--accent-error))]/10"
+              >
+                <FileText size={12} />
+                <span>Open log</span>
+              </button>
+            )}
           </div>
         </div>
       )}

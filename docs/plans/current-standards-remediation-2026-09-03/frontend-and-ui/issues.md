@@ -2,16 +2,25 @@
 
 ## Current State
 
-No execution-discovered issues exist because no slice has started. The rows
-below route the accepted audit findings without inventing remediation history.
+The rows below route accepted audit findings and execution discoveries without
+inventing remediation history.
 
-| ID | Audit source | Disposition | Owner / dependency | State |
-| --- | --- | --- | --- | --- |
-| FE-I01 | F-01 undecoded IPC values | Remediate in Milestone 4 after provider contracts are accepted | Frontend consumer; Rust and platform providers | `open` |
-| FE-I02 | F-02 cached model provenance | Remediate in Milestone 4 | Frontend | `open` |
-| FE-I03 | F-03 installation polling lifecycle | Remediate in next slice M0-S1 | Frontend | `open` |
-| FE-I04 | F-04 dialog/popup interaction | Remediate in Milestone 2 after harness admission | Frontend | `open` |
-| FE-I05 | F-05 progress/motion semantics | Remediate in Milestone 3 after harness admission | Frontend | `open` |
-| FE-I06 | F-06 error gate | Transferred; do not duplicate here | [Governance and verification plan](../governance-and-verification/plan.md) | `transferred` |
-| FE-I07 | F-07 frontend variants | Renderer behavior in Milestones 1/5; packaged artifacts transferred | Frontend / platform | `open` |
-| FE-I08 | F-08 count-based authority | Transferred; do not duplicate here | [Governance and verification plan](../governance-and-verification/plan.md) | `transferred` |
+| ID | Severity | Audit source / evidence | Disposition | Owner / dependency | State |
+| --- | --- | --- | --- | --- | --- |
+| FE-I01 | high | F-01 undecoded IPC values | Remediate in Milestone 4 after provider contracts are accepted | Frontend consumer; Rust and platform providers | `open` |
+| FE-I02 | medium | F-02 cached model provenance | Remediate in Milestone 4 | Frontend | `open` |
+| FE-I03 | high | F-03 installation polling lifecycle; [async-owner inventory](reports/frontend-async-owner-inventory.md); PRG-I12 found requested-install polling could precede backend admission | Accepted after M3-S3a added and proved the deferred-admission repair | Frontend | `resolved` |
+| FE-I04 | high | F-04 dialog/popup interaction; [accepted Chromium evidence](execution-ledger.md#2026-09-03--m2-s4-representative-chromium-evidence-accepted) | Accepted in Milestone 2 with focused Module/consumer tests and representative Chromium AX/focus/input evidence | Frontend | `resolved` |
+| FE-I05 | medium | F-05 progress/motion semantics | Accepted in Milestone 3 with focused and representative Chromium evidence | Frontend | `resolved` |
+| FE-I06 | medium | F-06 error gate | Transferred; do not duplicate here | [Governance and verification plan](../governance-and-verification/plan.md) | `transferred` |
+| FE-I07 | high | F-07 frontend variants | Renderer behavior in Milestones 1/5; packaged artifacts transferred | Frontend / platform | `open` |
+| FE-I08 | medium | F-08 count-based authority | Transferred; do not duplicate here | [Governance and verification plan](../governance-and-verification/plan.md) | `transferred` |
+| FE-I09 | medium | [Async-owner inventory](reports/frontend-async-owner-inventory.md#unrelated-timer-dispositions) found five unrelated async `setInterval` owners without serialization or stale-completion guards | Preserve current plan scope; schedule a focused async-owner remediation after this program unless an owning plan absorbs each row | Frontend follow-up | `open` |
+| FE-I10 | high | EC-18 in the governance [error-contract disposition](../governance-and-verification/reports/error-contract-gate-disposition.md): link-health refresh rejection hides unavailable state or leaves an unmarked stale projection | Before M4, classify against its decoded bridge/projection Seam and add exact M4 files/evidence or an exact focused slice | Frontend; program requires in-scope resolution | `open` |
+| FE-I11 | medium | EC-03 in the governance [error-contract disposition](../governance-and-verification/reports/error-contract-gate-disposition.md): native model-import picker rejection closes the interaction with no user-visible outcome | Before M4, classify against its decoded bridge/projection Seam and add exact M4 files/evidence or an exact focused slice | Frontend; program requires in-scope resolution | `open` |
+| FE-I12 | low | [Overlay inventory](reports/frontend-overlay-consumer-inventory.md#searched-non-members) found that the in-flow Link Health and Migration Reports disclosure triggers do not expose expanded/content relationships | Keep outside M2 because these disclosures do not share popup focus/dismiss lifecycle; schedule a focused disclosure-semantics repair | Frontend follow-up | `open` |
+| FE-I13 | medium | [M3-S3 runtime admission](execution-ledger.md#2026-09-03--m3-s3-runtime-admission-stopped-for-unreachable-status-view) found no production transition into `ProgressDetailsView`; successful terminal progress and the dialog presentation tag are cleared before the accepted status semantics can be observed | M3-S3a source repair and M3-S3b representative status evidence are accepted | Frontend | `resolved` |
+| PRG-I12 | high | Integration review found a requested install could read progress before backend admission, consume a prior terminal payload, invalidate its generation, and strand the newly accepted lifecycle | M3-S3a proves no read before successful admission and a current first read afterward; existing-install discovery remains immediate | Frontend / program review | `resolved` |
+| FE-I14 | high | Rust M2F handoff: canonical conversion-progress core fields serialize camelCase while handwritten `frontend/src/types/api-conversion.ts` claims snake_case | Do not repair against handwritten schema authority; in M4 consume the platform-generated decoder and delete the conflicting assertion/copy after the zero-Legacy gate | Frontend consumer; platform-generated decoder dependency | `blocked` |
+| FE-I15 | medium | [M3-S3b real Chromium counterevidence](execution-ledger.md#2026-09-03--m3-s3b-runtime-stopped-for-visible-reduced-motion-displacement): reduced-mode Popover entry retains `translateY(-6px)` into nonzero-opacity frames before snapping to rest; exit uses the same translated target | Accepted after exact source/test repair and four non-vacuous entry/dismiss real scenarios | Frontend / program review | `resolved` |
+| FE-I16 | low | Root full-suite run passed 470/471; unchanged `ModelMetadataModal.test.tsx` queried the deleted accessible backdrop label and did not await the modal's initial async state | Accepted after correction against the ModalDialog backdrop/document Interface; focused and full suites pass without act warnings | Frontend | `resolved` |

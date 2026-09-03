@@ -110,11 +110,11 @@ describe('useVersions', () => {
       installNetworkStatus: 'downloading' as InstallNetworkStatus,
       switchVersion: vi.fn().mockResolvedValue(true),
       installVersion: vi.fn().mockResolvedValue(true),
+      cancelInstallation: vi.fn().mockResolvedValue(true),
       removeVersion: vi.fn().mockResolvedValue(true),
       getVersionInfo: vi.fn().mockResolvedValue({ path: '/tmp/v1.2.3' } as VersionInfo),
       openPath: vi.fn().mockResolvedValue(true),
       openActiveInstall: vi.fn().mockResolvedValue(true),
-      fetchInstallationProgress: vi.fn().mockResolvedValue(installationProgress),
     });
   });
 
@@ -159,55 +159,21 @@ describe('useVersions', () => {
     expect(refreshAllMock).toHaveBeenCalledTimes(1);
   });
 
-  it('refreshes installing tag from fetching state and lets install-manager state override it', async () => {
-    let capturedInstallingTagUpdate: ((tag: string | null) => void) | undefined;
-    let managerInstallingTag: string | null = null;
-
-    useVersionFetchingMock.mockImplementation((options: { onInstallingTagUpdate?: (tag: string | null) => void }) => {
-      capturedInstallingTagUpdate = options.onInstallingTagUpdate;
-      return {
-        installedVersions: ['v1.2.3'],
-        activeVersion: 'v1.2.3',
-        availableVersions,
-        versionStatus,
-        defaultVersion: 'v1.2.3',
-        cacheStatus,
-        isLoading: false,
-        error: null,
-        isRateLimited: false,
-        rateLimitRetryAfter: null,
-        fetchInstalledVersions: vi.fn().mockResolvedValue(undefined),
-        fetchActiveVersion: vi.fn().mockResolvedValue(undefined),
-        fetchVersionStatus: vi.fn().mockResolvedValue(undefined),
-        refreshAll: vi.fn().mockResolvedValue(undefined),
-        fetchAvailableVersions: vi.fn().mockResolvedValue(undefined),
-        setDefaultVersion: vi.fn().mockResolvedValue(undefined),
-      };
-    });
-
-    useInstallationManagerMock.mockImplementation(() => ({
-      installingTag: managerInstallingTag,
+  it('projects installation identity only from the installation manager', () => {
+    useInstallationManagerMock.mockReturnValue({
+      installingTag: 'v2.0.0',
       installationProgress,
       installNetworkStatus: 'downloading' as InstallNetworkStatus,
       switchVersion: vi.fn().mockResolvedValue(true),
       installVersion: vi.fn().mockResolvedValue(true),
+      cancelInstallation: vi.fn().mockResolvedValue(true),
       removeVersion: vi.fn().mockResolvedValue(true),
       getVersionInfo: vi.fn().mockResolvedValue(null),
       openPath: vi.fn().mockResolvedValue(true),
       openActiveInstall: vi.fn().mockResolvedValue(true),
-      fetchInstallationProgress: vi.fn().mockResolvedValue(installationProgress),
-    }));
-
-    const { result, rerender } = renderHook(() => useVersions({ appId: 'torch' }));
-
-    act(() => {
-      capturedInstallingTagUpdate?.('v1.2.3');
     });
 
-    expect(result.current.installingTag).toBe('v1.2.3');
-
-    managerInstallingTag = 'v2.0.0';
-    rerender();
+    const { result } = renderHook(() => useVersions({ appId: 'torch' }));
 
     expect(result.current.installingTag).toBe('v2.0.0');
   });
@@ -245,11 +211,11 @@ describe('useVersions', () => {
         installNetworkStatus: 'downloading' as InstallNetworkStatus,
         switchVersion: vi.fn().mockResolvedValue(true),
         installVersion: vi.fn().mockResolvedValue(true),
+        cancelInstallation: vi.fn().mockResolvedValue(true),
         removeVersion: vi.fn().mockResolvedValue(true),
         getVersionInfo: vi.fn().mockResolvedValue(null),
         openPath: vi.fn().mockResolvedValue(true),
         openActiveInstall: vi.fn().mockResolvedValue(true),
-        fetchInstallationProgress: vi.fn().mockResolvedValue(installationProgress),
       };
     });
 

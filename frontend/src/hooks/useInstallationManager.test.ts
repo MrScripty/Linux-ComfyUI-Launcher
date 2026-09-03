@@ -4,6 +4,7 @@ import { APIError } from '../errors';
 import type { InstallationProgress, VersionRelease } from '../types/versions';
 
 const {
+  cancelInstallationApiMock,
   getInstallationProgressMock,
   installVersionApiMock,
   isApiAvailableMock,
@@ -15,20 +16,14 @@ const {
   removeVersionApiMock,
   switchVersionApiMock,
 } = vi.hoisted(() => ({
+  cancelInstallationApiMock: vi.fn<(_appId: string) => Promise<{ success: boolean; error?: string }>>(),
   getInstallationProgressMock: vi.fn<(_appId: string) => Promise<InstallationProgress | null>>(),
   installVersionApiMock: vi.fn<(_tag: string, _appId: string) => Promise<{ success: boolean; error?: string }>>(),
   isApiAvailableMock: vi.fn<() => boolean>(),
   openActiveInstallMock: vi.fn<() => Promise<boolean>>(),
   openPathMock: vi.fn<(_path: string) => Promise<boolean>>(),
   getVersionInfoMock: vi.fn<(_tag: string) => Promise<unknown>>(),
-  normalizeInstallationProgressMock: vi.fn<
-    (
-      progress: InstallationProgress,
-      availableVersions: VersionRelease[],
-      trackerState: unknown,
-      now: number
-    ) => { adjustedProgress: InstallationProgress; networkStatus: 'idle' | 'downloading' | 'stalled' | 'failed' }
-  >(),
+  normalizeInstallationProgressMock: vi.fn(),
   resetInstallationProgressTrackingMock: vi.fn<(_state: unknown) => void>(),
   removeVersionApiMock: vi.fn<(_tag: string, _appId: string) => Promise<{ success: boolean; error?: string }>>(),
   switchVersionApiMock: vi.fn<(_tag: string, _appId: string) => Promise<{ success: boolean; error?: string }>>(),
@@ -36,6 +31,7 @@ const {
 
 vi.mock('../api/adapter', () => ({
   api: {
+    cancel_installation: cancelInstallationApiMock,
     get_installation_progress: getInstallationProgressMock,
     install_version: installVersionApiMock,
     remove_version: removeVersionApiMock,
@@ -59,6 +55,22 @@ vi.mock('./installationProgressTracking', () => ({
 
 import { useInstallationManager } from './useInstallationManager';
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  reject: (error: unknown) => void;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, reject, resolve };
+}
+
 const availableVersions: VersionRelease[] = [
   {
     tagName: 'v1.2.3',
@@ -69,6 +81,10 @@ const availableVersions: VersionRelease[] = [
     archiveSize: 2048,
   },
 ];
+const installingAvailableVersions = availableVersions.map((release) => ({
+  ...release,
+  installing: true,
+}));
 
 const activeProgress: InstallationProgress = {
   tag: 'v1.2.3',
@@ -87,17 +103,20 @@ const activeProgress: InstallationProgress = {
   error: null,
 };
 
+function progressFor(tag: string): InstallationProgress {
+  return { ...activeProgress, tag };
+}
+
 describe('useInstallationManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useFakeTimers();
     isApiAvailableMock.mockReturnValue(true);
-    normalizeInstallationProgressMock.mockImplementation((progress) => ({
-      adjustedProgress: {
-        ...progress,
-        eta_seconds: 15,
-      },
-      networkStatus: 'stalled',
+    normalizeInstallationProgressMock.mockImplementation((progress: InstallationProgress) => ({
+      adjustedProgress: { ...progress, eta_seconds: 15 },
+      networkStatus: 'downloading',
     }));
+    cancelInstallationApiMock.mockResolvedValue({ success: true });
     installVersionApiMock.mockResolvedValue({ success: true });
     switchVersionApiMock.mockResolvedValue({ success: true });
     removeVersionApiMock.mockResolvedValue({ success: true });
@@ -108,11 +127,33 @@ describe('useInstallationManager', () => {
     vi.useRealTimers();
   });
 
-  it('normalizes active installation progress and exposes installation access helpers', async () => {
+  it('discovers manager-owned progress from an installing release hint', async () => {
     getInstallationProgressMock.mockResolvedValue(activeProgress);
-    openActiveInstallMock.mockResolvedValue(true);
-    openPathMock.mockResolvedValue(true);
-    getVersionInfoMock.mockResolvedValue({ path: '/tmp/v1.2.3' });
+
+    const { result } = renderHook(() => useInstallationManager({
+      appId: 'torch',
+      availableVersions: installingAvailableVersions,
+      onRefreshVersions: vi.fn(),
+    }));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
+    expect(getInstallationProgressMock).toHaveBeenCalledWith('torch');
+    expect(result.current.installingTag).toBe('v1.2.3');
+    expect(result.current.installationProgress).toEqual({
+      ...activeProgress,
+      eta_seconds: 15,
+    });
+    expect(result.current.installNetworkStatus).toBe('downloading');
+  });
+
+  it('starts polling a requested install only after the backend accepts its lifecycle', async () => {
+    const installAdmission = deferred<{ success: boolean; error?: string }>();
+    installVersionApiMock.mockReturnValue(installAdmission.promise);
+    getInstallationProgressMock.mockResolvedValue(activeProgress);
 
     const { result } = renderHook(() => useInstallationManager({
       appId: 'torch',
@@ -120,36 +161,226 @@ describe('useInstallationManager', () => {
       onRefreshVersions: vi.fn(),
     }));
 
-    let fetched: InstallationProgress | null = null;
+    let installation: Promise<boolean> | undefined;
     await act(async () => {
-      fetched = await result.current.fetchInstallationProgress();
+      installation = result.current.installVersion('v1.2.3');
+      await Promise.resolve();
     });
 
+    expect(getInstallationProgressMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      installAdmission.resolve({ success: true });
+      await installation;
+      await Promise.resolve();
+    });
+
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
     expect(getInstallationProgressMock).toHaveBeenCalledWith('torch');
-    expect(normalizeInstallationProgressMock).toHaveBeenCalled();
-    expect(fetched).toEqual({
-      ...activeProgress,
-      eta_seconds: 15,
-    });
     expect(result.current.installingTag).toBe('v1.2.3');
-    expect(result.current.installationProgress).toEqual({
-      ...activeProgress,
-      eta_seconds: 15,
-    });
-    expect(result.current.installNetworkStatus).toBe('stalled');
-
-    await act(async () => {
-      await result.current.openActiveInstall();
-      await result.current.openPath('/tmp/v1.2.3');
-      await result.current.getVersionInfo('v1.2.3');
-    });
-
-    expect(openActiveInstallMock).toHaveBeenCalledTimes(1);
-    expect(openPathMock).toHaveBeenCalledWith('/tmp/v1.2.3');
-    expect(getVersionInfoMock).toHaveBeenCalledWith('v1.2.3');
+    expect(result.current.installationProgress?.tag).toBe('v1.2.3');
   });
 
-  it('clears install state and refreshes versions when installation progress completes', async () => {
+  it('never overlaps progress requests and schedules the next poll only after settlement', async () => {
+    const firstProgress = deferred<InstallationProgress | null>();
+    const secondProgress = deferred<InstallationProgress | null>();
+    let activeRequests = 0;
+    let maximumActiveRequests = 0;
+    getInstallationProgressMock
+      .mockImplementationOnce(async () => {
+        activeRequests += 1;
+        maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+        try {
+          return await firstProgress.promise;
+        } finally {
+          activeRequests -= 1;
+        }
+      })
+      .mockImplementationOnce(async () => {
+        activeRequests += 1;
+        maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+        try {
+          return await secondProgress.promise;
+        } finally {
+          activeRequests -= 1;
+        }
+      });
+
+    const { result } = renderHook(() => useInstallationManager({
+      availableVersions,
+      onRefreshVersions: vi.fn(),
+    }));
+
+    await act(async () => {
+      await result.current.installVersion('v1.2.3');
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(4000);
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstProgress.resolve(activeProgress);
+      await firstProgress.promise;
+      await Promise.resolve();
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+      await Promise.resolve();
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(2);
+    expect(maximumActiveRequests).toBe(1);
+
+    await act(async () => {
+      secondProgress.resolve(activeProgress);
+      await secondProgress.promise;
+    });
+  });
+
+  it('serializes a new app lifecycle behind an old request and ignores the old completion', async () => {
+    const oldProgress = deferred<InstallationProgress | null>();
+    const newProgress = deferred<InstallationProgress | null>();
+    getInstallationProgressMock
+      .mockReturnValueOnce(oldProgress.promise)
+      .mockReturnValueOnce(newProgress.promise);
+
+    const { result, rerender } = renderHook(
+      ({ appId }) => useInstallationManager({
+        appId,
+        availableVersions,
+        onRefreshVersions: vi.fn(),
+      }),
+      { initialProps: { appId: 'torch' } }
+    );
+
+    await act(async () => {
+      await result.current.installVersion('old-tag');
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledWith('torch');
+
+    rerender({ appId: 'ollama' });
+    await act(async () => {
+      await result.current.installVersion('new-tag');
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      oldProgress.resolve({
+        ...progressFor('old-tag'),
+        completed_at: '2026-04-12T00:05:00Z',
+        success: true,
+      });
+      await oldProgress.promise;
+      await Promise.resolve();
+    });
+    expect(getInstallationProgressMock).toHaveBeenNthCalledWith(2, 'ollama');
+    expect(result.current.installationProgress).toBeNull();
+
+    await act(async () => {
+      newProgress.resolve(progressFor('new-tag'));
+      await newProgress.promise;
+      await Promise.resolve();
+    });
+    expect(result.current.installingTag).toBe('new-tag');
+    expect(result.current.installationProgress?.tag).toBe('new-tag');
+  });
+
+  it('supersedes an old tag lifecycle without overlapping its request', async () => {
+    const oldProgress = deferred<InstallationProgress | null>();
+    const newProgress = deferred<InstallationProgress | null>();
+    getInstallationProgressMock
+      .mockReturnValueOnce(oldProgress.promise)
+      .mockReturnValueOnce(newProgress.promise);
+
+    const { result } = renderHook(() => useInstallationManager({
+      appId: 'torch',
+      availableVersions,
+      onRefreshVersions: vi.fn(),
+    }));
+
+    await act(async () => {
+      await result.current.installVersion('old-tag');
+      await result.current.installVersion('new-tag');
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      oldProgress.resolve(progressFor('old-tag'));
+      await oldProgress.promise;
+      await Promise.resolve();
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(2);
+    expect(result.current.installationProgress).toBeNull();
+
+    await act(async () => {
+      newProgress.resolve(progressFor('new-tag'));
+      await newProgress.promise;
+      await Promise.resolve();
+    });
+    expect(result.current.installingTag).toBe('new-tag');
+    expect(result.current.installationProgress?.tag).toBe('new-tag');
+  });
+
+  it('prevents a completion after disable or unmount from mutating state or restarting polling', async () => {
+    const disabledProgress = deferred<InstallationProgress | null>();
+    getInstallationProgressMock.mockReturnValueOnce(disabledProgress.promise);
+
+    const { result, rerender, unmount } = renderHook(
+      ({ enabled }) => useInstallationManager({
+        enabled,
+        availableVersions,
+        onRefreshVersions: vi.fn(),
+      }),
+      { initialProps: { enabled: true } }
+    );
+
+    await act(async () => {
+      await result.current.installVersion('v1.2.3');
+    });
+    rerender({ enabled: false });
+
+    await act(async () => {
+      disabledProgress.resolve(activeProgress);
+      await disabledProgress.promise;
+      await Promise.resolve();
+    });
+    expect(result.current.installingTag).toBeNull();
+    expect(result.current.installationProgress).toBeNull();
+
+    unmount();
+    await act(async () => {
+      vi.advanceTimersByTime(4000);
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('observes a rejected request after unmount without scheduling more work', async () => {
+    const pendingProgress = deferred<InstallationProgress | null>();
+    getInstallationProgressMock.mockReturnValueOnce(pendingProgress.promise);
+
+    const { result, unmount } = renderHook(() => useInstallationManager({
+      availableVersions,
+      onRefreshVersions: vi.fn(),
+    }));
+
+    await act(async () => {
+      await result.current.installVersion('v1.2.3');
+    });
+    unmount();
+
+    await act(async () => {
+      pendingProgress.reject(new APIError('late failure', 'get_installation_progress'));
+      await pendingProgress.promise.catch(() => undefined);
+      await Promise.resolve();
+      vi.advanceTimersByTime(4000);
+    });
+    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes versions and retains successful terminal progress for presentation', async () => {
     const onRefreshVersions = vi.fn().mockResolvedValue(undefined);
     getInstallationProgressMock
       .mockResolvedValueOnce(activeProgress)
@@ -165,38 +396,39 @@ describe('useInstallationManager', () => {
     }));
 
     await act(async () => {
-      await result.current.fetchInstallationProgress();
+      await result.current.installVersion('v1.2.3');
+      await Promise.resolve();
     });
-
-    expect(result.current.installingTag).toBe('v1.2.3');
-    expect(result.current.installationProgress).not.toBeNull();
+    expect(result.current.installationProgress?.tag).toBe('v1.2.3');
 
     await act(async () => {
-      await result.current.fetchInstallationProgress();
+      vi.advanceTimersByTime(800);
+      await Promise.resolve();
     });
 
-    expect(result.current.installingTag).toBeNull();
-    expect(result.current.installationProgress).toBeNull();
-    expect(result.current.installNetworkStatus).toBe('idle');
-    expect(resetInstallationProgressTrackingMock).toHaveBeenCalled();
     expect(onRefreshVersions).toHaveBeenCalledTimes(1);
+    expect(result.current.installingTag).toBeNull();
+    expect(result.current.installationProgress).toEqual({
+      ...activeProgress,
+      completed_at: '2026-04-12T00:05:00Z',
+      eta_seconds: 15,
+      success: true,
+    });
+    expect(result.current.installNetworkStatus).toBe('idle');
   });
 
-  it('preserves failed completed progress so the UI can show the failed install', async () => {
+  it('preserves terminal failure for presentation', async () => {
     const failedProgress: InstallationProgress = {
       ...activeProgress,
       completed_at: '2026-04-12T00:05:00Z',
       success: false,
-      error: 'Could not find Ollama binary in extracted archive',
-      log_path: '/tmp/install-ollama.log',
+      error: 'Archive checksum mismatch',
     };
-    normalizeInstallationProgressMock.mockImplementation((progress) => ({
+    normalizeInstallationProgressMock.mockImplementation((progress: InstallationProgress) => ({
       adjustedProgress: progress,
       networkStatus: 'failed',
     }));
-    getInstallationProgressMock
-      .mockResolvedValueOnce(activeProgress)
-      .mockResolvedValueOnce(failedProgress);
+    getInstallationProgressMock.mockResolvedValue(failedProgress);
 
     const { result } = renderHook(() => useInstallationManager({
       availableVersions,
@@ -204,48 +436,72 @@ describe('useInstallationManager', () => {
     }));
 
     await act(async () => {
-      await result.current.fetchInstallationProgress();
-    });
-
-    await act(async () => {
-      await result.current.fetchInstallationProgress();
+      await result.current.installVersion('v1.2.3');
+      await Promise.resolve();
     });
 
     expect(result.current.installingTag).toBeNull();
-    expect(result.current.installationProgress).toEqual(failedProgress);
     expect(result.current.installNetworkStatus).toBe('failed');
+    expect(result.current.installationProgress?.error).toBe('Archive checksum mismatch');
   });
 
-  it('resets transient install state when installVersion fails before polling begins', async () => {
-    installVersionApiMock.mockResolvedValue({
+  it('preserves terminal cancellation separately and scopes its action to the app', async () => {
+    const cancelledProgress: InstallationProgress = {
+      ...activeProgress,
+      completed_at: '2026-04-12T00:05:00Z',
       success: false,
-      error: 'install denied',
+      error: 'User cancelled installation',
+    };
+    normalizeInstallationProgressMock.mockImplementation((progress: InstallationProgress) => ({
+      adjustedProgress: progress,
+      networkStatus: 'failed',
+    }));
+    getInstallationProgressMock.mockResolvedValue(cancelledProgress);
+
+    const { result } = renderHook(() => useInstallationManager({
+      appId: 'torch',
+      availableVersions,
+      onRefreshVersions: vi.fn(),
+    }));
+
+    await act(async () => {
+      await result.current.installVersion('v1.2.3');
+      await result.current.cancelInstallation();
+      await Promise.resolve();
     });
+
+    expect(cancelInstallationApiMock).toHaveBeenCalledWith('torch');
+    expect(result.current.installingTag).toBeNull();
+    expect(result.current.installNetworkStatus).toBe('failed');
+    expect(result.current.installationProgress?.error).toContain('cancel');
+  });
+
+  it('resets transient state when the install request fails', async () => {
+    const pendingProgress = deferred<InstallationProgress | null>();
+    getInstallationProgressMock.mockReturnValueOnce(pendingProgress.promise);
+    installVersionApiMock.mockResolvedValue({ success: false, error: 'install denied' });
 
     const { result } = renderHook(() => useInstallationManager({
       availableVersions,
       onRefreshVersions: vi.fn(),
     }));
 
-    let caughtError: unknown;
-    await act(async () => {
-      try {
-        await result.current.installVersion('v1.2.3');
-      } catch (error) {
-        caughtError = error;
-      }
-    });
-
-    expect(caughtError).toBeInstanceOf(APIError);
+    await expect(act(async () => result.current.installVersion('v1.2.3'))).rejects.toBeInstanceOf(APIError);
     expect(result.current.installingTag).toBeNull();
     expect(result.current.installationProgress).toBeNull();
     expect(result.current.installNetworkStatus).toBe('idle');
+
+    await act(async () => {
+      pendingProgress.resolve(activeProgress);
+      await pendingProgress.promise;
+    });
   });
 
-  it('starts install polling after a successful install request', async () => {
-    vi.useFakeTimers();
+  it('keeps version actions and installation access behind the manager Interface', async () => {
     const onRefreshVersions = vi.fn().mockResolvedValue(undefined);
-    getInstallationProgressMock.mockResolvedValue(activeProgress);
+    openActiveInstallMock.mockResolvedValue(true);
+    openPathMock.mockResolvedValue(true);
+    getVersionInfoMock.mockResolvedValue({ path: '/tmp/v1.2.3' });
 
     const { result } = renderHook(() => useInstallationManager({
       appId: 'torch',
@@ -254,42 +510,18 @@ describe('useInstallationManager', () => {
     }));
 
     await act(async () => {
-      await result.current.installVersion('v1.2.3');
+      await result.current.switchVersion('v1.2.3');
+      await result.current.removeVersion('v1.2.3');
+      await result.current.openActiveInstall();
+      await result.current.openPath('/tmp/v1.2.3');
+      await result.current.getVersionInfo('v1.2.3');
     });
 
-    expect(installVersionApiMock).toHaveBeenCalledWith('v1.2.3', 'torch');
-    expect(getInstallationProgressMock).toHaveBeenCalledTimes(1);
-    expect(onRefreshVersions).not.toHaveBeenCalled();
-
-    await act(async () => {
-      vi.advanceTimersByTime(800);
-    });
-
-    expect(getInstallationProgressMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('keeps polling when install progress is not initialized yet', async () => {
-    vi.useFakeTimers();
-    getInstallationProgressMock.mockResolvedValue(null);
-
-    const { result } = renderHook(() => useInstallationManager({
-      appId: 'llama-cpp',
-      availableVersions,
-      onRefreshVersions: vi.fn(),
-    }));
-
-    await act(async () => {
-      await result.current.installVersion('v1.2.3');
-    });
-
-    expect(result.current.installingTag).toBe('v1.2.3');
-    expect(result.current.installationProgress).toBeNull();
-
-    await act(async () => {
-      vi.advanceTimersByTime(800);
-    });
-
-    expect(getInstallationProgressMock).toHaveBeenCalledTimes(2);
-    expect(result.current.installingTag).toBe('v1.2.3');
+    expect(switchVersionApiMock).toHaveBeenCalledWith('v1.2.3', 'torch');
+    expect(removeVersionApiMock).toHaveBeenCalledWith('v1.2.3', 'torch');
+    expect(onRefreshVersions).toHaveBeenCalledTimes(2);
+    expect(openActiveInstallMock).toHaveBeenCalledTimes(1);
+    expect(openPathMock).toHaveBeenCalledWith('/tmp/v1.2.3');
+    expect(getVersionInfoMock).toHaveBeenCalledWith('v1.2.3');
   });
 });

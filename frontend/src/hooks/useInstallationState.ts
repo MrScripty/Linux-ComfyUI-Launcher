@@ -5,7 +5,7 @@
  * Extracted from InstallDialog.tsx
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { InstallationProgress } from './useVersions';
 
 interface UseInstallationStateOptions {
@@ -40,6 +40,7 @@ export function useInstallationState({
   const [showCompletedItems, setShowCompletedItems] = useState(false);
   const [hoveredTag, setHoveredTag] = useState<string | null>(null);
   const [cancelHoverTag, setCancelHoverTag] = useState<string | null>(null);
+  const presentedInstallationRef = useRef<string | null>(null);
 
   // Reset to list view when dialog opens
   useEffect(() => {
@@ -47,6 +48,23 @@ export function useInstallationState({
       setViewMode('list');
     }
   }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || !installingVersion || !progress) {
+      presentedInstallationRef.current = null;
+      return;
+    }
+
+    const presentationIdentity = [
+      progress.tag,
+      progress.started_at,
+      progress.completed_at ? `terminal:${progress.completed_at}` : 'active',
+    ].join(':');
+    if (presentedInstallationRef.current !== presentationIdentity) {
+      presentedInstallationRef.current = presentationIdentity;
+      setViewMode('details');
+    }
+  }, [installingVersion, isOpen, progress]);
 
   // Auto-switch to list view if no progress data
   useEffect(() => {

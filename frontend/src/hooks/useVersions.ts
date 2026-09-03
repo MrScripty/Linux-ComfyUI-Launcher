@@ -9,7 +9,7 @@
  * - Installation management → hooks/useInstallationManager.ts
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { isAPIAvailable } from '../api/adapter';
 import { useVersionFetching } from './useVersionFetching';
 import { useInstallationManager } from './useInstallationManager';
@@ -43,13 +43,13 @@ export interface UseVersionsResult {
   // Actions
   switchVersion: (tag: string) => Promise<boolean>;
   installVersion: (tag: string) => Promise<boolean>;
+  cancelInstallation: () => Promise<boolean>;
   removeVersion: (tag: string) => Promise<boolean>;
   getVersionInfo: (tag: string) => Promise<VersionInfo | null>;
   refreshAll: (forceRefresh?: boolean) => Promise<void>;
   refreshAvailableVersions: (forceRefresh?: boolean) => Promise<void>;
   openPath: (path: string) => Promise<boolean>;
   openActiveInstall: () => Promise<boolean>;
-  fetchInstallationProgress: () => Promise<InstallationProgress | null>;
   setDefaultVersion: (tag: string | null) => Promise<void>;
 }
 
@@ -66,8 +66,6 @@ export function useVersions({
 }: UseVersionsOptions = {}): UseVersionsResult {
   const resolvedAppId = appId ?? 'ollama';
   const isEnabled = enabled;
-  const [localInstallingTag, setLocalInstallingTag] = useState<string | null>(null);
-
   // Version fetching hook
   const {
     installedVersions,
@@ -90,7 +88,6 @@ export function useVersions({
     appId: resolvedAppId,
     enabled: isEnabled,
     trackAvailableVersions,
-    onInstallingTagUpdate: setLocalInstallingTag,
   });
 
   // Installation management hook
@@ -100,11 +97,11 @@ export function useVersions({
     installNetworkStatus,
     switchVersion,
     installVersion,
+    cancelInstallation,
     removeVersion,
     getVersionInfo,
     openPath,
     openActiveInstall,
-    fetchInstallationProgress,
   } = useInstallationManager({
     appId: resolvedAppId,
     enabled: isEnabled,
@@ -117,9 +114,6 @@ export function useVersions({
       ]);
     },
   });
-
-  // Merge installing tags from both sources
-  const installingTag = installManagerTag || localInstallingTag;
 
   // Initial load
   useEffect(() => {
@@ -153,7 +147,7 @@ export function useVersions({
     error,
     isRateLimited,
     rateLimitRetryAfter,
-    installingTag,
+    installingTag: installManagerTag,
     installationProgress,
     defaultVersion,
     installNetworkStatus,
@@ -162,13 +156,13 @@ export function useVersions({
     // Actions
     switchVersion,
     installVersion,
+    cancelInstallation,
     removeVersion,
     getVersionInfo,
     refreshAll,
     refreshAvailableVersions: fetchAvailableVersions,
     openPath,
     openActiveInstall,
-    fetchInstallationProgress,
     setDefaultVersion,
   };
 }

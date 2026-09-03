@@ -51,6 +51,15 @@ describe('ProgressDetailsView', () => {
     expect(screen.getByText('2 / 4')).toBeInTheDocument();
     expect(screen.getByText('wheel.whl')).toBeInTheDocument();
     expect(screen.getByText('Dependency install failed')).toBeInTheDocument();
+    expect(screen.getByRole('progressbar', { name: 'Overall installation progress' })).toHaveAttribute(
+      'aria-valuenow',
+      '70'
+    );
+    expect(screen.getByRole('progressbar', { name: 'Installing Dependencies progress' })).toHaveAttribute(
+      'aria-valuenow',
+      '45'
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent('Installation Failed');
 
     fireEvent.click(screen.getByRole('button', { name: 'Back' }));
     fireEvent.click(screen.getByText('Completed Items (1)'));
@@ -81,6 +90,8 @@ describe('ProgressDetailsView', () => {
     expect(
       screen.getByText('The installation was stopped and incomplete files have been removed')
     ).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveAttribute('aria-live', 'polite');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
 
     rerender(
       <ProgressDetailsView
@@ -100,5 +111,27 @@ describe('ProgressDetailsView', () => {
 
     expect(screen.getByText('Installation Complete!')).toBeInTheDocument();
     expect(screen.getByText('v1.2.3 has been successfully installed')).toBeInTheDocument();
+    const successStatus = screen.getByRole('status');
+    expect(successStatus).toHaveAttribute('aria-live', 'polite');
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+
+    rerender(
+      <ProgressDetailsView
+        progress={{
+          ...dependencyProgress,
+          error: null,
+          completed_at: '2026-04-12T00:05:00Z',
+          success: true,
+        }}
+        installingVersion="v1.2.3"
+        showCompletedItems={false}
+        onToggleCompletedItems={vi.fn()}
+        onBackToList={vi.fn()}
+        onOpenLogPath={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole('status')).toBe(successStatus);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
   });
 });

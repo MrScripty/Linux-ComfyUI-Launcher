@@ -21,23 +21,87 @@ const progress: InstallationProgress = {
 };
 
 describe('useInstallationState', () => {
-  it('resets the dialog view back to list whenever the dialog opens', () => {
+  it('shows a new active installation once and preserves Back for later progress updates', () => {
+    interface StateProps {
+      installingVersion: string | null;
+      progress: InstallationProgress | null;
+    }
+
+    const { result, rerender } = renderHook(
+      (props: StateProps) => useInstallationState({
+        isOpen: true,
+        installingVersion: props.installingVersion,
+        progress: props.progress,
+      }),
+      {
+        initialProps: {
+          installingVersion: null,
+          progress: null,
+        } satisfies StateProps,
+      }
+    );
+    const rerenderState = rerender as (props: StateProps) => void;
+
+    rerenderState({ installingVersion: 'v1.2.3', progress });
+    expect(result.current.viewMode).toBe('details');
+
+    act(() => {
+      result.current.setViewMode('list');
+    });
+    rerenderState({
+      installingVersion: 'v1.2.3',
+      progress: { ...progress, overall_progress: 75 },
+    });
+
+    expect(result.current.viewMode).toBe('list');
+  });
+
+  it('shows the terminal transition once after Back and preserves a later list choice', () => {
+    const { result, rerender } = renderHook(
+      (nextProgress: InstallationProgress) => useInstallationState({
+        isOpen: true,
+        installingVersion: 'v1.2.3',
+        progress: nextProgress,
+      }),
+      { initialProps: progress }
+    );
+
+    act(() => {
+      result.current.setViewMode('list');
+    });
+    rerender({
+      ...progress,
+      completed_at: '2026-04-12T00:05:00Z',
+      success: true,
+    });
+
+    expect(result.current.viewMode).toBe('details');
+
+    act(() => {
+      result.current.setViewMode('list');
+    });
+    rerender({
+      ...progress,
+      completed_at: '2026-04-12T00:05:00Z',
+      success: true,
+    });
+
+    expect(result.current.viewMode).toBe('list');
+  });
+
+  it('opens on the version list when no installation progress exists', () => {
     const { result, rerender } = renderHook(
       (props: { isOpen: boolean }) => useInstallationState({
         isOpen: props.isOpen,
-        installingVersion: 'v1.2.3',
-        progress,
+        installingVersion: null,
+        progress: null,
       }),
       {
         initialProps: { isOpen: false },
       }
     );
 
-    act(() => {
-      result.current.setViewMode('details');
-    });
-
-    expect(result.current.viewMode).toBe('details');
+    expect(result.current.viewMode).toBe('list');
 
     rerender({ isOpen: true });
 

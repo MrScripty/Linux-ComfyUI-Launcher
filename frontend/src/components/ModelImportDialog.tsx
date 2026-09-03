@@ -16,6 +16,7 @@ import { ImportLookupStep } from './model-import/ImportLookupStep';
 import { ImportResultStep } from './model-import/ImportResultStep';
 import { ImportReviewStep } from './model-import/ImportReviewStep';
 import { useModelImportWorkflow } from './model-import/useModelImportWorkflow';
+import { ModalDialog } from './ui';
 
 interface ModelImportDialogProps {
   /** Paths to import */
@@ -31,6 +32,8 @@ export const ModelImportDialog: React.FC<ModelImportDialogProps> = ({
   onClose,
   onImportComplete,
 }) => {
+  const titleId = React.useId();
+  const closeButtonRef = React.useRef<HTMLButtonElement>(null);
   const {
     step,
     entries,
@@ -63,12 +66,19 @@ export const ModelImportDialog: React.FC<ModelImportDialogProps> = ({
   } = useModelImportWorkflow({ importPaths, onImportComplete });
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="w-full max-w-3xl bg-[hsl(var(--launcher-bg-secondary))] rounded-xl shadow-2xl border border-[hsl(var(--launcher-border))] overflow-hidden">
+    <ModalDialog
+      ariaLabelledBy={titleId}
+      backdropClassName="bg-black/50"
+      contentClassName="w-full max-w-3xl bg-[hsl(var(--launcher-bg-secondary))] rounded-xl shadow-2xl border border-[hsl(var(--launcher-border))] overflow-hidden"
+      initialFocusRef={closeButtonRef}
+      isOpen={true}
+      onClose={onClose}
+      shouldCloseOnBackdrop={false}
+    >
         <div className="flex items-center justify-between px-6 py-4 border-b border-[hsl(var(--launcher-border))]">
           <div className="flex items-center gap-3">
             <FileBox className="w-5 h-5 text-[hsl(var(--launcher-accent-primary))]" />
-            <h2 className="text-lg font-semibold text-[hsl(var(--launcher-text-primary))]">
+            <h2 id={titleId} className="text-lg font-semibold text-[hsl(var(--launcher-text-primary))]">
               {step === 'classifying' && 'Inspecting import paths...'}
               {step === 'review' && 'Import Models'}
               {step === 'lookup' && 'Looking up metadata...'}
@@ -77,9 +87,11 @@ export const ModelImportDialog: React.FC<ModelImportDialogProps> = ({
             </h2>
           </div>
           <button
+            ref={closeButtonRef}
             onClick={onClose}
             className="p-1 rounded-md text-[hsl(var(--launcher-text-muted))] hover:text-[hsl(var(--launcher-text-primary))] hover:bg-[hsl(var(--launcher-bg-tertiary))] transition-colors"
-            title={(step === 'importing' || step === 'lookup' || step === 'classifying') ? 'Close' : 'Close'}
+            aria-label="Close model import dialog"
+            title="Close"
           >
             <X className="w-5 h-5" />
           </button>
@@ -160,7 +172,6 @@ export const ModelImportDialog: React.FC<ModelImportDialogProps> = ({
           shardedSets={shardedSets}
           step={step}
         />
-      </div>
-    </div>
+    </ModalDialog>
   );
 };

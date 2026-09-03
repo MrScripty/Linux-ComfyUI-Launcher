@@ -18,7 +18,6 @@ interface UseVersionFetchingOptions {
   appId?: string;
   enabled?: boolean;
   trackAvailableVersions?: boolean;
-  onInstallingTagUpdate?: (tag: string | null) => void;
 }
 
 interface UseVersionFetchingResult {
@@ -47,7 +46,6 @@ export function useVersionFetching({
   appId,
   enabled = true,
   trackAvailableVersions = true,
-  onInstallingTagUpdate,
 }: UseVersionFetchingOptions = {}): UseVersionFetchingResult {
   const resolvedAppId = appId ?? 'ollama';
   const isEnabled = enabled;
@@ -65,7 +63,6 @@ export function useVersionFetching({
     rateLimitRetryAfter,
   } = useAvailableVersionState({
     isEnabled,
-    onInstallingTagUpdate,
     resolvedAppId,
     trackAvailableVersions,
   });

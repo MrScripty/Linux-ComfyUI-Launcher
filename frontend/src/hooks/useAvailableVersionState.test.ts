@@ -65,12 +65,9 @@ describe('useAvailableVersionState', () => {
     vi.useRealTimers();
   });
 
-  it('maps available versions, notifies about installing tags, and schedules follow-up refreshes', async () => {
-    const onInstallingTagUpdate = vi.fn();
-
+  it('maps available versions and schedules follow-up refreshes', async () => {
     const { result } = renderHook(() => useAvailableVersionState({
       isEnabled: true,
-      onInstallingTagUpdate,
       resolvedAppId: 'ollama',
       trackAvailableVersions: true,
     }));
@@ -88,8 +85,6 @@ describe('useAvailableVersionState', () => {
         installing: true,
       }),
     ]);
-    expect(onInstallingTagUpdate).toHaveBeenCalledWith('v1.2.3');
-
     await act(async () => {
       vi.advanceTimersByTime(1500);
     });

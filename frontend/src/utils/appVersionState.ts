@@ -33,13 +33,13 @@ export const UNSUPPORTED_VERSION_STATE: AppVersionState = {
   },
   switchVersion: noopBoolean,
   installVersion: noopBoolean,
+  cancelInstallation: noopBoolean,
   removeVersion: noopBoolean,
   getVersionInfo: noopInfo,
   refreshAll: noopVoid,
   refreshAvailableVersions: noopVoid,
   openPath: noopBoolean,
   openActiveInstall: noopBoolean,
-  fetchInstallationProgress: noopInfo,
   setDefaultVersion: noopVoid,
 };
 

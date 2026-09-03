@@ -38,7 +38,7 @@ export function RemoteModelDownloadMenu({
   collectSelectedFilenames,
 }: RemoteModelDownloadMenuProps) {
   return (
-    <div className="absolute right-0 top-full z-10 mt-2 min-w-[200px] rounded border border-[hsl(var(--launcher-border))] bg-[hsl(var(--launcher-bg-overlay))] shadow-[0_12px_24px_hsl(var(--launcher-bg-primary)/0.6)]">
+    <>
       {isHydratingDetails && !hasExactDetails ? (
         <div className="flex items-center gap-2 px-3 py-3 text-xs text-[hsl(var(--text-muted))]">
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -135,6 +135,6 @@ export function RemoteModelDownloadMenu({
           </button>
         </>
       )}
-    </div>
+    </>
   );
 }

@@ -3,7 +3,7 @@
  *
  * Modal/page for installing app versions with progress tracking.
  * Reduced from 939 lines to orchestrator component by extracting:
- * - useInstallationProgress hook (progress polling)
+ * - useInstallationProgress hook (dialog presentation state)
  * - useInstallationState hook (UI state management)
  * - ProgressDetailsView component (detailed progress display)
  * - VersionListItem component (version cards)
@@ -11,7 +11,6 @@
  */
 
 import { useState, useEffect, useRef } from 'react';
-import { api } from '../api/adapter';
 import type { VersionRelease, InstallationProgress } from '../hooks/useVersions';
 import { useInstallationProgress } from '../hooks/useInstallationProgress';
 import { useInstallDialogLinks } from '../hooks/useInstallDialogLinks';
@@ -40,13 +39,13 @@ interface InstallDialogProps {
   installedVersions: string[];
   isLoading: boolean;
   onInstallVersion: (tag: string) => Promise<boolean>;
+  onCancelInstallation: () => Promise<boolean>;
   onRefreshAll: (forceRefresh?: boolean) => Promise<void>;
   onRemoveVersion: (tag: string) => Promise<boolean>;
   displayMode?: 'modal' | 'page';
   installingTag?: string | null;
   installationProgress?: InstallationProgress | null;
   installNetworkStatus?: 'idle' | 'downloading' | 'stalled' | 'failed';
-  onRefreshProgress?: () => Promise<unknown>;
   appDisplayName?: string;
   appId?: string;
   /** True when GitHub API rate limit was hit */
@@ -62,13 +61,13 @@ export function InstallDialog({
   installedVersions,
   isLoading,
   onInstallVersion,
+  onCancelInstallation,
   onRefreshAll,
   onRemoveVersion,
   displayMode = 'modal',
   installingTag,
   installationProgress,
   installNetworkStatus = 'idle',
-  onRefreshProgress,
   appDisplayName = 'Application',
   appId,
   isRateLimited = false,
@@ -91,10 +90,7 @@ export function InstallDialog({
     setFailedInstall,
     showCancellationNotice,
   } = useInstallationProgress({
-    appId,
-    installingVersion,
     externalProgress: installationProgress,
-    onRefreshProgress,
   });
 
   const {
@@ -129,17 +125,13 @@ export function InstallDialog({
       if (failedInstall?.tag === installingTag) {
         setFailedInstall(null);
       }
-    } else if (!installationProgress || installationProgress.completed_at) {
+    } else if (!installationProgress) {
       setInstallingVersion(null);
     }
   }, [installingTag, installationProgress, failedInstall, setFailedInstall]);
 
-  // Handle completion when progress is driven externally (hook polling)
+  // Reset dialog-only state after manager-owned terminal progress is visible.
   useEffect(() => {
-    if (!onRefreshProgress) {
-      return;
-    }
-
     if (!progress || !progress.completed_at) {
       return;
     }
@@ -154,7 +146,7 @@ export function InstallDialog({
     }, resetDelay);
 
     return () => clearTimeout(timer);
-  }, [progress, onRefreshProgress, setShowCompletedItems, setViewMode]);
+  }, [progress, setShowCompletedItems, setViewMode]);
 
   const filteredVersions = filterVersions(
     availableVersions,
@@ -175,9 +167,6 @@ export function InstallDialog({
 
     try {
       await onInstallVersion(tag);
-      if (onRefreshProgress) {
-        await onRefreshProgress();
-      }
       logger.info('Installation initiated successfully', { tag });
     } catch (error) {
       const isCancellation = isInstallationCancellation(error, cancellationRef.current);
@@ -203,8 +192,8 @@ export function InstallDialog({
 
     try {
       logger.info('Cancelling installation');
-      const result = await api.cancel_installation();
-      if (result.success) {
+      const wasCancelled = await onCancelInstallation();
+      if (wasCancelled) {
         logger.info('Installation cancelled successfully');
         cancellationRef.current = true;
         showCancellationNotice();
@@ -212,11 +201,14 @@ export function InstallDialog({
         setShowCompletedItems(false);
         setViewMode('list');
         setCancelHoverTag(null);
-      } else {
-        logger.error('Failed to cancel installation', { error: result.error });
       }
     } catch (error) {
       reportCancelError(error);
+      cancellationRef.current = false;
+      if (installingVersion) {
+        setErrorVersion(installingVersion);
+        setErrorMessage(getErrorMessage(error));
+      }
     }
   };
 

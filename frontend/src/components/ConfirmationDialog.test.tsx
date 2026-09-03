@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { ConfirmationDialog } from './ConfirmationDialog';
 
@@ -27,7 +27,7 @@ describe('ConfirmationDialog', () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
-  it('cancels on Escape before parent key handlers observe the event', () => {
+  it('cancels on Escape before parent key handlers observe the event', async () => {
     const onCancel = vi.fn();
     const parentKeyHandler = vi.fn();
 
@@ -43,7 +43,8 @@ describe('ConfirmationDialog', () => {
       />
     );
 
-    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus());
+    fireEvent.keyDown(document, { key: 'Escape' });
 
     expect(onCancel).toHaveBeenCalledTimes(1);
     expect(parentKeyHandler).not.toHaveBeenCalled();

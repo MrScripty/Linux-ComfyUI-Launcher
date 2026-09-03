@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RuntimeProfilesSnapshot } from '../types/api-runtime-profiles';
@@ -120,6 +121,59 @@ beforeEach(() => {
   });
 
 describe('ModelServeDialog configuration', () => {
+  it('uses the shared modal lifecycle without applying it to page mode', async () => {
+    function DialogHarness() {
+      const [isOpen, setIsOpen] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setIsOpen(true)}>Open serving</button>
+          {isOpen && (
+            <ModelServeDialog
+              model={{
+                id: 'modal-model',
+                name: 'Modal Model',
+                category: 'local',
+                primaryFormat: 'gguf',
+              }}
+              initialProfileId="emily-llama"
+              onClose={() => setIsOpen(false)}
+            />
+          )}
+        </>
+      );
+    }
+
+    render(<DialogHarness />);
+    const trigger = screen.getByRole('button', { name: 'Open serving' });
+    trigger.focus();
+    fireEvent.click(trigger);
+    expect(await screen.findByRole('dialog', { name: 'Serve Modal Model' })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('combobox', { name: /runtime target/i })).toHaveFocus());
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Serve Modal Model' })).not.toBeInTheDocument();
+    });
+    expect(trigger).toHaveFocus();
+
+    trigger.focus();
+    render(
+      <ModelServeDialog
+        model={{
+          id: 'page-model',
+          name: 'Page Model',
+          category: 'local',
+          primaryFormat: 'gguf',
+        }}
+        displayMode="page"
+        initialProfileId="emily-llama"
+        onClose={vi.fn()}
+      />
+    );
+    expect(screen.queryByRole('dialog', { name: 'Serve Page Model' })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
   it('uses the route editor selected profile when opening the dialog', async () => {
     render(
       <ModelServeDialog

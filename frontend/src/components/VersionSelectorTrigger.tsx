@@ -6,6 +6,7 @@ import {
   TriggerDefaultButton,
   VersionManagerButton,
 } from './VersionSelectorTriggerControls';
+import type { PopoverTriggerProps } from './ui';
 
 interface VersionSelectorTriggerProps {
   hasVersionsToShow: boolean;
@@ -27,7 +28,7 @@ interface VersionSelectorTriggerProps {
   isInstallPending: boolean;
   isInstallFailed: boolean;
   ringDegrees: number;
-  onToggleOpen: () => void;
+  popoverTriggerProps: PopoverTriggerProps;
   onToggleDefault: () => void;
   onOpenActiveInstall: (event: React.MouseEvent) => void;
   onOpenVersionManager: (event: React.MouseEvent) => void;
@@ -54,7 +55,7 @@ export function VersionSelectorTrigger({
   isInstallPending,
   isInstallFailed,
   ringDegrees,
-  onToggleOpen,
+  popoverTriggerProps,
   onToggleDefault,
   onOpenActiveInstall,
   onOpenVersionManager,
@@ -86,7 +87,8 @@ export function VersionSelectorTrigger({
               )}
             </span>
             <button
-              onClick={onToggleOpen}
+              type="button"
+              {...popoverTriggerProps}
               disabled={!hasVersionsToShow || isLoading || isSwitching}
               className="min-w-0 flex-1 text-left transition-opacity hover:opacity-80 disabled:cursor-not-allowed"
             >

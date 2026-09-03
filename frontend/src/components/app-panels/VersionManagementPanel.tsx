@@ -78,12 +78,12 @@ export function VersionManagementPanel({
             installedVersions={versions.installedVersions}
             isLoading={versions.isLoading}
             onInstallVersion={versions.installVersion}
+            onCancelInstallation={versions.cancelInstallation}
             onRemoveVersion={versions.removeVersion}
             onRefreshAll={versions.refreshAll}
             installingTag={versions.installingTag}
             installationProgress={versions.installationProgress}
             installNetworkStatus={versions.installNetworkStatus}
-            onRefreshProgress={versions.fetchInstallationProgress}
             displayMode="page"
             appDisplayName={appDisplayName}
             appId={versions.appId ?? undefined}

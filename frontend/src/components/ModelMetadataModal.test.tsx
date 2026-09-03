@@ -24,7 +24,7 @@ vi.mock('../api/models', () => ({
 }));
 
 describe('ModelMetadataModal', () => {
-  it('renders as a named dialog and closes from the backdrop or Escape key', () => {
+  it('renders as a named dialog and closes from the backdrop or Escape key', async () => {
     const onClose = vi.fn();
     getLibraryModelMetadataMock.mockResolvedValue({
       success: true,
@@ -40,12 +40,17 @@ describe('ModelMetadataModal', () => {
 
     render(<ModelMetadataModal modelId="model-1" modelName="Test Model" onClose={onClose} />);
 
-    expect(screen.getByRole('dialog', { name: 'Test Model' })).toBeInTheDocument();
+    const dialog = screen.getByRole('dialog', { name: 'Test Model' });
+    await screen.findByText('No embedded metadata available');
+    const backdrop = dialog.parentElement?.querySelector<HTMLElement>('[data-modal-backdrop]');
+    if (!backdrop) {
+      throw new TypeError('Expected metadata modal backdrop');
+    }
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close metadata modal' }));
+    fireEvent.mouseDown(backdrop);
     expect(onClose).toHaveBeenCalledTimes(1);
 
-    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 

@@ -25,7 +25,13 @@ function renderTrigger(overrides: Partial<React.ComponentProps<typeof VersionSel
     onOpenActiveInstall: vi.fn(),
     onOpenVersionManager: vi.fn(),
     onToggleDefault: vi.fn(),
-    onToggleOpen: vi.fn(),
+    popoverTriggerProps: {
+      'aria-controls': 'version-actions',
+      'aria-expanded': false,
+      'aria-haspopup': 'dialog',
+      onClick: vi.fn(),
+      ref: vi.fn(),
+    },
     ringDegrees: 0,
     showOpenedIndicator: false,
     ...overrides,
@@ -40,11 +46,15 @@ describe('VersionSelectorTrigger', () => {
     const props = renderTrigger();
 
     fireEvent.click(screen.getByRole('button', { name: 'v1.0.0' }));
-    expect(props.onToggleOpen).toHaveBeenCalledTimes(1);
+    expect(props.popoverTriggerProps.onClick).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'v1.0.0' })).toHaveAttribute(
+      'aria-controls',
+      'version-actions'
+    );
 
     fireEvent.click(screen.getByTitle('Click to unset as default'));
     expect(props.onToggleDefault).toHaveBeenCalledTimes(1);
-    expect(props.onToggleOpen).toHaveBeenCalledTimes(1);
+    expect(props.popoverTriggerProps.onClick).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByTitle('Open active version in file manager'));
     expect(props.onOpenActiveInstall).toHaveBeenCalledTimes(1);

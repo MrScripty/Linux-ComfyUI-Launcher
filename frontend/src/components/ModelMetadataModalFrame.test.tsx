@@ -21,10 +21,15 @@ describe('ModelMetadataModalFrame', () => {
     expect(screen.getByRole('dialog', { name: 'Test Model' })).toBeInTheDocument();
     expect(screen.getByText('Metadata content')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close metadata modal' }));
+    const dialog = screen.getByRole('dialog', { name: 'Test Model' });
+    const backdrop = dialog.parentElement?.querySelector<HTMLElement>('[data-modal-backdrop]');
+    if (!backdrop) {
+      throw new TypeError('Expected metadata dialog backdrop');
+    }
+    fireEvent.mouseDown(backdrop);
     expect(onClose).toHaveBeenCalledTimes(1);
 
-    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.keyDown(document, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 

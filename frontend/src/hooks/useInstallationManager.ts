@@ -1,13 +1,15 @@
 /**
- * Installation Manager Hook
- *
- * Manages version installation, removal, switching, and progress tracking.
- * Extracted from hooks/useVersions.ts
+ * Owns app-scoped version installation actions and progress synchronization.
  */
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, isAPIAvailable } from '../api/adapter';
-import type { InstallationProgress, InstallNetworkStatus, VersionRelease, VersionInfo } from '../types/versions';
+import type {
+  InstallationProgress,
+  InstallNetworkStatus,
+  VersionInfo,
+  VersionRelease,
+} from '../types/versions';
 import {
   createNetworkStatusState,
   type NetworkStatusState,
@@ -21,6 +23,8 @@ import {
 import { useInstallationAccess } from './useInstallationAccess';
 
 const logger = getLogger('useInstallationManager');
+const INSTALLATION_POLL_INTERVAL_MS = 800;
+const MAX_MISSING_PROGRESS_POLLS = 10;
 
 interface UseInstallationManagerOptions {
   appId?: string;
@@ -35,11 +39,22 @@ interface UseInstallationManagerResult {
   installNetworkStatus: InstallNetworkStatus;
   switchVersion: (tag: string) => Promise<boolean>;
   installVersion: (tag: string) => Promise<boolean>;
+  cancelInstallation: () => Promise<boolean>;
   removeVersion: (tag: string) => Promise<boolean>;
   getVersionInfo: (tag: string) => Promise<VersionInfo | null>;
   openPath: (path: string) => Promise<boolean>;
   openActiveInstall: () => Promise<boolean>;
-  fetchInstallationProgress: () => Promise<InstallationProgress | null>;
+}
+
+interface InstallationLifecycle {
+  appId: string;
+  generation: number;
+  tag: string;
+}
+
+interface ProgressRequest {
+  lifecycle: InstallationLifecycle;
+  promise: Promise<boolean>;
 }
 
 export function useInstallationManager({
@@ -54,21 +69,26 @@ export function useInstallationManager({
   const [installationProgress, setInstallationProgress] = useState<InstallationProgress | null>(null);
   const [installNetworkStatus, setInstallNetworkStatus] = useState<InstallNetworkStatus>('idle');
 
-  const installPollRef = useRef<NodeJS.Timeout | null>(null);
+  const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeProgressRequestRef = useRef<ProgressRequest | null>(null);
+  const generationRef = useRef(0);
+  const mountedRef = useRef(true);
+  const renderIdentityRef = useRef({ appId: resolvedAppId, enabled: isEnabled });
   const lastDownloadTagRef = useRef<string | null>(null);
   const lastStageRef = useRef<InstallationProgress['stage'] | null>(null);
   const pendingInstallTagRef = useRef<string | null>(null);
   const missingProgressPollsRef = useRef(0);
   const networkStateRef = useRef<NetworkStatusState>(createNetworkStatusState());
+  const runPollRef = useRef<(lifecycle: InstallationLifecycle) => void>(() => {});
+
+  renderIdentityRef.current = { appId: resolvedAppId, enabled: isEnabled };
+
   const { getVersionInfo, openActiveInstall, openPath } = useInstallationAccess({
     isEnabled,
     resolvedAppId,
   });
 
-  const resetInstallState = useCallback(() => {
-    setInstallingTag(null);
-    setInstallationProgress(null);
-    setInstallNetworkStatus('idle');
+  const resetTracking = useCallback(() => {
     resetInstallationProgressTracking({
       lastDownloadTag: lastDownloadTagRef.current,
       lastStage: lastStageRef.current,
@@ -80,117 +100,240 @@ export function useInstallationManager({
     missingProgressPollsRef.current = 0;
   }, []);
 
+  const resetInstallState = useCallback(() => {
+    setInstallingTag(null);
+    setInstallationProgress(null);
+    setInstallNetworkStatus('idle');
+    resetTracking();
+  }, [resetTracking]);
+
   const stopInstallPolling = useCallback(() => {
-    if (installPollRef.current) {
-      clearInterval(installPollRef.current);
-      installPollRef.current = null;
+    if (pollTimeoutRef.current) {
+      clearTimeout(pollTimeoutRef.current);
+      pollTimeoutRef.current = null;
     }
   }, []);
 
-  const startInstallPolling = useCallback((poll: () => void) => {
+  const isCurrentLifecycle = useCallback((lifecycle: InstallationLifecycle) => {
+    const renderIdentity = renderIdentityRef.current;
+    return mountedRef.current
+      && renderIdentity.enabled
+      && renderIdentity.appId === lifecycle.appId
+      && generationRef.current === lifecycle.generation;
+  }, []);
+
+  const beginInstallationLifecycle = useCallback((tag: string): InstallationLifecycle => {
+    generationRef.current += 1;
     stopInstallPolling();
-    installPollRef.current = setInterval(poll, 800);
+    resetTracking();
+    pendingInstallTagRef.current = tag;
+    setInstallingTag(tag);
+    setInstallationProgress(null);
+    setInstallNetworkStatus('idle');
+    return {
+      appId: resolvedAppId,
+      generation: generationRef.current,
+      tag,
+    };
+  }, [resetTracking, resolvedAppId, stopInstallPolling]);
+
+  const finishInstallationLifecycle = useCallback((
+    lifecycle: InstallationLifecycle,
+    terminalProgress?: InstallationProgress
+  ) => {
+    if (!isCurrentLifecycle(lifecycle)) {
+      return;
+    }
+
+    stopInstallPolling();
+    generationRef.current += 1;
+    resetTracking();
+    setInstallingTag(null);
+
+    if (terminalProgress) {
+      setInstallationProgress(terminalProgress);
+      setInstallNetworkStatus(terminalProgress.success ? 'idle' : 'failed');
+      return;
+    }
+
+    setInstallationProgress(null);
+    setInstallNetworkStatus('idle');
+  }, [isCurrentLifecycle, resetTracking, stopInstallPolling]);
+
+  const requestInstallationProgress = useCallback(async (
+    lifecycle: InstallationLifecycle
+  ): Promise<boolean> => {
+    if (!isCurrentLifecycle(lifecycle) || !isAPIAvailable()) {
+      return false;
+    }
+
+    const activeRequest = activeProgressRequestRef.current;
+    if (activeRequest) {
+      if (
+        activeRequest.lifecycle.appId === lifecycle.appId
+        && activeRequest.lifecycle.generation === lifecycle.generation
+      ) {
+        return activeRequest.promise;
+      }
+
+      await activeRequest.promise;
+      if (!isCurrentLifecycle(lifecycle)) {
+        return false;
+      }
+
+      const replacementRequest = activeProgressRequestRef.current;
+      if (replacementRequest) {
+        return replacementRequest.promise;
+      }
+    }
+
+    const promise = (async () => {
+      try {
+        const progress = await api.get_installation_progress(lifecycle.appId);
+        if (!isCurrentLifecycle(lifecycle)) {
+          return false;
+        }
+
+        if (progress && !progress.completed_at) {
+          pendingInstallTagRef.current = progress.tag || lifecycle.tag;
+          missingProgressPollsRef.current = 0;
+          setInstallingTag(progress.tag || lifecycle.tag);
+
+          const trackerState = {
+            lastDownloadTag: lastDownloadTagRef.current,
+            lastStage: lastStageRef.current,
+            networkState: networkStateRef.current,
+          };
+          const { adjustedProgress, networkStatus } = normalizeInstallationProgress(
+            progress,
+            availableVersions,
+            trackerState,
+            Date.now()
+          );
+          lastDownloadTagRef.current = trackerState.lastDownloadTag;
+          lastStageRef.current = trackerState.lastStage;
+          setInstallationProgress(adjustedProgress);
+          setInstallNetworkStatus(networkStatus);
+          return true;
+        }
+
+        if (progress?.completed_at) {
+          const trackerState = {
+            lastDownloadTag: lastDownloadTagRef.current,
+            lastStage: lastStageRef.current,
+            networkState: networkStateRef.current,
+          };
+          const { adjustedProgress } = normalizeInstallationProgress(
+            progress,
+            availableVersions,
+            trackerState,
+            Date.now()
+          );
+          lastDownloadTagRef.current = trackerState.lastDownloadTag;
+          lastStageRef.current = trackerState.lastStage;
+
+          if (progress.success) {
+            await onRefreshVersions();
+            if (!isCurrentLifecycle(lifecycle)) {
+              return false;
+            }
+          }
+
+          finishInstallationLifecycle(lifecycle, adjustedProgress);
+          return false;
+        }
+
+        if (
+          !progress?.completed_at
+          && pendingInstallTagRef.current
+          && missingProgressPollsRef.current < MAX_MISSING_PROGRESS_POLLS
+        ) {
+          missingProgressPollsRef.current += 1;
+          setInstallingTag(pendingInstallTagRef.current);
+          return true;
+        }
+
+        if (pendingInstallTagRef.current) {
+          await onRefreshVersions();
+          if (!isCurrentLifecycle(lifecycle)) {
+            return false;
+          }
+        }
+        finishInstallationLifecycle(lifecycle);
+        return false;
+      } catch (error) {
+        if (!isCurrentLifecycle(lifecycle)) {
+          return false;
+        }
+        if (error instanceof APIError) {
+          logger.error('API error fetching installation progress', {
+            error: error.message,
+            endpoint: error.endpoint,
+          });
+        } else if (error instanceof Error) {
+          logger.error('Unexpected error fetching installation progress', { error: error.message });
+        } else {
+          logger.error('Unknown error fetching installation progress', { error });
+        }
+        setInstallNetworkStatus('failed');
+        return true;
+      }
+    })();
+
+    const request: ProgressRequest = { lifecycle, promise };
+    activeProgressRequestRef.current = request;
+    try {
+      return await promise;
+    } finally {
+      if (activeProgressRequestRef.current === request) {
+        activeProgressRequestRef.current = null;
+      }
+    }
+  }, [availableVersions, finishInstallationLifecycle, isCurrentLifecycle, onRefreshVersions]);
+
+  const scheduleNextPoll = useCallback((lifecycle: InstallationLifecycle) => {
+    if (!isCurrentLifecycle(lifecycle)) {
+      return;
+    }
+    stopInstallPolling();
+    pollTimeoutRef.current = setTimeout(() => {
+      pollTimeoutRef.current = null;
+      runPollRef.current(lifecycle);
+    }, INSTALLATION_POLL_INTERVAL_MS);
+  }, [isCurrentLifecycle, stopInstallPolling]);
+
+  runPollRef.current = (lifecycle) => {
+    void requestInstallationProgress(lifecycle).then((shouldContinue) => {
+      if (shouldContinue && isCurrentLifecycle(lifecycle)) {
+        scheduleNextPoll(lifecycle);
+      }
+    });
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      generationRef.current += 1;
+      stopInstallPolling();
+    };
   }, [stopInstallPolling]);
 
   useEffect(() => {
-    if (installPollRef.current) {
-      clearInterval(installPollRef.current);
-      installPollRef.current = null;
-    }
+    generationRef.current += 1;
+    stopInstallPolling();
     resetInstallState();
-  }, [resolvedAppId, isEnabled, resetInstallState]);
+  }, [isEnabled, resetInstallState, resolvedAppId, stopInstallPolling]);
 
-  // Fetch current installation progress
-  const fetchInstallationProgress = useCallback(async () => {
-    if (!isAPIAvailable() || !isEnabled) {
-      return null;
+  const installingReleaseTag = availableVersions.find((release) => release.installing)?.tagName ?? null;
+  useEffect(() => {
+    if (!isEnabled || !installingReleaseTag || pendingInstallTagRef.current === installingReleaseTag) {
+      return;
     }
+    const lifecycle = beginInstallationLifecycle(installingReleaseTag);
+    runPollRef.current(lifecycle);
+  }, [beginInstallationLifecycle, installingReleaseTag, isEnabled]);
 
-    try {
-      const progress = await api.get_installation_progress(resolvedAppId);
-
-      if (progress && !progress.completed_at) {
-        pendingInstallTagRef.current = progress.tag || pendingInstallTagRef.current;
-        missingProgressPollsRef.current = 0;
-        setInstallingTag(progress.tag || null);
-        const trackerState = {
-          lastDownloadTag: lastDownloadTagRef.current,
-          lastStage: lastStageRef.current,
-          networkState: networkStateRef.current,
-        };
-        const { adjustedProgress, networkStatus } = normalizeInstallationProgress(
-          progress,
-          availableVersions,
-          trackerState,
-          Date.now()
-        );
-        lastDownloadTagRef.current = trackerState.lastDownloadTag;
-        lastStageRef.current = trackerState.lastStage;
-
-        setInstallationProgress(adjustedProgress);
-        setInstallNetworkStatus(networkStatus);
-
-        return adjustedProgress;
-      } else if (progress?.completed_at && !progress.success) {
-        pendingInstallTagRef.current = null;
-        missingProgressPollsRef.current = 0;
-        const trackerState = {
-          lastDownloadTag: lastDownloadTagRef.current,
-          lastStage: lastStageRef.current,
-          networkState: networkStateRef.current,
-        };
-        const { adjustedProgress } = normalizeInstallationProgress(
-          progress,
-          availableVersions,
-          trackerState,
-          Date.now()
-        );
-        lastDownloadTagRef.current = trackerState.lastDownloadTag;
-        lastStageRef.current = trackerState.lastStage;
-
-        stopInstallPolling();
-        setInstallingTag(null);
-        setInstallationProgress(adjustedProgress);
-        setInstallNetworkStatus('failed');
-
-        return adjustedProgress;
-      } else {
-        if (!progress?.completed_at && pendingInstallTagRef.current && missingProgressPollsRef.current < 10) {
-          missingProgressPollsRef.current += 1;
-          setInstallingTag(pendingInstallTagRef.current);
-          return null;
-        }
-
-        // Installation completed (progress.completed_at set) or no progress
-        // Clear all state and stop polling. On successful completion, refresh first so
-        // installed rows can switch to Ready/Uninstall instead of briefly returning to Download.
-        stopInstallPolling();
-
-        if (progress?.completed_at) {
-          pendingInstallTagRef.current = null;
-          missingProgressPollsRef.current = 0;
-          await onRefreshVersions();
-        } else if (pendingInstallTagRef.current) {
-          await onRefreshVersions();
-        }
-        resetInstallState();
-      }
-
-      return null;
-    } catch (error) {
-      if (error instanceof APIError) {
-        logger.error('API error fetching installation progress', { error: error.message, endpoint: error.endpoint });
-      } else if (error instanceof Error) {
-        logger.error('Unexpected error fetching installation progress', { error: error.message });
-      } else {
-        logger.error('Unknown error fetching installation progress', { error });
-      }
-      setInstallNetworkStatus('failed');
-      return null;
-    }
-  }, [availableVersions, isEnabled, onRefreshVersions, resetInstallState, resolvedAppId, stopInstallPolling]);
-
-  // Switch to a different installed version
   const switchVersion = useCallback(async (tag: string) => {
     if (!isAPIAvailable() || !isEnabled) {
       throw new APIError('API not available', 'switch_version');
@@ -198,12 +341,11 @@ export function useInstallationManager({
 
     try {
       const result = await api.switch_version(tag, resolvedAppId);
-      if (result.success) {
-        await onRefreshVersions();
-        return true;
-      } else {
+      if (!result.success) {
         throw new APIError(result.error || 'Failed to switch version', 'switch_version');
       }
+      await onRefreshVersions();
+      return true;
     } catch (error) {
       if (error instanceof APIError) {
         logger.error('API error switching version', { error: error.message, endpoint: error.endpoint, tag });
@@ -216,31 +358,22 @@ export function useInstallationManager({
     }
   }, [isEnabled, onRefreshVersions, resolvedAppId]);
 
-  // Install a new version
   const installVersion = useCallback(async (tag: string) => {
     if (!isAPIAvailable() || !isEnabled) {
       throw new APIError('API not available', 'install_version');
     }
 
-    pendingInstallTagRef.current = tag;
-    missingProgressPollsRef.current = 0;
-    setInstallingTag(tag);
-    startInstallPolling(() => {
-      void fetchInstallationProgress();
-    });
+    const lifecycle = beginInstallationLifecycle(tag);
 
     try {
       const result = await api.install_version(tag, resolvedAppId);
-      if (result.success) {
-        await fetchInstallationProgress();
-        return true;
-      } else {
+      if (!result.success) {
         throw new APIError(result.error || 'Failed to install version', 'install_version');
       }
+      runPollRef.current(lifecycle);
+      return true;
     } catch (error) {
-      stopInstallPolling();
-      resetInstallState();
-
+      finishInstallationLifecycle(lifecycle);
       if (error instanceof APIError) {
         logger.error('API error installing version', { error: error.message, endpoint: error.endpoint, tag });
       } else if (error instanceof Error) {
@@ -250,9 +383,20 @@ export function useInstallationManager({
       }
       throw error;
     }
-  }, [fetchInstallationProgress, isEnabled, resetInstallState, resolvedAppId, startInstallPolling, stopInstallPolling]);
+  }, [beginInstallationLifecycle, finishInstallationLifecycle, isEnabled, resolvedAppId]);
 
-  // Remove a version
+  const cancelInstallation = useCallback(async () => {
+    if (!isAPIAvailable() || !isEnabled) {
+      throw new APIError('API not available', 'cancel_installation');
+    }
+
+    const result = await api.cancel_installation(resolvedAppId);
+    if (!result.success) {
+      throw new APIError(result.error || 'Failed to cancel installation', 'cancel_installation');
+    }
+    return true;
+  }, [isEnabled, resolvedAppId]);
+
   const removeVersion = useCallback(async (tag: string) => {
     if (!isAPIAvailable() || !isEnabled) {
       throw new APIError('API not available', 'remove_version');
@@ -260,12 +404,11 @@ export function useInstallationManager({
 
     try {
       const result = await api.remove_version(tag, resolvedAppId);
-      if (result.success) {
-        await onRefreshVersions();
-        return true;
-      } else {
+      if (!result.success) {
         throw new APIError(result.error || 'Failed to remove version', 'remove_version');
       }
+      await onRefreshVersions();
+      return true;
     } catch (error) {
       if (error instanceof APIError) {
         logger.error('API error removing version', { error: error.message, endpoint: error.endpoint, tag });
@@ -278,25 +421,16 @@ export function useInstallationManager({
     }
   }, [isEnabled, onRefreshVersions, resolvedAppId]);
 
-  // Cleanup polling on unmount
-  useEffect(() => {
-    return () => {
-      if (installPollRef.current) {
-        clearInterval(installPollRef.current);
-      }
-    };
-  }, []);
-
   return {
     installingTag,
     installationProgress,
     installNetworkStatus,
     switchVersion,
     installVersion,
+    cancelInstallation,
     removeVersion,
     getVersionInfo,
     openPath,
     openActiveInstall,
-    fetchInstallationProgress,
   };
 }

@@ -1,12 +1,15 @@
 # Plan: Frontend and UI Standards Remediation
 
-**Plan status:** `Planned`
+**Plan status:** `Active`
 
-**Current phase:** Planned and awaiting an explicit `start`; no implementation slice has started.
+**Current phase:** Milestones 0 through 3 are accepted. M4 renderer source is
+blocked pending the producer/platform contract handoff.
 
-**Next slice:** On explicit `start`, M0-S1 — make `useInstallationManager` the sole serialized installation-progress owner, remove the unused dialog-local polling fallback, and add overlap, supersession, and unmount regression evidence.
+**Next slice:** After the M4 provider dependency is accepted, perform its
+mandatory FE-I10/FE-I11/FE-I14 pre-start classification before any renderer
+contract source edit.
 
-**Acceptance status:** `pending`
+**Acceptance status:** `partial`
 
 **Execution ledger:** [execution-ledger.md](execution-ledger.md)
 
@@ -47,9 +50,9 @@ changes only owners whose current behavior cannot support the audited claims.
 | --- | --- | --- | --- | --- | --- | --- |
 | FE-A1 | Every desktop RPC response or event used by renderer code arrives through the accepted platform decoder Interface; invalid, unsupported, unavailable, and operation-failure outcomes remain distinct and cannot become domain values through assertions or fallback substitution. | `contract` | `simulated` (generated-decoder test Adapter and malformed payload corpus) | `automated` | `pending` | Pending Milestone 4; producer proof remains linked to the Rust and platform plans |
 | FE-A2 | A valid saved model list renders immediately with visible cached provenance and real or explicitly unknown age; failed refresh remains visibly degraded and retryable; successful refresh replaces it with fresh authoritative state. | `user-workflow` | `representative` (built renderer in its supported desktop browser runtime) | `automated` | `pending` | Pending Milestones 1 and 4 |
-| FE-A3 | Installation progress has at most one request in flight for its current owner, and completions superseded by app/tag changes or unmount cannot mutate current state; success, failure, and cancellation remain distinguishable. | `integration` | `simulated` (controlled deferred request Adapter and fake clock) | `automated` | `pending` | Pending Milestone 0 |
-| FE-A4 | Affected modal and popup workflows expose names and state programmatically, support pointer and keyboard operation, contain and restore focus where modal, dismiss predictably, and preserve nested-dialog focus order. | `user-workflow` | `representative` (built renderer with keyboard and accessibility-tree observations) | `automated` | `pending` | Pending Milestones 1 and 2 |
-| FE-A5 | Installation progress and terminal outcomes are programmatically announced without duplicate noise, and the operating-system reduced-motion preference suppresses nonessential CSS and Framer Motion movement. | `user-workflow` | `representative` (built renderer with accessibility-tree and media-preference control) | `automated` | `pending` | Pending Milestones 1 and 3 |
+| FE-A3 | Installation progress has at most one request in flight for its current owner, begins only after the backend admits a requested lifecycle, and completions superseded by app/tag changes or unmount cannot mutate current state; success, failure, and cancellation remain distinguishable. | `integration` | `simulated` (controlled deferred request Adapter and fake clock) | `automated` | `satisfied` | [M0-S1 evidence](execution-ledger.md#2026-09-03--m0-s1-installation-progress-owner-accepted) plus accepted [PRG-I12 repair evidence](execution-ledger.md#2026-09-03--m3-s3a-status-reachability-terminal-retention-and-admission-order-accepted) |
+| FE-A4 | Affected modal and popup workflows expose names and state programmatically, support pointer and keyboard operation, contain and restore focus where modal, dismiss predictably, and preserve nested-dialog focus order. | `user-workflow` | `representative` (built renderer with keyboard and accessibility-tree observations) | `automated` | `satisfied` | [M2-S4 Chromium evidence](execution-ledger.md#2026-09-03--m2-s4-representative-chromium-evidence-accepted) |
+| FE-A5 | Installation progress and terminal outcomes are programmatically announced without duplicate noise, and the operating-system reduced-motion preference suppresses nonessential CSS and Framer Motion movement. | `user-workflow` | `representative` (built renderer with accessibility-tree and media-preference control) | `automated` | `satisfied` | [M3-S3b real-entry evidence](execution-ledger.md#2026-09-03--m3-s3b-popover-motion-and-terminal-semantics-accepted) |
 | FE-A6 | Both frontend build modes start through their real entry point; the default renderer exposes supported inference-plugin UI, while the library-only renderer omits that UI and still completes the core model-library workflow. | `user-workflow` | `representative` (built default and library-only renderers in the supported desktop browser runtime) | `automated` | `pending` | Pending Milestone 5; packaged-artifact claims remain in the platform plan |
 | FE-A7 | Frontend behavior documentation describes only the accepted cache provenance, keyboard/focus, reduced-motion, and variant behavior, and routes verification policy to the governance owner. | `focused` | `not-applicable` | `manual` | `pending` | Pending Milestones 3 through 5 |
 
@@ -123,13 +126,13 @@ changes only owners whose current behavior cannot support the audited claims.
 
 | Decision | Module / Interface / Seam | Production and test Adapters | Evidence / consequence |
 | --- | --- | --- | --- |
-| Deepen `useInstallationManager` as the sole installation synchronization Module for the resolved app/tag identity. Its existing result/actions are the Interface; serialized polling and generation ownership stay hidden. | Seam between renderer lifecycle and desktop installation operations. | Production Adapter is the accepted desktop API; tests use controlled deferred operations and a fake clock through the hook Interface. | Deletes the unused dialog-local polling owner instead of coordinating two loops. |
+| Deepen `useInstallationManager` as the sole installation synchronization Module for the resolved app/tag identity. Its result/actions Interface owns current progress and every installation lifecycle action, including app-scoped cancellation; serialized polling and generation ownership stay hidden. | Seam between renderer lifecycle and desktop installation operations. | Production Adapter is the accepted desktop API; tests use controlled deferred operations and a fake clock through the hook Interface. | Deletes the unused dialog-local polling owner and unscoped dialog cancellation instead of coordinating lifecycle across callers. |
 | Deepen `useModels` as the model-library projection Module. Its small renderer Interface adds provenance/freshness/degraded outcome and retry beside current model groups/actions. | Seam between authoritative catalog refresh, disposable local projection, and presentation. | Production Adapter is the accepted decoded models operation plus browser storage; tests use valid/legacy/malformed snapshots and controlled refresh outcomes. | One owner decides immediate display, freshness, replacement, and recovery. No second store is added. |
 | Consume the platform-generated decoded desktop Interface. Keep a frontend API wrapper only when it adds renderer-domain composition or recovery; delete fallback/pass-through helpers that erase outcome distinctions. | Existing Electron/preload process boundary; this plan owns only its renderer consumer side. | Platform owns the production decoder Adapter. Frontend tests use its proof-bearing test Adapter, not hand-authored parallel schemas. | Prevents schema drift and removes `{ } as DesktopBridgeAPI`/arbitrary fallback authority from renderer paths. |
 | Add one `ModalDialog` Module whose Interface owns accessible role/name, initial focus, containment, Escape/backdrop policy, nested restoration, and cleanup. Feature content owns titles, messages, and actions. | Seam between modal lifecycle policy and feature content. | No external production Adapter is needed; component tests supply focusable content, and representative tests drive the public component behavior. | Replaces partial duplicated focus hooks/frames. The Module is deeper than a styling wrapper. |
 | Add one `Popover` Module whose Interface owns trigger relationship/state, outside/Escape dismissal, focus entry/return, and cleanup. Feature content selects semantics appropriate to its actual actions. | Seam between non-modal popup lifecycle and selector/search/download content. | No external production Adapter is needed; tests drive trigger/content behavior through the Interface. | Does not introduce a generic menu/listbox abstraction or hide feature semantics. |
 | Implement progress/status semantics in the existing progress view and motion preference at the frontend composition root/CSS boundary. | Existing presentation owners; no shared Module until a second consumer needs the full lifecycle. | Representative harness controls progress and media preference. | Avoids a hypothetical announcement framework for a single current lifecycle. |
-| The renderer harness is admitted by a bounded experiment before its tool is selected. | Seam between built renderer behavior and acceptance evidence. | Real built renderer is the production subject; deterministic state fixtures are test Adapters only for external operations. | A jsdom assertion cannot decide browser focus geometry, media preference, or built-entry behavior. |
+| Use the installed Electron runtime and Chromium DevTools Protocol behind one package command; a frontend runner owns temporary builds/process cleanup, an Electron main Adapter owns browser input/accessibility/media observation, and deterministic fixtures own only external operations. | Seam between built renderer behavior and acceptance evidence. | Real built renderer and production preload are the production subject; IPC fixtures replace only external operation providers. | [Admission evidence](reports/renderer-harness-admission.md) reached the intended modal failure without a new dependency; jsdom and release smoke cannot decide the same outcomes. |
 
 ## Dependencies And Ownership
 
@@ -186,8 +189,9 @@ silently added to every local hook.
 
 ### Deferred decisions
 
-- Exact harness dependency and command name remain unavailable until the
-  admitted investigation decides them.
+- The package-local command name remains integration-owned until Milestone 5;
+  the admitted implementation uses existing Electron/Vite/Node dependencies
+  and the three-file owner split recorded in the admission report.
 - The exact decoded desktop Interface remains provider-owned until the Rust and
   platform plans accept it. This plan will not draft a temporary schema.
 - Existing version-1 cache retention ends only when the minimum supported
@@ -270,29 +274,42 @@ remove the unused second polling loop.
 - `frontend/src/components/InstallDialog.test.tsx`
 - `frontend/src/hooks/useVersions.ts`
 - `frontend/src/hooks/useVersions.test.ts`
+- `frontend/src/hooks/useSelectedAppVersions.test.ts`
+- `frontend/src/hooks/useVersionFetching.ts`
+- `frontend/src/hooks/useVersionFetching.test.ts`
+- `frontend/src/hooks/useAvailableVersionState.ts`
+- `frontend/src/hooks/useAvailableVersionState.test.ts`
+- `frontend/src/components/app-panels/VersionManagementPanel.tsx`
+- `frontend/src/utils/appVersionState.ts`
 - `reports/frontend-async-owner-inventory.md`
 - this plan, ledger, and issues files
 
 **Tasks:**
 
-- [ ] Record the bounded installation/timer consumer inventory and disposition;
+- [x] Record the bounded installation/timer consumer inventory and disposition;
   unrelated polling owners become follow-up issues unless they share the exact
   current-invocation defect.
-- [ ] Replace interval overlap with a serialized self-scheduling loop whose
+- [x] Replace interval overlap with a serialized self-scheduling loop whose
   next request starts only after the current request settles.
-- [ ] Give each enabled app/tag lifecycle a generation and prevent superseded
+- [x] Start polling a requested install only after the backend accepts that
+  lifecycle; retain immediate polling only for an existing release-discovery
+  lifecycle.
+- [x] Give each enabled app/tag lifecycle a generation and prevent superseded
   or unmounted completions from mutating state.
-- [ ] Keep non-cancellable completions observed and classified; do not abandon
+- [x] Keep non-cancellable completions observed and classified; do not abandon
   rejected promises.
-- [ ] Remove the unreachable dialog-local polling fallback and narrow its
+- [x] Remove the unreachable dialog-local polling fallback and narrow its
   presentation Interface.
-- [ ] Add controlled overlap, app/tag change, disable/unmount, success,
+- [x] Route cancellation through the manager with the resolved app identity;
+  keep cancellation distinct from failure while its terminal progress is
+  observed.
+- [x] Add controlled overlap, app/tag change, disable/unmount, success,
   failure, and cancellation tests.
 
 **Acceptance gate:** FE-A3 plus passing affected typecheck, lint, and focused
 Vitest evidence.
 
-**Status:** `Planned`
+**Status:** `Accepted` after PRG-I12 repair review
 
 ### Milestone 1: Admit Representative Renderer Evidence
 
@@ -306,18 +323,18 @@ renderer-only user-workflow claims.
 
 **Tasks:**
 
-- [ ] Run the admitted one-workflow experiment without changing dependencies
+- [x] Run the admitted one-workflow experiment without changing dependencies
   or permanent tooling.
-- [ ] Record environment, command prototype, isolated-state fixture, process
+- [x] Record environment, command prototype, isolated-state fixture, process
   cleanup, observed browser/accessibility surfaces, runtime, reachable negative
   failure, and comparison with existing Vitest/release smoke tests.
-- [ ] Select existing tooling, one new runner, or `unsupported`; if a new runner
+- [x] Select existing tooling, one new runner, or `unsupported`; if a new runner
   or different write set is selected, revise Milestone 5 before implementation.
 
 **Acceptance gate:** Reviewed admission report meets the stopping condition and
 names one deciding environment/oracle or a typed blocker.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 2: Establish Modal And Popup Interaction Modules
 
@@ -328,6 +345,7 @@ modal and popup consumers without changing feature-domain content.
 
 - `frontend/src/components/ui/ModalDialog.tsx`
 - `frontend/src/components/ui/ModalDialog.test.tsx`
+- `frontend/src/components/ui/OverlayEscapeStack.ts`
 - `frontend/src/components/ui/Popover.tsx`
 - `frontend/src/components/ui/Popover.test.tsx`
 - `frontend/src/components/ui/index.ts`
@@ -339,6 +357,7 @@ modal and popup consumers without changing feature-domain content.
 - `frontend/src/components/ModelMetadataModalFrame.test.tsx`
 - `frontend/src/components/ModelServeDialog.tsx`
 - `frontend/src/components/ModelServeDialog.test.tsx`
+- `frontend/src/components/model-serve/ModelServeDialogContent.tsx`
 - `frontend/src/components/model-serve/useDialogFocusTrap.ts`
 - `frontend/src/components/ModelImportDialog.tsx`
 - `frontend/src/components/ModelImportDialog.test.tsx`
@@ -355,27 +374,28 @@ modal and popup consumers without changing feature-domain content.
 - `frontend/src/components/RemoteModelDownloadMenu.tsx`
 - `frontend/src/components/RemoteModelDownloadMenu.test.tsx`
 - `frontend/src/components/RemoteModelListItemActions.tsx`
+- `frontend/src/components/RemoteModelListItemActions.test.tsx`
 - `reports/frontend-overlay-consumer-inventory.md`
 - this plan, ledger, and issues files
 
 **Tasks:**
 
-- [ ] Record the bounded overlay consumer matrix, actual interaction semantics,
+- [x] Record the bounded overlay consumer matrix, actual interaction semantics,
   and migrate/already-safe/delete/follow-up disposition.
-- [ ] Implement `ModalDialog` and migrate one representative nested-capable
+- [x] Implement `ModalDialog` and migrate one representative nested-capable
   consumer; prove name, entry, containment, Escape/backdrop, cleanup, and focus
   restoration through the Interface before migrating matching dialogs.
-- [ ] Implement `Popover`, select feature-correct semantics, and prove trigger
+- [x] Implement `Popover`, select feature-correct semantics, and prove trigger
   relationship/state, keyboard/pointer dismissal, focus entry/return, and
   cleanup before migrating matching popups.
-- [ ] Delete superseded focus lifecycle machinery after its last consumer
+- [x] Delete superseded focus lifecycle machinery after its last consumer
   migrates; do not retain compatibility wrappers without a consumer.
-- [ ] Run representative focus/accessibility workflows selected in Milestone 1.
+- [x] Run representative focus/accessibility workflows selected in Milestone 1.
 
 **Acceptance gate:** FE-A4 with focused component tests and representative
 runtime evidence; every inventoried consumer has a disposition.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 3: Make Progress, Outcomes, And Motion Perceivable
 
@@ -386,24 +406,71 @@ preference true without adding an unsupported general accessibility claim.
 
 - `frontend/src/components/ProgressDetailsView.tsx`
 - `frontend/src/components/ProgressDetailsView.test.tsx`
+- `frontend/src/components/ui/Popover.tsx`
+- `frontend/src/components/ui/Popover.test.tsx`
+- `frontend/src/components/ModelMetadataModal.test.tsx`
+- `frontend/src/components/InstallDialog.tsx`
+- `frontend/src/components/InstallDialog.test.tsx`
+- `frontend/src/hooks/useInstallationManager.ts`
+- `frontend/src/hooks/useInstallationManager.test.ts`
+- `frontend/src/hooks/useInstallationState.ts`
+- `frontend/src/hooks/useInstallationState.test.ts`
 - `frontend/src/index.tsx`
 - `frontend/src/index.css`
 - `frontend/README.md`
 - this plan, ledger, and issues files
 
+**Slice sequence:**
+
+- M3-S1: `ProgressDetailsView.tsx` and its focused test only.
+- M3-S2: composition-root and CSS reduced-motion policy only.
+- M3-S3a: program-approved FE-I13 repair through only the existing
+  installation manager, state, and dialog source/tests, including the PRG-I12
+  requested-install admission-order regression that reopened FE-A3.
+- M3-S3b: representative normal/reduced runtime evidence and affected README
+  behavior claims, after M3-S3a acceptance and serialized documentation
+  ownership confirmation.
+
+**M3-S3b re-plan gate:** Real Chromium proved the CSS policy but found that
+`MotionConfig reducedMotion="user"` still lets the Popover's initial
+`translateY(-6px)` persist into nonzero-opacity frames before snapping to its
+resting position. Program review admitted only `Popover.tsx` and its colocated
+test: use the operating-system preference to select zero entry and exit
+translation under reduce while retaining `-6px` in normal mode and preserving
+opacity behavior. The deciding rerun must record positive entry and dismissal
+samples in all four default/library-only × normal/reduced scenarios and reject
+any visible reduced transform. The root also admitted a test-only M2 follow-up
+in `ModelMetadataModal.test.tsx`: replace its deleted backdrop-label query with
+the actual backdrop/document interactions and await initial async state without
+act warnings. The full frontend suite must be green before README or FE-A5
+acceptance.
+
+**M3-S3 re-plan gate:** Runtime admission found that no production caller sets
+the progress view to `details`, successful terminal progress is cleared by the
+manager, and the dialog clears its presentation tag on any terminal payload.
+Resolve `FE-I13` through the existing installation owner chain with the exact
+M3-S3a files and focused behavior evidence before representative runtime
+resumes. Integration review additionally found PRG-I12: a requested lifecycle
+could poll before backend admission and consume a prior terminal payload.
+M3-S3a included the deferred-admission regression and the accepted repair that
+re-satisfied FE-A3/M0. The library-only entry has no installation feature by
+design; installation-status
+evidence is not applicable there, while motion-policy evidence still covers
+both real entries.
+
 **Tasks:**
 
-- [ ] Give determinate progress a programmatic name/value and announce terminal
+- [x] Give determinate progress a programmatic name/value and announce terminal
   success/failure at the appropriate politeness without duplicate updates.
-- [ ] Apply the operating-system reduced-motion preference to Framer Motion at
+- [x] Apply the operating-system reduced-motion preference to Framer Motion at
   the composition root and to nonessential CSS animation/transition behavior.
-- [ ] Verify normal and reduced modes in the representative runtime.
-- [ ] Update only the affected behavior claims in the frontend README; leave
+- [x] Verify normal and reduced modes in the representative runtime.
+- [x] Update only the affected behavior claims in the frontend README; leave
   gate/count policy cleanup to governance.
 
 **Acceptance gate:** FE-A5 and the applicable portion of FE-A7.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 4: Adopt Decoded Contracts And Honest Model Projection
 
@@ -412,6 +479,13 @@ instant model display with explicit provenance, degradation, and recovery.
 
 **Dependency gate:** Accepted Rust DTO/error contract and platform-generated
 decoder Interface. This milestone must not start by inventing either locally.
+
+**Pre-start re-plan gate:** Classify the link-health refresh rejection
+(`FE-I10`) and model-import picker rejection (`FE-I11`) against this
+milestone's decoded bridge/projection Seam. When an outcome shares that owner,
+add its exact consumers and behavior evidence to this milestone before source
+edits. Otherwise add one exact focused slice with its own write set and gate;
+neither finding may be deferred outside this program.
 
 **Allowed write set:**
 
@@ -456,7 +530,7 @@ decoder Interface. This milestone must not start by inventing either locally.
 **Acceptance gate:** FE-A1, FE-A2, and the applicable portion of FE-A7. Link
 provider contract/decoder evidence without claiming ownership of it.
 
-**Status:** `Planned`
+**Status:** `Blocked` pending accepted Rust DTO/error and platform decoder handoff
 
 ### Milestone 5: Prove Default And Library-Only Renderer Behavior
 
@@ -469,13 +543,9 @@ changes to shared package scripts.
 **Allowed write set:**
 
 - `frontend/package.json`
-- `pnpm-lock.yaml` only if the admitted harness requires an accepted dependency
-- `frontend/vite.config.ts`
-- `frontend/vitest.config.ts`
-- `frontend/tests/renderer/fixtures.ts`
-- `frontend/tests/renderer/accessibility.test.ts`
-- `frontend/tests/renderer/model-projection.test.ts`
-- `frontend/tests/renderer/build-modes.test.ts`
+- `frontend/tests/renderer/run.mjs`
+- `frontend/tests/renderer/electron-main.cjs`
+- `frontend/tests/renderer/fixtures.cjs`
 - `frontend/README.md`
 - this plan, ledger, and issues files
 
@@ -527,10 +597,11 @@ environments, or the plan remains non-accepted with explicit issues.
 
 ## Blockers
 
-- No blocker prevents the next slice, M0-S1.
+- No blocker prevents M0-S1. The program integration owner accepted the
+  critical Rust RPC disclosure evidence and released frontend source work.
 - Milestone 4 is dependency-gated on accepted Rust and platform contract work.
-- Milestones 2, 3, and 5 cannot claim representative acceptance until
-  Milestone 1 admits a capable runtime harness.
+- No harness blocker remains for Milestones 2, 3, and 5; the accepted report
+  admits the installed Electron/CDP environment without a new dependency.
 
 ## Re-Plan Triggers
 
@@ -552,8 +623,8 @@ environments, or the plan remains non-accepted with explicit issues.
 
 ## Final Acceptance
 
-- Acceptance status: `pending`
+- Acceptance status: `partial`
 - Deferred follow-ups: Rust schema/error production, Electron/generated decoder
   production, packaged-artifact verification, CI scheduling, and any broader
   accessibility conformance remain with their named sibling owners.
-- Final status: `Planned`
+- Final status: `Active`

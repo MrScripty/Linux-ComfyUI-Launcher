@@ -9,6 +9,7 @@ import {
   reportVersionSwitchError,
 } from './VersionSelectorState';
 import { VersionSelectorTrigger } from './VersionSelectorTrigger';
+import { Popover } from './ui';
 
 const logger = getLogger('VersionSelector');
 
@@ -50,7 +51,7 @@ export function VersionSelector({
   const [isOpeningPath, setIsOpeningPath] = useState(false);
   const [showOpenedIndicator, setShowOpenedIndicator] = useState(false);
   const openedIndicatorTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const initialVersionFocusRef = useRef<HTMLButtonElement>(null);
 
   const handleVersionSwitch = async (tag: string) => {
     if (tag === activeVersion) {
@@ -153,13 +154,12 @@ export function VersionSelector({
     });
   }, [activeVersion, defaultVersion, onMakeDefault]);
 
-  const handleToggleOpen = useCallback(() => {
-    logger.debug('Version selector clicked', { hasVersionsToShow, isOpen });
-    if (hasVersionsToShow) {
-      setIsOpen(!isOpen);
-      logger.debug('Dropdown toggled', { newState: !isOpen });
+  const handleOpenChange = useCallback((nextIsOpen: boolean) => {
+    logger.debug('Version selector state changed', { hasVersionsToShow, nextIsOpen });
+    if (hasVersionsToShow || !nextIsOpen) {
+      setIsOpen(nextIsOpen);
     }
-  }, [hasVersionsToShow, isOpen]);
+  }, [hasVersionsToShow]);
 
   const handleOpenVersionManager = useCallback((event: React.MouseEvent) => {
     logger.info('Opening version manager');
@@ -175,56 +175,50 @@ export function VersionSelector({
     };
   }, []);
 
-  // Close dropdown on outside click
   useEffect(() => {
-    const handleOutsideClick = (event: MouseEvent | TouchEvent) => {
-      if (!isOpen) return;
-      const target = event.target as Node | null;
-      if (containerRef.current && target && !containerRef.current.contains(target)) {
-        setIsOpen(false);
-      }
-    };
-
-    document.addEventListener('mousedown', handleOutsideClick);
-    document.addEventListener('touchstart', handleOutsideClick);
-    return () => {
-      document.removeEventListener('mousedown', handleOutsideClick);
-      document.removeEventListener('touchstart', handleOutsideClick);
-    };
-  }, [isOpen]);
+    if (!hasVersionsToShow) {
+      setIsOpen(false);
+    }
+  }, [hasVersionsToShow]);
 
   return (
-    <div className="relative w-full" ref={containerRef}>
-      <VersionSelectorTrigger
-        hasVersionsToShow={hasVersionsToShow}
-        hasInstalledVersions={hasInstalledVersions}
-        installingVersion={installingVersion}
-        isLoading={isLoading}
-        isSwitching={isSwitching}
-        activeVersion={activeVersion}
-        defaultVersion={defaultVersion ?? null}
-        displayVersion={displayVersion}
-        showOpenedIndicator={showOpenedIndicator}
-        isOpeningPath={isOpeningPath}
-        folderIconColor={folderIconColor}
-        emphasizeInstall={emphasizeInstall}
-        hasNewVersion={hasNewVersion}
-        latestVersion={latestVersion}
-        installNetworkStatus={installNetworkStatus}
-        hasInstallActivity={hasInstallActivity}
-        isInstallPending={isInstallPending}
-        isInstallFailed={isInstallFailed}
-        ringDegrees={ringDegrees}
-        onToggleOpen={handleToggleOpen}
-        onToggleDefault={handleToggleDefault}
-        onOpenActiveInstall={handleOpenActiveInstall}
-        onOpenVersionManager={handleOpenVersionManager}
-        canMakeDefault={Boolean(onMakeDefault && activeVersion)}
-      />
-
+    <Popover
+      contentClassName="absolute left-0 right-0 top-full z-50 mt-1 overflow-hidden rounded bg-[hsl(var(--surface-overlay))]/80 backdrop-blur-sm"
+      initialFocusRef={initialVersionFocusRef}
+      isOpen={isOpen}
+      label="Version actions"
+      onOpenChange={handleOpenChange}
+      rootClassName="relative w-full"
+      trigger={(popoverTriggerProps) => (
+        <VersionSelectorTrigger
+          hasVersionsToShow={hasVersionsToShow}
+          hasInstalledVersions={hasInstalledVersions}
+          installingVersion={installingVersion}
+          isLoading={isLoading}
+          isSwitching={isSwitching}
+          activeVersion={activeVersion}
+          defaultVersion={defaultVersion ?? null}
+          displayVersion={displayVersion}
+          showOpenedIndicator={showOpenedIndicator}
+          isOpeningPath={isOpeningPath}
+          folderIconColor={folderIconColor}
+          emphasizeInstall={emphasizeInstall}
+          hasNewVersion={hasNewVersion}
+          latestVersion={latestVersion}
+          installNetworkStatus={installNetworkStatus}
+          hasInstallActivity={hasInstallActivity}
+          isInstallPending={isInstallPending}
+          isInstallFailed={isInstallFailed}
+          ringDegrees={ringDegrees}
+          popoverTriggerProps={popoverTriggerProps}
+          onToggleDefault={handleToggleDefault}
+          onOpenActiveInstall={handleOpenActiveInstall}
+          onOpenVersionManager={handleOpenVersionManager}
+          canMakeDefault={Boolean(onMakeDefault && activeVersion)}
+        />
+      )}
+    >
       <VersionSelectorDropdown
-        isOpen={isOpen}
-        hasVersionsToShow={hasVersionsToShow}
         combinedVersions={combinedVersions}
         activeVersion={activeVersion}
         installingVersion={installingVersion}
@@ -233,9 +227,10 @@ export function VersionSelector({
         defaultVersion={defaultVersion ?? null}
         isSwitching={isSwitching}
         isLoading={isLoading}
+        initialFocusRef={initialVersionFocusRef}
         onMakeDefault={onMakeDefault}
         onSwitchVersion={handleVersionSwitch}
       />
-    </div>
+    </Popover>
   );
 }

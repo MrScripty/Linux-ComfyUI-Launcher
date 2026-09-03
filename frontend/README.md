@@ -68,6 +68,16 @@ requires React Aria `useHover` instead of raw mouse hover handlers. jsdom tests
 are useful for component contracts but do not prove real focus, layout,
 contrast, reduced motion, or assistive-technology behavior.
 
+Installation details expose named, determinate progress. Routine progress
+updates are not live announcements; one atomic terminal region announces
+failure assertively and cancellation or success politely. This installation
+surface exists only in the default build.
+
+The renderer follows the operating-system reduced-motion preference. Reduced
+mode removes nonessential Popover entry and dismissal translation while
+retaining opacity feedback, and bounds CSS animations and transitions to a
+near-zero duration and one iteration.
+
 ## Commands
 
 From the repository root:

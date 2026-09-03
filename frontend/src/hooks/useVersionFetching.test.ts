@@ -112,11 +112,8 @@ describe('useVersionFetching', () => {
   });
 
   it('refreshes installed, active, default, status, and available version state together', async () => {
-    const onInstallingTagUpdate = vi.fn();
-
     const { result } = renderHook(() => useVersionFetching({
       appId: 'torch',
-      onInstallingTagUpdate,
     }));
 
     await act(async () => {

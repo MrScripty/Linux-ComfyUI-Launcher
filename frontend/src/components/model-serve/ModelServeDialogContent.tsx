@@ -12,7 +12,6 @@ import { ModelServeHeader } from './ModelServeHeader';
 import type { ModelServeControls, ModelServeFormState } from './modelServeHelpers';
 
 interface ModelServeDialogContentProps {
-  dialogRef: RefObject<HTMLDivElement | null>;
   profileSelectRef: RefObject<HTMLSelectElement | null>;
   model: ModelInfo;
   isDialogMode: boolean;
@@ -44,7 +43,6 @@ interface ModelServeDialogContentProps {
 }
 
 export function ModelServeDialogContent({
-  dialogRef,
   profileSelectRef,
   model,
   isDialogMode,
@@ -76,7 +74,6 @@ export function ModelServeDialogContent({
 }: ModelServeDialogContentProps) {
   return (
     <div
-      ref={dialogRef}
       className={
         isDialogMode
           ? 'w-full max-w-xl rounded-lg border border-[hsl(var(--launcher-border))] bg-[hsl(var(--launcher-bg-primary))] p-4 shadow-2xl'
