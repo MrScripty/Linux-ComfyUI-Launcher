@@ -6,7 +6,7 @@ $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
 
 if (-not $nodeCommand) {
     Write-Error '[launcher] error: node missing; install Node.js from https://nodejs.org/'
-    exit 1
+    exit 3
 }
 
 $env:PUMAS_LAUNCHER_DISPLAY_NAME = './launcher.ps1'

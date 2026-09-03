@@ -14,6 +14,11 @@ corepack pnpm install --frozen-lockfile
 
 On Windows, use the same actions through `launcher.ps1`.
 
+Both wrappers require Node and delegate to `scripts/launcher/cli.mjs`; neither
+wrapper owns release-specific parsing or environment policy. The shared
+launcher accepts `linux`, `darwin`, and `win32` and returns exit code 5 for an
+unsupported operating system.
+
 ## Standards
 
 The standards source is:
@@ -61,6 +66,14 @@ npm run -w electron validate
 npm run test:launcher
 node scripts/launcher/cli.mjs --help
 ```
+
+The release smoke owns the process tree it starts. At maximum uptime it requests
+graceful POSIX process-group termination, escalates to a forced group kill after
+the grace window, and fails if forced cleanup is not observed by the final
+deadline. Windows does not expose an equivalent graceful tree operation to this
+launcher, so it reports that mechanism unavailable and escalates to bounded,
+observed `taskkill.exe /t /f`. These are failure/cleanup semantics, not evidence
+that the packaged application works on a target OS.
 
 ### Torch Sidecar
 
@@ -135,7 +148,7 @@ intended to decide a property.
 | Frontend `check:types` in `build-frontend` | The configured renderer TypeScript program type-checks without emit; the compiler is authoritative for static consistency. | Build also type-checks while emitting; the no-emit command gives direct diagnosis before tests/build. | Workflow-blocking on representative Linux CI; local on demand. |
 | Frontend `test:run` in `build-frontend` | Vitest component/unit assertions pass in jsdom or their selected simulation. | Decides local renderer behavior only; representative browser/Electron workflows remain separately owned. | Workflow-blocking on representative Linux CI; local on demand. |
 | Frontend default build in `build-frontend` | Vite emits the default renderer bundle consumed by Electron; build completion and output production are the oracle. | Does not prove renderer behavior or library-only mode. | Workflow-blocking on Linux CI; output is an input to all Electron package jobs. |
-| `test:launcher` in `verify-launcher` | Shared CLI parsing, action delegation, package-manager invocation, and shell/PowerShell wrapper parity satisfy their Node test assertions. | Release smoke traverses a real startup path; these tests provide focused failure diagnosis. | Workflow-blocking on representative Linux CI; local on demand. |
+| `test:launcher` in `verify-launcher` | Shared CLI parsing, closed platform selection, action delegation, package-manager invocation, wrapper delegation, and controlled max/grace/force/process-tree outcomes satisfy their Node and child-process assertions. | Release smoke traverses a real startup path; the focused suite diagnoses contract and cleanup failures but Linux execution does not prove Windows or macOS process behavior. | Workflow-blocking on representative Linux CI; local on demand. |
 | Torch Ruff lint and format checks in `verify-launcher` | Python source satisfies the selected Ruff diagnostics and formatting projection. | Static support only; unit and real-runtime claims remain distinct. | Workflow-blocking on representative Linux CI; local on demand. |
 | Torch unit suite in `verify-launcher` | Sidecar unit assertions pass with their declared local fakes/substitutes. | Does not prove ASGI, middleware, model loading, GPU, or inference in a resolved Torch environment. | Workflow-blocking on representative Linux CI; local on demand. |
 | `launcher.sh --build-release` plus `--release-smoke` in `verify-launcher` | The Linux release layout builds and the Electron process starts under the recorded Xvfb smoke conditions for its bounded observation. | Build/startup only; no user workflow or non-Linux runtime claim. | Workflow-blocking on Linux Xvfb CI. |

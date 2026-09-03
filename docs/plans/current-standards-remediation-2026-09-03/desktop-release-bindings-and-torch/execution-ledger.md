@@ -15,8 +15,11 @@
   from `Planned` to `Active`.
 - Milestone 0 is `Accepted`; the report and two canonical matrices agree and are
   visible versioned inputs.
-- Current next slice: validate the Rust producer/projection handoff before
-  starting Milestone 1 source changes.
+- Milestone 1 is `Blocked`: Rust's credential-disclosure prerequisite is
+  accepted, but the canonical producer projection still contains legacy
+  operations and handler-owned event shapes.
+- Current slice: Milestone 4 wrapper parity, explicit platform selection, and
+  bounded launcher-owned process-tree outcomes.
 
 ## Entries
 
@@ -122,6 +125,111 @@
 - Supporting checks: current plan structure and scoped diff checks pass.
 - Result: Milestone 0 `Accepted`. Shared ownership of `.gitignore` and both
   matrices is released; later changes require a new serial handoff.
+
+### 2026-09-03 — Start Milestone 4 launcher outcome slice
+
+- Operation: `continue`; plan remains `Active`, Milestone 4 moves from
+  `Planned` to `Active`, and Milestone 1 is explicitly `Blocked` rather than
+  projecting an incomplete producer contract.
+- Development decision: `build`, after bounded inspection confirmed three
+  related failures at one existing ownership seam: Bash has a wrapper-specific
+  release path, unknown platforms default to Linux, and bounded commands have
+  no forced-termination deadline.
+- Coherent slice: make both wrappers delegate every action to the shared Node
+  launcher, make the platform factory closed over accepted OS values, and make
+  launcher-owned child trees reach one observed completion after graceful then
+  forced termination through an OS Adapter.
+- Exact initial write set:
+  - `launcher.sh`
+  - `launcher.ps1`
+  - `scripts/launcher/actions.mjs`
+  - `scripts/launcher/commands.mjs`
+  - `scripts/launcher/contract.mjs`
+  - `scripts/launcher/platform-service.mjs`
+  - `scripts/launcher/platform-linux.mjs`
+  - `scripts/launcher/platform-macos.mjs`
+  - `scripts/launcher/platform-windows.mjs`
+  - `scripts/launcher/actions.test.mjs`
+  - `scripts/launcher/commands.test.mjs`
+  - `scripts/launcher/wrappers.test.mjs`
+  - this plan, ledger, issues, and
+    `reports/launcher-platform-evidence.md`
+- Shared-file handoff: root serialized `README.md` and
+  `docs/DEVELOPMENT.md` for launcher-only updates, but their mutation is held
+  until the focused Linux source contract passes. `package.json` is excluded.
+- Initial oracle order: first demonstrate the wrapper fast path, unknown-to-
+  Linux fallback, and unbounded ignored-termination behavior; then implement.
+- Evidence boundary: Linux x64 runs locally as required-real evidence. Windows
+  x64 and macOS arm64 remain `unavailable` until the same suite executes on
+  accepted real target runners; no result is inferred across OS boundaries.
+- Deep-module review: keep validation, timers, and one-terminal-result policy
+  inside `commands.mjs`; platform modules are mechanism-only Adapters for
+  process-tree termination. No parallel action registry or generic process
+  framework is admitted.
+
+### 2026-09-03 — Re-plan typed platform failure at the CLI boundary
+
+- Trigger: the initial unsupported-platform oracle showed that
+  `createPlatformService()` is invoked before `cli.mjs` enters its
+  `LauncherError` boundary. Fixing only the factory would emit an unhandled
+  stack rather than the declared typed diagnostic and exit code.
+- Re-plan: add the already-Milestone-4-owned `scripts/launcher/cli.mjs` to the
+  current exact write set and move platform composition inside the existing
+  error boundary. This is not a new Adapter or registry.
+- Claim impact: DRBT-A6 only. No governance claim matrix or schedule changes.
+
+### 2026-09-03 — Re-plan shared POSIX and bounded Windows mechanisms
+
+- Trigger: focused cross-review found identical Linux/macOS process-group
+  signal implementations and an unbounded Windows `taskkill.exe` helper nested
+  inside the otherwise bounded command lifecycle.
+- Re-plan: add `scripts/launcher/platform-posix-process.mjs` to the Milestone 4
+  and current write sets, move the identical POSIX mechanism there, and give
+  the Windows helper its own execution and forced-close observation deadlines
+  inside the command's force window.
+- Oracle correction: replace the loaded-runner-sensitive `<900ms` assertion
+  with a controlled child self-exit marker that must remain absent after forced
+  termination.
+- Composition result: one process policy owner (`commands.mjs`), one shared
+  POSIX mechanism Adapter, and one Windows mechanism Adapter. No target-specific
+  behavior is hidden by duplication and no generic process framework is added.
+- Claim impact: DRBT-A6 only. Windows/macOS required-real outcomes remain
+  `unavailable` until target execution.
+
+### 2026-09-03 — Reach focused Linux M4 source/test boundary
+
+- Source result: Bash and PowerShell are policy-free delegates with the same
+  dependency exit; the platform factory is closed over `linux`, `darwin`, and
+  `win32`; the CLI catches unsupported-platform construction; bounded smoke
+  commands own a per-platform tree through one max/grace/force/close policy.
+- Design correction: Linux and macOS now share the single
+  `platform-posix-process.mjs` process-group mechanism. Windows explicitly
+  reports graceful tree termination unavailable, escalates to `/t /f`, and
+  bounds plus force-observes the `taskkill.exe` helper inside the outer force
+  window.
+- Stable diagnostics: command arguments and absolute command paths are absent
+  from launcher-generated child failure messages; spawn/termination failures
+  expose stable codes rather than raw dependency text.
+- Outcome-marker oracle: the force test proves the controlled child's
+  self-exit marker remains absent, replacing the original wall-clock margin.
+- Local real evidence: the Linux process test terminates a real SIGTERM-
+  resistant parent and descendant process group; the native Bash wrapper
+  returns exit 0 for help and exit 2 for invalid usage.
+- Focused/full oracle: `npm run test:launcher` passes 41 tests outside the
+  restricted sandbox required for nested Bash execution. `bash -n launcher.sh`
+  and the scoped whitespace diff check pass.
+- Composed ownership oracle: a controlled child closes before a deferred
+  termination helper; the public command result remains pending until the
+  helper completes. An ineffective Adapter produces the typed incomplete-
+  cleanup result around the declared max/grace/force boundary and well before
+  the fixture's five-second self-exit, after which the test explicitly removes
+  the fixture.
+- Windows helper seam: controlled spawn tests cover observed exit 0, stable
+  nonzero mapping, helper timeout, forced helper kill, and observed helper
+  close. The outer runner joins that Adapter outcome before settling.
+- Cross-target boundary: Windows helper unit evidence is green, but it is not a
+  substitute for real Windows process semantics. Windows x64 and macOS arm64
+  remain `unavailable`; Milestone 4 and DRBT-A6 remain `Active`/`pending`.
 
 ## Reports
 

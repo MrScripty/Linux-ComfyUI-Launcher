@@ -9,10 +9,10 @@ import { executeAction } from './actions.mjs';
 
 async function main(argv = process.argv.slice(2)) {
   const context = createLauncherContext();
-  const platformService = createPlatformService();
-  const runtime = { context, platformService };
 
   try {
+    const platformService = createPlatformService();
+    const runtime = { context, platformService };
     const parsedArgs = parseArgs(argv);
     return await executeAction(parsedArgs, runtime);
   } catch (error) {

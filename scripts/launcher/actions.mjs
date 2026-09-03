@@ -233,6 +233,7 @@ async function runReleaseSmoke(runtime) {
       },
       minUptimeMs: RELEASE_SMOKE_MIN_UPTIME_MS,
       maxUptimeMs: RELEASE_SMOKE_MAX_UPTIME_MS,
+      processTree: platformService.processTree,
     }
   );
 

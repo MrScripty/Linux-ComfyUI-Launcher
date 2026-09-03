@@ -4,6 +4,7 @@ export const EXIT_CODES = Object.freeze({
   USAGE_ERROR: 2,
   MISSING_DEPENDENCY: 3,
   MISSING_RELEASE_ARTIFACT: 4,
+  UNSUPPORTED_PLATFORM: 5,
 });
 
 export const ACTION_FLAGS = Object.freeze({
@@ -51,6 +52,7 @@ Exit codes:
   2 usage error
   3 missing dependency for runtime
   4 missing release artifact
+  5 unsupported operating system
 `;
 }
 

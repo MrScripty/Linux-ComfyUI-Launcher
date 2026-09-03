@@ -1,8 +1,10 @@
 import path from 'node:path';
+import { createPosixProcessTree } from './platform-posix-process.mjs';
 
 export function createMacOSPlatformService() {
   return Object.freeze({
-    id: 'macos',
+    id: 'darwin',
+    processTree: createPosixProcessTree(),
     corepackCommand: 'corepack',
     cargoCommand: 'cargo',
     pythonCommand: 'python3',

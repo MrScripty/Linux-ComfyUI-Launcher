@@ -2,12 +2,13 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestone 1 canonical Rust producer handoff review.
+**Current phase:** Milestone 4 launcher platform and process outcomes.
 
-**Next slice:** Confirm the Rust plan's canonical request, response, error, and
-event declaration plus projection mechanism and completed credential-disclosure
-repair, then implement Milestone 1's generated Electron projection and runtime
-decoders without creating a second semantic authority.
+**Next slice:** Cross-review the green Linux launcher source/test boundary,
+reconcile only evidence-backed launcher behavior in the reserved root docs,
+and route the same suite to required-real Windows x64 and macOS arm64 runners.
+Milestone 1 remains blocked until the Rust plan hands off a complete zero-legacy
+canonical request, response, error, and event projection.
 
 **Acceptance status:** `pending`
 
@@ -370,7 +371,10 @@ shared workflow change.
 typecheck/build, focused decoder tests, generator freshness, and built-RPC
 cross-process tests pass in their declared environments.
 
-**Status:** `Planned`
+**Status:** `Blocked` — Rust has closed the credential-disclosure prerequisite,
+but its canonical producer declaration still contains legacy operations and
+handler-owned event shapes. Generating now would freeze a partial second
+authority.
 
 ### Milestone 2: Preserve Desktop Authority and Stream Lifecycle
 
@@ -490,6 +494,7 @@ termination without platform fallback or orphaned work.
 - `scripts/launcher/contract.mjs`
 - `scripts/launcher/errors.mjs`
 - `scripts/launcher/platform-service.mjs`
+- `scripts/launcher/platform-posix-process.mjs`
 - `scripts/launcher/platform-linux.mjs`
 - `scripts/launcher/platform-macos.mjs`
 - `scripts/launcher/platform-windows.mjs`
@@ -503,16 +508,16 @@ termination without platform fallback or orphaned work.
 
 **Tasks:**
 
-- [ ] Consume the accepted OS/action matrix; return typed unsupported or
+- [x] Consume the accepted OS/action matrix; return typed unsupported or
   unavailable outcomes for unknown target/platform facts instead of selecting
   Linux.
-- [ ] Remove wrapper-specific release behavior so Bash and PowerShell delegate
+- [x] Remove wrapper-specific release behavior so Bash and PowerShell delegate
   the same parsed actions, validation, environment semantics, and exit codes to
   the shared launcher Module.
 - [ ] Define process and process-tree ownership, normal completion, signal/
   console behavior, graceful deadline, escalation deadline, forced termination,
   partial cleanup, and diagnostic mapping separately for each accepted OS.
-- [ ] Implement bounded termination only for launcher-owned processes and
+- [x] Implement bounded termination only for launcher-owned processes and
   observe `spawn`, `error`, `exit`, and `close` without double completion.
 - [ ] Test wrapper equivalence, invalid platform/action/environment, spawn
   failure, graceful exit, ignored termination, forced kill, child trees,
@@ -521,7 +526,7 @@ termination without platform fallback or orphaned work.
 **Acceptance gate:** DRBT-A6 is satisfied; launcher unit tests and required-real
 OS wrapper/process suites pass with no unresolved child or false success.
 
-**Status:** `Planned`
+**Status:** `Active`
 
 ### Milestone 5: Generate, Test, and Package Accepted Binding Cohorts
 

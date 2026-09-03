@@ -10,7 +10,23 @@
 
 ## Active Issues
 
-`none`
+### DRBT-I6 — Windows and macOS launcher evidence unavailable locally
+
+- Severity: High for release promotion; no effect on bounded Linux
+  implementation.
+- Evidence: the current execution environment is Linux x64. Source review or
+  Linux process behavior cannot prove Windows console/process-tree semantics or
+  macOS runtime behavior.
+- Relationship: leaves DRBT-A6 pending and blocks promotion of the accepted
+  Windows x64 and macOS arm64 artifacts until required-real evidence exists.
+- Owner/boundary: Milestone 4 owns the shared launcher contract and per-OS
+  Adapters; Milestone 6 supplies accepted target runners and release gates.
+- Disposition: implement one portable launcher contract with platform-specific
+  mechanisms and record non-local target outcomes as `unavailable`, not passed.
+- Verification: execute the same wrapper/platform/process integration suite on
+  accepted Windows x64 and macOS arm64 runners and observe no orphaned child or
+  false success.
+- Revisit trigger: target CI execution or an accepted target-matrix change.
 
 ## Resolved Issues
 

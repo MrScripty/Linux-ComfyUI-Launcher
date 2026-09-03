@@ -11,44 +11,80 @@ export async function runCommand(command, args, options = {}) {
   const env = { ...process.env, ...options.env };
 
   await new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env,
-      stdio: 'inherit',
-      shell: false,
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env,
+        stdio: 'inherit',
+        shell: false,
+      });
+    } catch (error) {
+      reject(createSpawnError(command, error));
+      return;
+    }
+    let settled = false;
+    let spawned = false;
+    let exitOutcome;
+
+    const finish = (callback, value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      callback(value);
+    };
+
+    child.once('error', (error) => {
+      finish(reject, createSpawnError(command, error));
     });
 
-    child.on('error', (error) => {
-      reject(
-        new LauncherError(
-          `failed to run ${formatCommand(command, args)}: ${error.message}`,
-          { exitCode: EXIT_CODES.OPERATION_FAILED }
-        )
-      );
+    child.once('spawn', () => {
+      spawned = true;
     });
 
-    child.on('close', (code, signal) => {
-      if (signal) {
-        reject(
+    child.once('exit', (code, signal) => {
+      exitOutcome = { code, signal };
+    });
+
+    child.once('close', (code, signal) => {
+      const observedCode = exitOutcome?.code ?? code;
+      const observedSignal = exitOutcome?.signal ?? signal;
+
+      if (!spawned) {
+        finish(
+          reject,
+          new LauncherError(`${describeCommand(command)} closed before spawn`, {
+            exitCode: EXIT_CODES.OPERATION_FAILED,
+          })
+        );
+        return;
+      }
+
+      if (observedSignal) {
+        finish(
+          reject,
           new LauncherError(
-            `${formatCommand(command, args)} terminated by signal ${signal}`,
+            `${describeCommand(command)} terminated by signal ${observedSignal}`,
             { exitCode: EXIT_CODES.OPERATION_FAILED }
           )
         );
         return;
       }
 
-      if (code !== 0) {
-        reject(
+      if (observedCode !== 0) {
+        finish(
+          reject,
           new LauncherError(
-            `${formatCommand(command, args)} exited with code ${code}`,
+            `${describeCommand(command)} exited with code ${observedCode}`,
             { exitCode: EXIT_CODES.OPERATION_FAILED }
           )
         );
         return;
       }
 
-      resolve();
+      finish(resolve);
     });
   });
 }
@@ -57,98 +93,226 @@ export async function runBoundedCommand(command, args, options = {}) {
   const env = { ...process.env, ...options.env };
   const minUptimeMs = options.minUptimeMs ?? 0;
   const maxUptimeMs = options.maxUptimeMs ?? 30_000;
-  const detached = process.platform !== 'win32';
+  const terminationGraceMs = options.terminationGraceMs ?? 2_000;
+  const forceCloseMs = options.forceCloseMs ?? 2_000;
+  const processTree = options.processTree;
+
+  validateBoundedDurations({
+    minUptimeMs,
+    maxUptimeMs,
+    terminationGraceMs,
+    forceCloseMs,
+  });
+
+  if (!processTree?.spawnOptions || typeof processTree.terminate !== 'function') {
+    throw new LauncherError('bounded command requires a platform process-tree adapter', {
+      exitCode: EXIT_CODES.OPERATION_FAILED,
+    });
+  }
 
   await new Promise((resolve, reject) => {
     const startedAt = Date.now();
     let timedOut = false;
+    let forceStarted = false;
+    let forceWindowExpired = false;
+    let settled = false;
+    let childClosed = false;
+    let pendingTerminations = 0;
+    let exitOutcome;
+    let terminationFailure;
+    let maxTimer;
+    let graceTimer;
+    let forceTimer;
 
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env,
-      detached,
-      stdio: 'inherit',
-      shell: false,
-    });
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env,
+        ...processTree.spawnOptions,
+        stdio: 'inherit',
+        shell: false,
+      });
+    } catch (error) {
+      reject(createSpawnError(command, error));
+      return;
+    }
 
-    const killTimer = setTimeout(() => {
-      timedOut = true;
-      terminateBoundedChild(child, detached);
-    }, maxUptimeMs);
+    const clearTimers = () => {
+      clearTimeout(maxTimer);
+      clearTimeout(graceTimer);
+      clearTimeout(forceTimer);
+    };
 
-    child.on('error', (error) => {
-      clearTimeout(killTimer);
-      reject(
-        new LauncherError(
-          `failed to run ${formatCommand(command, args)}: ${error.message}`,
-          { exitCode: EXIT_CODES.OPERATION_FAILED }
-        )
+    const finish = (callback, value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimers();
+      callback(value);
+    };
+
+    const fail = (message) => {
+      finish(
+        reject,
+        new LauncherError(message, { exitCode: EXIT_CODES.OPERATION_FAILED })
       );
+    };
+
+    const requestTermination = (force) => {
+      pendingTerminations += 1;
+      Promise.resolve()
+        .then(() => {
+          if (!settled) {
+            return processTree.terminate(child, {
+              force,
+              deadlineMs: force ? forceCloseMs : terminationGraceMs,
+            });
+          }
+        })
+        .catch((error) => {
+          terminationFailure = describeTerminationFailure(error);
+          if (!force) {
+            beginForcedTermination();
+          }
+        })
+        .finally(() => {
+          pendingTerminations -= 1;
+          finishTimedOutCommandWhenOwnedWorkStops();
+        });
+    };
+
+    const finishTimedOutCommandWhenOwnedWorkStops = () => {
+      if (settled || !timedOut || pendingTerminations !== 0) {
+        return;
+      }
+
+      const detail = terminationFailure
+        ? `; termination adapter reported ${terminationFailure}`
+        : '';
+      if (childClosed) {
+        fail(`${describeCommand(command)} exceeded smoke window (${maxUptimeMs}ms)${detail}`);
+        return;
+      }
+
+      if (forceWindowExpired) {
+        fail(
+          `${describeCommand(command)} exceeded smoke window (${maxUptimeMs}ms) and did not close within the forced termination window (${forceCloseMs}ms)${detail}`
+        );
+      }
+    };
+
+    const beginForcedTermination = () => {
+      if (settled || forceStarted) {
+        return;
+      }
+
+      forceStarted = true;
+      clearTimeout(graceTimer);
+      requestTermination(true);
+      forceTimer = setTimeout(() => {
+        forceWindowExpired = true;
+        finishTimedOutCommandWhenOwnedWorkStops();
+      }, forceCloseMs);
+    };
+
+    child.once('error', (error) => {
+      fail(`failed to start ${describeCommand(command)}: ${describeProcessError(error)}`);
     });
 
-    child.on('close', (code, signal) => {
-      clearTimeout(killTimer);
+    child.once('spawn', () => {
+      maxTimer = setTimeout(() => {
+        timedOut = true;
+        requestTermination(false);
+        graceTimer = setTimeout(beginForcedTermination, terminationGraceMs);
+      }, maxUptimeMs);
+    });
+
+    child.once('exit', (code, signal) => {
+      exitOutcome = { code, signal };
+      if (!timedOut) {
+        clearTimeout(maxTimer);
+      }
+    });
+
+    child.once('close', (code, signal) => {
+      childClosed = true;
       const elapsedMs = Date.now() - startedAt;
+      const observedCode = exitOutcome?.code ?? code;
+      const observedSignal = exitOutcome?.signal ?? signal;
 
       if (timedOut) {
-        reject(
-          new LauncherError(
-            `${formatCommand(command, args)} exceeded smoke window (${maxUptimeMs}ms)`,
-            { exitCode: EXIT_CODES.OPERATION_FAILED }
-          )
-        );
+        finishTimedOutCommandWhenOwnedWorkStops();
         return;
       }
 
-      if (signal) {
-        reject(
-          new LauncherError(
-            `${formatCommand(command, args)} terminated by signal ${signal}`,
-            { exitCode: EXIT_CODES.OPERATION_FAILED }
-          )
-        );
+      if (observedSignal) {
+        fail(`${describeCommand(command)} terminated by signal ${observedSignal}`);
         return;
       }
 
-      if (code !== 0) {
-        reject(
-          new LauncherError(
-            `${formatCommand(command, args)} exited with code ${code}`,
-            { exitCode: EXIT_CODES.OPERATION_FAILED }
-          )
-        );
+      if (observedCode !== 0) {
+        fail(`${describeCommand(command)} exited with code ${observedCode}`);
         return;
       }
 
       if (elapsedMs < minUptimeMs) {
-        reject(
-          new LauncherError(
-            `${formatCommand(command, args)} exited before the minimum smoke window (${elapsedMs}ms < ${minUptimeMs}ms)`,
-            { exitCode: EXIT_CODES.OPERATION_FAILED }
-          )
+        fail(
+          `${describeCommand(command)} exited before the minimum smoke window (${elapsedMs}ms < ${minUptimeMs}ms)`
         );
         return;
       }
 
-      resolve();
+      finish(resolve);
     });
   });
 }
 
-function terminateBoundedChild(child, detached) {
-  if (detached && child.pid) {
-    try {
-      process.kill(-child.pid, 'SIGTERM');
-      return;
-    } catch {
-      child.kill('SIGTERM');
-      return;
-    }
+function describeTerminationFailure(error) {
+  if (error && typeof error === 'object' && 'code' in error) {
+    return String(error.code);
   }
 
-  child.kill('SIGTERM');
+  return error instanceof Error ? error.name : 'unknown failure';
 }
 
-function formatCommand(command, args) {
-  return [command, ...args].join(' ');
+function validateBoundedDurations({
+  minUptimeMs,
+  maxUptimeMs,
+  terminationGraceMs,
+  forceCloseMs,
+}) {
+  const values = [minUptimeMs, maxUptimeMs, terminationGraceMs, forceCloseMs];
+  if (!values.every(Number.isFinite)
+    || minUptimeMs < 0
+    || maxUptimeMs <= 0
+    || terminationGraceMs < 0
+    || forceCloseMs < 100
+    || minUptimeMs > maxUptimeMs) {
+    throw new LauncherError('invalid bounded command deadlines', {
+      exitCode: EXIT_CODES.OPERATION_FAILED,
+    });
+  }
+}
+
+function describeCommand(command) {
+  const segments = String(command).replaceAll('\\', '/').split('/');
+  return segments.at(-1) || 'launcher child process';
+}
+
+function describeProcessError(error) {
+  if (error && typeof error === 'object' && 'code' in error) {
+    return String(error.code);
+  }
+
+  return error instanceof Error ? error.name : 'unknown failure';
+}
+
+function createSpawnError(command, error) {
+  return new LauncherError(
+    `failed to start ${describeCommand(command)}: ${describeProcessError(error)}`,
+    { exitCode: EXIT_CODES.OPERATION_FAILED }
+  );
 }

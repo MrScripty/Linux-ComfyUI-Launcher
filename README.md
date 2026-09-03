@@ -34,7 +34,9 @@ See [Architecture](docs/ARCHITECTURE.md) for process and ownership details.
 
 ## Desktop Quick Start
 
-The root launchers share one Node implementation.
+The root launchers require Node and delegate every action to one shared
+implementation, so Bash and PowerShell use the same parsing, environment, and
+exit-code contract.
 
 ```bash
 ./launcher.sh --install
@@ -52,7 +54,9 @@ On Windows:
 
 Release-mode local builds use `--build-release` followed by `--run-release`.
 Run either launcher with `--help` for the complete command and exit-code
-contract.
+contract. Unsupported operating systems are rejected explicitly. The
+`--release-smoke` action owns its child process tree and treats a missed
+maximum/grace/force deadline as failure rather than leaving the smoke running.
 
 Inference integrations are included in the default desktop build. Build the
 model-library-only variant with:
@@ -117,7 +121,8 @@ see [Development](docs/DEVELOPMENT.md) and [Releasing](RELEASING.md).
 
 Linux x64 is the primary development and runtime target. CI also compiles and
 packages Windows x64 and macOS arm64 artifacts, but runtime evidence on those
-platforms is narrower.
+platforms is narrower. Launcher process-tree behavior is verified locally on
+Linux; equivalent required-real Windows and macOS evidence remains pending.
 
 Binding generators exist for Python, Kotlin, Swift, Ruby, and C#, with a local
 C# smoke harness. These surfaces are not yet backed by a complete host/runtime
