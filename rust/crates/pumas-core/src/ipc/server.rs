@@ -9,11 +9,14 @@
 //! spawned task. The `PrimaryState` is shared via `Arc` and uses internal
 //! synchronization (RwLock) for mutable access.
 
-use super::protocol::{read_frame, write_frame, IpcRequest, IpcResponse};
+use super::protocol::{
+    read_frame, write_frame, IpcError, IpcRequest, IpcResponse, LocalIpcCommand, LocalIpcOperation,
+};
 use crate::config::RegistryConfig;
 use crate::model_library::ModelLibraryUpdateSubscriber;
 use crate::models::ModelLibraryUpdateNotification;
 use crate::{PumasError, Result};
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,6 +46,7 @@ impl Drop for ActiveConnectionGuard {
 
 /// Handle to a running IPC server. Dropping shuts down the server.
 pub struct IpcServerHandle {
+    #[cfg(test)]
     pub addr: SocketAddr,
     pub port: u16,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -53,6 +57,7 @@ pub struct IpcServerHandle {
 
 impl IpcServerHandle {
     /// Get the address the server is listening on.
+    #[cfg(test)]
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -111,7 +116,7 @@ fn abort_connection_tasks(tasks: &ConnectionTasks) {
 ///
 /// Implemented by `PrimaryState` to handle incoming requests.
 #[async_trait::async_trait]
-pub trait IpcDispatch: Send + Sync + 'static {
+pub(crate) trait IpcDispatch: Send + Sync + 'static {
     /// Dispatch a JSON-RPC method call and return the result.
     async fn dispatch(
         &self,
@@ -130,7 +135,7 @@ pub trait IpcDispatch: Send + Sync + 'static {
 }
 
 /// IPC server that listens for client connections.
-pub struct IpcServer;
+pub(crate) struct IpcServer;
 
 impl IpcServer {
     /// Start the IPC server on a random local port.
@@ -159,6 +164,7 @@ impl IpcServer {
         ));
 
         Ok(IpcServerHandle {
+            #[cfg(test)]
             addr,
             port,
             shutdown_tx: Some(shutdown_tx),
@@ -248,15 +254,36 @@ impl IpcServer {
                 }
             };
 
-            if request.method == "subscribe_model_library_update_stream_since" {
-                Self::handle_model_library_update_stream_request(
-                    request,
-                    dispatch,
-                    &mut writer,
-                    shutdown_rx,
-                )
-                .await?;
-                return Ok(());
+            if LocalIpcOperation::from_wire_name(&request.method)
+                == Some(LocalIpcOperation::SubscribeModelLibraryUpdateStreamSince)
+            {
+                match LocalIpcCommand::decode(
+                    LocalIpcOperation::SubscribeModelLibraryUpdateStreamSince,
+                    request.params,
+                ) {
+                    Ok(LocalIpcCommand::SubscribeModelLibraryUpdateStreamSince {
+                        cursor,
+                        connection_token,
+                    }) => {
+                        Self::handle_model_library_update_stream_request(
+                            request.id,
+                            &cursor,
+                            &connection_token,
+                            dispatch,
+                            &mut writer,
+                            shutdown_rx,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Ok(_) => unreachable!("stream operation decoded to a non-stream command"),
+                    Err(error) => {
+                        let response = IpcResponse::error(request.id, error);
+                        let response_bytes = serde_json::to_vec(&response)?;
+                        write_frame(&mut writer, &response_bytes).await?;
+                        continue;
+                    }
+                }
             }
 
             let response = Self::process_request(request, dispatch).await;
@@ -267,29 +294,21 @@ impl IpcServer {
     }
 
     fn parse_request_frame(frame: Vec<u8>) -> std::result::Result<IpcRequest, Box<IpcResponse>> {
-        let request_str = String::from_utf8(frame).map_err(|_| {
-            Box::new(IpcResponse::error(
-                None,
-                -32600,
-                "Invalid Request: invalid UTF-8 in IPC frame".to_string(),
-            ))
-        })?;
-        let request: IpcRequest = match serde_json::from_str(&request_str) {
-            Ok(req) => req,
-            Err(e) => {
-                return Err(Box::new(IpcResponse::error(
-                    None,
-                    -32700,
-                    format!("Parse error: {}", e),
-                )));
-            }
-        };
+        let request_value: serde_json::Value = serde_json::from_slice(&frame)
+            .map_err(|_| Box::new(IpcResponse::error(None, IpcError::parse_error())))?;
+        let request: IpcRequest = serde_json::from_value(request_value)
+            .map_err(|_| Box::new(IpcResponse::error(None, IpcError::invalid_request())))?;
 
-        if request.jsonrpc != "2.0" {
+        if request.jsonrpc != "2.0"
+            || request
+                .id
+                .as_ref()
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+        {
             return Err(Box::new(IpcResponse::error(
                 request.id,
-                -32600,
-                "Invalid Request: expected jsonrpc 2.0".to_string(),
+                IpcError::invalid_request(),
             )));
         }
 
@@ -297,21 +316,29 @@ impl IpcServer {
     }
 
     async fn process_request<D: IpcDispatch>(request: IpcRequest, dispatch: &D) -> IpcResponse {
-        let params = request
-            .params
-            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let Some(operation) = LocalIpcOperation::from_wire_name(&request.method) else {
+            return IpcResponse::error(request.id, IpcError::method_not_found());
+        };
+        let command = match LocalIpcCommand::decode(operation, request.params) {
+            Ok(command) => command,
+            Err(error) => return IpcResponse::error(request.id, error),
+        };
+        let method = command.operation().wire_name();
+        let params = command.into_dispatch_params();
 
-        match dispatch.dispatch(&request.method, params).await {
-            Ok(result) => IpcResponse::success(request.id, result),
-            Err(e) => {
-                let code = e.to_rpc_error_code();
-                IpcResponse::error(request.id, code, e.to_string())
-            }
+        match dispatch.dispatch(method, params).await {
+            Ok(result) => match operation.validate_outcome(result) {
+                Ok(outcome) => IpcResponse::success(request.id, outcome),
+                Err(error) => IpcResponse::error(request.id, error),
+            },
+            Err(error) => IpcResponse::error(request.id, IpcError::from_pumas(&error)),
         }
     }
 
     async fn handle_model_library_update_stream_request<D, W>(
-        request: IpcRequest,
+        id: Option<serde_json::Value>,
+        cursor: &str,
+        connection_token: &str,
         dispatch: &D,
         writer: &mut W,
         shutdown_rx: &mut watch::Receiver<bool>,
@@ -320,29 +347,23 @@ impl IpcServer {
         D: IpcDispatch,
         W: AsyncWriteExt + Unpin,
     {
-        let id = request.id.clone();
-        let params = request
-            .params
-            .unwrap_or(serde_json::Value::Object(Default::default()));
-        let cursor = params["cursor"]
-            .as_str()
-            .ok_or_else(|| PumasError::InvalidParams {
-                message: "cursor is required".to_string(),
-            })?;
-        let connection_token = params["connection_token"].as_str();
-
-        let Some(mut subscriber) = dispatch
-            .subscribe_model_library_update_stream_since(cursor, connection_token)
-            .await?
-        else {
-            let response = IpcResponse::error(
-                id,
-                -32601,
-                "model-library update streaming is not supported".to_string(),
-            );
-            let response_bytes = serde_json::to_vec(&response)?;
-            write_frame(writer, &response_bytes).await?;
-            return Ok(());
+        let mut subscriber = match dispatch
+            .subscribe_model_library_update_stream_since(cursor, Some(connection_token))
+            .await
+        {
+            Ok(Some(subscriber)) => subscriber,
+            Ok(None) => {
+                let response = IpcResponse::error(id, IpcError::method_not_found());
+                let response_bytes = serde_json::to_vec(&response)?;
+                write_frame(writer, &response_bytes).await?;
+                return Ok(());
+            }
+            Err(error) => {
+                let response = IpcResponse::error(id, IpcError::from_pumas(&error));
+                let response_bytes = serde_json::to_vec(&response)?;
+                write_frame(writer, &response_bytes).await?;
+                return Ok(());
+            }
         };
 
         let handshake = subscriber.handshake().clone();
@@ -355,9 +376,18 @@ impl IpcServer {
         }
 
         loop {
-            let update = tokio::select! {
-                result = subscriber.next_event() => result?,
+            let update_result = tokio::select! {
+                result = subscriber.next_event() => result,
                 _ = shutdown_rx.changed() => return Ok(()),
+            };
+            let update = match update_result {
+                Ok(update) => update,
+                Err(error) => {
+                    let response = IpcResponse::error(id, IpcError::from_pumas(&error));
+                    let response_bytes = serde_json::to_vec(&response)?;
+                    write_frame(writer, &response_bytes).await?;
+                    return Ok(());
+                }
             };
             let notification = ModelLibraryUpdateNotification {
                 cursor: update.cursor.clone(),
@@ -378,27 +408,31 @@ mod tests {
     use std::io::ErrorKind;
     use tokio::time::{timeout, Duration};
 
-    struct EchoDispatch;
+    struct ContractDispatch;
 
     #[async_trait::async_trait]
-    impl IpcDispatch for EchoDispatch {
+    impl IpcDispatch for ContractDispatch {
         async fn dispatch(
             &self,
             method: &str,
             params: serde_json::Value,
         ) -> std::result::Result<serde_json::Value, PumasError> {
-            match method {
-                "echo" => Ok(params),
-                "fail" => Err(PumasError::Other("test failure".to_string())),
-                _ => Err(PumasError::InvalidParams {
-                    message: format!("Unknown method: {}", method),
-                }),
+            assert_eq!(method, "model_library_selector_snapshot");
+            assert_eq!(params["connection_token"], "test-connection-token");
+            match params["request"]["search"].as_str() {
+                Some("trigger-failure") => Err(PumasError::Other(
+                    "private dispatch failure at /private/model".to_string(),
+                )),
+                Some("trigger-wrong-outcome") => Ok(serde_json::json!({ "wrong": true })),
+                _ => Ok(serde_json::to_value(
+                    crate::models::ModelLibrarySelectorSnapshot::empty("model-library-updates:0"),
+                )?),
             }
         }
     }
 
     async fn start_test_server() -> Option<IpcServerHandle> {
-        match IpcServer::start(Arc::new(EchoDispatch)).await {
+        match IpcServer::start(Arc::new(ContractDispatch)).await {
             Ok(handle) => Some(handle),
             Err(PumasError::Io {
                 source: Some(err), ..
@@ -423,7 +457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_echo_roundtrip() {
+    async fn test_server_closed_contract_roundtrip() {
         let Some(mut handle) = start_test_server().await else {
             return;
         };
@@ -432,8 +466,14 @@ mod tests {
         let mut stream = TcpStream::connect(handle.addr()).await.unwrap();
         let (mut reader, mut writer) = stream.split();
 
-        // Send a request
-        let request = IpcRequest::new("echo", serde_json::json!({"hello": "world"}), 1);
+        let request = IpcRequest::new(
+            LocalIpcOperation::ModelLibrarySelectorSnapshot,
+            serde_json::json!({
+                "request": { "limit": 25 },
+                "connection_token": "test-connection-token",
+            }),
+            1,
+        );
         let request_bytes = serde_json::to_vec(&request).unwrap();
         write_frame(&mut writer, &request_bytes).await.unwrap();
 
@@ -442,7 +482,9 @@ mod tests {
         let response: IpcResponse = serde_json::from_slice(&response_bytes).unwrap();
 
         assert!(response.error.is_none());
-        assert_eq!(response.result, Some(serde_json::json!({"hello": "world"})));
+        let snapshot: crate::models::ModelLibrarySelectorSnapshot =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(snapshot.cursor, "model-library-updates:0");
 
         handle.shutdown();
     }
@@ -456,7 +498,14 @@ mod tests {
         let mut stream = TcpStream::connect(handle.addr()).await.unwrap();
         let (mut reader, mut writer) = stream.split();
 
-        let request = IpcRequest::new("fail", serde_json::json!({}), 2);
+        let request = IpcRequest::new(
+            LocalIpcOperation::ModelLibrarySelectorSnapshot,
+            serde_json::json!({
+                "request": { "search": "trigger-failure" },
+                "connection_token": "test-connection-token",
+            }),
+            2,
+        );
         let request_bytes = serde_json::to_vec(&request).unwrap();
         write_frame(&mut writer, &request_bytes).await.unwrap();
 
@@ -466,8 +515,99 @@ mod tests {
         assert!(response.error.is_some());
         let err = response.error.unwrap();
         assert_eq!(err.code, -32603); // Internal error
-        assert!(err.message.contains("test failure"));
+        assert_eq!(err.message, "Local IPC operation failed");
+        let encoded = serde_json::to_string(&err).unwrap();
+        assert!(!encoded.contains("private dispatch failure"));
+        assert!(!encoded.contains("/private/model"));
 
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_unknown_operation_before_dispatch() {
+        let Some(mut handle) = start_test_server().await else {
+            return;
+        };
+        let mut stream = TcpStream::connect(handle.addr()).await.unwrap();
+        let (mut reader, mut writer) = stream.split();
+        let request = IpcRequest::new_unchecked("list_models", serde_json::json!({}), 3);
+        write_frame(&mut writer, &serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        let response: IpcResponse =
+            serde_json::from_slice(&read_frame(&mut reader).await.unwrap().unwrap()).unwrap();
+
+        assert_eq!(response.error.unwrap().code, -32601);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_extra_fields_and_oversized_values() {
+        let Some(mut handle) = start_test_server().await else {
+            return;
+        };
+        let mut stream = TcpStream::connect(handle.addr()).await.unwrap();
+        let (mut reader, mut writer) = stream.split();
+
+        for (id, params) in [
+            (
+                4,
+                serde_json::json!({
+                    "request": { "limit": 25 },
+                    "connection_token": "test-connection-token",
+                    "unexpected": true,
+                }),
+            ),
+            (
+                5,
+                serde_json::json!({
+                    "request": { "limit": 1001 },
+                    "connection_token": "test-connection-token",
+                }),
+            ),
+            (
+                6,
+                serde_json::json!({
+                    "request": { "offset": -1 },
+                    "connection_token": "test-connection-token",
+                }),
+            ),
+        ] {
+            let request =
+                IpcRequest::new(LocalIpcOperation::ModelLibrarySelectorSnapshot, params, id);
+            write_frame(&mut writer, &serde_json::to_vec(&request).unwrap())
+                .await
+                .unwrap();
+            let response: IpcResponse =
+                serde_json::from_slice(&read_frame(&mut reader).await.unwrap().unwrap()).unwrap();
+            assert_eq!(response.error.unwrap().code, -32602);
+        }
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_server_rejects_wrong_dispatch_outcome_type() {
+        let Some(mut handle) = start_test_server().await else {
+            return;
+        };
+        let mut stream = TcpStream::connect(handle.addr()).await.unwrap();
+        let (mut reader, mut writer) = stream.split();
+        let request = IpcRequest::new(
+            LocalIpcOperation::ModelLibrarySelectorSnapshot,
+            serde_json::json!({
+                "request": { "search": "trigger-wrong-outcome" },
+                "connection_token": "test-connection-token",
+            }),
+            7,
+        );
+        write_frame(&mut writer, &serde_json::to_vec(&request).unwrap())
+            .await
+            .unwrap();
+        let response: IpcResponse =
+            serde_json::from_slice(&read_frame(&mut reader).await.unwrap().unwrap()).unwrap();
+
+        assert_eq!(response.error.unwrap().code, -32603);
         handle.shutdown();
     }
 
@@ -488,6 +628,62 @@ mod tests {
 
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, -32700);
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_server_distinguishes_invalid_envelope_from_invalid_params() {
+        let Some(mut handle) = start_test_server().await else {
+            return;
+        };
+        let mut stream = TcpStream::connect(handle.addr()).await.unwrap();
+        let (mut reader, mut writer) = stream.split();
+        let cases = [
+            (
+                serde_json::json!({
+                    "jsonrpc": "1.0",
+                    "method": "model_library_selector_snapshot",
+                    "params": {
+                        "request": {},
+                        "connection_token": "test-connection-token",
+                    },
+                    "id": 8,
+                }),
+                -32600,
+            ),
+            (
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "model_library_selector_snapshot",
+                    "params": {
+                        "request": {},
+                        "connection_token": "test-connection-token",
+                    },
+                    "id": 9,
+                    "unexpected": true,
+                }),
+                -32600,
+            ),
+            (
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "model_library_selector_snapshot",
+                    "params": null,
+                    "id": 10,
+                }),
+                -32602,
+            ),
+        ];
+
+        for (request, expected_code) in cases {
+            write_frame(&mut writer, &serde_json::to_vec(&request).unwrap())
+                .await
+                .unwrap();
+            let response: IpcResponse =
+                serde_json::from_slice(&read_frame(&mut reader).await.unwrap().unwrap()).unwrap();
+            assert_eq!(response.error.unwrap().code, expected_code);
+        }
 
         handle.shutdown();
     }

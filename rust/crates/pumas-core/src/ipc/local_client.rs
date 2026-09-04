@@ -1,6 +1,6 @@
 //! Explicit local client API for attaching to a running Pumas instance.
 
-use super::protocol::{read_frame, write_frame, IpcRequest, IpcResponse};
+use super::protocol::{read_frame, write_frame, IpcRequest, IpcResponse, LocalIpcOperation};
 use super::IpcClient;
 use crate::models::{
     ModelExecutionDescriptorBatchItem, ModelInferenceSettingsBatchItem,
@@ -18,7 +18,6 @@ use tokio::net::TcpStream;
 static LOCAL_STREAM_REQUEST_ID: AtomicU64 = AtomicU64::new(1_000_000);
 
 /// Explicit same-device client for a running Pumas Library instance.
-#[derive(Debug)]
 pub struct PumasLocalClient {
     client: IpcClient,
     instance: InstanceEntry,
@@ -69,7 +68,7 @@ impl PumasLocalClient {
         request: ModelLibrarySelectorSnapshotRequest,
     ) -> Result<ModelLibrarySelectorSnapshot> {
         self.call_owner_method(
-            "model_library_selector_snapshot",
+            LocalIpcOperation::ModelLibrarySelectorSnapshot,
             serde_json::json!({ "request": request }),
         )
         .await
@@ -81,7 +80,7 @@ impl PumasLocalClient {
         request: ResolveModelArtifactLoadTargetRequest,
     ) -> Result<ResolveModelArtifactLoadTargetResponse> {
         self.call_owner_method(
-            "resolve_model_artifact_load_target",
+            LocalIpcOperation::ResolveModelArtifactLoadTarget,
             serde_json::json!({ "request": request }),
         )
         .await
@@ -93,7 +92,7 @@ impl PumasLocalClient {
         model_ids: Vec<String>,
     ) -> Result<Vec<ModelPackageFactsSummaryBatchItem>> {
         self.call_owner_method(
-            "resolve_model_package_facts_summaries",
+            LocalIpcOperation::ResolveModelPackageFactsSummaries,
             serde_json::json!({ "model_ids": model_ids }),
         )
         .await
@@ -105,7 +104,7 @@ impl PumasLocalClient {
         model_ids: Vec<String>,
     ) -> Result<Vec<ModelExecutionDescriptorBatchItem>> {
         self.call_owner_method(
-            "resolve_model_execution_descriptors_batch",
+            LocalIpcOperation::ResolveModelExecutionDescriptorsBatch,
             serde_json::json!({ "model_ids": model_ids }),
         )
         .await
@@ -117,7 +116,7 @@ impl PumasLocalClient {
         model_ids: Vec<String>,
     ) -> Result<Vec<ModelInferenceSettingsBatchItem>> {
         self.call_owner_method(
-            "get_inference_settings_batch",
+            LocalIpcOperation::GetInferenceSettingsBatch,
             serde_json::json!({ "model_ids": model_ids }),
         )
         .await
@@ -138,7 +137,7 @@ impl PumasLocalClient {
                 })?;
         let request_id = LOCAL_STREAM_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let request = IpcRequest::new(
-            "subscribe_model_library_update_stream_since",
+            LocalIpcOperation::SubscribeModelLibraryUpdateStreamSince,
             serde_json::json!({
                 "cursor": cursor,
                 "connection_token": self.connection_token()?,
@@ -153,13 +152,19 @@ impl PumasLocalClient {
                 port: self.instance.port,
             })?;
 
-        let handshake: ModelLibraryUpdateSubscription =
-            read_stream_response(&mut stream, self.instance.pid, self.instance.port).await?;
+        let handshake: ModelLibraryUpdateSubscription = read_stream_response(
+            &mut stream,
+            self.instance.pid,
+            self.instance.port,
+            request_id,
+        )
+        .await?;
         Ok(PumasLocalModelLibraryUpdateStream {
             handshake,
             stream,
             primary_pid: self.instance.pid,
             primary_port: self.instance.port,
+            request_id,
         })
     }
 
@@ -172,26 +177,33 @@ impl PumasLocalClient {
             })
     }
 
-    async fn call_owner_method<T>(&self, method: &str, mut params: serde_json::Value) -> Result<T>
+    async fn call_owner_method<T>(
+        &self,
+        operation: LocalIpcOperation,
+        mut params: serde_json::Value,
+    ) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
     {
         params["connection_token"] = serde_json::json!(self.connection_token()?);
-        let value = self.client.call(method, params).await?;
+        let value = self.client.call(operation, params).await?;
         serde_json::from_value(value).map_err(|err| PumasError::Json {
-            message: format!("Failed to decode local client response for {method}: {err}"),
+            message: format!(
+                "Failed to decode local client response for {}",
+                operation.wire_name()
+            ),
             source: Some(err),
         })
     }
 }
 
 /// Active local model-library update stream.
-#[derive(Debug)]
 pub struct PumasLocalModelLibraryUpdateStream {
     handshake: ModelLibraryUpdateSubscription,
     stream: TcpStream,
     primary_pid: u32,
     primary_port: u16,
+    request_id: u64,
 }
 
 impl PumasLocalModelLibraryUpdateStream {
@@ -200,7 +212,13 @@ impl PumasLocalModelLibraryUpdateStream {
     }
 
     pub async fn next_notification(&mut self) -> Result<ModelLibraryUpdateNotification> {
-        read_stream_response(&mut self.stream, self.primary_pid, self.primary_port).await
+        read_stream_response(
+            &mut self.stream,
+            self.primary_pid,
+            self.primary_port,
+            self.request_id,
+        )
+        .await
     }
 }
 
@@ -208,6 +226,7 @@ async fn read_stream_response<T: serde::de::DeserializeOwned>(
     stream: &mut TcpStream,
     primary_pid: u32,
     primary_port: u16,
+    expected_id: u64,
 ) -> Result<T> {
     let response_bytes = read_frame(stream)
         .await
@@ -225,13 +244,7 @@ async fn read_stream_response<T: serde::de::DeserializeOwned>(
             source: Some(err),
         })?;
 
-    if let Some(error) = response.error {
-        return Err(PumasError::Other(error.message));
-    }
-
-    let result = response
-        .result
-        .ok_or_else(|| PumasError::Other("local stream response missing result".to_string()))?;
+    let result = response.into_result(expected_id)?;
     serde_json::from_value(result).map_err(|err| PumasError::Json {
         message: format!("Failed to decode local stream payload: {err}"),
         source: Some(err),
@@ -273,7 +286,8 @@ fn loopback_tcp_addr(instance: &InstanceEntry) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{IpcDispatch, IpcServer};
+    use crate::ipc::server::IpcDispatch;
+    use crate::ipc::IpcServer;
     use crate::model_library::ModelLibrary;
     use crate::models::{
         ModelArtifactState, ModelEntryPathState, ModelLibraryChangeKind,
@@ -563,7 +577,10 @@ mod tests {
         let mut instance = ready_instance(12345);
         instance.endpoint = "0.0.0.0:12345".to_string();
 
-        let err = PumasLocalClient::connect(instance).await.unwrap_err();
+        let err = match PumasLocalClient::connect(instance).await {
+            Ok(_) => panic!("non-loopback local IPC endpoint was accepted"),
+            Err(error) => error,
+        };
         assert!(matches!(err, PumasError::InvalidParams { .. }));
     }
 
@@ -572,7 +589,10 @@ mod tests {
         let mut instance = ready_instance(12345);
         instance.status = InstanceStatus::Claiming;
 
-        let err = PumasLocalClient::connect(instance).await.unwrap_err();
+        let err = match PumasLocalClient::connect(instance).await {
+            Ok(_) => panic!("non-ready local IPC instance was accepted"),
+            Err(error) => error,
+        };
         assert!(matches!(err, PumasError::InvalidParams { .. }));
     }
 
@@ -581,7 +601,10 @@ mod tests {
         let mut instance = ready_instance(12345);
         instance.connection_token = None;
 
-        let err = PumasLocalClient::connect(instance).await.unwrap_err();
+        let err = match PumasLocalClient::connect(instance).await {
+            Ok(_) => panic!("local IPC instance without a token was accepted"),
+            Err(error) => error,
+        };
         assert!(matches!(err, PumasError::InvalidParams { .. }));
     }
 

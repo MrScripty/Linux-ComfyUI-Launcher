@@ -8,9 +8,9 @@
 //! The client uses a tokio `Mutex` to serialize access to the TCP stream,
 //! allowing safe concurrent use from multiple async tasks.
 
-use super::protocol::{
-    read_frame, read_frame_blocking, write_frame, write_frame_blocking, IpcRequest, IpcResponse,
-};
+use super::protocol::{read_frame, write_frame, IpcRequest, IpcResponse, LocalIpcOperation};
+#[cfg(test)]
+use super::protocol::{read_frame_blocking, write_frame_blocking};
 use crate::config::RegistryConfig;
 use crate::{PumasError, Result};
 use std::net::SocketAddr;
@@ -21,8 +21,9 @@ use tracing::debug;
 
 /// IPC client that connects to a primary instance's server.
 #[derive(Debug)]
-pub struct IpcClient {
+pub(crate) struct IpcClient {
     stream: Mutex<TcpStream>,
+    #[cfg(test)]
     addr: SocketAddr,
     next_id: AtomicU64,
     /// PID of the primary instance (for error reporting).
@@ -35,7 +36,7 @@ impl IpcClient {
     /// Connect to a primary instance's IPC server.
     ///
     /// Uses the configured connection timeout from `RegistryConfig`.
-    pub async fn connect(addr: SocketAddr, pid: u32) -> Result<Self> {
+    pub(crate) async fn connect(addr: SocketAddr, pid: u32) -> Result<Self> {
         let stream = tokio::time::timeout(
             RegistryConfig::IPC_CONNECT_TIMEOUT,
             TcpStream::connect(addr),
@@ -54,6 +55,7 @@ impl IpcClient {
 
         Ok(Self {
             stream: Mutex::new(stream),
+            #[cfg(test)]
             addr,
             next_id: AtomicU64::new(1),
             primary_pid: pid,
@@ -65,9 +67,13 @@ impl IpcClient {
     ///
     /// Returns the result value on success, or a `PumasError` on failure.
     /// If the connection is broken, returns `SharedInstanceLost`.
-    pub async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+    pub(crate) async fn call(
+        &self,
+        operation: LocalIpcOperation,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let request = IpcRequest::new(method, params, id);
+        let request = IpcRequest::new(operation, params, id);
         let request_bytes = serde_json::to_vec(&request)?;
 
         let mut stream = self.stream.lock().await;
@@ -94,28 +100,19 @@ impl IpcClient {
             })?;
 
         let response: IpcResponse =
-            serde_json::from_slice(&response_bytes).map_err(|e| PumasError::Json {
-                message: format!("Failed to parse IPC response: {}", e),
-                source: Some(e),
-            })?;
-
-        if let Some(err) = response.error {
-            return Err(PumasError::Other(err.message));
-        }
-
-        response
-            .result
-            .ok_or_else(|| PumasError::Other("IPC response missing result".to_string()))
+            serde_json::from_slice(&response_bytes).map_err(invalid_response)?;
+        response.into_result(id)
     }
 
     /// Call a JSON-RPC method on the primary instance using a fresh blocking socket.
+    #[cfg(test)]
     pub fn call_blocking(
         &self,
-        method: &str,
+        operation: LocalIpcOperation,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let request = IpcRequest::new(method, params, id);
+        let request = IpcRequest::new(operation, params, id);
         let request_bytes = serde_json::to_vec(&request)?;
 
         let mut stream =
@@ -161,23 +158,15 @@ impl IpcClient {
             })?;
 
         let response: IpcResponse =
-            serde_json::from_slice(&response_bytes).map_err(|e| PumasError::Json {
-                message: format!("Failed to parse IPC response: {}", e),
-                source: Some(e),
-            })?;
-
-        if let Some(err) = response.error {
-            return Err(PumasError::Other(err.message));
-        }
-
-        response
-            .result
-            .ok_or_else(|| PumasError::Other("IPC response missing result".to_string()))
+            serde_json::from_slice(&response_bytes).map_err(invalid_response)?;
+        response.into_result(id)
     }
+}
 
-    /// Get the address of the connected primary instance.
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+fn invalid_response(error: serde_json::Error) -> PumasError {
+    PumasError::Json {
+        message: "Invalid local IPC response envelope".to_string(),
+        source: Some(error),
     }
 }
 
@@ -197,17 +186,11 @@ mod tests {
             method: &str,
             params: serde_json::Value,
         ) -> std::result::Result<serde_json::Value, PumasError> {
-            match method {
-                "ping" => Ok(serde_json::json!("pong")),
-                "add" => {
-                    let a = params["a"].as_i64().unwrap_or(0);
-                    let b = params["b"].as_i64().unwrap_or(0);
-                    Ok(serde_json::json!(a + b))
-                }
-                _ => Err(PumasError::InvalidParams {
-                    message: format!("Unknown method: {}", method),
-                }),
-            }
+            assert_eq!(method, "model_library_selector_snapshot");
+            assert_eq!(params["connection_token"], "test-token");
+            Ok(serde_json::to_value(
+                crate::models::ModelLibrarySelectorSnapshot::empty("model-library-updates:0"),
+            )?)
         }
     }
 
@@ -234,14 +217,25 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client.call("ping", serde_json::json!({})).await.unwrap();
-        assert_eq!(result, serde_json::json!("pong"));
+        let result = client
+            .call(
+                LocalIpcOperation::ModelLibrarySelectorSnapshot,
+                serde_json::json!({
+                    "request": { "limit": 25 },
+                    "connection_token": "test-token",
+                }),
+            )
+            .await
+            .unwrap();
+        let snapshot: crate::models::ModelLibrarySelectorSnapshot =
+            serde_json::from_value(result).unwrap();
+        assert_eq!(snapshot.cursor, "model-library-updates:0");
 
         handle.shutdown();
     }
 
     #[tokio::test]
-    async fn test_client_call_with_params() {
+    async fn test_client_call_rejects_invalid_params() {
         let Some(mut handle) = start_test_server().await else {
             return;
         };
@@ -251,10 +245,19 @@ mod tests {
             .unwrap();
 
         let result = client
-            .call("add", serde_json::json!({"a": 3, "b": 4}))
-            .await
-            .unwrap();
-        assert_eq!(result, serde_json::json!(7));
+            .call(
+                LocalIpcOperation::ModelLibrarySelectorSnapshot,
+                serde_json::json!({
+                    "request": { "limit": -1 },
+                    "connection_token": "test-token",
+                }),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(PumasError::InvalidParams { message })
+                if message == "Invalid local IPC parameters"
+        ));
 
         handle.shutdown();
     }
@@ -270,12 +273,20 @@ mod tests {
             .unwrap();
 
         let result = tokio::task::spawn_blocking(move || {
-            client.call_blocking("ping", serde_json::json!({}))
+            client.call_blocking(
+                LocalIpcOperation::ModelLibrarySelectorSnapshot,
+                serde_json::json!({
+                    "request": { "limit": 25 },
+                    "connection_token": "test-token",
+                }),
+            )
         })
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(result, serde_json::json!("pong"));
+        let snapshot: crate::models::ModelLibrarySelectorSnapshot =
+            serde_json::from_value(result).unwrap();
+        assert_eq!(snapshot.cursor, "model-library-updates:0");
 
         handle.shutdown();
     }
@@ -290,7 +301,12 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client.call("nonexistent", serde_json::json!({})).await;
+        let result = client
+            .call(
+                LocalIpcOperation::ModelLibrarySelectorSnapshot,
+                serde_json::json!({}),
+            )
+            .await;
         assert!(result.is_err());
 
         handle.shutdown();
@@ -323,7 +339,16 @@ mod tests {
             .unwrap();
 
         // Verify it works first
-        let result = client.call("ping", serde_json::json!({})).await;
+        let params = serde_json::json!({
+            "request": { "limit": 25 },
+            "connection_token": "test-token",
+        });
+        let result = client
+            .call(
+                LocalIpcOperation::ModelLibrarySelectorSnapshot,
+                params.clone(),
+            )
+            .await;
         assert!(result.is_ok());
 
         // Shut down the server
@@ -333,7 +358,12 @@ mod tests {
         let mut detected_shutdown = false;
         for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let result = client.call("ping", serde_json::json!({})).await;
+            let result = client
+                .call(
+                    LocalIpcOperation::ModelLibrarySelectorSnapshot,
+                    params.clone(),
+                )
+                .await;
             if result.is_err() {
                 detected_shutdown = true;
                 break;

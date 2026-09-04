@@ -10,12 +10,11 @@
 //! - **Client**: Connects to a primary instance, proxies API calls transparently
 //! - **Protocol**: Shared framing and JSON-RPC types used by both
 
-pub mod client;
+mod client;
 pub mod local_client;
-pub mod protocol;
-pub mod server;
+pub(crate) mod protocol;
+pub(crate) mod server;
 
-pub use client::IpcClient;
-pub use local_client::PumasLocalClient;
-pub use protocol::{IpcRequest, IpcResponse};
-pub use server::{IpcDispatch, IpcServer, IpcServerHandle};
+pub(crate) use client::IpcClient;
+pub use local_client::{PumasLocalClient, PumasLocalModelLibraryUpdateStream};
+pub(crate) use server::{IpcServer, IpcServerHandle};

@@ -95,6 +95,93 @@ fn create_indexable_test_model(root: &Path, model_id: &str, official_name: &str)
     .unwrap();
 }
 
+async fn raw_local_ipc_call(port: u16, request: serde_json::Value) -> serde_json::Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let request = serde_json::to_vec(&request).unwrap();
+    stream
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&request).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length).await.unwrap();
+    let mut response = vec![0_u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut response).await.unwrap();
+    serde_json::from_slice(&response).unwrap()
+}
+
+#[tokio::test]
+async fn test_local_ipc_production_adapter_rejects_unauthorized_and_obsolete_operations() {
+    let temp_dir = create_test_env();
+    let _registry = RegistryTestGuard::new(temp_dir.path());
+    let api = PumasApi::builder(temp_dir.path())
+        .with_hf_client(false)
+        .with_process_manager(false)
+        .build()
+        .await
+        .unwrap();
+    let port = api.start_ipc_server().await.unwrap();
+
+    let unauthorized = raw_local_ipc_call(
+        port,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "model_library_selector_snapshot",
+            "params": {
+                "request": {},
+                "connection_token": "synthetic-invalid-local-token",
+            },
+            "id": 1,
+        }),
+    )
+    .await;
+    assert_eq!(unauthorized["error"]["code"], -32602);
+    assert_eq!(unauthorized["error"]["data"]["class"], "invalid_params");
+    assert_eq!(
+        unauthorized["error"]["message"],
+        "Invalid local IPC parameters"
+    );
+    assert!(!unauthorized
+        .to_string()
+        .contains("synthetic-invalid-local-token"));
+
+    for (id, method) in [
+        "list_models",
+        "get_hf_download_progress",
+        "cancel_hf_download",
+        "pause_hf_download",
+        "resume_hf_download",
+        "list_hf_downloads",
+        "list_interrupted_downloads",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let obsolete = raw_local_ipc_call(
+            port,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": {},
+                "id": id + 2,
+            }),
+        )
+        .await;
+        assert_eq!(obsolete["error"]["code"], -32601, "method={method}");
+        assert_eq!(
+            obsolete["error"]["data"]["class"], "method_not_found",
+            "method={method}"
+        );
+        assert!(obsolete.get("result").is_none(), "method={method}");
+    }
+}
+
 #[tokio::test]
 async fn test_api_creation_succeeds() {
     let temp_dir = create_test_env();
