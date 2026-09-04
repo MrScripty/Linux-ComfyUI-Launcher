@@ -1837,8 +1837,11 @@ impl ModelLibrary {
     }
 
     fn list_models_sync(&self) -> Result<Vec<ModelRecord>> {
-        self.search_models_filtered_sync("", 10000, 0, None, None)
-            .map(|result| result.models)
+        let mut models = self.index.list_all()?;
+        self.project_dependency_bindings_for_records(&mut models)?;
+        self.project_display_fields_for_records(&mut models);
+        annotate_and_dedupe_records_by_artifact(&mut models);
+        Ok(models)
     }
 
     fn get_model_sync(&self, model_id: &str) -> Result<Option<ModelRecord>> {
@@ -1879,22 +1882,20 @@ impl ModelLibrary {
         let active_bindings = self
             .index()
             .list_active_model_dependency_bindings(model_id, None)?;
-        if !active_bindings.is_empty() {
-            metadata.dependency_bindings = Some(
-                active_bindings
-                    .iter()
-                    .cloned()
-                    .map(|binding| crate::models::DependencyBindingRef {
-                        binding_id: Some(binding.binding_id),
-                        profile_id: Some(binding.profile_id),
-                        profile_version: Some(binding.profile_version),
-                        binding_kind: Some(binding.binding_kind),
-                        backend_key: binding.backend_key,
-                        platform_selector: binding.platform_selector,
-                    })
-                    .collect(),
-            );
-        }
+        metadata.dependency_bindings = Some(
+            active_bindings
+                .iter()
+                .cloned()
+                .map(|binding| crate::models::DependencyBindingRef {
+                    binding_id: Some(binding.binding_id),
+                    profile_id: Some(binding.profile_id),
+                    profile_version: Some(binding.profile_version),
+                    binding_kind: Some(binding.binding_kind),
+                    backend_key: binding.backend_key,
+                    platform_selector: binding.platform_selector,
+                })
+                .collect(),
+        );
         apply_recommended_backend_hint(metadata, &active_bindings);
 
         Ok(())
@@ -1925,45 +1926,43 @@ impl ModelLibrary {
             *metadata = Value::Object(Default::default());
         }
 
-        if !active_bindings.is_empty() {
-            let refs = active_bindings
-                .iter()
-                .cloned()
-                .map(|binding| {
-                    let mut value = serde_json::Map::new();
-                    value.insert("binding_id".to_string(), Value::String(binding.binding_id));
-                    value.insert("profile_id".to_string(), Value::String(binding.profile_id));
-                    value.insert(
-                        "profile_version".to_string(),
-                        Value::Number(binding.profile_version.into()),
-                    );
-                    value.insert(
-                        "binding_kind".to_string(),
-                        Value::String(binding.binding_kind),
-                    );
-                    value.insert(
-                        "backend_key".to_string(),
-                        binding
-                            .backend_key
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
-                    );
-                    value.insert(
-                        "platform_selector".to_string(),
-                        binding
-                            .platform_selector
-                            .map(Value::String)
-                            .unwrap_or(Value::Null),
-                    );
-                    Value::Object(value)
-                })
-                .collect::<Vec<_>>();
+        let refs = active_bindings
+            .iter()
+            .cloned()
+            .map(|binding| {
+                let mut value = serde_json::Map::new();
+                value.insert("binding_id".to_string(), Value::String(binding.binding_id));
+                value.insert("profile_id".to_string(), Value::String(binding.profile_id));
+                value.insert(
+                    "profile_version".to_string(),
+                    Value::Number(binding.profile_version.into()),
+                );
+                value.insert(
+                    "binding_kind".to_string(),
+                    Value::String(binding.binding_kind),
+                );
+                value.insert(
+                    "backend_key".to_string(),
+                    binding
+                        .backend_key
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                );
+                value.insert(
+                    "platform_selector".to_string(),
+                    binding
+                        .platform_selector
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                );
+                Value::Object(value)
+            })
+            .collect::<Vec<_>>();
 
-            let obj = metadata
-                .as_object_mut()
-                .ok_or_else(|| PumasError::Other("metadata must be a JSON object".to_string()))?;
-            obj.insert("dependency_bindings".to_string(), Value::Array(refs));
-        }
+        let obj = metadata
+            .as_object_mut()
+            .ok_or_else(|| PumasError::Other("metadata must be a JSON object".to_string()))?;
+        obj.insert("dependency_bindings".to_string(), Value::Array(refs));
 
         let mut metadata_typed = serde_json::from_value::<ModelMetadata>(metadata.clone())?;
         apply_recommended_backend_hint(&mut metadata_typed, &active_bindings);
@@ -6543,6 +6542,84 @@ mod tests {
         let relative_root = temp_dir.path().strip_prefix(&cwd).unwrap().to_path_buf();
         let library = ModelLibrary::new(relative_root).await.unwrap();
         (temp_dir, library)
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_every_record_beyond_legacy_search_cap() {
+        const MODEL_COUNT: usize = 10_001;
+        let (_temp_dir, library) = setup_library().await;
+
+        let mut connection = rusqlite::Connection::open(library.index().db_path()).unwrap();
+        let transaction = connection.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO models (
+                        id, path, cleaned_name, official_name, model_type,
+                        tags_json, hashes_json, metadata_json, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 'llm', '[]', '{}', '{}', ?5)",
+                )
+                .unwrap();
+            for index in 0..MODEL_COUNT {
+                let id = format!("llm/catalog/model-{index:05}");
+                insert
+                    .execute(rusqlite::params![
+                        id,
+                        format!("/library/llm/catalog/model-{index:05}"),
+                        format!("model-{index:05}"),
+                        format!("Model {index:05}"),
+                        format!("2026-09-03T00:00:{:02}Z", index % 60),
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+
+        let models = library.list_models().await.unwrap();
+        assert_eq!(models.len(), MODEL_COUNT);
+        assert_eq!(
+            models.first().map(|model| model.id.as_str()),
+            Some("llm/catalog/model-00000")
+        );
+        assert_eq!(
+            models.last().map(|model| model.id.as_str()),
+            Some("llm/catalog/model-10000")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_propagates_corrupt_row_decode_failure() {
+        let (_temp_dir, library) = setup_library().await;
+        let connection = rusqlite::Connection::open(library.index().db_path()).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER model_search_ai;
+                 DROP TRIGGER model_search_au;
+                 DROP TRIGGER model_search_ad;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO models (
+                    id, path, cleaned_name, official_name, model_type,
+                    tags_json, hashes_json, metadata_json, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, 'llm', ?5, '{}', '{}', ?6)",
+                rusqlite::params![
+                    "llm/catalog/corrupt",
+                    "/library/llm/catalog/corrupt",
+                    "corrupt",
+                    "Corrupt",
+                    rusqlite::types::Value::Blob(vec![0xff]),
+                    "2026-09-03T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        assert!(library
+            .index()
+            .search("", None, None, 10, 0)
+            .is_ok_and(|result| result.models.is_empty()));
+        assert!(library.list_models().await.is_err());
     }
 
     fn write_min_safetensors(path: &Path) {
@@ -11376,6 +11453,46 @@ mod tests {
                 .get("recommended_backend")
                 .and_then(Value::as_str),
             Some("pytorch")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_replaces_stale_metadata_dependency_bindings_with_authoritative_empty() {
+        let (_temp_dir, library) = setup_library().await;
+        let model_id = "llm/llama/stale-dependency-projection";
+        let model_dir = library.build_model_path("llm", "llama", "stale-dependency-projection");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        write_min_safetensors(&model_dir.join("model.safetensors"));
+
+        let metadata = ModelMetadata {
+            schema_version: Some(2),
+            model_id: Some(model_id.to_string()),
+            model_type: Some("llm".to_string()),
+            family: Some("llama".to_string()),
+            cleaned_name: Some("stale-dependency-projection".to_string()),
+            official_name: Some("Stale Dependency Projection".to_string()),
+            dependency_bindings: Some(vec![crate::models::DependencyBindingRef {
+                binding_id: Some("stale-binding".to_string()),
+                profile_id: Some("stale-profile".to_string()),
+                profile_version: Some(1),
+                binding_kind: Some("required_core".to_string()),
+                backend_key: Some("pytorch".to_string()),
+                platform_selector: None,
+            }]),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        library.index_model_dir(&model_dir).await.unwrap();
+
+        let listed = library.list_models().await.unwrap();
+        let listed_model = listed.iter().find(|model| model.id == model_id).unwrap();
+        assert_eq!(
+            listed_model
+                .metadata
+                .get("dependency_bindings")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 

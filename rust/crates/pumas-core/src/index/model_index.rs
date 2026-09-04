@@ -663,6 +663,30 @@ impl ModelIndex {
         Ok(result)
     }
 
+    /// Return every model in stable order without applying a pagination cap.
+    ///
+    /// Unlike the search path, this complete-list contract propagates any row
+    /// decode failure so callers cannot mistake a partial catalog for success.
+    pub fn list_all(&self) -> Result<Vec<ModelRecord>> {
+        let conn = self.conn.lock().map_err(|_| PumasError::Database {
+            message: "Failed to acquire connection lock".to_string(),
+            source: None,
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, path, cleaned_name, official_name, model_type,
+                    tags_json, hashes_json, metadata_json, updated_at
+             FROM models
+             ORDER BY updated_at DESC, id ASC",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_record)?;
+        let mut models = Vec::new();
+        for row in rows {
+            models.push(row?);
+        }
+        Ok(models)
+    }
+
     /// Delete a model by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().map_err(|_| PumasError::Database {
