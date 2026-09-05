@@ -17,12 +17,13 @@
   clients must not retain the grant. The existing builder already rejects a
   second primary for one launcher root, but that registry claim is not proof of
   physical-root exclusion or last-effect completion.
-- **Mechanism candidate:** acquire nonblocking exclusion on a fresh capability-
-  relative open of the held root directory inode. Independent contenders must
-  not use duplicated file descriptions. Reuse the existing filesystem-locking
-  dependency if its real adapter passes; contention is a typed busy outcome,
-  and unsupported/I/O failure refuses without a sidecar or path fallback.
-  Exact busy/error projection remains an implementation-admission obligation.
+- **Mechanism selected, implementation pending:** nonblocking `fs2` exclusion on
+  a fresh readable capability-relative root open. A Linux dependency probe found
+  `open_dir(".")` yields EBADF; `root.open(".")` passes independent-open and
+  child-process contention/release. Duplicated descriptors share custody and
+  are not independent contenders. The
+  [grant admission](plan.md#physical-root-execution-grant-admission) owns typed
+  busy/read/consumer policy; unsupported/I/O failure has no sidecar/path fallback.
   Do not hold the store transaction lock through effects. Per-destination locks
   require a separate missing-directory/creation arbitration protocol.
 - **Lifetime contract:** task envelopes, cancellation transfer, and every actual
@@ -81,6 +82,14 @@
   Drop drainage, physical-root execution grants, and Pending replay remain open.
   Revisit on an effect outside admitted custody, a demonstrated ownership gap, or a
   requirement for concurrent independent mutation engines.
+- **Admission refinement at `099adaf0`:** core pre-worker destination preparation,
+  ticket index refresh, restore settlement and read-triggered reconciliation all
+  need phase custody. Registry entries can outlive drained work, and queued
+  followers can wait behind a paused head indefinitely: neither is authority to
+  pin an otherwise idle root. Active handoff retains custody continuously; idle
+  reacquisition revalidates exact durable authority before effects. Public
+  notifications follow this task's grant release. Implement the bounded grant
+  next; no new Pending replay or general library-exclusion claim is accepted.
 
 ## Open Decision Dependencies
 

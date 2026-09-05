@@ -241,10 +241,12 @@ Metadata/index success precedes settlement; retained failures remain retryable;
 notifications follow release. C4-1 through C4-4, dual core/RPC suites, and strict
 affected lint pass on Linux.
 
-**Next slice:** Admit the physical-root execution grant identified in RUST-I13,
-including its exact effect/consumer population and independent-process evidence.
-The shutdown/importer prerequisites are accepted; grant implementation and
-Pending replay are not. No live mutation, schema, or old-format support.
+**Next slice:** Implement the physical-root execution grant under the Rust plan's
+[bounded grant admission](rust-library-and-rpc/plan.md#physical-root-execution-grant-admission).
+It binds phase-scoped custody, idle handoff, current durable authority, and busy
+consumer behavior. The shutdown/importer prerequisites and grant design are
+accepted; grant runtime behavior and Pending replay are not. No live mutation,
+schema, or old-format support.
 Cargo/commits stay serial; full C3/M4 and program acceptance remain open.
 
 The following checkpoints refine Slice C's integration order; they preserve its

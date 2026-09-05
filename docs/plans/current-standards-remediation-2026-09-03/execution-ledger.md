@@ -20,6 +20,20 @@
 
 ## Slice Log
 
+### 2026-09-05 — Physical-root exclusion design admitted
+
+- Two bounded subagent traces and root review define phase-scoped exclusion for
+  actual download mutation, including pre-worker preparation and restore. Idle
+  clients, paused/queued waits and finished receipts must not pin the root;
+  active effects and cancellation transfers must retain it through observation.
+- A real cap_std/fs2 child-process probe identifies the readable capability
+  handle required for locking; the directory-only handle fails with EBADF.
+  The [Rust plan](rust-library-and-rpc/plan.md#physical-root-execution-grant-admission)
+  owns the implementation contract and G-1 through G-4; its ledger owns probe
+  limits and source traces. Next implement that slice, not another prerequisite.
+- This is a design checkpoint, not runtime exclusion or Pending replay acceptance.
+  Source, live data, prior test evidence and platform claims remain unchanged.
+
 ### 2026-09-05 — Managed download importer checkpoint accepted
 
 - C4 now awaits actual metadata/index success before ordinary/restored terminal

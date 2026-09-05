@@ -21,6 +21,46 @@
 
 ## Slice Log
 
+### 2026-09-05 — Physical-root grant implementation admission
+
+- Continue `docs/plans/current-standards-remediation-2026-09-03/rust-library-and-rpc/plan.md`
+  at `099adaf0`, standards `ada383273b85c6522fdcb4d6e270b9c5a8711ec0`.
+  Standards changes since `19764768` concern their own navigation-authoring plan
+  and generated evidence, not the selected normative policies. Root owns this
+  documentation-only admission; two subagents trace lifetime and consumers
+  read-only, with no source edits or Cargo concurrency.
+- Investigation answers where root custody begins/ends and which real handle
+  supports native exclusion. Task-only locking misses core destination preparation,
+  ticket index refresh and restore/store reconciliation. Whole-client or strong
+  historical TaskEntry ownership pins idle roots. Root additionally identifies
+  queued followers behind paused heads: wait-only work must not retain exclusion.
+  Admit protected phases, observed effects and gap-free active transfer, with
+  fresh durable validation after idle handoff. No additional exploratory slice.
+- The installed `cap-std 4.0.3` plus `fs2 0.4.3` adapter probe lives at
+  `/tmp/pumas-root-grant-probe.BKhSXj/probe.rs`. It is compiled with `rustc
+  --edition=2021`, the existing `rust/target/debug/deps` dependency directory and
+  its cap_std/fs2 rlibs, then run against its own temporary root. Initial
+  `Dir::open_dir(".")` fails `try_lock_exclusive` with EBADF. Changing only the
+  open to readable `Dir::open(".")` passes same-process independent contention,
+  real child-process contention and final-close release. Duplicated descriptions
+  correctly share the incumbent lock. Both temp and workspace report the Linux
+  ext filesystem family. This selects a mechanism; it does not prove production
+  identity validation, phase retention, process-death recovery or platform breadth.
+- Busy is a new core domain outcome using existing wire conflict semantics and
+  UniFFI Config conversion; no protocol discriminator. Snapshot reads can remain
+  available without mutating reconciliation but cannot promise durable freshness.
+  Required mutating restore refuses busy; no empty-success startup fallback.
+- The plan owns exact source/consumer write sets, G-1 through G-4 evidence,
+  composed-design review and implementation decision. This checkpoint admits the
+  design only. Existing C4 runtime acceptance and all live data are unchanged;
+  no full suites or GUI run are claimed for documentation work.
+- Lifetime review accepts phase custody. Consumer review identifies one wording
+  conflict: pre-admission preparation cannot prove a retained admission that does
+  not exist yet. The corrected contract preserves its existing request/capability
+  authority under exclusion, while exact durable revalidation applies to existing
+  admissions. Both reviews accept that distinction. Five plan contracts and
+  whitespace checks pass; only the five parent/Rust planning records are staged.
+
 ### 2026-09-05 — C4 awaited importer finalization accepted on Linux
 
 - Accept the slice based on `39e71eaf`, standards

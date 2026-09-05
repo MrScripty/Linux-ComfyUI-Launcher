@@ -68,11 +68,155 @@ C4 awaited managed-download importer finalization is now accepted under the
 success precedes settlement, failures retain retry custody, and notifications
 follow logical release. C4-1 through C4-4 and dual core/RPC and lint gates pass.
 
-**Next slice:** Admit the physical-root execution grant identified by RUST-I13,
-now that bounded shutdown and managed importer ownership are accepted. Define
-its exact consumer/effect population and independent-process evidence before
-implementation. Pending replay, relocation, and whole-runtime teardown remain
-unaccepted; this checkpoint does not close C3/M4 or the program.
+**Next slice:** Implement the physical-root execution grant under the
+[bounded grant admission](#physical-root-execution-grant-admission). Shutdown
+and managed importer prerequisites are accepted. Pending replay, relocation,
+and whole-runtime teardown remain unaccepted; this is not C3/M4 completion.
+
+## Physical-Root Execution Grant Admission
+
+**Outcome:** independent cooperating HF clients cannot overlap protected download
+mutation on the same physical library root. One client's active mutation phases
+share exclusion, allowing its different destinations to progress concurrently.
+This is advisory download-engine exclusion, not a lock against unrelated model
+imports, catalog operations, external writers, or every library API.
+
+**Mechanism:** `DownloadDestinationRoot` owns physical/logical identity checks
+and a fresh readable capability-relative root open (`root.open(".")`), directory
+verification, and nonblocking `fs2::FileExt::try_lock_exclusive`. Revalidate the
+held physical identity and logical library UUID before and after acquisition.
+Do not use `try_clone` as an independent contender: it shares an open description.
+`open_dir(".")` is also unsuitable on the tested Linux adapter: its handle yields
+EBADF when locked. Do not create a lock sidecar or fall back to ambient paths,
+blocking acquisition, an in-process-only lock, or a different identity.
+Keep existing identity-initialization locking separate and unchanged.
+
+**Lifetime:** the existing `DownloadTaskOwner` weakly caches the live grant by
+physical identity. Configured roots, idle clients, historical task receipts, and
+persisted admissions do not strongly retain it. Acquire lazily before protected
+work, outside synchronous guards, with acquisition and closure under existing
+invocation custody. Same-client acquisition must join the same live grant rather
+than race independent opens into false contention. Independently opened recovery
+capabilities may join only after proving the same configured physical root.
+
+Strong custody belongs to bounded mutation phases and their retained observation,
+not merely to `TaskEntry` or an abortable work future. Actual blocking closures,
+async import work, and their observers retain custody through completion and
+failure recording. Transfer custody to an executing cancellation/projection
+successor before predecessor release; no unlock/reacquire gap across active work.
+Use the existing owned-effect machinery to distinguish abortable work from its
+retained observation; no separate task registry or grant-release reaper.
+Prepared mutation work remains protected through abandonment/drain, but a worker
+waiting for destination eligibility must release its admission-phase custody
+after effects are observed. Paused heads with queued followers must permit idle
+handoff. Reacquire and revalidate before that worker starts destination effects.
+Finished-but-unpolled entries must not pin the grant. Required terminal projection
+is protected; public completion notification follows this task's grant release
+as well as destination release, while shutdown still observes the notification.
+
+**Protected consumer population:**
+
+| Entry/owner | Required disposition |
+| --- | --- |
+| Shared core `api/hf.rs` start and ticket recovery, reached by public Rust and IPC | Acquire before artifact destination preparation or index refresh; retain into immediate mutation work. |
+| Direct HF start, resume, pause, cancellation and recovery admission | Protect durable admission/status/quarantine and destination effects, including operations without a worker; preserve existing recovery authority. |
+| Restore and byte-complete finalization | Protect strict inventory reconciliation, Verified settlement, importer and terminal settlement even when no worker remains. Pending replay stays refused. |
+| Worker/cancellation/projection phases | Retain through real file/metadata/index/store effects and observation; active handoffs cannot create a gap. |
+| Progress/list/snapshot reconciliation | Acquire on demand for mutation; otherwise return only the observed runtime projection. |
+| Inspection, search, idle client and no-root reads | No grant retained; no new root requirement for read-only behavior. |
+| Explicit shutdown | Drain protected phases and transfers before releasing their custody; runtime-only final projection requires no invented filesystem authority. |
+
+For existing-admission execution, validate current destination authority, exact
+retained admission attempt/domain/destination/bound files, revocation state, and
+applicable durable queue eligibility **before** the first destination effect.
+Pre-admission destination preparation and ticket index refresh retain their
+existing request/root/capability authority under the grant; this adds no new
+payload, relocation, marker or cleanup authority where no admission yet exists.
+Use the store's canonical policy, not copied HF inventory interpretation. Current
+runtime generation/reservation checks remain necessary but are not durable proof
+after idle handoff. Cancellation uses its quarantine/cleanup authority, not an
+ordinary worker's execution permission. A stale client cannot restore its old
+snapshot over another client's settled or revoked custody.
+
+**Failure/read contract:** add core `DownloadRootBusy` for real contention, mapped
+to existing RPC `-32011` conflict and partial-action `download_root_busy`. Do not
+classify open, identity, or unsupported-lock errors as busy. Mutating Result
+operations refuse without protected effects; no automatic retry is added. Restore
+is a mutating Result operation, so a busy required restore fails startup rather
+than pretending to have restored an empty inventory. Existing Option/Vec/snapshot
+reads may return their last observed runtime projection without reconciliation
+when busy; they promise neither fresh durable inventory nor successful repair.
+Preserve existing no-root read behavior and non-busy failure handling. IPC already
+preserves the wire conflict category but converts it back to `PumasError::Other`;
+do not claim a new typed round-trip or introduce a protocol discriminator here.
+The existing UniFFI exhaustive conversion maps this busy outcome to Config,
+consistent with its current busy errors; no FFI schema or public lock handle.
+
+**Implementation ownership/write set:** root serially integrates shared contracts
+and plans. Capability owner: `rust/crates/pumas-core/src/model_library/download_recovery.rs`.
+Lifecycle owner: `src/model_library/hf/lifecycle.rs`. HF integration owner:
+`src/model_library/hf/{mod,download,types}.rs` and `src/api/hf.rs` (all relative to
+`rust/crates/pumas-core`). Store owner may add a canonical read-only eligibility
+operation in `src/model_library/download_store.rs` if current operations cannot
+express the existing policy without duplication. Root owns `src/error.rs`,
+`src/tests.rs`, `src/ipc/protocol.rs`, `rust/crates/pumas-rpc/src/contract.rs`, and
+`rust/crates/pumas-uniffi/src/bindings.rs` for diagnostic/consumer integration.
+Tests stay in these existing owners; README/Rustdoc and parent/Rust plan, issue,
+and ledger records are allowed. No Cargo/dependency, schema, live data, UI,
+relocation, general importer, or Pending replay changes. Interface coordination,
+Cargo gates, staged review and commits remain serial; workers escalate ownership
+or contract conflicts rather than edit shared authority independently.
+
+**Evidence** (pending; automated Linux representative filesystem, real child
+processes for G-1; current source supports Unix root capabilities only):
+
+- `G-1`, system: independent clients/processes using the actual root adapter
+  contend across alias paths and different destinations; release after normal
+  completion and process death permits a fresh contender. Root replacement and
+  changed UUID refuse without touching replacement payload.
+- `G-2`, integration: same-client destinations overlap; idle/search, paused with
+  queued followers, and finished-but-unpolled clients do not pin exclusion.
+  A stale client reacquires after handoff and refuses revoked/settled authority.
+- `G-3`, integration/system: hold real pre-start destination/metadata work, final
+  importer and cancellation cleanup; caller/client drop, shutdown and active
+  cancellation transfer cannot let an independent contender acquire early.
+  Include abandoned prepared work and success/error/panic observation.
+- `G-4`, contract/integration: public Rust and IPC shared preparation refuse busy
+  before effects; restore and read reconciliation follow their distinct contracts;
+  busy, unsupported/I/O and stale identity remain distinguishable. RPC/IPC wire
+  conflict and existing UniFFI conversion are tested, without a new protocol.
+
+Reuse the existing store subprocess fixture pattern (current test executable,
+exact ignored helper, pipe handshake), not a new test framework. Final gates:
+both core/RPC configurations, focused binding conversion, affected strict
+all-target Clippy, formatting and five plan contracts. Linux proves only its
+tested filesystem semantics; Windows/macOS runtime and hard-process Pending
+recovery remain unaccepted.
+
+**Composed-design review: applicable.** Capability owns where/what is locked and
+native identity; lifecycle owns when custody starts, transfers and ends; store
+owns which durable admission authorizes an effect. Their reasons for change are
+independent. Required order is grant, current authority, effects, observation,
+release; client lifetime and destination queue waiting are accidental lock
+lifetimes. Callers keep existing operations plus a busy result, not lock handles
+or OS details; builder only supplies the configured root. A locking-adapter change
+touches capability, a custody change lifecycle/HF, and a queue-policy change store
+plus its typed consumer. Dependencies carry concrete capability/custody Interfaces,
+not raw descriptors or copied durable layouts. Each owner has focused evidence;
+cross-process and actual-effect tests prove their composition. Deleting the grant
+would spread physical exclusion policy across consumers; deleting the weak cache
+would break same-client reuse. No new generic adapter, scheduler, persistence
+format or registry is justified. Necessary native exclusion and asynchronous
+custody remain localized in existing owners, with phase scope preventing idle
+pinning and retained observation preventing early release.
+
+**Development decision:** implement. Two bounded traces identify the reachable
+consumer and custody population. The real dependency probe resolves readable
+handle selection; no further exploratory prerequisite is needed. Re-plan only
+if implementation exposes an unowned protected effect, incompatible consumer
+promise, unsupported required filesystem behavior, or inability to preserve both
+idle handoff and active custody. Do not enable Pending replay merely because
+the grant is present.
 
 ## Awaited Download Importer Admission
 
