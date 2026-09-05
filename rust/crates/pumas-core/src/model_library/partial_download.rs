@@ -13,6 +13,74 @@ pub(crate) struct PartialArtifactFinalization {
     pub promoted_files: usize,
 }
 
+/// Filesystem operations used by the shared partial-artifact policy. The
+/// adapter owns path authority and cleanup failure semantics.
+pub(crate) trait PartialDownloadFiles {
+    fn file_len(&self, filename: &str) -> Result<Option<u64>>;
+    fn part_len(&self, filename: &str) -> Result<Option<u64>>;
+    fn rename_part_to_file(&self, filename: &str) -> Result<()>;
+    fn remove_part(&self, filename: &str) -> Result<()>;
+    fn remove_marker(&self) -> Result<()>;
+}
+
+struct PathDownloadFiles<'a>(&'a Path);
+
+impl PartialDownloadFiles for PathDownloadFiles<'_> {
+    fn file_len(&self, filename: &str) -> Result<Option<u64>> {
+        match download_artifact_paths(self.0, filename) {
+            Some((path, _)) => regular_file_size(&path),
+            None => Ok(None),
+        }
+    }
+
+    fn part_len(&self, filename: &str) -> Result<Option<u64>> {
+        match download_artifact_paths(self.0, filename) {
+            Some((_, path)) => regular_file_size(&path),
+            None => Ok(None),
+        }
+    }
+
+    fn rename_part_to_file(&self, filename: &str) -> Result<()> {
+        let (final_path, part_path) =
+            download_artifact_paths(self.0, filename).ok_or_else(|| PumasError::InvalidParams {
+                message: "Invalid partial artifact filename".into(),
+            })?;
+        std::fs::rename(&part_path, final_path)
+            .map_err(|error| PumasError::io_with_path(error, part_path))
+    }
+
+    fn remove_part(&self, filename: &str) -> Result<()> {
+        let (_, part_path) =
+            download_artifact_paths(self.0, filename).ok_or_else(|| PumasError::InvalidParams {
+                message: "Invalid partial artifact filename".into(),
+            })?;
+        if let Err(error) = std::fs::remove_file(&part_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "Failed to remove stale completed download part {}: {}",
+                    part_path.display(),
+                    error
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_marker(&self) -> Result<()> {
+        let marker_path = self.0.join(DOWNLOAD_MARKER_FILENAME);
+        if let Err(error) = std::fs::remove_file(&marker_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "Failed to remove completed download marker {}: {}",
+                    marker_path.display(),
+                    error
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn download_artifact_paths(
     model_dir: &Path,
     relative_path: &str,
@@ -64,6 +132,14 @@ pub(crate) fn infer_expected_sizes_from_total(
     expected_files: &[String],
     total_size: Option<u64>,
 ) -> Result<HashMap<String, u64>> {
+    infer_expected_sizes_with_files(&PathDownloadFiles(model_dir), expected_files, total_size)
+}
+
+pub(crate) fn infer_expected_sizes_with_files(
+    files: &impl PartialDownloadFiles,
+    expected_files: &[String],
+    total_size: Option<u64>,
+) -> Result<HashMap<String, u64>> {
     let Some(total_size) = total_size.filter(|size| *size > 0) else {
         return Ok(HashMap::new());
     };
@@ -85,13 +161,9 @@ pub(crate) fn infer_expected_sizes_from_total(
         if !seen.insert(relative_path) {
             continue;
         }
-        let Some((final_path, part_path)) = download_artifact_paths(model_dir, relative_path)
-        else {
-            return Ok(HashMap::new());
-        };
-        if let Some(size) = regular_file_size(&final_path)? {
+        if let Some(size) = files.file_len(relative_path)? {
             completed_size = completed_size.saturating_add(size);
-        } else if regular_file_size(&part_path)?.is_some() {
+        } else if files.part_len(relative_path)?.is_some() {
             unfinished.push(relative_path.clone());
         } else {
             return Ok(HashMap::new());
@@ -111,10 +183,22 @@ pub(crate) fn infer_expected_sizes_from_total(
     Ok(HashMap::from([(unfinished.remove(0), expected_size)]))
 }
 
-/// Atomically promote every exact-size `.part` file once the selected artifact
+/// Promote every exact-size `.part` file once the selected artifact
 /// is locally complete. Unknown-size partials are left untouched.
 pub(crate) fn finalize_download_artifact_if_complete(
     model_dir: &Path,
+    expected_files: &[String],
+    expected_sizes: &HashMap<String, u64>,
+) -> Result<PartialArtifactFinalization> {
+    finalize_download_artifact_with_files(
+        &PathDownloadFiles(model_dir),
+        expected_files,
+        expected_sizes,
+    )
+}
+
+pub(crate) fn finalize_download_artifact_with_files(
+    files: &impl PartialDownloadFiles,
     expected_files: &[String],
     expected_sizes: &HashMap<String, u64>,
 ) -> Result<PartialArtifactFinalization> {
@@ -130,19 +214,14 @@ pub(crate) fn finalize_download_artifact_if_complete(
         if !seen.insert(relative_path) {
             continue;
         }
-        let Some((final_path, part_path)) = download_artifact_paths(model_dir, relative_path)
-        else {
-            return Ok(PartialArtifactFinalization::default());
-        };
-
-        if regular_file_size(&final_path)?.is_some() {
-            if regular_file_size(&part_path)?.is_some() {
-                stale_parts.push(part_path);
+        if files.file_len(relative_path)?.is_some() {
+            if files.part_len(relative_path)?.is_some() {
+                stale_parts.push(relative_path);
             }
             continue;
         }
 
-        let Some(part_size) = regular_file_size(&part_path)? else {
+        let Some(part_size) = files.part_len(relative_path)? else {
             return Ok(PartialArtifactFinalization::default());
         };
         let Some(expected_size) = expected_sizes.get(relative_path) else {
@@ -151,35 +230,17 @@ pub(crate) fn finalize_download_artifact_if_complete(
         if part_size != *expected_size {
             return Ok(PartialArtifactFinalization::default());
         }
-        promotions.push((part_path, final_path));
+        promotions.push(relative_path);
     }
 
-    for (part_path, final_path) in &promotions {
-        std::fs::rename(part_path, final_path)
-            .map_err(|error| PumasError::io_with_path(error, part_path))?;
+    for filename in &promotions {
+        files.rename_part_to_file(filename)?;
     }
-    for stale_part in &stale_parts {
-        if let Err(error) = std::fs::remove_file(stale_part) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    "Failed to remove stale completed download part {}: {}",
-                    stale_part.display(),
-                    error
-                );
-            }
-        }
+    for filename in &stale_parts {
+        files.remove_part(filename)?;
     }
 
-    let marker_path = model_dir.join(DOWNLOAD_MARKER_FILENAME);
-    if let Err(error) = std::fs::remove_file(&marker_path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                "Failed to remove completed download marker {}: {}",
-                marker_path.display(),
-                error
-            );
-        }
-    }
+    files.remove_marker()?;
 
     Ok(PartialArtifactFinalization {
         complete: true,
