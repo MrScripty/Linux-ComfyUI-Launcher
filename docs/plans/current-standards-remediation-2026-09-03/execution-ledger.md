@@ -3389,6 +3389,27 @@
   unresolved-state restore precedes broader transport/UI integration; full
   C3/C4 and Milestone 2 acceptance remain pending.
 
+### 2026-09-05 — Coordinated Draft Integration Authorized
+
+- User approved completing integration defects before commits, including the
+  staged UniFFI adapter and retaining the correctness-safe approximately
+  one-second marker barrier. The parent plan supersedes the corresponding
+  product and downstream sequence holds, not full C3/C4 or release acceptance.
+- Work is split by owner: reconciliation caller-cancellation ownership;
+  RPC catalog/FTS blocking projection and current-format process fixtures;
+  canonical generated desktop representations; and actual Electron/renderer
+  consumption. Root coordinates display-cache scope, plans, gates, and commits.
+- Initial behavioral tests reproduced overlapping rebuild cleanup after caller
+  cancellation and the obsolete preload recovery request. The request seam
+  now passes; complete source and GUI acceptance remain pending.
+- Display bootstrap scopes read-only cache entries using an opaque digest of
+  canonical model root, physical root identity, and the current logical marker.
+  Missing identity means no cache. Root replacement/remount invalidates cache;
+  the digest never grants filesystem access or recovery authority. The main
+  synchronous IPC handler returns an already-computed state, with no IO/wait.
+- Commit verified coherent drafts before investigating RUST-I12. No live model
+  data, paused downloads, or private migration backups are part of these edits.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.

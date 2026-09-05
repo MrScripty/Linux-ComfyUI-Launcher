@@ -2,15 +2,16 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestone 2 first-visible-frame performance decision gate
-after real Electron correctness and proportionality counterevidence.
+**Current phase:** Approved bounded draft integration and Milestone 2
+first-visible-frame verification, following the user's 2026-09-05 acceptance
+of the correctness-safe roughly one-second causal marker barrier.
 
-**Next slice:** Select whether to accept the frozen causal marker barrier's
-measured default-startup cost or re-plan another construction that proves the
-first visible frame without it. Direct ready-to-show bootstrapping and hidden
-`capturePage` were rejected by bounded real Electron prototypes. No further
-source slice is admitted; stream ownership remains separate. Milestone 1
-remains blocked on the complete Rust producer projection, Milestone 3
+**Next slice:** Complete the coordinated RPC/preload/renderer contract and
+root-scoped display bootstrap under the parent plan's approved integration.
+Retain the marker barrier and verify no-bridge and immediate/delayed/never
+terminal cases plus actual Electron. Direct ready-to-show bootstrapping and
+hidden `capturePage` remain rejected alternatives. Stream ownership remains
+separate. Milestone 1 is not accepted by this bounded integration; Milestone 3
 runtime/deployment remains unavailable, and Milestone 4 remains pending
 required-real Windows/macOS evidence.
 

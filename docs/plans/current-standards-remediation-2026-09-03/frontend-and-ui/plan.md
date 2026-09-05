@@ -2,21 +2,19 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestones 0 through 3 are accepted. The bounded XR-S1
-launcher-root recovery consumer and renderer half of the construction-safe
-visibility handshake are implemented; the representative NativeImage oracle
-disproved renderer-frame timing as a reveal authority, so cross-owner
-verification awaits a re-planned first-visible-frame owner. The main-owned
-marker challenge was correct but added material hidden-window latency, while a
-temporary terminal-boot/flushSync plus hidden-capture alternative failed to
-capture its inserted marker. XR-S1 product startup source is frozen. M4 renderer source remains blocked pending the
-catalog/search producer and platform-decoder handoff.
+**Current phase:** Milestones 0 through 3 are accepted. The user's 2026-09-05
+decision accepts the main-owned causal marker barrier's roughly one-second
+cost and admits bounded XR-S1/M4 integration with the candidate catalog/search
+producer and generated platform decoder. Renderer-frame timing and hidden
+capture remain rejected reveal authorities. This is source admission, not
+acceptance of the unfinished M4 milestone.
 
-**Next slice:** Re-plan XR-S1 only after a construction-safe first-visible-frame
-owner satisfies both terminal-frame truth and immediate model-list intent;
-then run the full producer/preload/renderer conformance matrix. After the M4 provider dependency is accepted, perform its mandatory
-FE-I10/FE-I11/FE-I14 pre-start classification before any renderer contract
-source edit.
+**Next slice:** Complete the coordinated producer/preload/renderer conformance
+matrix, retaining the approved marker barrier. Preserve FE-I10/FE-I11/FE-I14
+consumer classifications: catalog/search use the closed projection, scan/import
+keep their distinct raw record contract, cached rows are root-scoped and
+display-only, and downloads without exact association remain orphan rows.
+No cached path, ticket, activity, or action authority is admitted.
 
 **Acceptance status:** `partial`
 

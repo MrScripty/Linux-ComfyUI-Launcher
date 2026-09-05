@@ -26,7 +26,9 @@ accepted within their existing evidence limits. Rust M2H/M2I acceptance and M2J
 remain pending, as do the complete producer/desktop contract and frontend M4.
 The UI work depends on that contract stabilizing.
 
-The next checkpoint is C3. C3 and C4 cover
+The next checkpoint is the user-approved 2026-09-05 coordinated draft
+integration and verification, followed by standards-aligned commits and the
+RUST-I12 collision fix. General C3/C4 completion remains separate. C3 and C4 cover
 production lifecycle integration and real importer ownership respectively.
 Their acceptance
 does not imply full PRG-I19 or user-workflow acceptance. The
@@ -685,24 +687,25 @@ and current Standards plan gates, then explicitly freeze for both reviews.
 Stop rather than widening if a closed public outcome or another owner is
 required.
 
-Slice D, Slice E, M2J, full aggregate gates, general Drop drain, and downstream
-consumer implementation remain held. Verified incremental commits follow the
+Slice D, Slice E, M2J, full aggregate acceptance, and general Drop drain
+remain held. The approved bounded downstream integration is defined below.
+Verified incremental commits follow the
 current commit decision; incompatible producer-only integration remains held.
 Re-review M2I's recovery projection before starting
 M2J. Accept Rust Milestone 2 only
 after every reachable
 operation is closed and the temporary `Legacy` contract is absent, and hand
 that canonical producer
-Interface to platform Milestone 1. PRG-I21 first-visible-frame work is blocked
-at an explicit product decision: accept and document the correctness-safe
-roughly one-second marker delay, or authorize a new bounded platform
-presentation-architecture investigation. Both the terminal-bootstrap and
+Interface to platform Milestone 1. The user's 2026-09-05 `continue` decision
+accepts PRG-I21's correctness-safe roughly one-second marker delay and
+authorizes completing the held draft integration before committing it,
+including the required staged UniFFI adapter. Both the terminal-bootstrap and
 hidden-capture alternatives failed; no immediate but causally unproved reveal
 may be admitted. Neither launcher-root tranche may integrate
 until the no-bridge negative and immediate/delayed/never-terminal composed
 oracles pass.
 
-**Downstream Frontend M4 re-plan hold:** Read-only cross-owner review confirms
+**Approved bounded downstream integration:** Read-only cross-owner review confirms
 the current renderer cannot consume the candidate closed Rust catalog or
 `{modelId,recoveryToken}` recovery action and cannot treat its unscoped v1
 snapshot as evidence for the selected launcher root. Before source admission,
@@ -719,16 +722,23 @@ action state. Fresh partial recovery alone may invoke exact
 downloads remain explicit orphan rows rather than repo/name/quantization
 guesses.
 
-Implementation remains serialized after Rust M2I Slices B-E and M2J: M4-S1
+For this coordinated replacement, the same 2026-09-05 decision supersedes the
+sequence hold requiring all Rust M2I Slices B-E and M2J before consumer edits.
+It does not accept those unfinished milestones or general application Drop
+drain. Reconciliation retains an admitted run through caller cancellation;
+RPC catalog and FTS share one projection with owned blocking work; process
+fixtures use current owner admission, not legacy store serialization. M4-S1
 adopts generated catalog types and builds the projection core; M4-S2 owns the
 root-scoped snapshot/lifecycle and PRG-I21 consumer; M4-S3 migrates row,
 activity, action, and runtime consumers; link health, picker, and generated
 conversion-type deletion are separate overlapping M4-S4 dispositions. Exact
-write sets and evidence are recorded in the program ledger. No frontend or
-platform source is admitted by this re-plan. PRG-I21 additionally needs a
-product-approved narrower representative `ready-to-show` claim, workload, and
-startup budget; no universal compositor-causality or arbitrary one-sample
-threshold claim is implied.
+write sets and evidence are recorded in the program ledger. This bounded
+integration admits the required frontend/platform source, canonical generated
+contract, and root-scoped display-only bootstrap; it does not admit unrelated
+release or Torch work. PRG-I21 retains the representative startup workload and
+approved marker barrier, with no universal compositor-causality or arbitrary
+one-sample threshold claim. Verify and commit coherent drafts before starting
+RUST-I12 collision remediation; preserve distinct repositories and quants.
 
 Platform may also continue
 independent Torch request-contract narrowing, but PRG-I17 requires a serialized
@@ -866,7 +876,7 @@ one focused plan cannot accept another owner's behavior by agreement alone.
 | Link-health refresh and model-import picker rejection failures discovered during governance classification remain in this program. Before frontend Milestone 4, the frontend owner must classify them into that existing authority or admit one exact focused slice; active Milestone 0 absorbs only installation-cancellation feedback. | Program and frontend plans | [Governance error-contract disposition](governance-and-verification/reports/error-contract-gate-disposition.md) and PRG-I5 | Deferring both findings outside this program |
 | Historical audit text remains fixed to its baseline; plans and current guides own forward implementation authority. | Documentation/program owner | Audit baseline and documentation workflow | Editing evidence into current instructions |
 | PRG-I19 remains one Critical program gate but is implemented as five serialized review slices: durable publication/revocation; deep task/blocking ownership; ordinary lifecycle migration; recovery-domain correctness; then closed/composed evidence. Verified incremental commits may preserve completed coherent outcomes; M2J/downstream consumer implementation and incompatible producer-only integration remain held. | Program and Rust owners | Independent review found unrelated persistence, lifecycle, domain, and evidence failures that evolve and fail independently | Repeated broad patches to `hf/download.rs` with one aggregate test boundary |
-| The user authorizes coherent verified incremental commits. Verify each candidate's actual contents in isolation from unrelated working-tree changes and preserve compatible reachable contracts. This supersedes blanket staging/commit holds, without authorizing consumer implementation, release, full C3 acceptance, or incompatible producer-only integration. PRG-I21 still requires its product decision. | Program integration owner; focused owners supply candidate evidence | User direction to commit verified work before continuing implementation | Treating a commit as whole-plan acceptance or relying on passing checks from a different candidate |
+| The user authorizes coherent verified incremental commits and, on 2026-09-05, completion of the required coordinated consumer integration, staged UniFFI adapter, and correctness-safe roughly one-second PRG-I21 marker barrier. Verify actual candidate contents and preserve compatible reachable contracts. Release, full C3 acceptance, and incompatible producer-only integration remain excluded. | Program integration owner; focused owners supply candidate evidence | User direction to complete integration fixes before commits and collision remediation | Treating a commit as whole-plan acceptance or relying on checks from a different candidate |
 
 ## Evidence And Oracle Plan
 
@@ -1113,8 +1123,8 @@ links, and their already-declared final documentation/report write sets.
   and a truthful first framebuffer. The causal marker path adds roughly one
   second; terminal-bootstrap and hidden-capture alternatives did not prove the
   required result. The downstream re-plan above owns the narrower
-  representative startup claim, workload, and budget. Product acceptance of
-  that claim remains open; no timing threshold or unproved reveal closes it.
+  representative startup claim and workload. The user accepted the existing
+  roughly one-second barrier on 2026-09-05; no unproved reveal replaces it.
   The no-bridge and immediate/delayed/never-terminal composed checks remain
   required before integration.
 - PRG-I17 blocks managed Torch deployment, DRBT-A5 required-real runtime work,
@@ -1122,10 +1132,10 @@ links, and their already-declared final documentation/report write sets.
   may continue independently, but no Rust/plugin/manifest/frontend deployment
   write set is admitted until the current producer boundary is stable and the
   program serializes the selected removal/disabled or repaired disposition.
-- Platform Milestone 1 cannot generate, and frontend Milestone 4 cannot consume,
-  the desktop contract until Rust Milestone 2 supplies that stable handoff;
-  frontend must also complete its required FE-I10/FE-I11/FE-I14 classification
-  before source mutation.
+- Platform Milestone 1 generation and frontend Milestone 4 consumption are
+  admitted only for the approved bounded coordinated draft integration above;
+  the complete milestones remain pending. The FE-I10/FE-I11/FE-I14 consumer
+  classifications and producer/preload/renderer proof remain required.
 - Platform DRBT-A6 remains unavailable for Windows x64 and macOS arm64 until
   accepted required-real runners execute the launcher suite.
 - Later target, binding, release, persistence, and lifecycle claims remain
