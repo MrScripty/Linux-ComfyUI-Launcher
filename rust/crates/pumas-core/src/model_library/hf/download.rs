@@ -3517,7 +3517,11 @@ impl HuggingFaceClient {
                         )
                         .await?;
                         debug!("Waiting {:?} before retry", delay);
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            biased;
+                            _ = task_context.pause_requested(&pause_flag) => return Err(PumasError::DownloadPaused),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
                     }
                 }
             }
@@ -3760,7 +3764,12 @@ impl HuggingFaceClient {
             info!("Resuming download from byte {}", resume_from_byte);
         }
 
-        let response = request.send().await.map_err(|e| PumasError::Network {
+        let response = tokio::select! {
+            biased;
+            _ = task_context.pause_requested(pause_flag) => return Err(PumasError::DownloadPaused),
+            response = request.send() => response,
+        }
+        .map_err(|e| PumasError::Network {
             message: format!("Download request failed: {}", e),
             cause: Some(e.to_string()),
         })?;
@@ -3798,7 +3807,18 @@ impl HuggingFaceClient {
         let start_time = std::time::Instant::now();
         let mut last_publish = Instant::now();
 
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = task_context.pause_requested(pause_flag) => {
+                    file.flush(task_context).await?;
+                    return Err(PumasError::DownloadPaused);
+                }
+                chunk = stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             #[cfg(test)]
             task_context.observe_cancellation_check();
             if cancel_flag.load(Ordering::Relaxed) {
@@ -5207,17 +5227,11 @@ impl HuggingFaceClient {
 
     /// Pause an active download. Preserves the `.part` file for later resume.
     pub async fn pause_download(&self, download_id: &str) -> Result<bool> {
-        let paused = {
+        let generation = {
             let mut downloads = self.downloads.write().await;
-            let current_worker = self
-                .download_tasks
-                .snapshot(download_id)
-                .is_some_and(|task| {
-                    task.role == TaskRole::Worker && task.started && !task.outer_finished
-                });
-            if !current_worker {
+            let Some(generation) = self.download_tasks.active_worker_generation(download_id) else {
                 return Ok(false);
-            }
+            };
             let Some(state) = downloads.get_mut(download_id) else {
                 return Ok(false);
             };
@@ -5228,12 +5242,13 @@ impl HuggingFaceClient {
             {
                 return Ok(false);
             }
-            state.pause_flag.store(true, Ordering::Relaxed);
+            state.pause_flag.store(true, Ordering::Release);
             state.status = DownloadStatus::Pausing;
-            true
+            generation
         };
+        generation.wake_pause();
         self.publish_download_snapshot().await;
-        Ok(paused)
+        Ok(true)
     }
 
     /// Resume a paused or errored download from its `.part` file.
@@ -5709,6 +5724,280 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(after_cancel.list_downloads().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pause_settles_while_response_headers_are_stalled_without_losing_partial() {
+        assert_pause_settles_during_stalled_response(StalledResponse::Headers).await;
+    }
+
+    #[tokio::test]
+    async fn pause_settles_while_response_body_is_stalled_without_losing_transferred_bytes() {
+        assert_pause_settles_during_stalled_response(StalledResponse::Body).await;
+    }
+
+    #[tokio::test]
+    async fn pause_settles_during_retry_backoff_without_another_request() {
+        assert_pause_settles_during_stalled_response(StalledResponse::Retry).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_stalled_body_pause_persistence_without_stale_paused() {
+        assert_pause_settles_during_stalled_response(StalledResponse::CancelDuringPause).await;
+    }
+
+    #[tokio::test]
+    async fn immediately_resuming_stalled_body_pause_transfers_remaining_range() {
+        assert_pause_settles_during_stalled_response(StalledResponse::ImmediateResume).await;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StalledResponse {
+        Headers,
+        Body,
+        Retry,
+        CancelDuringPause,
+        ImmediateResume,
+    }
+
+    async fn assert_pause_settles_during_stalled_response(stall: StalledResponse) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let stall_body = !matches!(stall, StalledResponse::Headers);
+        let retry = matches!(stall, StalledResponse::Retry);
+        let temp = TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requested_sender, requested) = tokio::sync::oneshot::channel();
+        let (release_sender, release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert!(headers.len() < 4096);
+                headers.push(socket.read_u8().await.unwrap());
+            }
+            assert!(String::from_utf8(headers)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("range: bytes=3-"));
+            if stall_body {
+                socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 3-7/8\r\nConnection: close\r\n\r\nde").await.unwrap();
+            }
+            requested_sender.send(()).unwrap();
+            if retry {
+                drop(socket);
+                release.await.unwrap();
+                return tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err();
+            }
+            release.await.unwrap();
+            if !stall_body {
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+            true
+        });
+        let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+        client.set_test_download_base_url(format!("http://{address}"));
+        *client.auth_token.write().await = None;
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 8,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let destination = temp.path().join("model");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("weights.gguf.part"), b"abc").unwrap();
+        let id = client
+            .start_download(
+                &recovery_test_request("acme/model", &["weights.gguf".into()]),
+                &destination,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), requested)
+            .await
+            .unwrap()
+            .unwrap();
+        if stall_body {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !client.list_downloads().await.iter().any(|entry| {
+                    entry.download_id == id
+                        && entry.downloaded_bytes == Some(5)
+                        && (!retry || entry.retrying == Some(true))
+                }) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        if matches!(stall, StalledResponse::CancelDuringPause) {
+            let (entered_sender, entered) = tokio::sync::oneshot::channel();
+            let entered_sender = std::sync::Mutex::new(Some(entered_sender));
+            let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
+            let continue_receiver = std::sync::Mutex::new(continue_receiver);
+            client
+                .download_tasks
+                .set_blocking_observer(Some(Arc::new(move |operation| {
+                    if operation == "persist download pause" {
+                        if let Some(sender) = entered_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = continue_receiver.lock().unwrap().recv();
+                        }
+                    }
+                })));
+            assert!(client.pause_download(&id).await.unwrap());
+            let reached = tokio::time::timeout(Duration::from_secs(3), entered).await;
+            if reached.is_err() {
+                let _ = continue_sender.send(());
+            }
+            reached.unwrap().unwrap();
+            assert!(client.cancel_download(&id).await.unwrap());
+            assert_eq!(
+                client.get_download_status(&id).await,
+                Some(DownloadStatus::Cancelling)
+            );
+            continue_sender.send(()).unwrap();
+            release_sender.send(()).unwrap();
+            assert!(server.await.unwrap());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while client.get_download_status(&id).await != Some(DownloadStatus::Cancelled)
+                    || client
+                        .download_tasks
+                        .snapshot(&id)
+                        .is_some_and(|task| !task.finished)
+                {
+                    assert_ne!(
+                        client.get_download_status(&id).await,
+                        Some(DownloadStatus::Paused)
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            client.download_tasks.set_blocking_observer(None);
+            let mut restarted = HuggingFaceClient::new(temp.path().join("restarted")).unwrap();
+            restarted
+                .configure_download_destination_root(temp.path())
+                .unwrap();
+            restarted.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+            restarted.restore_persisted_downloads().await.unwrap();
+            assert!(restarted.list_downloads().await.is_empty());
+            return;
+        }
+        assert!(client.pause_download(&id).await.unwrap());
+        let paused = tokio::time::timeout(Duration::from_millis(500), async {
+            while client.get_download_status(&id).await != Some(DownloadStatus::Paused) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if paused.is_ok() && matches!(stall, StalledResponse::ImmediateResume) {
+            // Do not drain the paused generation first: public Paused is the
+            // promise that callers may immediately request a successor.
+            assert_resumed_partial_completes(&mut client, &id, &destination).await;
+            release_sender.send(()).unwrap();
+            assert!(server.await.unwrap());
+            return;
+        }
+        release_sender.send(()).unwrap();
+        let no_extra_request = server.await.unwrap();
+        if paused.is_err() {
+            client.cancel_download(&id).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client
+                .download_tasks
+                .snapshot(&id)
+                .is_some_and(|task| !task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            paused.is_ok(),
+            "pause must settle without waiting for {stall:?}"
+        );
+        assert!(
+            no_extra_request,
+            "paused retry must not send another request"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("weights.gguf.part")).unwrap(),
+            if stall_body {
+                b"abcde".as_slice()
+            } else {
+                b"abc".as_slice()
+            }
+        );
+        let mut restarted = HuggingFaceClient::new(temp.path().join("restarted")).unwrap();
+        restarted
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        restarted.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+        restarted.restore_persisted_downloads().await.unwrap();
+        assert_eq!(
+            restarted.get_download_status(&id).await,
+            Some(DownloadStatus::Paused)
+        );
+        if stall_body {
+            assert_resumed_partial_completes(&mut restarted, &id, &destination).await;
+        }
+    }
+
+    async fn assert_resumed_partial_completes(
+        client: &mut HuggingFaceClient,
+        id: &str,
+        destination: &Path,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        client.set_test_download_base_url(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert!(headers.len() < 4096);
+                headers.push(socket.read_u8().await.unwrap());
+            }
+            assert!(String::from_utf8(headers)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("range: bytes=5-"));
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 5-7/8\r\nConnection: close\r\n\r\nfgh").await.unwrap();
+        });
+        assert!(client.resume_download(id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status(id).await != Some(DownloadStatus::Completed)
+                || client
+                    .download_tasks
+                    .snapshot(id)
+                    .is_some_and(|task| !task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("weights.gguf")).unwrap(),
+            b"abcdefgh"
+        );
     }
     #[tokio::test]
     async fn admitted_error_resumes_with_exact_authority_before_and_after_restart() {

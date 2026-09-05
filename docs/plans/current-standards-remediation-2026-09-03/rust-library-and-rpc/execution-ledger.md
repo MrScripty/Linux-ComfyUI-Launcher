@@ -1775,6 +1775,53 @@
   guard-free effects, actual importer ownership, and hard-process-crash proof
   remain with their existing owners; stalled pause is the next slice.
 
+### 2026-09-04 — Stalled Network-Wait Pause
+
+- Continued C3 at the admitted public pause/status seam. Three separate reds
+  held response headers, held a body after two transferred bytes, and entered
+  retry backoff: each remained Pausing past the fixture deadline. The fix
+  wakes the exact worker generation at those waits, not during file writes.
+  The atomic flag remains request truth; registration precedes its check and
+  notification occurs outside the state guard. Body pause awaits owned flush;
+  existing settlement owns persistence and cancellation precedence.
+- Five public regressions preserve partial bytes, restore durable Paused,
+  cancel during held pause persistence without stale publication/restart
+  resurrection, and immediately resume without first draining the old owner.
+  Fresh-owner and immediate resume issue real `Range: bytes=5-` requests and
+  finish the exact `abcdefgh` payload. All 15 focused `pause_` checks pass.
+  TDD supplied the red–green sequence; design review kept wakeup custody in
+  the existing lifecycle owner rather than adding a public control surface,
+  separate registry, polling loop, or shorter network timeout.
+- Independent narrow review accepted the frozen two-file source. Candidate
+  `/tmp/pumas-pause-candidate.6QCrpx` is an unregistered archive of `d8c12f4e`
+  plus only `hf/download.rs` and `hf/lifecycle.rs`, excluding held API/RPC/UI
+  drafts. Reviewed SHA-256: download
+  `acdb4ba35f9571d2b85e9269544d07a5a388abb38798e3338ee52f6d1c94759c`;
+  lifecycle
+  `f5ed2d4c08e855a7a6b6ab8a1b35a81206133550e4285c2ce1ba6adadd1cf2ef`.
+- Root verification on Linux, Rust/Cargo 1.92.0:
+  `cargo test --offline -p pumas-library`, also with `--no-default-features`,
+  passes 1,180 checks per configuration: 1,078 library tests, 96 integration
+  tests, and six doctests. The existing three helper and eight doctest ignores
+  are unchanged. Strict core Clippy passes with `--all-targets --all-features
+  -- -D warnings` and separately `--all-targets --no-default-features
+  -- -D warnings`. Scoped Rustfmt and diff checks pass. Local loopback access
+  enables real socket fixtures; no live Hugging Face service is required.
+- `cargo clippy --offline --workspace --exclude pumas_rustler --all-targets
+  --all-features -- -D warnings` also passes, compiling unchanged committed
+  consumers. Rustler retains the existing BEAM-tooling exclusion. Accept this
+  two-source-file incremental checkpoint with its plan/issue/ledger updates;
+  all five plan contracts pass before commit. The standards revision is
+  `97789165`; applicable normative Markdown is unchanged since
+  `b8805364`. No dependency, public signature, persistence schema, or held
+  consumer changes are included.
+- Network waits are the bounded result, not complete C3 acceptance. Read-only
+  review identified reachable queued-pause starvation behind a paused FIFO
+  predecessor; `RUST-I9` owns the next slice and its public regression.
+  Comprehensive unresolved-state restore, admitted relocation, guard-free
+  effects/publication, hard-process-crash proof, and C4 importer ownership
+  remain open. No GUI, release, or cross-platform acceptance is claimed.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):

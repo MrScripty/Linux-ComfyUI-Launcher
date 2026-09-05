@@ -3337,6 +3337,18 @@
   stalled-pause ownership. Other worktree changes and the original staged
   UniFFI blob remain preserved.
 
+### 2026-09-04 — Network-Wait Pause Checkpoint
+
+- C3's stalled headers, body, and retry waits now wake through the existing
+  generation owner. Red–green regressions cover retained bytes, durable pause,
+  cancellation, fresh restore, and immediate resume with actual Range transfer.
+  Independent review accepts the narrow source; dual full-package tests and
+  strict core/workspace lint pass. Accept this incremental checkpoint; the
+  focused Rust ledger owns exact verification and evidence limits.
+- `RUST-I9` records the separate queued-successor pause gap as the next C3
+  slice. Full C3/C4 and transport/UI acceptance remain pending. Unrelated
+  drafts and the original staged UniFFI change remain separately owned.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.

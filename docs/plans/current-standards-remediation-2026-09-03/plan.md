@@ -3,14 +3,15 @@
 **Plan status:** `Active`
 
 **Current phase:** PRG-I19 Slice C remains unaccepted as a whole. Its core
-recovery, legacy relocation, and cancellation-quarantine checkpoint is verified
-for incremental integration, with dual full-package tests and strict lint green.
+recovery, legacy relocation, cancellation-quarantine, and network-wait pause
+checkpoints are verified for incremental integration, with dual full-package
+tests and strict lint green.
 This supersedes PRG-I24's legacy composition gate, not the remaining C3 claims.
 C1's store repair is internally verified: compilation succeeds, independent
 source review accepted the repair, and store, atomic-publication, and HF
 regressions pass in both feature configurations. The September 4 audit's build
-failure is resolved. Production lifecycle integration remains incomplete, with
-unused integration warnings visible rather than suppressed. C2's held
+failure is resolved. Production lifecycle integration remains incomplete;
+the integrated core checkpoint passes strict lint without suppression. C2's held
 destination and marker-publication source is also internally verified:
 independent review and root regression checks passed in both feature
 configurations. C3's narrower admission/resume checkpoint has passed independent
@@ -218,8 +219,10 @@ requests or aborts the currently owned async handles; it has no Slice B drain
 or completion claim for running blocking work or finalizer-captured
 predecessors. Its existing test remains narrow unstarted-worker evidence.
 
-**Next slice:** Complete C3 stalled-pause ownership under the focused Rust plan,
-preserving the verified core recovery, queue, cancellation, and relocation
+**Next slice:** Complete C3 queued-pause ownership (`RUST-I9`) under the focused
+Rust plan: a started successor must settle pause without waiting for its paused
+destination predecessor, retaining exact admission and FIFO position. Preserve
+the verified network-wait pause, recovery, cancellation, and relocation
 regressions. Ticket recovery is additive; existing transport callers retain
 their old method until explicitly migrated. RPC, bindings, and UI remain held.
 The interrupted-response → fresh-owner restore → cancel path now
@@ -238,9 +241,9 @@ preceding contract is verified and the focused owner records the handoff.
 
 | Checkpoint | State | Owned result and deciding evidence |
 | --- | --- | --- |
-| C1 — Store contract | Accepted (internal checkpoint) | Independent source review accepted; 38 store tests, atomic-publication regressions, and 155 HF regressions pass in both feature configurations. Compilation passes with unused integration warnings. |
+| C1 — Store contract | Accepted (internal checkpoint) | Independent source review accepted; 38 store tests, atomic-publication regressions, and 155 HF regressions passed the C1 checkpoint. Subsequent core integration passes full package tests and strict lint in both feature configurations. |
 | C2 — Destination authority | Accepted (internal checkpoint) | Independent source review accepted; root reproduced 14 recovery, 22 atomic, 38 store, and 155 HF tests in both feature configurations. One atomic and two store helper tests remain ignored. Both library checks pass with 23 unused-integration warning groups. |
-| C3 — Lifecycle integration | Active | Core ticket recovery, legacy migration/relocation, and cancellation quarantine are independently reviewed and verified for incremental integration. Full package tests pass in both feature configurations; strict core/workspace lint and unchanged-consumer compilation pass. Remaining: hard process-crash recovery, owned comprehensive unresolved-state restore, stalled pause, admitted relocation, and guard-free effects/publication. See the focused Rust ledger for exact verification. |
+| C3 — Lifecycle integration | Active | Core ticket recovery, legacy migration/relocation, and cancellation quarantine are independently reviewed and verified for incremental integration. Network-wait pause also passes independent review and dual full-package tests. Remaining: queued-pause ownership, hard process-crash recovery, owned comprehensive unresolved-state restore, admitted relocation, and guard-free effects/publication. See the focused Rust ledger for exact verification and lint gates. |
 | C4 — Importer integration | Planned | The builder's actual async importer is observed and drained. Held Aux+cancel and Completion+queued-successor tests prove real mutation ownership; failed import retains bytes and resumes without downloading them again. |
 
 Store repair owns `model_library/download_store.rs` and its colocated tests;

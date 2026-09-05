@@ -34,7 +34,7 @@ pub(super) enum TaskRole {
 }
 
 #[derive(Clone)]
-pub(super) struct TaskGeneration(Arc<()>);
+pub(super) struct TaskGeneration(Arc<Notify>);
 
 impl PartialEq for TaskGeneration {
     fn eq(&self, other: &Self) -> bool {
@@ -46,7 +46,11 @@ impl Eq for TaskGeneration {}
 
 impl TaskGeneration {
     fn new() -> Self {
-        Self(Arc::new(()))
+        Self(Arc::new(Notify::new()))
+    }
+
+    pub(super) fn wake_pause(&self) {
+        self.0.notify_waiters();
     }
 
     pub(super) fn matches(&self, other: &Self) -> bool {
@@ -1100,6 +1104,19 @@ impl DownloadTaskOwner {
         snapshot
     }
 
+    pub(super) fn active_worker_generation(&self, download_id: &str) -> Option<TaskGeneration> {
+        self.tasks
+            .lock()
+            .expect("HF task owner lock poisoned")
+            .get(download_id)
+            .filter(|entry| {
+                entry.role == TaskRole::Worker
+                    && TaskStartState::load(&entry.start_state) == TaskStartState::Running
+                    && !entry.outer.is_finished()
+            })
+            .map(|entry| entry.generation.clone())
+    }
+
     #[cfg(test)]
     fn generation_for_test(&self, download_id: &str) -> Option<TaskGeneration> {
         self.tasks
@@ -2131,6 +2148,18 @@ impl DownloadTaskOwner {
 }
 
 impl TaskContext {
+    pub(super) async fn pause_requested(&self, pause_flag: &AtomicBool) {
+        loop {
+            let notified = self.generation.0.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if pause_flag.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub(super) fn download_id(&self) -> &str {
         &self.download_id
     }

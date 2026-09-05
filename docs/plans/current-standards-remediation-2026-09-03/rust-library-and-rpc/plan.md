@@ -3,14 +3,16 @@
 **Plan status:** `Active`
 
 **Current phase:** Milestone 1 is accepted. Milestone 2's C3 core recovery,
-legacy relocation, and cancellation-quarantine checkpoint is verified for
-incremental integration. Full C3 remains active and unaccepted. Milestone 2 remains producer
+legacy relocation, cancellation-quarantine, and network-wait pause checkpoints
+are verified for incremental integration. Full C3 remains active and unaccepted. Milestone 2 remains producer
 contract work that is valid for loopback desktop RPC and local core IPC.
 `RUST-I1` is resolved: desktop RPC is loopback-only and LAN support is removed.
 
-**Next slice:** Complete C3 stalled-pause ownership at headers, body, and retry
-waits, using the existing task owner and public pause/status seam. Preserve the
-verified recovery, queue, cancellation, and relocation regressions. The additive
+**Next slice:** Complete C3 queued-pause ownership (`RUST-I9`) using the existing
+task owner and public pause/status seam. A started successor must settle pause
+while a paused destination head retains its claim, without destination effects
+or loss of its admission/FIFO position. Preserve the verified network-wait
+pause, recovery, queue, cancellation, and relocation regressions. The additive
 `resume_partial_download_with_ticket` is available to core callers; existing
 repo/path consumers retain their prior contract until explicitly migrated.
 No fresh ticket is synthesized for legacy calls. Unrelated Result-shape,
@@ -46,7 +48,7 @@ with only its isolated red HF-unavailable oracle recorded.
 | --- | --- | --- |
 | C1 (internally verified) | Durable admission, restart reconciliation, quarantine, and exact queue settlement behind the store Interface | 38 store tests and atomic/HF regressions pass in both feature configurations; independent source review accepted |
 | C2 (internally verified) | Held configured-root destination authority and marker publisher ready for runtime integration | Independent source review accepted; root reproduced 14 recovery, 22 atomic-publication, 38 store, and 155 HF tests in both feature configurations |
-| C3 (active; incremental core checkpoint verified) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Core ticket recovery, legacy relocation, and cancellation quarantine pass independent review, dual full-package tests, and strict lint. Full C3 remains open; ledger owns exact boundaries |
+| C3 (active; incremental core checkpoint verified) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Core ticket recovery, legacy relocation, cancellation quarantine, and network-wait pause pass independent review, dual full-package tests, and strict lint. Full C3 remains open; ledger owns exact boundaries |
 | C4 | Importer mutations are awaited before settlement; notifications follow release | Real async importer held during cancellation/completion; successor progress and terminal-state tests |
 
 The complete producer/consumer boundary still requires the existing later
@@ -103,7 +105,8 @@ Pending source/target custody on uncertainty. The physical
 destination mutex remains; comprehensive restore still needs task ownership
 and hidden/Pending-state reconciliation. Verified cleanup history now restores
 without mutation authority; Pending state and active quarantine queues still
-refuse restoration. Stalled pause and admitted relocation remain pending. Unknown admissions
+refuse restoration. Network-wait pause now passes focused and dual package
+regressions; queued-pause ownership and admitted relocation remain pending. Unknown admissions
 fail closed but do not yet have the complete recovery path. Runtime release
 facts are retained until owner drop to prevent stale-inventory resurrection.
 The real asynchronous importer and callback ordering remain C4. This admission
