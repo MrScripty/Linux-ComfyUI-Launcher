@@ -1920,6 +1920,69 @@
   private backup artifacts, unrelated drafts, and the original staged UniFFI
   change are excluded from the source commit. Full C3/Milestone 2 stay pending.
 
+### 2026-09-04 — GUI Startup Identity Correction
+
+- Real GUI verification after `3745a049` indexed 83 models, then failed with
+  `Persisted download destination identity changed`. The two saved roots used
+  device 66312; the current root uses 66310 with the same path and inode.
+  The cause/time of that device-number change is unknown. The renderer
+  misleadingly displayed an empty library, and closing the window accessed a
+  destroyed native object; failed startup also left a backend restart timer.
+- `7d979e28` separates persisted UUID identity from live physical capability
+  identity. The configured root owner durably initializes the strict bounded
+  marker; recovery inspection remains read-only. Missing/changed held identity
+  fails closed. Copying the marker preserves logical identity, not filesystem
+  authority. No runtime acceptance or migration of physical IDs remains.
+  Review moved the new filesystem reads into existing owned blocking work.
+- Final isolated source passed both full core configurations: 1,068 library,
+  96 integration, and six doctests per configuration (1,170 passes and 11
+  existing ignores). Strict supported-workspace all-feature Clippy and
+  no-default core all-target Clippy passed with warnings denied. The development
+  RPC backend was rebuilt from that source; no release build is claimed.
+- `ee9d38fa` makes library loading/unavailability explicit in both frontend
+  compositions without hiding saved rows or presenting an unknown count as
+  zero. Isolated frontend tests/types/lint passed (480 tests); the complete
+  working frontend, including held drafts, passed 511 tests.
+  `1a36c1a4` stops failed bridge ownership and fences post-stop port allocation.
+  Isolated Electron behavior tests/build/lint passed (63 tests); the working
+  Electron tree passed 125 behavior tests with one existing skip. The native
+  closed-window guard is retained in the uncommitted presentation draft whose
+  callback introduced the failure; unrelated drafts were not folded in.
+- The selected offline repair changes only two queue destination root fields,
+  preserving snapshots, attempts, ordering and files. An exact backup must
+  precede marker initialization and complete-store validation precedes atomic
+  publication. The first operator attempt safely refused an absent nested
+  payload directory before backup/marker creation; a regression reproduced it
+  and the temporary operator was corrected. Six operator fixtures and strict
+  lint passed. Publication returned `durable_verified`; readback exactly
+  matched candidate SHA-256
+  `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+  Both records remain paused and all 60 recorded file facts are unchanged.
+  Private backup, candidate, operator source and provenance are retained in
+  `.download-identity-repair.0yLHd9`; no operator code is shipped.
+- Real Linux/X11 Electron verification used the rebuilt development RPC binary
+  and current working-tree renderer/main builds, including held UI drafts.
+  The loaded search count is 83; scrolling shows partial percentages, not
+  “ready to finish.” Captured renderer errors are empty, and closing through
+  the application's actual close control exits successfully after bridge
+  cleanup, without the destroyed-window exception or a post-cleanup restart.
+  Cold-profile reconciliation still takes time; loading is now truthful.
+  A native X11 warm-start capture after window visibility confirms cached rows
+  are painted while loading. Early CDP captures before painting and a close
+  request whose evaluation reply was destroyed are not timing/shutdown proof;
+  the final harness observes target closure and successful process exit.
+  An initial early capture and external-window-close attempt were not treated
+  as loaded-list or shutdown acceptance. Deciding screenshots/console logs
+  are retained under `.download-identity-repair.0yLHd9/verification`.
+  One existing Qwen embedding reclassification destination collision remains
+  a non-blocking warning (`RUST-I12`); no merge, deletion, or move was attempted.
+- Source commits used isolated indexes and enabled hooks; the original staged
+  UniFFI blob and unrelated working-tree changes remain intact. Standards
+  revision is `1609c304`; all five plan contracts and diff checks pass. The
+  temporary operator's execute permissions are removed after acceptance.
+  This correction does not close full C3, C4, the
+  producer/consumer migration, or cross-platform/release acceptance.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):

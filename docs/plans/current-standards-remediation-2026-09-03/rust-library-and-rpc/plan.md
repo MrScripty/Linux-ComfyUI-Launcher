@@ -3,7 +3,8 @@
 **Plan status:** `Active`
 
 **Current phase:** Milestone 1 is accepted. Milestone 2's C3 core recovery,
-cancellation-quarantine, network/queued pause, and current-only cutover checkpoints
+cancellation-quarantine, network/queued pause, current-only cutover, and stable
+persisted library identity checkpoints
 are verified for incremental integration. Old partial relocation is retired.
 Full C3 remains active and unaccepted. Milestone 2 remains producer
 contract work that is valid for loopback desktop RPC and local core IPC.
@@ -27,8 +28,12 @@ comprehensive unresolved-state restore, admitted relocation, guard-free effects,
 and C4 importer ownership remain open. Exact evidence is in the ledger:
 the current cutover passed full core package tests in both feature
 configurations and strict core/supported-workspace Clippy without warning
-suppression. The development RPC backend was rebuilt; release and GUI
-acceptance remain separate.
+suppression. The development RPC backend was rebuilt. A scoped Linux GUI check
+now shows 83 models and clean shutdown with the current working-tree
+renderer/main, including held drafts; this does not accept their wider
+consumer migration. Release/package and other-platform acceptance remain
+separate. `RUST-I11` records the backed-up two-field identity repair; the
+non-blocking reclassification collision in `RUST-I12` remains open.
 C3 lifecycle integration and C4 importer integration proceed in
 that order; they are reviewable checkpoints, not independently shippable claims.
 The accepted Slice B
