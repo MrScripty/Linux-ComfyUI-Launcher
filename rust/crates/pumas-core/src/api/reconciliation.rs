@@ -1357,8 +1357,12 @@ fn is_non_fatal_adoption_error(message: &str) -> bool {
         || message.contains("Missing shard")
 }
 
-fn is_non_fatal_reclassify_error(message: &str) -> bool {
-    message.contains("destination") && message.contains("already exists")
+fn is_non_fatal_reclassify_error(error: &PumasError) -> bool {
+    matches!(
+        error,
+        PumasError::Io { source: Some(source), .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists
+    )
 }
 
 async fn reconcile_model_scope(primary: &ReconciliationInputs, model_id: &str) -> Result<()> {
@@ -1381,7 +1385,7 @@ async fn reconcile_model_scope(primary: &ReconciliationInputs, model_id: &str) -
         primary.model_library.index_model_dir(&model_dir).await?;
         if let Err(err) = primary.model_library.reclassify_model(model_id).await {
             let message = err.to_string();
-            if is_non_fatal_reclassify_error(&message) {
+            if is_non_fatal_reclassify_error(&err) {
                 tracing::debug!(
                     "Reconcile(model): skipping reclassify collision for {}: {}",
                     model_id,
@@ -1974,12 +1978,18 @@ mod tests {
 
     #[test]
     fn test_non_fatal_reclassify_error_classification() {
-        assert!(is_non_fatal_reclassify_error(
-            "Cannot reclassify unknown/a/b: destination /tmp/x already exists"
-        ));
-        assert!(!is_non_fatal_reclassify_error(
-            "Cannot reclassify: permission denied"
-        ));
+        let native_collision = PumasError::io_with_path(
+            std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            Path::new("/library/occupied"),
+        );
+        assert!(is_non_fatal_reclassify_error(&native_collision));
+        assert!(!is_non_fatal_reclassify_error(&PumasError::io_with_path(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            Path::new("/library/occupied"),
+        )));
+        assert!(!is_non_fatal_reclassify_error(&PumasError::Other(
+            "Cannot reclassify: destination already exists".into(),
+        )));
     }
 
     #[test]

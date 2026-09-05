@@ -17,6 +17,7 @@
 //! - **Windows**: Full support
 //! - **macOS**: Architecture ready, implementation pending
 
+pub(crate) mod filesystem;
 pub mod paths;
 pub mod permissions;
 pub mod process;

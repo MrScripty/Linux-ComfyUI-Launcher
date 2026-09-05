@@ -103,6 +103,10 @@ notify = { workspace = true }
 # Cross-language bindings (optional)
 uniffi = { workspace = true, optional = true }
 
+# Atomic non-replacing classification moves on Linux and macOS.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "=1.1.3", features = ["fs"] }
+
 # Platform-specific: Unix
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

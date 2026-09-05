@@ -3269,26 +3269,32 @@ impl ModelLibrary {
             return Ok(None);
         }
 
-        let cleaned_name = metadata.cleaned_name.clone().unwrap_or_else(|| {
-            model_id
-                .split('/')
-                .next_back()
-                .unwrap_or(model_id)
-                .to_string()
-        });
-
-        let new_dir = self.build_model_path(&new_type_str, &new_family, &cleaned_name);
+        // Reclassification changes the category, not the stored artifact identity.
+        // Display names may be shared by multiple repositories or quantizations.
+        let basename = model_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| PumasError::InvalidParams {
+                message: "Model directory must have a UTF-8 basename".into(),
+            })?;
+        let new_dir = self
+            .library_root
+            .join(normalize_name(&new_type_str))
+            .join(normalize_name(&new_family))
+            .join(basename);
         let new_model_id = format!(
             "{}/{}/{}",
             normalize_name(&new_type_str),
             normalize_name(&new_family),
-            normalize_name(&cleaned_name)
+            basename
         );
 
         if new_dir == model_dir {
             // Path didn't change (directory already correct)
             metadata.model_id = Some(new_model_id.clone());
-            apply_target_identity_to_metadata(&mut metadata, &new_model_id);
+            metadata.model_type = Some(normalize_name(&new_type_str));
+            metadata.family = Some(normalize_name(&new_family));
+            metadata.architecture_family = Some(normalize_name(&new_family));
             self.save_metadata(&model_dir, &metadata).await?;
             self.index_model_dir(&model_dir).await?;
             return Ok(Some(new_model_id));
@@ -3296,43 +3302,33 @@ impl ModelLibrary {
 
         // Check for collision at new path
         if tokio::fs::try_exists(&new_dir).await? {
-            if directories_have_identical_contents_async(model_dir.clone(), new_dir.clone()).await?
-            {
-                tracing::info!(
-                    "Reclassify dedupe: removing duplicate source {} in favor of existing destination {}",
-                    model_dir.display(),
-                    new_dir.display()
-                );
-
-                if let Some(mut existing_metadata) =
-                    load_model_metadata_async(self.clone(), new_dir.clone()).await?
-                {
-                    existing_metadata.model_id = Some(new_model_id.clone());
-                    apply_target_identity_to_metadata(&mut existing_metadata, &new_model_id);
-                    existing_metadata.updated_date = Some(chrono::Utc::now().to_rfc3339());
-                    self.save_metadata(&new_dir, &existing_metadata).await?;
-                }
-
-                let _ = self.index.delete(model_id);
-                tokio::fs::remove_dir_all(&model_dir).await?;
-                cleanup_empty_parent_dirs_after_move_async(&model_dir, &self.library_root).await;
-                self.index_model_dir(&new_dir).await?;
-                return Ok(Some(new_model_id));
-            }
-
-            return Err(PumasError::Other(format!(
-                "Cannot reclassify {}: destination {} already exists",
-                model_id,
-                new_dir.display()
-            )));
+            return Err(PumasError::io_with_path(
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "Reclassification destination already exists",
+                ),
+                &new_dir,
+            ));
         }
 
-        // Move the directory
+        // The preflight is only an early diagnostic. The native operation also
+        // refuses a target created concurrently, including an empty directory.
         tokio::fs::create_dir_all(new_dir.parent().unwrap()).await?;
-        tokio::fs::rename(&model_dir, &new_dir).await?;
+        let source = model_dir.clone();
+        let target = new_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::platform::filesystem::rename_directory_noreplace(&source, &target)
+                .map_err(|error| PumasError::io_with_path(error, &target))
+        })
+        .await
+        .map_err(|error| {
+            PumasError::Other(format!("Failed to join reclassification move: {error}"))
+        })??;
 
         metadata.model_id = Some(new_model_id.clone());
-        apply_target_identity_to_metadata(&mut metadata, &new_model_id);
+        metadata.model_type = Some(normalize_name(&new_type_str));
+        metadata.family = Some(normalize_name(&new_family));
+        metadata.architecture_family = Some(normalize_name(&new_family));
         self.save_metadata(&new_dir, &metadata).await?;
 
         // Clean up empty parent directories left behind
@@ -3760,14 +3756,6 @@ async fn collect_model_dirs_async(library: ModelLibrary) -> Result<Vec<PathBuf>>
                 err
             ))
         })
-}
-
-async fn directories_have_identical_contents_async(left: PathBuf, right: PathBuf) -> Result<bool> {
-    tokio::task::spawn_blocking(move || directories_have_identical_contents(&left, &right))
-        .await
-        .map_err(|err| {
-            PumasError::Other(format!("Failed to join directory comparison task: {}", err))
-        })?
 }
 
 async fn path_is_symlink_async(path: &Path) -> Result<bool> {
@@ -8593,7 +8581,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reclassify_model_dedupes_identical_collision_and_updates_index() {
+    async fn test_reclassify_model_preserves_quant_basename_and_display_metadata() {
+        let (_, library) = setup_library().await;
+        let source_id = "unknown/qwen3/qwen--qwen3-embedding-8b-gguf__q4_k_m";
+        let existing_id = "embedding/qwen3/qwen3-embedding-8b-gguf";
+        let expected_id = "embedding/qwen3/qwen--qwen3-embedding-8b-gguf__q4_k_m";
+        for (id, quant, payload) in [(source_id, "Q4_K_M", b"q4"), (existing_id, "Q8_0", b"q8")] {
+            let directory = library.library_root().join(id);
+            std::fs::create_dir_all(&directory).unwrap();
+            write_min_safetensors(&directory.join("model.safetensors"));
+            std::fs::write(directory.join("quant.bin"), payload).unwrap();
+            let metadata = ModelMetadata {
+                model_id: Some(id.into()),
+                model_type: Some("embedding".into()),
+                family: Some("qwen3".into()),
+                official_name: Some("Qwen3 Embedding 8B GGUF".into()),
+                cleaned_name: Some("qwen3-embedding-8b-gguf".into()),
+                repo_id: Some("Qwen/Qwen3-Embedding-8B-GGUF".into()),
+                selected_artifact_id: Some(format!(
+                    "qwen--qwen3-embedding-8b-gguf__{}",
+                    quant.to_lowercase()
+                )),
+                selected_artifact_files: Some(vec!["model.safetensors".into()]),
+                selected_artifact_quant: Some(quant.into()),
+                ..Default::default()
+            };
+            library.save_metadata(&directory, &metadata).await.unwrap();
+            library.index_model_dir(&directory).await.unwrap();
+        }
+        let existing_dir = library.library_root().join(existing_id);
+        let existing_metadata = std::fs::read(existing_dir.join("metadata.json")).unwrap();
+        let moved = library.reclassify_model(source_id).await.unwrap();
+        assert_eq!(moved.as_deref(), Some(expected_id));
+        let moved_dir = library.library_root().join(expected_id);
+        assert_eq!(std::fs::read(moved_dir.join("quant.bin")).unwrap(), b"q4");
+        assert_eq!(
+            std::fs::read(existing_dir.join("quant.bin")).unwrap(),
+            b"q8"
+        );
+        assert_eq!(
+            std::fs::read(existing_dir.join("metadata.json")).unwrap(),
+            existing_metadata
+        );
+        assert!(!library.library_root().join(source_id).exists());
+        let metadata = library.load_metadata(&moved_dir).unwrap().unwrap();
+        assert_eq!(
+            metadata.cleaned_name.as_deref(),
+            Some("qwen3-embedding-8b-gguf")
+        );
+        assert_eq!(
+            metadata.official_name.as_deref(),
+            Some("Qwen3 Embedding 8B GGUF")
+        );
+        assert_eq!(
+            metadata.repo_id.as_deref(),
+            Some("Qwen/Qwen3-Embedding-8B-GGUF")
+        );
+        assert_eq!(metadata.selected_artifact_quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(
+            metadata.selected_artifact_id.as_deref(),
+            Some("qwen--qwen3-embedding-8b-gguf__q4_k_m")
+        );
+        assert!(library.get_model(source_id).await.unwrap().is_none());
+        assert!(library.get_model(expected_id).await.unwrap().is_some());
+        assert!(library.get_model(existing_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reclassify_model_preserves_identical_payloads_from_different_repos() {
         let (_, library) = setup_library().await;
 
         let source_dir = library.build_model_path("unknown", "test", "collision-dedupe");
@@ -8607,12 +8662,20 @@ mod tests {
             model_type: Some("llm".to_string()),
             official_name: Some("Collision Dedupe".to_string()),
             cleaned_name: Some("collision-dedupe".to_string()),
+            repo_id: Some("first/model".into()),
             ..Default::default()
         };
 
         let metadata_json = serde_json::to_string_pretty(&metadata).unwrap();
         std::fs::write(source_dir.join("metadata.json"), &metadata_json).unwrap();
-        std::fs::write(target_dir.join("metadata.json"), &metadata_json).unwrap();
+        let mut target_metadata = metadata.clone();
+        target_metadata.model_id = Some("diffusion/test/collision-dedupe".into());
+        target_metadata.model_type = Some("diffusion".into());
+        target_metadata.repo_id = Some("second/model".into());
+        library
+            .save_metadata(&target_dir, &target_metadata)
+            .await
+            .unwrap();
         write_min_safetensors(&source_dir.join("model.safetensors"));
         write_min_safetensors(&target_dir.join("model.safetensors"));
         std::fs::write(
@@ -8629,36 +8692,41 @@ mod tests {
         library.index_model_dir(&source_dir).await.unwrap();
         library.index_model_dir(&target_dir).await.unwrap();
 
-        let moved = library
+        let source_before = std::fs::read(source_dir.join("metadata.json")).unwrap();
+        let target_before = std::fs::read(target_dir.join("metadata.json")).unwrap();
+        let payload_before = std::fs::read(source_dir.join("model.safetensors")).unwrap();
+        let error = library
             .reclassify_model("unknown/test/collision-dedupe")
             .await
-            .unwrap();
+            .expect_err("reclassification must not merge separate library entries");
+        assert!(matches!(error, PumasError::Io { source: Some(error), .. }
+            if error.kind() == std::io::ErrorKind::AlreadyExists));
         assert_eq!(
-            moved.as_deref().map(normalize_path_separators),
-            Some("diffusion/test/collision-dedupe".to_string())
+            std::fs::read(source_dir.join("metadata.json")).unwrap(),
+            source_before
         );
-
-        assert!(!source_dir.exists());
-        assert!(target_dir.exists());
-
-        let target_metadata = library.load_metadata(&target_dir).unwrap().unwrap();
         assert_eq!(
-            target_metadata.model_id.as_deref(),
-            Some("diffusion/test/collision-dedupe")
+            std::fs::read(target_dir.join("metadata.json")).unwrap(),
+            target_before
         );
-        assert_eq!(target_metadata.model_type.as_deref(), Some("diffusion"));
-
-        let unknown_row = library
-            .index()
-            .get("unknown/test/collision-dedupe")
-            .unwrap();
-        assert!(unknown_row.is_none());
-
-        let target_row = library
-            .index()
-            .get("diffusion/test/collision-dedupe")
-            .unwrap();
-        assert!(target_row.is_some());
+        assert_eq!(
+            std::fs::read(source_dir.join("model.safetensors")).unwrap(),
+            payload_before
+        );
+        assert_eq!(
+            std::fs::read(target_dir.join("model.safetensors")).unwrap(),
+            payload_before
+        );
+        assert!(library
+            .get_model("unknown/test/collision-dedupe")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(library
+            .get_model("diffusion/test/collision-dedupe")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -8712,7 +8780,8 @@ mod tests {
             .reclassify_model("unknown/test/collision-blocked")
             .await
             .expect_err("non-identical collision should still fail");
-        assert!(err.to_string().contains("destination"));
+        assert!(matches!(err, PumasError::Io { source: Some(error), .. }
+            if error.kind() == std::io::ErrorKind::AlreadyExists));
         assert!(source_dir.exists());
         assert!(target_dir.exists());
     }

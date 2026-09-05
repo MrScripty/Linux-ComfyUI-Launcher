@@ -3461,6 +3461,18 @@
   UniFFI adapter. The still-reproduced Qwen destination collision is RUST-I12;
   its separate diagnosis and no-loss correction follow the source commit.
 
+### 2026-09-05 — Collision Correction Accepted on Linux
+
+- RUST-I12's Qwen warning was caused by display-name destination naming losing
+  quant identity. Reclassification now preserves artifact basenames and refuses
+  occupied targets without deduplicating or replacing either entry.
+- The live Q4_K_M directory relocated independently of Q8_0; both full payload
+  hashes and all paused-download evidence remain unchanged. Initial and repeat
+  GUI startup report zero reclassification errors, 83 models, zero renderer
+  errors, and clean shutdown. Dual core suites and strict lint pass; the focused
+  Rust ledger owns evidence and Windows/macOS runtime limitations. No broader
+  lifecycle or release milestone is closed by this correction.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.

@@ -2007,6 +2007,60 @@
   General application Drop/drain, complete C3/C4, desktop integration, and
   RUST-I12 collision remediation remain unaccepted by this checkpoint.
 
+### 2026-09-05 — RUST-I12 Collision Correction Admitted
+
+- Following coordinated desktop commit `2b081fba`, real GUI startup still
+  reproduces the Qwen reclassification collision. Read-only inspection proves
+  distinct Q4_K_M and Q8_0 artifacts in the same repository; `cleaned_name`
+  loses the source directory's repo/quant identity when forming the target.
+- Selected source scope: preserve the exact artifact basename while changing
+  category/family, retain display and selected-artifact metadata, and remove
+  reclassification's content-based deletion. An occupied exact target refuses
+  without changing either entry; no suffix guessing or automatic merging.
+- The existing exists-check followed by rename cannot exclude target creation
+  during the gap. The move therefore gains a small platform-owned no-replace
+  primitive, called through awaited blocking work. Linux/macOS use the safe
+  `rustix` rename-with-flags API; Windows uses its non-replacing native move.
+  `rustix` 1.1.3 is selected for the required Linux/macOS semantics and safe
+  wrapper; standard Unix rename overwrites an empty directory and the current
+  nix wrapper covers only GNU Linux. Promote the already pinned resolution to
+  an explicit core target dependency with filesystem support, not a new public
+  feature. No unsafe domain code or weaker rename fallback is admitted.
+- Verification requires naming and identical-bytes/different-repo regressions,
+  atomic occupied-target refusal, both core configurations and strict lint,
+  exact live payload preservation, and repeat real GUI startup without the
+  warning. Linux/X11 and the current local filesystem provide runtime evidence;
+  Windows/macOS target runtime evidence remains unavailable, not passed.
+  This does not claim full path containment, general move crash recovery,
+  broader C3/C4 completion, or cross-platform release acceptance.
+- Both public reclassification failures reproduced before correction: distinct
+  quants collided at a shared display-name target, and identical bytes from
+  different repositories caused source deletion. The corrected reclassification
+  group passes 13/13. Three real filesystem checks prove successful movement
+  and refusal of an occupied empty directory or dangling symlink. Independent
+  review confirms the native flags have no replacing fallback.
+- Reconciliation now classifies `AlreadyExists` from the retained IO cause;
+  a native-error regression reproduced the old message-parsing failure.
+  Both full core feature configurations pass 1,188 tests with 11 existing
+  ignores. Strict supported-workspace all-target/all-feature lint, no-default
+  core all-target lint, full formatting, diff checks, and all five plan
+  contracts pass. The final default RPC backend builds.
+- Live Linux/X11 verification accepts the bounded correction: first startup
+  reports `1/83 reclassified, 0 errors`; repeat startup reports
+  `0/83 reclassified, 0 errors`. Both render 83 catalog models, two labelled
+  paused activities, nine partial percentages, zero renderer errors, and clean
+  window-control shutdown. Q4_K_M is now at
+  `embedding/qwen3/qwen--qwen3-embedding-8b-gguf__q4_k_m`; Q8_0 remains at
+  `embedding/qwen3/qwen3-embedding-8b-gguf`. Neither model was merged or deleted.
+- Both full payload SHA256 values are unchanged (`3fcd3febec8b` and
+  `d20ddc71e8a5` prefixes). Repo, display-name, selected-file, and quant metadata
+  remain unchanged for both entries. The two paused download records retain
+  store hash `a0885e5f` and all 60 tracked payload paths. Exact hashes, metadata
+  backups, test logs, and GUI captures remain in the private
+  `/tmp/pumas-draft-integration.tEfbTc` evidence directory. Accept RUST-I12 for
+  the verified Linux environment; Windows/macOS runtime and broader release
+  evidence remain unavailable rather than inferred from these host checks.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):
