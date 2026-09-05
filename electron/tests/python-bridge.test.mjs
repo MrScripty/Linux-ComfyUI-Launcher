@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { runInNewContext } from 'node:vm';
 import {
   PythonBridge,
   parseModelDownloadUpdateSseChunk,
@@ -51,6 +55,50 @@ function createBridge(timerController) {
     timerController,
   });
 }
+
+test('stop during port allocation prevents the pending start from spawning a backend', async () => {
+  const bridgeUrl = new URL('../dist/python-bridge.js', import.meta.url);
+  const requireBridge = createRequire(bridgeUrl);
+  const exports = {};
+  const server = new EventEmitter();
+  let portAllocated;
+  let spawned = 0;
+  Object.assign(server, {
+    listen(_port, _host, callback) { portAllocated = callback; },
+    address: () => ({ port: 49152 }),
+    close(callback) { callback(); },
+  });
+  runInNewContext(readFileSync(bridgeUrl, 'utf8'), {
+    exports,
+    process: { env: {} },
+    setTimeout,
+    clearTimeout,
+    require(specifier) {
+      if (specifier === 'net') return { createServer: () => server };
+      if (specifier === 'electron-log') return { info() {}, warn() {}, error() {} };
+      if (specifier === 'child_process') return {
+        spawn() {
+          spawned += 1;
+          throw new Error('forbidden post-stop spawn');
+        },
+      };
+      return requireBridge(specifier);
+    },
+  });
+  const bridge = new exports.PythonBridge({
+    port: 0,
+    debug: false,
+    rustBinaryPath: process.execPath,
+    launcherRoot: process.cwd(),
+  });
+  const starting = bridge.start();
+  const stoppedStart = assert.rejects(starting, /stopped during startup/);
+  await bridge.stop();
+  portAllocated();
+  await stoppedStart;
+  assert.equal(spawned, 0);
+  assert.equal(bridge.isRunning(), false);
+});
 
 test('bridge is not reported running until the RPC server is ready', () => {
   const bridge = createBridge(new FakeTimerController());

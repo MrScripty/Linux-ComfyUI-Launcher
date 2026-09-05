@@ -412,6 +412,9 @@ export class PythonBridge {
 
     // Find available port
     this.port = this.options.port || await this.findAvailablePort();
+    if (this.isShuttingDown) {
+      throw new Error('Backend bridge stopped during startup');
+    }
     log.info(`Starting backend bridge on port ${this.port}`);
 
     // Get command configuration

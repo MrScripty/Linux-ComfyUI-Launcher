@@ -537,7 +537,18 @@ async function initializeBackend(): Promise<void> {
   try {
     await backendInitializationPromise;
   } catch (error) {
-    pythonBridge = null;
+    const failedBridge = pythonBridge;
+    if (failedBridge) {
+      try {
+        await failedBridge.stop();
+        if (pythonBridge === failedBridge) {
+          pythonBridge = null;
+        }
+      } catch {
+        // Keep the owner available for application cleanup to retry shutdown.
+        log.error('Failed to stop backend bridge after initialization failure.');
+      }
+    }
     throw error;
   } finally {
     backendInitializationPromise = null;
