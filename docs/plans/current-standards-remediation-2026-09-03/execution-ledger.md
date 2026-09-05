@@ -3302,6 +3302,23 @@
   formatting pass. This does not resolve the relocation blocker; the focused
   ledger records the exact evidence and corrected source hash.
 
+### 2026-09-04 — Legacy Relocation Implemented; Integration Gate Open
+
+- User approval admits coordinated migration and relocation; C3 is Active.
+  Using the design and TDD skills, separate store, capability, and HF owners
+  implemented a legacy move with Pending source/target custody. Root replaced
+  the migration caller's move-first/ignored-refusal/rollback path. Independent
+  reviews accepted the narrow protocol after foreign-owner, stale-source,
+  post-move reporting, and notification-ordering corrections.
+- The isolated source candidate compiles but fails strict Clippy. It is not
+  committed or accepted; required production core recovery integration must
+  be inventoried before admitting held callers. No lint suppression or RPC/UI
+  scope expansion is authorized. The focused Rust ledger owns exact source
+  hashes, regression results, failed-gate evidence, and remaining limits.
+- This checkpoint changes implementation and scope evidence, not full C3,
+  consumer, GUI, or release acceptance. Existing unrelated changes and the
+  original staged UniFFI blob remain preserved.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.

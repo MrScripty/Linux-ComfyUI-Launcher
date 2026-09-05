@@ -1588,6 +1588,102 @@
   This safety correction remains in the uncommitted draft; the HF results above
   precede it, and no relocation or full-C3 acceptance is claimed.
 
+### 2026-09-04 — Approved Relocation Composition
+
+- The user's affirmative response approves coordinated model migration and
+  owned relocation. This supersedes RUST-I8's scope hold, not any failed gate.
+  Continue `docs/plans/current-standards-remediation-2026-09-03/rust-library-and-rpc/plan.md`;
+  the plan is Active and the source draft remains unaccepted.
+- The first implementation preserves existing admitted/recovery refusal before
+  effects and supplies the missing legacy physical-move owner. A Pending store
+  intent precedes movement and blocks both destinations. After proven durable
+  filesystem/marker completion, finish atomically publishes target row and
+  removes intent; a visible target-only document is then valid after restart.
+  A remaining Pending document stays blocked. No automatic rollback, Applied
+  receipt registry, or guessed filesystem reconciliation is introduced.
+- Root owns migration orchestration and records. Its two consumers pass the
+  real model library and optional HF client explicitly; the `api/state.rs`
+  expansion is limited to that call site and changes no IPC representation.
+  Store, capability, and HF source owners are separate; Cargo runs serialize.
+  Independent review checks the store's entire mutation family.
+- No-replace movement uses the existing Linux capability/libc mechanisms;
+  unsupported kernels/filesystems/targets return explicit failure, not copy or
+  replacing rename. Pumas excludes its own competing directory mutations.
+  External source-name swaps are checked before/after but cannot be atomically
+  prevented by renameat2; changed postconditions remain indeterminate without
+  cleanup. This is not a hostile-writer exclusion or cross-platform release claim.
+
+- Implementation and independent narrow reviews now agree on the legacy
+  composition. Store review reproduced a foreign ordinary/quarantined row
+  bypass at either path; the shared validator now rejects all four cases.
+  Capability review added durable ancestor links, post-move source checks, and
+  nonblocking/no-follow marker reads that reject FIFOs and non-object JSON.
+  HF review moved queue notification outside the state guard, added pending
+  destination rechecks, and retained ownership when the caller is dropped.
+  Cancellation waits for relocation rather than aborting its physical work.
+- The migration regression failed before replacement: the caller reported
+  `moved_partial` despite lifecycle refusal. It now delegates to HF with the
+  expected source identity, preserves bytes on refusal, and proves successful
+  movement through the real caller, marker, reopened store, and model index.
+  Post-move index/resume errors retain `moved_partial` plus an error; report
+  counts truthfully record both. Complete models keep their existing path;
+  untracked partials are explicitly skipped. No global runtime registry or live
+  Hugging Face service is used by this fixture.
+- Final reviewed draft SHA-256: `hf/download.rs`
+  `082187ffb0b4acbe603aef343c3d8e1c9cb0777f0072e836c82402cda33ea2c3`;
+  `hf/lifecycle.rs`
+  `3d7ea27ec5aac9eda7e2dc176b4a50b9506efde01b2d4fc543e4da987d4b053f`;
+  `hf/types.rs`
+  `219271b3dbd13aac6f3299e9d432085bf383a783e7341a013888061a7018a770`;
+  `download_store.rs`
+  `172c3d0d4050e787c2b084c2310fc396763827e6dadfb15b0b66e6f4cef3293b`;
+  `download_recovery.rs`
+  `530004beca609217a22ec4e68d78da6be0619bdf2d140d861283b994ccbe234c`;
+  root-owned `api/migration.rs`
+  `1d5346b8c370333aae8b3d466045d3e3a7be85aa63c7ecf35c1cd6de8743ebd3`.
+  Reviews accept this narrow source protocol, not full C3 or integration.
+- An unregistered archive candidate at
+  `/tmp/pumas-relocation-candidate.jZ3nzd` is based on `f0f89ed2`. It includes
+  the workspace/core manifests and lockfile, metadata atomic module and export,
+  model-library export, store/capability, four HF owner files, builder, migration,
+  and only the migration argument hunk in `api/state.rs`. It excludes the held
+  API/RPC recovery wire, bindings, Electron/UI, and unrelated formatting changes.
+  Builds serialize using the repository's existing Cargo target directory;
+  the candidate itself was compiled, not merely the mixed working tree.
+- Final isolated behavioral matrix: `cargo test --offline -q -p pumas-library
+  --lib <filter>` passes with both default and `--no-default-features` for
+  `model_library::hf::` (168), `api::migration::` (3),
+  `model_library::download_recovery::` (23), `model_library::download_store::`
+  (43, two helper tests ignored), and `metadata::atomic::` (22, one helper
+  ignored): 259 passes per configuration. The initial sandboxed HF run had
+  167 passes and a loopback-bind permission failure; the approved socket-access
+  rerun passes all 168. This is automated local contract evidence, not live
+  service or hard-process-crash acceptance. Scoped formatting, diff checks,
+  and all five plan-contract checks pass.
+- Isolated production `cargo check --offline -p pumas-library` passes in default
+  and no-default configurations, with unused-integration warnings (35 in the
+  default check). Strict
+  `cargo clippy --offline -p pumas-library --all-targets --all-features -- -D warnings`
+  fails (39 library and 14 library-test diagnostics). Recovery consumers excluded
+  from the slice leave dead code/imports; other findings include large enum
+  variants, bool-then filtering, and question-mark simplifications. This is an
+  affected-package failure of the repository's strict policy, not a successful
+  workspace gate. No lint was suppressed and no source commit is accepted.
+- Next: inventory the production core recovery ticket/validation, admission,
+  and real `api/hf.rs` caller contracts before admitting that exact integration
+  boundary; repair lints in their existing owners and reverify the isolated
+  result. Do not manufacture callers, publish private helpers, or silently add
+  held RPC/binding/UI consumers to make the gate green. Current standards route
+  revision is `0b10cb84`; prior revision evidence remains historical.
+- Limits remain explicit: one active runtime per root; pending restart blocks
+  both locations without guessing reconciliation; only legacy dormant moves are
+  supported here. Notification occurs outside the state guard after snapshot,
+  but no snapshot-before-successor-first-poll guarantee is claimed. Admitted
+  relocation, comprehensive owned restore/quarantine, stalled pause,
+  guard-free physical effects, hard-process-crash proof, and C4 importer work
+  remain open. The GUI was not validated. The original staged UniFFI blob
+  `2af018c1e1c27effc7fb3ddf2c77f0570cb78fb9` remains separately owned.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):

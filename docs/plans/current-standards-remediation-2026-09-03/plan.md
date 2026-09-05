@@ -3,7 +3,7 @@
 **Plan status:** `Active`
 
 **Current phase:** PRG-I19 Slice C remains unaccepted as a whole. Its queue
-candidate is blocked on the relocation/migration composition decision (PRG-I24).
+candidate is active after the user approved coordinated relocation/migration (PRG-I24).
 The independent shared finalization-policy extraction is committed; no queue
 or relocation acceptance follows from that checkpoint.
 C1's store repair is internally verified: compilation succeeds, independent
@@ -218,9 +218,11 @@ requests or aborts the currently owned async handles; it has no Slice B drain
 or completion claim for running blocking work or finalizer-captured
 predecessors. Its existing test remains narrow unstarted-worker evidence.
 
-**Next slice:** Resolve PRG-I24's C3 scope decision for the model-migration caller
-and owned relocation before further queue integration. The current draft must
-not be accepted with stale capability or a weakened relocation assertion.
+**Next slice:** Resolve the isolated C3 candidate's production core recovery
+integration boundary and strict Clippy failures under the focused Rust plan.
+PRG-I24's legacy migration/owned-relocation composition is implemented and
+narrowly reviewed, not accepted for integration. Inventory the held core caller
+and its contracts before admission; RPC, bindings, and UI remain held.
 The interrupted-response → fresh-owner restore → cancel path now
 transfers real bytes through loopback HTTP. The narrow admission checkpoint
 now rejects unconfigured starts, retains admitted resume authority, and tests
@@ -239,7 +241,7 @@ preceding contract is verified and the focused owner records the handoff.
 | --- | --- | --- |
 | C1 — Store contract | Accepted (internal checkpoint) | Independent source review accepted; 38 store tests, atomic-publication regressions, and 155 HF regressions pass in both feature configurations. Compilation passes with unused integration warnings. |
 | C2 — Destination authority | Accepted (internal checkpoint) | Independent source review accepted; root reproduced 14 recovery, 22 atomic, 38 store, and 155 HF tests in both feature configurations. One atomic and two store helper tests remain ignored. Both library checks pass with 23 unused-integration warning groups. |
-| C3 — Lifecycle integration | Blocked | Earlier admission/resume checkpoint reviewed with both feature configurations' targeted tests passing. Current queue-identity draft is unaccepted: relocation fails and coordinated migration scope awaits a user decision (PRG-I24). Remaining: hard process-crash recovery, owned comprehensive restore and quarantine, stalled pause, relocation, and guard-free effects/publication. See the focused Rust plan for the narrower evidence boundary. |
+| C3 — Lifecycle integration | Active | Earlier admission/resume checkpoint reviewed with both feature configurations' targeted tests passing. PRG-I24 legacy relocation and migration are implemented and narrowly reviewed; the isolated source candidate fails strict Clippy and remains unaccepted. Remaining: production core recovery integration, hard process-crash recovery, owned comprehensive restore and quarantine, stalled pause, admitted relocation, and guard-free effects/publication. See the focused Rust ledger for exact verification. |
 | C4 — Importer integration | Planned | The builder's actual async importer is observed and drained. Held Aux+cancel and Completion+queued-successor tests prove real mutation ownership; failed import retains bytes and resumes without downloading them again. |
 
 Store repair owns `model_library/download_store.rs` and its colocated tests;

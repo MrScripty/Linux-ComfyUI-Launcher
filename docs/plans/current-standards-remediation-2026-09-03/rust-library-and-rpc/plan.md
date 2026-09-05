@@ -1,18 +1,21 @@
 # Plan: Rust Library and RPC Standards Remediation
 
-**Plan status:** `Blocked`
+**Plan status:** `Active`
 
 **Current phase:** Milestone 1 is accepted. Milestone 2's C3 queue candidate is
-blocked on the relocation/migration composition decision in RUST-I8. The shared
+active following the user's approval to coordinate migration and relocation
+in RUST-I8. The shared
 finalization-policy extraction is independently verified; the queue draft is
 not accepted. Milestone 2 otherwise remains producer
 contract work that is valid for loopback desktop RPC and local core IPC.
 `RUST-I1` is resolved: desktop RPC is loopback-only and LAN support is removed.
 
-**Next slice:** Obtain the C3 scope decision for the model-migration caller and
-owned relocation transition before further queue integration. Do not preserve
-stale destination capability or bypass the relocation regression to accept the
-current draft. The real transferred-byte interrupted
+**Next slice:** Establish the exact production core recovery integration boundary
+needed to make the isolated C3 candidate reachable and lint-clean. Legacy owned
+relocation and its migration caller are implemented and narrowly reviewed, but
+the isolated candidate fails strict Clippy. Inventory the held core caller and
+its contracts before admitting it; do not suppress warnings or pull RPC/UI
+consumers into this slice. The real transferred-byte interrupted
 response → settled Error → fresh-owner restore → cancel path is now verified;
 hard process-crash recovery remains unproved. C1 store repairs and C2 destination
 authority passed independent source review and targeted regressions in both
@@ -47,7 +50,7 @@ with only its isolated red HF-unavailable oracle recorded.
 | --- | --- | --- |
 | C1 (internally verified) | Durable admission, restart reconciliation, quarantine, and exact queue settlement behind the store Interface | 38 store tests and atomic/HF regressions pass in both feature configurations; independent source review accepted |
 | C2 (internally verified) | Held configured-root destination authority and marker publisher ready for runtime integration | Independent source review accepted; root reproduced 14 recovery, 22 atomic-publication, 38 store, and 155 HF tests in both feature configurations |
-| C3 (blocked; queue draft unaccepted) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Earlier admission/interrupted-transfer checkpoints remain verified. The new legacy-alias regression passes, but the existing relocation regression fails; RUST-I8 blocks this draft |
+| C3 (active; queue draft unaccepted) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Earlier admission/interrupted-transfer checkpoints remain verified. RUST-I8 scope is approved; legacy relocation and its migration caller must pass before draft acceptance |
 | C4 | Importer mutations are awaited before settlement; notifications follow release | Real async importer held during cancellation/completion; successor progress and terminal-state tests |
 
 The complete producer/consumer boundary still requires the existing later
@@ -98,10 +101,11 @@ and real partial-file writes, then an orderly Error before reopening; it is not
 a process-crash or live Hugging Face service claim. The earlier marker-failure
 and seeded-final-file regressions retain their narrower meaning. The unaccepted
 queue draft uses held identities and one retained capability per state, but
-relocation still leaves path and authority inconsistent. The physical
+legacy relocation now transfers path and retained authority together, with
+Pending source/target custody on uncertainty. The physical
 destination mutex remains; comprehensive restore still
 needs task ownership, legacy migration, and hidden/quarantined/recovery-state
-reconciliation. Stalled pause and relocation remain pending. Unknown admissions
+reconciliation. Stalled pause and admitted relocation remain pending. Unknown admissions
 fail closed but do not yet have the complete recovery path. Runtime release
 facts are retained until owner drop to prevent stale-inventory resurrection.
 The real asynchronous importer and callback ordering remain C4. This admission
@@ -116,6 +120,8 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   the existing untracked
   `rust/crates/pumas-core/src/model_library/download_recovery.rs`,
   `rust/crates/pumas-core/src/api/builder.rs`,
+  `rust/crates/pumas-core/src/api/migration.rs`,
+  `rust/crates/pumas-core/src/api/state.rs` (migration call-site arguments only),
   `rust/crates/pumas-core/src/model_library/partial_download.rs`,
   `rust/crates/pumas-core/src/metadata/atomic.rs`, and
   `rust/crates/pumas-core/src/metadata/mod.rs`.
@@ -178,6 +184,40 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   library callers retain their behavior; HF restoration must not regain ambient
   filesystem authority or duplicate the policy. This replaces the prior
   nine-file count limit, not the product, consumer, or dependency boundaries.
+- **Relocation scope approved:** the user approved coordinated migration and
+  owned relocation after PRG-I24. The existing public relocation entry point
+  owns preflight, physical movement, marker publication, persistence, and
+  state/queue transfer. Its only production caller, `api/migration.rs`, delegates
+  those effects and must not ignore refusal or roll back an unknown outcome.
+  A partial directory without a tracked owner remains explicitly skipped with
+  a report reason; no ambient move substitutes for missing lifecycle authority.
+  Complete-model migration is unchanged.
+  This checkpoint supports legacy dormant downloads; existing admitted/recovery
+  refusal moves before all effects. Admitted queue-graph evolution remains C3
+  work, not an accepted capability or a new silent disablement.
+  A durable intent precedes movement and reserves both identities. Unknown
+  outcomes preserve records and block conflicting work, including after reopen;
+  no automatic rollback or guessed restart placement is admitted.
+  Cancellation waits for the owned relocation result and re-reads authority.
+  Root owns caller/records, store_checkpoint owns `download_store.rs`,
+  destination_checkpoint owns the four HF files, and a separately assigned
+  capability owner may edit only `download_recovery.rs`. Cargo runs serialize;
+  no worker commits or edits another owner's files.
+  Acceptance: real temporary-directory/store relocation and public migration
+  orchestration, exact refusal without movement, cancellation, collision and
+  publication-failure preservation, then affected default/no-default suites.
+  These are automated integration/contract claims on the local Linux filesystem;
+  other-platform and hard-process-crash acceptance remain separate.
+  Composed-design review is applicable: filesystem authority stays in the held
+  capability, durable intent in the store, task/cancellation and queue custody
+  in HF, and report/index projection in migration. Moving a model necessarily
+  coordinates these owners; callers no longer know rename/rollback ordering.
+  Filesystem mechanism changes stay in the capability and publication mechanics
+  in the store; migration consumes a settled result, not either representation.
+  The intent is necessary to preserve bytes and exclude both destinations after
+  interruption; deleting it moves that obligation back to callers and restore.
+  Reuse existing task, atomic publisher, capability and queue owners; no general
+  migration framework, additional runtime or independent registry is admitted.
 - **Held boundaries:** no further source expansion, public constructor/wire outcome,
   manifest, RPC/IPC/UniFFI, frontend/Electron, package/generated/CI, or shared-
   document mutation. The metadata files expose only the existing atomic writer
@@ -845,4 +885,4 @@ no required-real environment is represented by a lower-fidelity substitute.
   tests, real binding-host cohorts, generators, packaged artifacts, and release
   evidence remain with the desktop/platform plan; frontend presentation remains
   with the frontend/UI plan.
-- Final status: `Blocked`
+- Final status: `Active`
