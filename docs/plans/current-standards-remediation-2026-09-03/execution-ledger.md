@@ -20,6 +20,19 @@
 
 ## Slice Log
 
+### 2026-09-05 — Verified Recovery terminal settlement
+
+- Continued C3 from `2e79993c` with one implementation agent and an independent
+  read-only reviewer. Root retained plan, gate, and commit ownership. Source
+  is confined to `hf/download.rs`; no live library or schema changes.
+- The new real-store regression reproduced the blanket refusal of Verified
+  Recovery cleanup still awaiting exact queue settlement. The narrow fix
+  preserves durable revocation and hidden history while allowing its follower
+  to proceed. Pending/unquarantined Recovery remains blocked without mutation.
+- The [Rust verification record](rust-library-and-rpc/execution-ledger.md#2026-09-05--verified-recovery-restore-verification)
+  owns exact source, RED/GREEN, review, final gates, and evidence limits. This
+  is not full C3/C4, process-crash, GUI, or Windows/macOS acceptance.
+
 ### 2026-09-05 — Verified Ambient restart settlement checkpoint
 
 - Continued after plan reconciliation `14b53c74`. A real current-format store

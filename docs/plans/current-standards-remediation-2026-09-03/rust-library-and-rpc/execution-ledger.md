@@ -21,6 +21,57 @@
 
 ## Slice Log
 
+### 2026-09-05 — Verified Recovery settlement admitted
+
+- Continued this plan from `2e79993c` against unchanged standards `1609c304`.
+  Inspection established a current-format cutpoint through real store calls:
+  ordinary head/follower admission, exact admitted ticket handoff, durable
+  Recovery quarantine, cleanup verification, then restart before settlement.
+- Existing strict store validation ties Recovery quarantine to durable
+  revocation and the exact retained Recovery admission attempt; existing
+  settlement retains both tombstone and sticky quarantine. Admit only
+  `hf/download.rs` and regressions, without schema or public API changes.
+- Required outcome: settle this proven terminal owner, keep it hidden and
+  revoked, restore the follower in its recorded position, and permit progress.
+  Pending/unquarantined Recovery and hidden/unknown admission still refuse.
+  Record actual RED before the narrow source change, then focused and dual
+  core/lint evidence. General crash recovery and C4 remain open.
+
+### 2026-09-05 — Verified Recovery restore verification
+
+- Source `hf/download.rs` SHA-256
+  `19679a9e76dbf2f76366dc85bb74338de490993c597b1158f9868744e1a74039`.
+  The validator admits active Recovery only for the same-ID Verified Recovery
+  quarantine. Existing strict store validation proves durable revocation and
+  retained exact admission. Settlement reuses the retained task owner; final
+  inventory checks and Ambient-only runtime history projection are unchanged.
+- RED command: `cargo test --offline -p pumas-library --lib
+  restore_settles_verified_recovery_cleanup_without_restoring_revoked_authority`.
+  Before production edits it failed with Validation field `download_recovery`,
+  message `Active recovery custody requires explicit reconciliation before
+  restore`. The same regression passes after the narrow eligibility change.
+- Positive evidence proves exact released-admission preservation, follower
+  ordinal and predecessor attempt, unchanged revocation/quarantine, no revoked
+  runtime entry or generic resume/cancel authority, follower completion, and a
+  second fresh restore. Pending and unquarantined Recovery separately produce
+  the exact refusal with unchanged queue, tombstone, quarantine, and payload.
+  All nine `--lib restore_` cases pass, including the existing caller-cancellation
+  and ordinary Verified cleanup boundaries. Independent final review passes.
+- Focused logs: `/tmp/pumas-verified-recovery-restore-{red,green,focused}.log`.
+  Root gate logs: `/tmp/pumas-verified-recovery.AXeA4p/`. These Linux fixtures
+  exercise a persisted cutpoint, not process-kill, live transfer, or non-Linux
+  runtime evidence. Live download store hash remains
+  `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+- Final gates pass: `cargo test --offline -p pumas-library` both default and
+  `--no-default-features`, each 1,194 passing (1,091 unit plus 103 integration/doc)
+  with 11 existing ignores. Full package tests used the permitted real local
+  socket/process environment. Strict `cargo clippy --offline -p pumas-library
+  --all-targets --all-features -- -D warnings` and the same command with
+  `--no-default-features` replacing `--all-features` pass; workspace formatting,
+  diff whitespace, and all five plan contracts pass. No lint suppression or
+  hook bypass. This terminal settlement checkpoint is accepted; Pending cleanup,
+  unquarantined Recovery, hidden admission, and C4 remain unfinished.
+
 ### 2026-09-05 — Verified Ambient pre-settlement restore corrected
 
 - Exact source: `hf/download.rs`, SHA-256

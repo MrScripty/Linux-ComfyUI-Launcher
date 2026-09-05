@@ -209,14 +209,16 @@ requests or aborts the currently owned async handles; it has no Slice B drain
 or completion claim for running blocking work or finalizer-captured
 predecessors. Its existing test remains narrow unstarted-worker evidence.
 
-**Next slice:** Bound the remaining C3 unresolved-state restore contract before
-implementation, preserving the accepted Verified Ambient settlement checkpoint.
-Pending cleanup, unresolved Recovery custody, and hidden admission still fail
-closed; their snapshots cannot grant fresh execution authority. Identify the
-exact durable proof and lifecycle owner needed for the next supported case,
-then record its source set and deciding regression. C4 importer ownership
-remains separate. No old-format support, live mutation, or schema change is
-admitted by this investigation. Cargo and commits remain serialized.
+Verified Recovery terminal settlement is accepted after review and core gates,
+preserving revocation, hidden history, and the follower's exact queue position.
+
+**Next slice:** Bound Pending cleanup restoration against durable intent, exact
+admission, and held destination authority. The Rust owner must identify its
+retained cleanup owner and a deciding real-store/filesystem regression before
+admitting source. Snapshots alone cannot authorize deletion or resumption.
+Unquarantined Recovery, hidden/unknown admission, C4 importer changes,
+old-format support, live mutation, and schema changes remain excluded. Cargo
+and commits remain serialized.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

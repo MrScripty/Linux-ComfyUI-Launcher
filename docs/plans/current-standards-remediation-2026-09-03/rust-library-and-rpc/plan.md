@@ -24,12 +24,20 @@ history, successor progress, and retained settlement after caller cancellation.
 Initial and returned inventory both reject unresolved custody; no filesystem
 cleanup replay or new admission is inferred.
 
-**Next slice:** Bound the remaining C3 unresolved-state restore case. Identify
-exact durable proof and lifecycle
-ownership before admitting source and a deciding regression. Pending cleanup,
-unresolved Recovery custody, and hidden admission still fail closed; snapshots
-cannot grant new execution authority. No live mutation, schema change, legacy
-support, or C4 importer change is admitted by this investigation.
+The matching Verified Recovery settlement is accepted after review and gates.
+Strict store validation binds its same-ID cleanup to durable revocation and
+the retained admission attempt. The regression proves exact settlement,
+preserved hidden history/tombstone, follower progress, and repeat restore
+without recreating execution authority. Pending and unquarantined Recovery
+still refuse with unchanged custody and payload.
+
+**Next slice:** Bound Pending cleanup restoration against its durable intent,
+exact admission, and held destination authority before admitting implementation.
+Require a deciding real-store/filesystem regression and retained cleanup owner;
+do not treat the snapshot alone as permission to delete or resume. Unquarantined
+Recovery and hidden/unknown admission remain separate. No live mutation,
+schema change, legacy support, or C4 importer change is admitted by this
+investigation; persisted-cutpoint tests do not prove hard-process recovery.
 
 The current-only cutover and queued pause remain accepted. Full C3, admitted
 relocation, guard-free effects, C4 awaited importer integration, and hard-process
@@ -110,9 +118,10 @@ is not hard-process-crash or live Hugging Face evidence. Marker-failure and
 seeded-file tests retain their narrower meaning. Held identities, network and
 queued pause, and removal of old partial relocation are integrated. Unknown
 admissions, Pending cleanup, and unresolved active Recovery custody still fail
-closed without a complete recovery path. Verified Ambient cleanup now settles
-its exact remaining admission before restore; the focused checkpoint is accepted. Runtime
-release facts remain retained until owner drop. Physical
+closed without a complete recovery path. Verified Ambient cleanup settles its
+exact remaining admission before restore; its focused checkpoint is accepted.
+Verified Recovery settlement is also accepted. Runtime release facts remain
+retained until owner drop. Physical
 destination locking, admitted relocation, and C4 real awaited importer/callback
 ordering remain unfinished. Selected producer/consumer GUI integration is
 accepted separately, not evidence of full C3 or client-drop completion.
@@ -201,9 +210,9 @@ accepted separately, not evidence of full C3 or client-drop completion.
   refuses partial-directory moves without effects; complete-model migration is
   unchanged. Admitted relocation remains separate C3 work. Do not reintroduce
   compatibility, infer historical FIFO, or rerun conversion during startup.
-- **Held boundaries:** the next investigation admits no source changes until
-  its exact write set and deciding regression are recorded. The broader write
-  set above records C3/C4 ownership, not permission
+- **Held boundaries:** the next investigation admits no further source changes
+  until its exact write set and deciding regression are recorded. The broader
+  write set above records C3/C4 ownership, not permission
   to expand this checkpoint. Selected RPC/frontend/Electron/generated/CI changes
   are already accepted at `2b081fba`; no new wire or consumer change is needed.
   The metadata files expose only the existing atomic writer
