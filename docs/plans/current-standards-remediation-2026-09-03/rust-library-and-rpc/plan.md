@@ -47,17 +47,25 @@ only VerifiedIntent through its durable barrier; existing restore settles the
 exact queue entry without file deletion. Pending and publication-failure refusal
 remain verified. Production HF and supported store format are unchanged.
 
-**Next slice:** Bound cross-client/process ownership through cleanup drain
-before admitting Pending replay. Select the ownership lifetime, exclusion
-mechanism, exact write set, and deciding held-worker/interruption evidence before
-implementation. A fresh client or persisted snapshot is not abandonment proof;
-keep Pending restore refusal until the complete execution contract is verified.
+Ownership investigation selects a physical-root execution grant shared by one
+HF client's active lifecycles, not a configured-root lifetime lock. Idle/search
+clients must not pin it. RUST-I13 records the design and the newly identified
+shutdown/importer dependencies; no lease implementation is accepted.
+
+**Next slice:** Bound retained HF shutdown/effect ownership with an actual
+production consumer of completion and failure. Trace the runtime teardown path,
+record the exact write set and deciding held-write/client-drop regression using
+only weak test observation, then admit implementation. Do not substitute a
+detached drain or unused lease Interface. Pending replay stays refused; importer
+handoff needs a separately admitted C4 contract before replay can be accepted.
 
 Pending replay remains excluded. Investigation found three prerequisites:
 cross-client/process exclusion through cleanup drain; distinguishing persisted
 intent phases currently projected together as Pending; and parent-sync deletion
 durability. Parent-sync durability, phase-aware cancellation preparation,
-and terminal intent restart confirmation are accepted. Preserve fresh-client
+and terminal intent restart confirmation are accepted. Execution exclusion now
+depends on bounded M4 shutdown and C4 importer coordination, rather than merely
+adding a lock. Preserve fresh-client
 refusal while an earlier cleanup is held. No snapshot-derived deletion/resume,
 live library mutation, legacy support, or C4 importer change is admitted.
 

@@ -21,6 +21,27 @@
 
 ## Slice Log
 
+### 2026-09-05 — Execution ownership prerequisites reconciled
+
+- Continue from `4ab3910b`, standards `aff5b867`. Two independent read-only
+  investigations and root source review found that a root-held lease alone
+  cannot prove last-effect ownership. RUST-I13 owns the findings, selected grant
+  design, rejected alternatives, lifetime contract, and deciding regression.
+- The root Linux probe used independently opened read-only directory descriptors
+  and nonblocking `flock`: the second open contended while the first held the
+  lock, then acquired after the first descriptor closed. Fixture directory:
+  `/tmp/pumas-ownership-probe.jLIgOj`. This proves that local kernel mechanism
+  only—not the Rust adapter, crash release, task retention, or other platforms.
+- Re-plan the next slice around retained HF shutdown/effect ownership with an
+  actual runtime completion/failure consumer. Importer coordination is a separate
+  C4 dependency of eventual Pending replay. Do not introduce an unused lock
+  Interface or treat client Drop/abort requests as effect drain.
+- This checkpoint changes planning records only; no source, Cargo, GUI, live
+  store, or payload changes. Prior test results remain historical, not rerun
+  acceptance. All five plan contracts and documentation diff checks pass;
+  live store hash remains `a0885e5f` (full value recorded in the preceding source
+  checkpoint). Accept only this sequencing correction, not runtime ownership.
+
 ### 2026-09-05 — Terminal intent restart verification
 
 - Actual REDs reproduced Pending after reconciliation and public restore's

@@ -20,6 +20,17 @@
 
 ## Slice Log
 
+### 2026-09-05 — Ownership dependency correction
+
+- Read-only investigation found that client/root lifetime does not cover every
+  running file write or detached importer. A lock alone cannot authorize Pending
+  cleanup replay. RUST-I13 and the Rust ledger own the precise evidence and
+  proposed active-engine grant, including idle-client handoff.
+- Re-plan C3's next prerequisite around retained HF shutdown/effect ownership
+  and its actual runtime result consumer; C4 importer coordination also precedes
+  replay acceptance. No source implementation or runtime acceptance is claimed
+  by this documentation-only checkpoint.
+
 ### 2026-09-05 — Terminal intent restart confirmation
 
 - Continue from `b491ec97`: confirm only cleanup already recorded as finished,

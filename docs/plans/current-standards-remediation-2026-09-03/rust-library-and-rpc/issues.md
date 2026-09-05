@@ -1,5 +1,51 @@
 # Rust Library and RPC Issues
 
+## RUST-I13 — Execution exclusion requires retained effect ownership
+
+- **Severity/owner:** High; Rust HF lifecycle and runtime integration owners,
+  with C4 importer ownership. Pending cleanup replay remains unavailable.
+- **Evidence at `4ab3910b`:** `hf/mod.rs:353` calls `abort_all` on Drop;
+  `hf/lifecycle.rs:1583` removes task entries and aborts nested observers without
+  draining running blocking closures. `hf/download.rs:1000` writes through a
+  captured raw file wrapper, not the root capability. Recovery capabilities also
+  open independent roots. Builder completion callbacks launch importer work
+  outside HF drain. A configured-root lock can therefore release too early.
+- **Selected design, not implementation acceptance:** one physical-root grant
+  shared across a single HF client's active mutation lifecycles, weakly cached
+  by that client's execution owner. Keep same-client concurrency; independent
+  clients contend, even for different destinations. Idle, inspection, and search
+  clients must not retain the grant. The existing builder already rejects a
+  second primary for one launcher root, but that registry claim is not proof of
+  physical-root exclusion or last-effect completion.
+- **Mechanism candidate:** acquire nonblocking exclusion on a fresh capability-
+  relative open of the held root directory inode. Independent contenders must
+  not use duplicated file descriptions. Reuse the existing filesystem-locking
+  dependency if its real adapter passes; contention is a typed busy outcome,
+  and unsupported/I/O failure refuses without a sidecar or path fallback.
+  Exact busy/error projection remains an implementation-admission obligation.
+  Do not hold the store transaction lock through effects. Per-destination locks
+  require a separate missing-directory/creation arbitration protocol.
+- **Lifetime contract:** task envelopes, cancellation transfer, and every actual
+  blocking closure/file effect retain ownership through observed completion.
+  No release/reacquire gap between worker and finalizer. At mutation entry,
+  revalidate destination identity, exact retained admission, and durable queue
+  eligibility under the grant; stale runtime snapshots are not authority.
+  Importer effects need an awaited or explicitly transferred owner before this
+  grant can justify Pending replay. Do not claim general library-wide exclusion.
+- **Next admission:** choose the real runtime consumer of HF shutdown completion
+  and failure. Center the initial slice on `hf/lifecycle.rs`, `hf/mod.rs`, tests,
+  and that consumer only where required. A detached drain spawned by Drop or
+  the existing outcome-discarding retired-task reaper is not sufficient.
+- **Deciding regression:** hold a real blocking write, retain only a weak test
+  reference to its task owner, and drop the client. Production ownership must
+  survive until the effect and its success/error/panic outcome are observed by
+  teardown. A test-owned strong reference must not manufacture retention.
+  Later lease gates include independent-process contention/release, same-client
+  concurrency, idle handoff, root replacement refusal, and last-effect release.
+- **Disposition:** sequencing re-planned; no runtime edits or lease acceptance.
+  Revisit on teardown-consumer selection, a demonstrated ownership gap, or a
+  requirement for concurrent independent mutation engines.
+
 ## Open Decision Dependencies
 
 | ID | Relationship and evidence | Owner | Current disposition | Required verification | Revisit trigger |

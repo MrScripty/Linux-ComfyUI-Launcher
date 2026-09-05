@@ -222,16 +222,19 @@ deletion authority from a stale Pending projection or missing admitted snapshot.
 Terminal intent restart confirmation is accepted after review and dual core
 gates: existing restore can settle completed cleanup without repeating deletion.
 
-**Next slice:** Bound cross-client/process ownership through cleanup drain
-before admitting Pending replay. The Rust owner selects its lifetime, exclusion
-mechanism, exact source, and held-worker/interruption evidence before implementation.
-Fresh-client creation is not abandonment proof. No live mutation, schema change,
-old-format support, or C4 expansion. Cargo and commits remain serialized.
+**Next slice:** Bound retained HF shutdown/effect ownership and name its actual
+runtime completion/failure consumer before source admission. RUST-I13 records
+why a root lock alone is insufficient: running writes can outlive client Drop,
+and importer work escapes download drain. Pending replay now depends on bounded
+M4 ownership and separately admitted C4 coordination. No live mutation, schema,
+old-format support, or broader source change is admitted. Cargo/commits stay serial.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.
-Only C3 is the next implementation slice. Later checkpoints advance after the
-preceding contract is verified and the focused owner records the handoff.
+C3 remains active, but its Pending replay cannot precede the newly identified
+M4/C4 ownership prerequisites. The focused owner must admit each exact source
+contract before implementation; historical checkpoint order is not permission
+to bypass those dependencies.
 
 | Checkpoint | State | Owned result and deciding evidence |
 | --- | --- | --- |
