@@ -49,6 +49,11 @@
   the earlier owner-only wiring scope with one coherent invocation-to-RPC slice.
   Existing artifact relocation policy is not accepted by observing its effects;
   admitted relocation and importer ownership remain separate work.
+- **Implementation-time consumer correction:** local IPC's `api/state_hf.rs`
+  duplicated the public start/recover/partial paths and could bypass core
+  invocation admission. Consolidate those consumers onto shared owned functions
+  in this slice; do not accept a public-method-only shutdown guarantee. Ticket
+  recovery's async index refresh also requires retained effect observation.
 - **Accepted prerequisite:** cancellation now retains predecessor observation in
   the existing nested-task owner (`hf/lifecycle.rs` only). The started-finalizer
   interruption regression proves terminal observation cannot finish while
@@ -61,9 +66,18 @@
   teardown. A test-owned strong reference must not manufacture retention.
   Later lease gates include independent-process contention/release, same-client
   concurrency, idle handoff, root replacement refusal, and last-effect release.
-- **Disposition:** bounded predecessor custody and shutdown design accepted;
-  implement the admitted shutdown slice next. Runtime shutdown, client Drop
-  drainage, and lease acceptance remain open.
+- **Explicit shutdown accepted:** one lifecycle state closes invocation/task
+  admission and captures prepared, installed, and retired custody atomically.
+  Real held effects and final projection precede the shared receipt; Rust and
+  IPC consumers share preparation and RPC observes both HF and catalog drains.
+  SD-1 through SD-4, independent reviews, dual core/RPC suites, and strict lint
+  pass on Linux. Drop requests this drain but does not synchronously observe it.
+- **Disposition:** bounded predecessor custody and explicit download shutdown
+  accepted. Admit C4 awaited importer finalization next: builder callbacks still
+  enqueue work, restored completion settles before import, and importer metadata
+  removal/index failures can be logged or ignored. Awaiting that existing future
+  alone cannot justify terminal success. Whole-runtime teardown, general client
+  Drop drainage, physical-root execution grants, and Pending replay remain open.
   Revisit on an effect outside admitted custody, a demonstrated ownership gap, or a
   requirement for concurrent independent mutation engines.
 

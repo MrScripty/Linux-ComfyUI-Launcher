@@ -134,6 +134,14 @@ pub enum PumasError {
     #[error("Configuration error: {message}")]
     Config { message: String },
 
+    /// Download shutdown permanently closed admission for this client.
+    #[error("Download lifecycle is closed")]
+    DownloadLifecycleClosed,
+
+    /// Owned work drained, but one or more terminal observations failed.
+    #[error("Download shutdown observed {failures} failure(s)")]
+    DownloadShutdownFailed { failures: usize },
+
     #[error("Invalid app ID: {0}")]
     InvalidAppId(String),
 
@@ -279,6 +287,7 @@ impl PumasError {
     pub fn to_rpc_error_code(&self) -> i32 {
         match self {
             PumasError::Network { .. }
+            | PumasError::DownloadLifecycleClosed
             | PumasError::Timeout(_)
             | PumasError::RateLimited { .. }
             | PumasError::CircuitBreakerOpen { .. } => -32000,
@@ -407,6 +416,22 @@ macro_rules! io_err {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_shutdown_errors_preserve_terminal_classification() {
+        let closed = PumasError::DownloadLifecycleClosed;
+        assert_eq!(closed.to_rpc_error_code(), -32000);
+        assert!(!closed.is_retryable());
+        assert_eq!(closed.to_string(), "Download lifecycle is closed");
+
+        let failed = PumasError::DownloadShutdownFailed { failures: 2 };
+        assert_eq!(failed.to_rpc_error_code(), -32603);
+        assert!(!failed.is_retryable());
+        assert_eq!(
+            failed.to_string(),
+            "Download shutdown observed 2 failure(s)"
+        );
+    }
 
     #[test]
     fn test_error_display() {

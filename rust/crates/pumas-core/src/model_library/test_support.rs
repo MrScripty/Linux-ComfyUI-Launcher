@@ -2,6 +2,7 @@
 //!
 //! This adapter exercises current configured-root admission. It does not import
 //! legacy stores, bypass the durable publisher, or start network workers.
+//! Owned blocking fixtures exercise shutdown through the real HF task owner.
 
 use super::download_recovery::DownloadDestinationRoot;
 use super::download_store::{
@@ -12,6 +13,37 @@ use crate::{PumasError, Result};
 use std::path::Path;
 
 pub use super::download_store::PersistedDownload;
+
+/// Run isolated fixture work through the real download invocation/effect owner.
+///
+/// The returned future owns its client reference so the API can move into its
+/// real server supervisor. The fixture owns every file and synchronization gate
+/// used by `work`; this helper does not grant live-library mutation authority.
+pub fn run_download_blocking_fixture<T, F>(
+    api: &crate::PumasApi,
+    work: F,
+) -> impl std::future::Future<Output = Result<T>> + Send + 'static
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let client = api.primary().hf_client.clone();
+    async move {
+        let client = client.ok_or_else(|| PumasError::Config {
+            message: "Download fixture requires an HF client".into(),
+        })?;
+        client
+            .run_download_invocation(move |context| async move {
+                context
+                    .run_fallible_blocking_named("download integration fixture", work)
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!("Download fixture observation failed: {error}"))
+                    })?
+            })
+            .await
+    }
+}
 
 /// Admit a paused fixture through the real current-format store owner.
 ///

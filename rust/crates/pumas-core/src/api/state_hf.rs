@@ -104,150 +104,11 @@ pub(super) async fn start_hf_download(
     primary: &PrimaryState,
     request: &model_library::DownloadRequest,
 ) -> std::result::Result<String, PumasError> {
-    use crate::api::hf::{apply_remote_model_metadata, normalized_download_hint};
-    use tracing::{info, warn};
-
     let client = primary
         .hf_client
-        .as_ref()
-        .ok_or_else(|| PumasError::Config {
-            message: "HuggingFace client not initialized".to_string(),
-        })?;
-
-    let mut resolved_request = request.clone();
-    let mut resolved_pipeline_tag =
-        normalized_download_hint(resolved_request.pipeline_tag.as_deref()).map(ToOwned::to_owned);
-    let mut remote_model = None;
-    let mut huggingface_evidence = match client.get_model_snapshot(&request.repo_id).await {
-        Ok((model, evidence)) => {
-            remote_model = Some(model);
-            Some(evidence)
-        }
-        Err(err) => {
-            warn!(
-                "Failed to capture HF evidence for {} before download: {}",
-                request.repo_id, err
-            );
-            None
-        }
-    };
-    if let Some(remote_pipeline_tag) = huggingface_evidence
-        .as_ref()
-        .and_then(|evidence| normalized_download_hint(evidence.pipeline_tag.as_deref()))
-    {
-        resolved_pipeline_tag = Some(remote_pipeline_tag.to_string());
-    }
-    let mut resolved_model_type = if let Some(ref evidence) = huggingface_evidence {
-        let resolved = model_library::resolve_model_type_from_huggingface_evidence(
-            primary.model_library.index(),
-            Some(&resolved_request.official_name),
-            resolved_pipeline_tag.as_deref(),
-            request.model_type.as_deref(),
-            Some(evidence),
-        )?;
-        (resolved.model_type != model_library::ModelType::Unknown)
-            .then(|| resolved.model_type.as_str().to_string())
-    } else {
-        None
-    };
-
-    if resolved_model_type.is_none() || resolved_pipeline_tag.is_none() {
-        if remote_model.is_none() {
-            remote_model = Some(client.get_model_info(&request.repo_id).await?);
-        }
-        let model_info = remote_model.as_ref().expect("remote model must be present");
-        if resolved_pipeline_tag.is_none() {
-            resolved_pipeline_tag =
-                normalized_download_hint(Some(model_info.kind.as_str())).map(ToOwned::to_owned);
-        }
-        if resolved_model_type.is_none() {
-            resolved_model_type = crate::api::hf::resolve_model_type_from_hints_async(
-                primary.model_library.index().clone(),
-                vec![
-                    normalized_download_hint(request.model_type.as_deref()).map(ToOwned::to_owned),
-                    resolved_pipeline_tag.clone(),
-                    normalized_download_hint(Some(model_info.kind.as_str())).map(ToOwned::to_owned),
-                ],
-            )
-            .await?;
-        }
-    }
-    if let Some(model_info) = remote_model.as_ref() {
-        apply_remote_model_metadata(&mut resolved_request, model_info);
-    } else if resolved_request.license_status.is_none() {
-        resolved_request.license_status = Some("license_unknown".to_string());
-    }
-
-    let should_check_bundle = resolved_model_type
-        .as_deref()
-        .is_none_or(|model_type| model_type == "diffusion")
-        || resolved_pipeline_tag.as_deref() == Some("text-to-image");
-    if should_check_bundle {
-        match client.classify_repo_bundle(&request.repo_id).await {
-            Ok(Some(bundle)) => {
-                if resolved_request.filename.is_some()
-                    || resolved_request.filenames.is_some()
-                    || resolved_request.quant.is_some()
-                {
-                    info!(
-                        "HF repo {} classified as {:?}; forcing full bundle download",
-                        request.repo_id, bundle.bundle_format
-                    );
-                }
-                resolved_request.filename = None;
-                resolved_request.filenames = None;
-                resolved_request.quant = None;
-                resolved_request.bundle_format = Some(bundle.bundle_format);
-                resolved_request.pipeline_class = Some(bundle.pipeline_class);
-                if resolved_pipeline_tag.is_none() {
-                    resolved_pipeline_tag = Some("text-to-image".to_string());
-                }
-                if resolved_model_type.is_none() {
-                    resolved_model_type = Some("diffusion".to_string());
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!(
-                    "Failed to classify HF repo {} as a bundle: {}",
-                    request.repo_id, err
-                );
-            }
-        }
-    }
-
-    resolved_request.pipeline_tag = resolved_pipeline_tag;
-    let model_type = resolved_model_type.unwrap_or_else(|| "unknown".to_string());
-    let architecture_family = model_library::infer_architecture_family_for_download(
-        &resolved_request,
-        huggingface_evidence.as_ref(),
-    );
-    resolved_request.family = architecture_family.clone();
-    let selected_artifact =
-        model_library::SelectedArtifactIdentity::from_download_request(&resolved_request, None);
-    resolved_request.model_type = Some(model_type.clone());
-    let dest_dir = primary
-        .model_library
-        .prepare_artifact_download_destination(
-            &model_type,
-            &architecture_family,
-            &selected_artifact.artifact_id,
-        )?;
-    if model_type == "unknown" {
-        warn!(
-            "Download {} is starting with unknown model_type after HF metadata lookup; destination={}",
-            request.repo_id,
-            dest_dir.display()
-        );
-    }
-    if let Some(ref mut evidence) = huggingface_evidence {
-        evidence.requested_model_type = request.model_type.clone();
-        evidence.requested_pipeline_tag = request.pipeline_tag.clone();
-        evidence.requested_quant = request.quant.clone();
-    }
-    client
-        .start_download(&resolved_request, &dest_dir, huggingface_evidence)
-        .await
+        .clone()
+        .ok_or_else(hf_client_unavailable)?;
+    crate::PumasApi::start_hf_download_owned(primary.model_library.clone(), client, request).await
 }
 
 pub(super) async fn get_hf_download_progress(
@@ -322,71 +183,17 @@ pub(super) async fn recover_download(
     repo_id: &str,
     dest_dir: &str,
 ) -> std::result::Result<String, PumasError> {
-    let dest =
-        crate::api::hf::validate_existing_local_directory_lookup_path(dest_dir, "dest_dir").await?;
-
     let client = primary
         .hf_client
-        .as_ref()
-        .ok_or_else(|| PumasError::Config {
-            message: "HuggingFace client not initialized".to_string(),
-        })?;
-
-    let parts: Vec<&str> = repo_id.splitn(2, '/').collect();
-    if parts.len() != 2 {
-        return Err(PumasError::Config {
-            message: format!(
-                "Invalid repo_id format (expected 'owner/name'): {}",
-                repo_id
-            ),
-        });
-    }
-
-    let model_type = dest
-        .strip_prefix(primary.model_library.library_root())
-        .ok()
-        .and_then(|rel| rel.components().next())
-        .and_then(|c| c.as_os_str().to_str())
-        .map(String::from);
-
-    let metadata =
-        load_model_metadata_or_default(primary.model_library.clone(), dest.clone()).await?;
-    let recovery_filenames = metadata
-        .selected_artifact_files
         .clone()
-        .filter(|files| !files.is_empty())
-        .or_else(|| {
-            metadata
-                .expected_files
-                .clone()
-                .filter(|files| !files.is_empty())
-        });
-    if recovery_filenames.is_some() {
-        tracing::info!(
-            "Recovering partial download for {} using artifact file metadata from {}",
-            repo_id,
-            dest.display()
-        );
-    }
-
-    let request = model_library::DownloadRequest {
-        repo_id: repo_id.to_string(),
-        family: parts[0].to_string(),
-        official_name: parts[1].to_string(),
-        model_type,
-        quant: None,
-        filename: None,
-        filenames: recovery_filenames,
-        pipeline_tag: None,
-        bundle_format: None,
-        pipeline_class: None,
-        release_date: None,
-        download_url: None,
-        model_card_json: None,
-        license_status: None,
-    };
-
-    client.start_download(&request, &dest, None).await
+        .ok_or_else(hf_client_unavailable)?;
+    crate::PumasApi::recover_download_owned(
+        primary.model_library.clone(),
+        client,
+        repo_id,
+        dest_dir,
+    )
+    .await
 }
 
 pub(super) async fn resume_partial_download(
@@ -394,128 +201,22 @@ pub(super) async fn resume_partial_download(
     repo_id: &str,
     dest_dir: &str,
 ) -> std::result::Result<models::PartialDownloadAction, PumasError> {
-    let dest =
-        match crate::api::hf::validate_existing_local_directory_lookup_path(dest_dir, "dest_dir")
-            .await
-        {
-            Ok(dest) => dest,
-            Err(PumasError::InvalidParams { .. } | PumasError::NotFound { .. }) => {
-                return Ok(models::PartialDownloadAction {
-                    action: "none".to_string(),
-                    download_id: None,
-                    status: None,
-                    reason_code: Some("dest_dir_missing".to_string()),
-                    message: Some(format!("directory not found: {}", dest_dir)),
-                });
-            }
-            Err(err) => return Err(err),
-        };
-
-    let client = match primary.hf_client.as_ref() {
-        Some(client) => client,
-        None => {
-            return Ok(models::PartialDownloadAction {
-                action: "none".to_string(),
-                download_id: None,
-                status: None,
-                reason_code: Some("hf_client_unavailable".to_string()),
-                message: Some("HuggingFace client not initialized".to_string()),
-            });
-        }
-    };
-
-    if let Some(download_id) = client.find_download_id_by_dest_dir(&dest).await {
-        let status = client.get_download_status(&download_id).await;
-        if let Some(status) = status {
-            match status {
-                models::DownloadStatus::Paused | models::DownloadStatus::Error => {
-                    match client.resume_download(&download_id).await {
-                        Ok(true) => {
-                            return Ok(models::PartialDownloadAction {
-                                action: "resume".to_string(),
-                                download_id: Some(download_id),
-                                status: Some(models::DownloadStatus::Queued),
-                                reason_code: None,
-                                message: None,
-                            });
-                        }
-                        Ok(false) => {
-                            return Ok(models::PartialDownloadAction {
-                                action: "none".to_string(),
-                                download_id: Some(download_id),
-                                status: Some(status),
-                                reason_code: Some("resume_rejected".to_string()),
-                                message: Some(format!(
-                                    "tracked download cannot be resumed from status {:?}",
-                                    status
-                                )),
-                            });
-                        }
-                        Err(err) => {
-                            return Ok(models::PartialDownloadAction {
-                                action: "none".to_string(),
-                                download_id: Some(download_id),
-                                status: Some(status),
-                                reason_code: Some(
-                                    crate::api::hf::partial_download_reason_code(&err).to_string(),
-                                ),
-                                message: Some(err.to_string()),
-                            });
-                        }
-                    }
-                }
-                models::DownloadStatus::Queued
-                | models::DownloadStatus::Downloading
-                | models::DownloadStatus::Pausing
-                | models::DownloadStatus::Cancelling => {
-                    return Ok(models::PartialDownloadAction {
-                        action: "attach".to_string(),
-                        download_id: Some(download_id),
-                        status: Some(status),
-                        reason_code: None,
-                        message: None,
-                    });
-                }
-                models::DownloadStatus::Completed => {
-                    return Ok(models::PartialDownloadAction {
-                        action: "none".to_string(),
-                        download_id: Some(download_id),
-                        status: Some(status),
-                        reason_code: Some("already_completed".to_string()),
-                        message: Some("tracked download is already completed".to_string()),
-                    });
-                }
-                models::DownloadStatus::Cancelled => {
-                    return Ok(models::PartialDownloadAction {
-                        action: "none".to_string(),
-                        download_id: Some(download_id),
-                        status: Some(status),
-                        reason_code: Some("already_cancelled".to_string()),
-                        message: Some(
-                            "tracked download was cancelled; start a new download".to_string(),
-                        ),
-                    });
-                }
-            }
-        }
-    }
-
-    match recover_download(primary, repo_id, dest_dir).await {
-        Ok(download_id) => Ok(models::PartialDownloadAction {
-            action: "recover".to_string(),
-            download_id: Some(download_id),
-            status: Some(models::DownloadStatus::Queued),
-            reason_code: None,
-            message: None,
-        }),
-        Err(err) => Ok(models::PartialDownloadAction {
+    let Some(client) = primary.hf_client.clone() else {
+        return Ok(models::PartialDownloadAction {
             action: "none".to_string(),
             download_id: None,
             status: None,
-            reason_code: Some(crate::api::hf::partial_download_reason_code(&err).to_string()),
-            message: Some(err.to_string()),
-        }),
-    }
+            reason_code: Some("hf_client_unavailable".to_string()),
+            message: Some("HuggingFace client not initialized".to_string()),
+        });
+    };
+    crate::PumasApi::resume_partial_download_owned(
+        primary.model_library.clone(),
+        client,
+        repo_id,
+        dest_dir,
+    )
+    .await
 }
 
 pub(super) async fn refetch_metadata_from_hf(
@@ -817,6 +518,61 @@ pub(super) async fn get_hf_auth_status(
 #[cfg(test)]
 mod download_lifecycle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ipc_download_mutations_share_closed_invocation_admission() {
+        use crate::ipc::server::IpcDispatch;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let api = crate::api::hf::tests::recovery_api_fixture(temp.path(), None).await;
+        api.shutdown_downloads().await.unwrap();
+        let request = serde_json::json!({
+            "repo_id": "shutdown-fixture/model",
+            "family": "shutdown-fixture",
+            "official_name": "model",
+            "filename": "weights.gguf",
+        });
+        for (method, params) in [
+            ("start_hf_download", serde_json::json!({"request": request})),
+            (
+                "recover_download",
+                serde_json::json!({"repo_id": "shutdown-fixture/model", "dest_dir": "/missing-shutdown-fixture"}),
+            ),
+            (
+                "resume_partial_download",
+                serde_json::json!({"repo_id": "shutdown-fixture/model", "dest_dir": "/missing-shutdown-fixture"}),
+            ),
+            (
+                "pause_hf_download",
+                serde_json::json!({"download_id": "missing"}),
+            ),
+            (
+                "resume_hf_download",
+                serde_json::json!({"download_id": "missing"}),
+            ),
+            (
+                "cancel_hf_download",
+                serde_json::json!({"download_id": "missing"}),
+            ),
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                api.primary().dispatch(method, params),
+            )
+            .await
+            .expect("closed IPC admission must not start metadata or directory effects");
+            assert!(
+                matches!(result, Err(PumasError::DownloadLifecycleClosed)),
+                "{method}: {result:?}"
+            );
+        }
+        assert!(!api
+            .primary()
+            .model_library
+            .library_root()
+            .join("llm")
+            .exists());
+    }
 
     #[tokio::test]
     async fn interrupted_scan_join_failure_is_not_an_empty_success() {

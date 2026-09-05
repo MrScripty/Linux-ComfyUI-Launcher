@@ -83,6 +83,17 @@ impl CatalogProjection {
         }
     }
 
+    /// Hold the real worker inside an admitted blocking job for shutdown tests.
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(
+        &self,
+    ) -> Result<(oneshot::Receiver<()>, std::sync::mpsc::Sender<()>)> {
+        let (entered, ready) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        self.admit(Job::Gate(entered, blocked))?;
+        Ok((ready, release))
+    }
+
     fn admit(&self, job: Job) -> Result<()> {
         self.admission
             .lock()

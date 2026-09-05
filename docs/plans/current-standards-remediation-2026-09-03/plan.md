@@ -226,13 +226,20 @@ Cancellation predecessor custody is accepted after independent review and dual
 core gates. Interrupting a started finalizer cannot hide unfinished predecessor
 effects or their failures. This does not establish client Drop drainage.
 
-**Next slice:** Implement explicit download shutdown end to end under the
-Rust plan's [shutdown admission](rust-library-and-rpc/plan.md#explicit-download-shutdown-admission).
-It covers core preparation before HF task registration, atomic invocation/task
-custody, interruption projection, and retained RPC shutdown results. The bounded
-design checkpoint is accepted; shutdown runtime evidence remains pending.
-Pending replay still depends on bounded M4 ownership and C4 coordination. No live
-mutation, schema, or old-format support. Cargo/commits stay serial.
+Explicit download shutdown is accepted under the Rust plan's
+[bounded admission](rust-library-and-rpc/plan.md#explicit-download-shutdown-admission).
+Core and IPC preparation share atomic invocation/task custody; real effects and
+final interruption projection drain before retained HF/RPC results. Independent
+reviews, SD-1 through SD-4, dual core/RPC suites, and strict affected lint pass on
+Linux. This supersedes earlier abort-only descriptions for that population, not
+for importers or the application's whole runtime.
+
+**Next slice:** Admit C4 awaited ordinary/restored download-import finalization
+before terminal settlement, with truthful metadata/index failure and notification
+ordering. The focused Rust owner records the exact write set and regressions
+before source changes. Physical-root grants and Pending replay remain held on
+that dependency. No live mutation, schema, or old-format support. Cargo/commits
+stay serial; full C3/M4 and program acceptance remain open.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

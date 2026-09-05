@@ -17,6 +17,18 @@ use tokio::sync::RwLock;
 static REGISTRY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) async fn build_test_api(launcher_root: &Path) -> PumasApi {
+    build_test_api_with_services(launcher_root, false, false).await
+}
+
+pub(crate) async fn build_test_api_with_hf(launcher_root: &Path) -> PumasApi {
+    build_test_api_with_services(launcher_root, true, true).await
+}
+
+async fn build_test_api_with_services(
+    launcher_root: &Path,
+    with_hf_client: bool,
+    with_process_manager: bool,
+) -> PumasApi {
     std::fs::create_dir_all(launcher_root.join("launcher-data")).unwrap();
     let registry_path = launcher_root.join("registry-test").join("registry.db");
     let _registry_guard = REGISTRY_TEST_LOCK
@@ -26,8 +38,8 @@ pub(crate) async fn build_test_api(launcher_root: &Path) -> PumasApi {
     std::env::set_var("PUMAS_REGISTRY_DB_PATH", &registry_path);
     let api = PumasApi::builder(launcher_root)
         .auto_create_dirs(true)
-        .with_hf_client(false)
-        .with_process_manager(false)
+        .with_hf_client(with_hf_client)
+        .with_process_manager(with_process_manager)
         .build()
         .await;
     std::env::remove_var("PUMAS_REGISTRY_DB_PATH");

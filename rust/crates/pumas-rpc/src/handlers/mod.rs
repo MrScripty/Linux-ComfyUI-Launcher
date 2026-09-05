@@ -29,7 +29,7 @@ mod serving_onnx;
 mod shared;
 mod status;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(feature = "inference-plugins")]
 mod torch;
 #[cfg(feature = "inference-plugins")]

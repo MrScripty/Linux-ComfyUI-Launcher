@@ -57,11 +57,18 @@ core gates. A retained observer keeps terminal observation incomplete until
 predecessor effects drain; inherited failures remain observable without failing
 successful new cleanup. Failed observation cannot synthesize absence.
 
-**Next slice:** Implement explicit download shutdown end to end under the
-[shutdown admission](#explicit-download-shutdown-admission): public invocation
-admission, retained task/effect drainage, and the RPC supervisor consuming the
-result. Do not expose a shutdown method before its admission paths are covered.
-The design checkpoint is accepted; runtime evidence remains pending.
+Explicit download shutdown is accepted for the admitted Linux population:
+public Rust and IPC preparation, retained task/effect drainage, final interrupted
+state projection, and the RPC supervisor's shared result. Independent review,
+dual core/RPC suites, strict affected lint, and SD-1 through SD-4 pass. This does
+not accept importer completion, physical-root leases, or whole-runtime teardown.
+
+**Next slice:** Admit C4's awaited download-import finalization for ordinary
+completion and byte-complete restore. Record the exact importer/HF/builder write
+set and deciding regressions before source changes. Importer metadata/index
+success must precede terminal settlement; notification-only callbacks follow
+logical destination release. A queued future or logged import failure is not
+completion. Reuse the lifecycle owner; keep Pending replay and root leases held.
 
 ## Explicit Download Shutdown Admission
 
@@ -126,14 +133,34 @@ claiming completion. No new RPC endpoint, frontend method, or plugin shutdown.
 `rust/crates/pumas-core/src/model_library/hf/{lifecycle,download,mod}.rs` and inline
 tests. Root integrates `rust/crates/pumas-core/src/api/hf.rs`, lifecycle errors in
 `rust/crates/pumas-core/src/error.rs`, and their existing consumer projections.
+The HF owner consolidates duplicate download entry points in
+`rust/crates/pumas-core/src/api/state_hf.rs` onto those shared owned functions;
+local IPC must not retain an independent pre-admission implementation.
 RPC owner writes `rust/crates/pumas-rpc/src/server.rs` and inline tests; adjacent
 `main.rs`, `contract.rs`, and `catalog_projection.rs` changes are limited to this
-shutdown/result contract. The existing exhaustive conversion in
+shutdown/result contract. The existing test-only
+`rust/crates/pumas-rpc/src/handlers/test_support.rs` may share its API setup guard
+with HF-enabled server fixtures: handler fixtures temporarily override the
+process-wide registry path, so independent server construction is not isolated.
+Its declaration in `handlers/mod.rs` may become crate-visible under `cfg(test)`
+for those sibling fixtures, without changing production visibility.
+Keep the real API/HF/server owners and concurrency assertions; no retry, new
+global test lock, whole-test serialization, or production registry change.
+The existing exhaustive conversion in
 `rust/crates/pumas-uniffi/src/bindings.rs` may adapt errors without adding a host
 shutdown surface. Root alone owns these plans/ledgers/issues, Cargo, and commits.
+Root may extend `rust/crates/pumas-core/src/model_library/test_support.rs` under
+its existing explicit fixture feature so RPC tests can hold a real HF-owned
+blocking operation. This is not a production testing endpoint or new scheduler.
+The existing `model_library/mod.rs` may re-export the invocation context within
+the crate for core recovery preparation; it is not a public library export.
+`rust/crates/pumas-core/Cargo.toml` may enable Tokio's existing multithread runtime
+for dev-only fixtures that must acknowledge request cancellation while another
+task is held at a synchronous projection hook; production features are unchanged.
 No library relocation-policy, store/schema, importer, or live-data edits.
 
-**Required evidence** (all pending; automated, representative Linux):
+**Required evidence** (accepted 2026-09-05; automated, representative Linux;
+commands and limitations in the execution ledger):
 
 - `SD-1`, focused: closure versus prepared installation, retired transfer, and
   gated finalizer/projection; no missed effect, new execution, or stranded receipt.
@@ -158,7 +185,9 @@ owner, and RPC owns process teardown. Admission-to-custody transfer and receipt
 completion are required interleavings; separate-map gaps and read-triggered
 post-close work are accidental. Callers know only admission failure and awaited
 shutdown, not registry or gate layout. A new task role changes lifecycle tests;
-a recovery rule changes download policy; RPC error aggregation changes only
+a recovery rule changes download policy; public Rust and IPC download entry
+points delegate the same owned implementation rather than duplicate it;
+RPC error aggregation changes only
 teardown. Core passes a lifecycle Interface, not maps or task handles. These
 concerns can be tested independently, while the real supervisor path proves
 composition. Deleting retained admission/receipt machinery would push joins,
@@ -166,8 +195,8 @@ closure races, and cancellation handling into callers; no new generic scheduler,
 registry mirror, trait hierarchy, or dependency is justified. Necessary lifetime
 coordination replaces scattered tracking inside the existing owner.
 
-**Development decision:** implement. The bounded investigation ends with this
-admission; no additional exploratory prerequisite is selected. Re-plan only if
+**Development decision:** accepted for incremental integration. The bounded
+implementation and its required evidence are complete. Re-plan only if
 a reachable effect falls outside the owned invocation/task population, a caller
 cannot preserve the declared error/read contract, or completion requires C4
 importer ownership. No full C3/M4 or root-lease acceptance is inferred.

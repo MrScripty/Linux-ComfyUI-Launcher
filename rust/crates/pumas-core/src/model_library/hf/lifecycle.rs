@@ -25,6 +25,7 @@ type FallibleBlockingReceiver<T, E> =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TaskRole {
+    Invocation,
     AdmissionTransition,
     RecoveryTransition,
     Worker,
@@ -399,6 +400,7 @@ pub(super) enum ProjectionOutcome {
     Failed,
     Panicked,
     Superseded,
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -570,7 +572,7 @@ impl ProjectionCell {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum BlockingTaskError {
+pub(crate) enum BlockingTaskError {
     StaleGeneration,
     Join(String),
     ResultChannelClosed,
@@ -604,7 +606,28 @@ struct NestedCompletion {
 }
 
 struct RetiredTask {
-    observer: JoinHandle<()>,
+    observer: JoinHandle<usize>,
+}
+
+enum StartGate {
+    Work(oneshot::Sender<()>),
+    Custody(oneshot::Sender<()>),
+}
+
+impl StartGate {
+    fn start(self) {
+        match self {
+            Self::Work(sender) | Self::Custody(sender) => {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    fn drain(self) {
+        if let Self::Custody(sender) = self {
+            let _ = sender.send(());
+        }
+    }
 }
 
 struct TaskEntry {
@@ -616,7 +639,7 @@ struct TaskEntry {
     nested_failures_archived: usize,
     predecessor_failures_archived: usize,
     projection: Option<Arc<ProjectionCell>>,
-    starts: Vec<oneshot::Sender<()>>,
+    starts: Vec<StartGate>,
     superseded_projection: Option<Arc<ProjectionCell>>,
     abort_on_start: Vec<tokio::task::AbortHandle>,
     start_state: Arc<AtomicU8>,
@@ -705,9 +728,7 @@ type ProjectionObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 #[derive(Default)]
 pub(super) struct DownloadTaskOwner {
-    tasks: Mutex<HashMap<String, TaskEntry>>,
-    prepared: Mutex<HashMap<usize, PreparedEntry>>,
-    retired: Mutex<Vec<RetiredTask>>,
+    state: Mutex<OwnerState>,
     retired_observations: AtomicUsize,
     #[cfg(test)]
     blocking_observer: Mutex<Option<BlockingObserver>>,
@@ -733,12 +754,126 @@ pub(super) struct DownloadTaskOwner {
     projection_observer: Mutex<Option<ProjectionObserver>>,
 }
 
+#[derive(Default)]
+struct OwnerState {
+    // Admission, ownership transfers, and shutdown capture share this mutex.
+    // Entries leave these populations only for another registered observer.
+    closed: bool,
+    tasks: HashMap<String, TaskEntry>,
+    prepared: HashMap<usize, PreparedEntry>,
+    retired: Vec<RetiredTask>,
+    retired_failures: usize,
+    shutdown: Option<ShutdownReceipt>,
+    shutdown_driver: Option<JoinHandle<()>>,
+}
+
+struct InvocationWaiter {
+    owner: Arc<DownloadTaskOwner>,
+    id: String,
+    generation: TaskGeneration,
+}
+
+impl Drop for InvocationWaiter {
+    fn drop(&mut self) {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .expect("HF task owner lock poisoned");
+        let start = if state
+            .tasks
+            .get(&self.id)
+            .is_some_and(|entry| entry.generation.matches(&self.generation))
+        {
+            state
+                .tasks
+                .remove(&self.id)
+                .map(|entry| retire_entry(&mut state, entry))
+        } else {
+            None
+        };
+        drop(state);
+        if let Some(start) = start {
+            let _ = start.send(());
+        }
+    }
+}
+
+fn retire_entry(state: &mut OwnerState, mut entry: TaskEntry) -> oneshot::Sender<()> {
+    // The observer is registered in custody before this lock is released.
+    // It is never aborted: blocking descendants must remain owned through join.
+    entry.outer.abort();
+    for abort in entry.abort_on_start.drain(..) {
+        abort.abort();
+    }
+    let (start, started) = oneshot::channel();
+    let observer = tokio::spawn(async move {
+        let _ = started.await;
+        for gate in entry.starts.drain(..) {
+            gate.drain();
+        }
+        drain_shutdown_entry(entry).await
+    });
+    state.retired.push(RetiredTask { observer });
+    start
+}
+
+async fn drain_shutdown_entry(entry: TaskEntry) -> usize {
+    let projection = entry.projection.clone();
+    let superseded = entry.superseded_projection.clone();
+    let role = entry.role;
+    let observed = AssertUnwindSafe(observe_entry(entry, role, false))
+        .catch_unwind()
+        .await;
+    let mut failures = match observed {
+        Ok(observation) => {
+            observation.nested_failures
+                + usize::from(observation.terminal == TaskTerminal::Panicked)
+        }
+        Err(_) => 1,
+    };
+    for cell in [projection, superseded].into_iter().flatten() {
+        // A broken receipt must not drop unrelated entries still awaiting
+        // drain. Retain failure without recovering poisoned projection state.
+        if std::panic::catch_unwind(AssertUnwindSafe(|| {
+            cell.settle(ProjectionOutcome::Shutdown)
+        }))
+        .is_err()
+        {
+            failures += 1;
+        }
+    }
+    failures
+}
+
+#[derive(Clone)]
+pub(super) struct ShutdownReceipt {
+    result: tokio::sync::watch::Receiver<Option<usize>>,
+}
+
+impl ShutdownReceipt {
+    pub(super) async fn wait(mut self) -> crate::Result<()> {
+        loop {
+            if let Some(failures) = *self.result.borrow_and_update() {
+                return if failures == 0 {
+                    Ok(())
+                } else {
+                    Err(crate::PumasError::DownloadShutdownFailed { failures })
+                };
+            }
+            if self.result.changed().await.is_err() {
+                return Err(crate::PumasError::DownloadShutdownFailed { failures: 1 });
+            }
+        }
+    }
+}
+
 impl fmt::Debug for DownloadTaskOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let count = self
-            .tasks
+            .state
             .lock()
-            .map(|tasks| tasks.len())
+            .map(|state| state.tasks.len())
             .unwrap_or_default();
         formatter
             .debug_struct("DownloadTaskOwner")
@@ -747,7 +882,7 @@ impl fmt::Debug for DownloadTaskOwner {
     }
 }
 
-pub(super) struct TaskContext {
+pub(crate) struct TaskContext {
     owner: Weak<DownloadTaskOwner>,
     download_id: String,
     generation: TaskGeneration,
@@ -770,7 +905,6 @@ pub(super) struct PreparedTask {
     download_id: String,
     generation: TaskGeneration,
     role: TaskRole,
-    projection: Option<Arc<ProjectionCell>>,
     start_state: Arc<AtomicU8>,
     armed: bool,
 }
@@ -842,6 +976,159 @@ pub(super) enum CancelPredecessor {
 }
 
 impl DownloadTaskOwner {
+    pub(super) fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("HF task owner lock poisoned")
+            .closed
+    }
+
+    pub(super) fn ensure_open(&self) -> crate::Result<()> {
+        if self.is_closed() {
+            Err(crate::PumasError::DownloadLifecycleClosed)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Owns pre-task preparation independently of its caller. Dropping the
+    /// waiter cancels only this invocation's outer work; registered effects
+    /// remain in retired custody, and installed child generations are untouched.
+    pub(super) async fn run_invocation<T, F, Fut>(
+        self: &Arc<Self>,
+        operation: F,
+    ) -> crate::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = crate::Result<T>> + Send + 'static,
+    {
+        let id = format!("invocation-{}", uuid::Uuid::new_v4());
+        let (sender, receiver) = oneshot::channel();
+        let prepared = self.prepare(
+            id.clone(),
+            TaskRole::Invocation,
+            move |context| async move {
+                let result = operation(context).await;
+                let _ = sender.send(result);
+            },
+        )?;
+        let generation = prepared.generation.clone();
+        let installed = self
+            .install_gated(prepared)
+            .map_err(|_| crate::PumasError::DownloadLifecycleClosed)?;
+        let waiter = InvocationWaiter {
+            owner: self.clone(),
+            id,
+            generation,
+        };
+        installed.start();
+        let result = receiver.await.map_err(|_| {
+            if self.is_closed() {
+                crate::PumasError::DownloadLifecycleClosed
+            } else {
+                crate::PumasError::DownloadShutdownFailed { failures: 1 }
+            }
+        })?;
+        drop(waiter);
+        self.ensure_open()?;
+        result
+    }
+
+    pub(super) async fn shutdown<F, Fut>(self: &Arc<Self>, final_projection: F) -> crate::Result<()>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = crate::Result<()>> + Send + 'static,
+    {
+        self.request_shutdown(final_projection).wait().await
+    }
+
+    /// Permanently closes admission and retains one drain driver. The first
+    /// projection callback wins; every waiter observes the same outcome after
+    /// all captured effects and final projection have completed. This is not
+    /// persisted cleanup confirmation or permission to release queue ownership.
+    pub(super) fn request_shutdown<F, Fut>(self: &Arc<Self>, final_projection: F) -> ShutdownReceipt
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = crate::Result<()>> + Send + 'static,
+    {
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        if let Some(receipt) = &state.shutdown {
+            return receipt.clone();
+        }
+        state.closed = true;
+        // Abort requests do not poll user work. Issue them at the admission
+        // boundary so an already-extracted Work gate cannot start an outer
+        // after closure while the retained driver is still awaiting scheduling.
+        for entry in state.prepared.values() {
+            entry.outer.abort();
+        }
+        for entry in state.tasks.values() {
+            entry.outer.abort();
+            for abort in &entry.abort_on_start {
+                abort.abort();
+            }
+        }
+        let (result, receiver) = tokio::sync::watch::channel(None);
+        let receipt = ShutdownReceipt { result: receiver };
+        state.shutdown = Some(receipt.clone());
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // A search-only client may be dropped outside any executor. This
+            // requests closure but cannot claim an async projection was observed.
+            let _ = result.send(Some(1));
+            return receipt;
+        };
+        let prepared = std::mem::take(&mut state.prepared);
+        let tasks = std::mem::take(&mut state.tasks);
+        let retired = std::mem::take(&mut state.retired);
+        let mut failures = state.retired_failures;
+        let owner = self.clone();
+        let (start, started) = oneshot::channel();
+        state.shutdown_driver = Some(runtime.spawn(async move {
+            let _ = started.await;
+            for (_, entry) in prepared {
+                drop(entry.start);
+                if entry.outer.await.is_err_and(|error| error.is_panic()) {
+                    failures += 1;
+                }
+                if let Some(cell) = entry.projection {
+                    if std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        cell.settle(ProjectionOutcome::Shutdown)
+                    }))
+                    .is_err()
+                    {
+                        failures += 1;
+                    }
+                }
+            }
+            let mut draining = Vec::new();
+            for (_, mut entry) in tasks {
+                for gate in entry.starts.drain(..) {
+                    gate.drain();
+                }
+                draining.push(entry);
+            }
+            for entry in draining {
+                failures += drain_shutdown_entry(entry).await;
+            }
+            for task in retired {
+                failures += task.observer.await.unwrap_or(1);
+            }
+            if !matches!(
+                AssertUnwindSafe(async move { final_projection().await })
+                    .catch_unwind()
+                    .await,
+                Ok(Ok(()))
+            ) {
+                failures += 1;
+            }
+            let _ = result.send(Some(failures));
+            drop(owner);
+        }));
+        drop(state);
+        let _ = start.send(());
+        receipt
+    }
     pub(super) fn new() -> Self {
         Self::default()
     }
@@ -851,11 +1138,29 @@ impl DownloadTaskOwner {
         download_id: String,
         role: TaskRole,
         work: F,
-    ) -> PreparedTask
+    ) -> crate::Result<PreparedTask>
     where
         F: FnOnce(TaskContext) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        self.prepare_with_projection(download_id, role, None, work)
+    }
+
+    fn prepare_with_projection<F, Fut>(
+        self: &Arc<Self>,
+        download_id: String,
+        role: TaskRole,
+        projection: Option<Arc<ProjectionCell>>,
+        work: F,
+    ) -> crate::Result<PreparedTask>
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        if state.closed {
+            return Err(crate::PumasError::DownloadLifecycleClosed);
+        }
         let generation = TaskGeneration::new();
         let context = TaskContext {
             owner: Arc::downgrade(self),
@@ -870,30 +1175,26 @@ impl DownloadTaskOwner {
             }
         });
         let start_state = Arc::new(AtomicU8::new(TaskStartState::Gated as u8));
-        self.prepared
-            .lock()
-            .expect("HF prepared-task owner lock poisoned")
-            .insert(
-                generation.key(),
-                PreparedEntry {
-                    download_id: download_id.clone(),
-                    generation: generation.clone(),
-                    role,
-                    start,
-                    outer,
-                    projection: None,
-                    start_state: start_state.clone(),
-                },
-            );
-        PreparedTask {
+        state.prepared.insert(
+            generation.key(),
+            PreparedEntry {
+                download_id: download_id.clone(),
+                generation: generation.clone(),
+                role,
+                start,
+                outer,
+                projection: projection.clone(),
+                start_state: start_state.clone(),
+            },
+        );
+        Ok(PreparedTask {
             owner: Arc::downgrade(self),
             download_id,
             generation,
             role,
-            projection: None,
             start_state,
             armed: true,
-        }
+        })
     }
 
     pub(super) fn prepare_projection<F, Fut, P, PFut>(
@@ -901,7 +1202,7 @@ impl DownloadTaskOwner {
         download_id: String,
         project: F,
         project_panic: P,
-    ) -> PreparedProjection
+    ) -> crate::Result<PreparedProjection>
     where
         F: FnOnce(TaskContext, Option<TaskObservation>) -> Fut + Send + 'static,
         Fut: Future<Output = ProjectionOutcome> + Send + 'static,
@@ -910,9 +1211,10 @@ impl DownloadTaskOwner {
     {
         let cell = Arc::new(ProjectionCell::new(true));
         let project_cell = cell.clone();
-        let mut task = self.prepare(
+        let task = self.prepare_with_projection(
             download_id,
             TaskRole::TerminalProjection,
+            Some(cell.clone()),
             move |mut context| async move {
                 context.projection_failure = Some(project_cell.clone());
                 let predecessor = project_cell.wait_for_predecessor().await;
@@ -950,15 +1252,8 @@ impl DownloadTaskOwner {
                 }
                 project_cell.settle(outcome);
             },
-        );
-        task.projection = Some(cell.clone());
-        self.prepared
-            .lock()
-            .expect("HF prepared-task owner lock poisoned")
-            .get_mut(&task.generation.key())
-            .expect("prepared projection remains owner-registered")
-            .projection = Some(cell.clone());
-        PreparedProjection { task, cell }
+        )?;
+        Ok(PreparedProjection { task, cell })
     }
 
     /// Installs a prepared task while its start gate remains closed.
@@ -976,23 +1271,14 @@ impl DownloadTaskOwner {
         {
             return Err(prepared);
         }
-        let Some(entry) = self
-            .prepared
-            .lock()
-            .expect("HF prepared-task owner lock poisoned")
-            .remove(&prepared.generation.key())
-        else {
-            return Err(prepared);
-        };
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
-        if tasks.contains_key(&prepared.download_id) {
-            drop(tasks);
-            self.prepared
-                .lock()
-                .expect("HF prepared-task owner lock poisoned")
-                .insert(prepared.generation.key(), entry);
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        if state.closed || state.tasks.contains_key(&prepared.download_id) {
             return Err(prepared);
         }
+        let Some(entry) = state.prepared.remove(&prepared.generation.key()) else {
+            return Err(prepared);
+        };
+        let tasks = &mut state.tasks;
         let download_id = entry.download_id.clone();
         let generation = entry.generation.clone();
         tasks.insert(
@@ -1006,13 +1292,13 @@ impl DownloadTaskOwner {
                 nested_failures_archived: 0,
                 predecessor_failures_archived: 0,
                 projection: entry.projection,
-                starts: vec![entry.start],
+                starts: vec![StartGate::Work(entry.start)],
                 superseded_projection: None,
                 abort_on_start: Vec::new(),
                 start_state: entry.start_state,
             },
         );
-        drop(tasks);
+        drop(state);
         prepared.armed = false;
         Ok(InstalledTask {
             owner: self.clone(),
@@ -1042,9 +1328,10 @@ impl DownloadTaskOwner {
 
     pub(super) fn snapshot(&self, download_id: &str) -> Option<TaskSnapshot> {
         let snapshot = self
-            .tasks
+            .state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .map(|entry| TaskSnapshot {
                 role: entry.role,
@@ -1066,9 +1353,10 @@ impl DownloadTaskOwner {
     }
 
     pub(super) fn active_worker_generation(&self, download_id: &str) -> Option<TaskGeneration> {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .filter(|entry| {
                 entry.role == TaskRole::Worker
@@ -1080,36 +1368,40 @@ impl DownloadTaskOwner {
 
     #[cfg(test)]
     fn generation_for_test(&self, download_id: &str) -> Option<TaskGeneration> {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .map(|entry| entry.generation.clone())
     }
 
     #[cfg(test)]
     fn nested_count_for_test(&self, download_id: &str) -> Option<usize> {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .map(|entry| entry.nested.len())
     }
 
     #[cfg(test)]
     pub(super) fn outer_finished_for_test(&self, download_id: &str) -> bool {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .is_some_and(|entry| entry.outer.is_finished())
     }
 
     #[cfg(test)]
     fn prepared_count_for_test(&self) -> usize {
-        self.prepared
+        self.state
             .lock()
-            .expect("HF prepared-task owner lock poisoned")
+            .expect("HF task owner lock poisoned")
+            .prepared
             .len()
     }
 
@@ -1122,9 +1414,10 @@ impl DownloadTaskOwner {
         download_id: &str,
         generation: &TaskGeneration,
     ) -> bool {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .is_some_and(|entry| entry.generation.matches(generation))
     }
@@ -1135,16 +1428,18 @@ impl DownloadTaskOwner {
         generation: &TaskGeneration,
         role: TaskRole,
     ) -> bool {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .is_some_and(|entry| entry.generation.matches(generation) && entry.role == role)
     }
 
     /// Called under the download-state commit lock after durable confirmation.
     pub(super) fn promote_admission(&self, download_id: &str, generation: &TaskGeneration) -> bool {
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        let tasks = &mut state.tasks;
         let Some(entry) = tasks.get_mut(download_id) else {
             return false;
         };
@@ -1162,7 +1457,8 @@ impl DownloadTaskOwner {
         identity: PendingAdmissionIdentity,
         completed: tokio::sync::watch::Receiver<bool>,
     ) {
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        let tasks = &mut state.tasks;
         if let Some(entry) = tasks
             .get_mut(download_id)
             .filter(|entry| entry.generation.matches(generation))
@@ -1175,9 +1471,10 @@ impl DownloadTaskOwner {
         &self,
         identity: &PendingAdmissionIdentity,
     ) -> Option<(String, tokio::sync::watch::Receiver<bool>)> {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .iter()
             .find_map(|(id, entry)| {
                 if entry.role != TaskRole::AdmissionTransition {
@@ -1196,9 +1493,10 @@ impl DownloadTaskOwner {
         download_id: &str,
         identity: &PendingAdmissionIdentity,
     ) -> Option<(TaskGeneration, tokio::sync::watch::Receiver<bool>)> {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .get(download_id)
             .filter(|entry| entry.role == TaskRole::RecoveryTransition)
             .and_then(|entry| {
@@ -1212,19 +1510,22 @@ impl DownloadTaskOwner {
 
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .is_empty()
     }
 
     pub(super) fn ids(&self) -> Vec<String> {
         let ids = self
-            .tasks
+            .state
             .lock()
             .expect("HF task owner lock poisoned")
-            .keys()
-            .cloned()
+            .tasks
+            .iter()
+            .filter(|(_, entry)| entry.role != TaskRole::Invocation)
+            .map(|(id, _)| id.clone())
             .collect();
         #[cfg(test)]
         let observer = self
@@ -1246,7 +1547,7 @@ impl DownloadTaskOwner {
         self: &Arc<Self>,
         download_id: &str,
         finish: F,
-    ) -> CancelTransition
+    ) -> crate::Result<CancelTransition>
     where
         F: FnOnce(TaskContext, CancelPredecessor) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -1262,30 +1563,39 @@ impl DownloadTaskOwner {
                 observer();
             }
         }
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        if state.closed {
+            return Err(crate::PumasError::DownloadLifecycleClosed);
+        }
+        let tasks = &mut state.tasks;
         if let Some(current) = tasks.get_mut(download_id) {
             if current.role == TaskRole::CancelFinalizer && !current.finished() {
-                return if TaskStartState::load(&current.start_state) == TaskStartState::Running {
-                    CancelTransition::AlreadyRunning
-                } else {
-                    CancelTransition::Existing(InstalledTask {
-                        owner: self.clone(),
-                        download_id: download_id.to_string(),
-                        generation: current.generation.clone(),
-                        start_state: current.start_state.clone(),
-                    })
-                };
+                return Ok(
+                    if TaskStartState::load(&current.start_state) == TaskStartState::Running {
+                        CancelTransition::AlreadyRunning
+                    } else {
+                        CancelTransition::Existing(InstalledTask {
+                            owner: self.clone(),
+                            download_id: download_id.to_string(),
+                            generation: current.generation.clone(),
+                            start_state: current.start_state.clone(),
+                        })
+                    },
+                );
             }
         }
         let mut current = tasks.remove(download_id);
         let outer_finished_before_replacement = current
             .as_ref()
             .is_some_and(|entry| entry.outer.is_finished());
-        let abort_on_start = current
+        let mut abort_on_start: Vec<_> = current
             .as_ref()
             .map(|entry| entry.outer.abort_handle())
             .into_iter()
             .collect();
+        if let Some(entry) = current.as_mut() {
+            abort_on_start.append(&mut entry.abort_on_start);
+        }
         let superseded_projection = current.as_ref().and_then(|entry| {
             entry
                 .projection
@@ -1348,27 +1658,28 @@ impl DownloadTaskOwner {
                 projection: None,
                 starts: predecessor_starts
                     .into_iter()
-                    .chain(std::iter::once(predecessor_start))
-                    .chain(std::iter::once(start))
+                    .chain(std::iter::once(StartGate::Custody(predecessor_start)))
+                    .chain(std::iter::once(StartGate::Work(start)))
                     .collect(),
                 superseded_projection,
                 abort_on_start,
                 start_state: start_state.clone(),
             },
         );
-        drop(tasks);
-        CancelTransition::Started(InstalledTask {
+        drop(state);
+        Ok(CancelTransition::Started(InstalledTask {
             owner: self.clone(),
             download_id: download_id.to_string(),
             generation,
             start_state,
-        })
+        }))
     }
 
     #[cfg(test)]
     pub(super) async fn observe_finished(&self, download_id: &str) -> Option<TaskObservation> {
         let entry = {
-            let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+            let mut state = self.state.lock().expect("HF task owner lock poisoned");
+            let tasks = &mut state.tasks;
             if !tasks.get(download_id).is_some_and(TaskEntry::finished) {
                 return None;
             }
@@ -1378,13 +1689,15 @@ impl DownloadTaskOwner {
         Some(observe_entry(entry, role, false).await)
     }
 
+    #[cfg(test)]
     pub(super) async fn observe_finished_generation(
         &self,
         download_id: &str,
         generation: &TaskGeneration,
     ) -> Option<TaskObservation> {
         let entry = {
-            let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+            let mut state = self.state.lock().expect("HF task owner lock poisoned");
+            let tasks = &mut state.tasks;
             if !tasks
                 .get(download_id)
                 .is_some_and(|entry| entry.generation.matches(generation) && entry.finished())
@@ -1398,13 +1711,15 @@ impl DownloadTaskOwner {
     }
 
     pub(super) fn finished_or_projecting_ids(&self) -> Vec<String> {
-        self.tasks
+        self.state
             .lock()
             .expect("HF task owner lock poisoned")
+            .tasks
             .iter()
             .filter_map(|(download_id, entry)| {
-                (entry.role == TaskRole::TerminalProjection || entry.finished())
-                    .then_some(download_id.clone())
+                (entry.role != TaskRole::Invocation
+                    && (entry.role == TaskRole::TerminalProjection || entry.finished()))
+                .then_some(download_id.clone())
             })
             .collect()
     }
@@ -1419,16 +1734,20 @@ impl DownloadTaskOwner {
         inherit_failure: bool,
         project: F,
         project_panic: P,
-    ) -> ProjectionTransition
+    ) -> crate::Result<ProjectionTransition>
     where
         F: FnOnce(TaskContext, Option<TaskObservation>) -> Fut + Send + 'static,
         Fut: Future<Output = ProjectionOutcome> + Send + 'static,
         P: FnOnce(TaskContext) -> PFut + Send + 'static,
         PFut: Future<Output = ProjectionOutcome> + Send + 'static,
     {
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        if state.closed {
+            return Err(crate::PumasError::DownloadLifecycleClosed);
+        }
+        let tasks = &mut state.tasks;
         let Some(current) = tasks.get_mut(download_id) else {
-            return ProjectionTransition::NotReady;
+            return Ok(ProjectionTransition::NotReady);
         };
         if current.role == TaskRole::TerminalProjection {
             let cell = current
@@ -1436,7 +1755,7 @@ impl DownloadTaskOwner {
                 .clone()
                 .expect("terminal projection owns a projection cell");
             let generation = current.generation.clone();
-            return ProjectionTransition::Existing(InstalledProjection {
+            return Ok(ProjectionTransition::Existing(InstalledProjection {
                 task: InstalledTask {
                     owner: self.clone(),
                     download_id: download_id.to_string(),
@@ -1448,10 +1767,10 @@ impl DownloadTaskOwner {
                     generation,
                     cell,
                 },
-            });
+            }));
         }
         if !current.finished() {
-            return ProjectionTransition::NotReady;
+            return Ok(ProjectionTransition::NotReady);
         }
 
         let predecessor = tasks
@@ -1558,20 +1877,23 @@ impl DownloadTaskOwner {
                 nested_failures_archived: 0,
                 predecessor_failures_archived: 0,
                 projection: Some(cell.clone()),
-                starts: vec![predecessor_start, project_start],
+                starts: vec![
+                    StartGate::Custody(predecessor_start),
+                    StartGate::Work(project_start),
+                ],
                 superseded_projection: None,
                 abort_on_start: Vec::new(),
                 start_state: start_state.clone(),
             },
         );
-        drop(tasks);
+        drop(state);
 
         let ticket = ProjectionTicket {
             download_id: download_id.to_string(),
             generation: generation.clone(),
             cell,
         };
-        ProjectionTransition::Started(InstalledProjection {
+        Ok(ProjectionTransition::Started(InstalledProjection {
             task: InstalledTask {
                 owner: self.clone(),
                 download_id: download_id.to_string(),
@@ -1579,11 +1901,12 @@ impl DownloadTaskOwner {
                 start_state,
             },
             ticket,
-        })
+        }))
     }
 
     pub(super) fn settle_projection(&self, ticket: &ProjectionTicket) -> ProjectionSettlement {
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        let tasks = &mut state.tasks;
         let Some(entry) = tasks.get(&ticket.download_id) else {
             return if ticket.cell.is_settled() {
                 ProjectionSettlement::AlreadySettled
@@ -1606,26 +1929,14 @@ impl DownloadTaskOwner {
             return ProjectionSettlement::Pending;
         }
         ticket.cell.mark_settled();
-        let _ = tasks.remove(&ticket.download_id);
-        ProjectionSettlement::Settled
-    }
-
-    /// Requests shutdown without claiming that task or filesystem work has
-    /// already drained. Full client shutdown observation belongs to M4.
-    pub(super) fn abort_all(&self) {
-        let tasks = self
-            .tasks
-            .lock()
-            .expect("HF task owner lock poisoned")
-            .drain()
-            .map(|(_, entry)| entry)
-            .collect::<Vec<_>>();
-        for entry in tasks {
-            entry.outer.abort();
-            for nested in entry.nested {
-                nested.handle.abort();
-            }
+        let start = tasks
+            .remove(&ticket.download_id)
+            .map(|entry| retire_entry(&mut state, entry));
+        drop(state);
+        if let Some(start) = start {
+            let _ = start.send(());
         }
+        ProjectionSettlement::Settled
     }
 
     fn promote_generation(
@@ -1634,7 +1945,8 @@ impl DownloadTaskOwner {
         generation: &TaskGeneration,
         role: TaskRole,
     ) -> bool {
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        let tasks = &mut state.tasks;
         let Some(entry) = tasks.get_mut(download_id) else {
             return false;
         };
@@ -1647,7 +1959,11 @@ impl DownloadTaskOwner {
 
     fn start_generation(&self, download_id: &str, generation: &TaskGeneration) -> bool {
         let (aborts, superseded_projection, starts) = {
-            let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+            let mut state = self.state.lock().expect("HF task owner lock poisoned");
+            if state.closed {
+                return false;
+            }
+            let tasks = &mut state.tasks;
             let Some(entry) = tasks.get_mut(download_id) else {
                 return false;
             };
@@ -1670,7 +1986,7 @@ impl DownloadTaskOwner {
             cell.settle(ProjectionOutcome::Superseded);
         }
         for start in starts {
-            let _ = start.send(());
+            start.start();
         }
         true
     }
@@ -1681,125 +1997,83 @@ impl DownloadTaskOwner {
     /// that they ever ran.
     pub(super) fn rescue_abandoned(&self) {
         self.reap_retired();
-        let abandoned_prepared = {
-            let mut prepared = self
-                .prepared
-                .lock()
-                .expect("HF prepared-task owner lock poisoned");
-            let abandoned = prepared
-                .iter()
-                .filter_map(|(key, entry)| {
-                    (TaskStartState::load(&entry.start_state) == TaskStartState::Abandoned)
-                        .then_some(*key)
-                })
-                .collect::<Vec<_>>();
-            abandoned
-                .into_iter()
-                .filter_map(|key| prepared.remove(&key))
-                .collect::<Vec<_>>()
-        };
-        for entry in abandoned_prepared {
-            let abort = entry.outer.abort_handle();
-            abort.abort();
-            drop(entry.start);
-            self.retain_retired(entry.outer, Vec::new());
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        if state.closed {
+            return;
         }
-        let (to_start, to_abort) = {
-            let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
-            let mut to_start = Vec::new();
-            let mut abort_ids = Vec::new();
-            for (download_id, entry) in tasks.iter_mut() {
-                if TaskStartState::load(&entry.start_state) != TaskStartState::Abandoned {
-                    continue;
-                }
-                if matches!(
-                    entry.role,
-                    TaskRole::TerminalProjection | TaskRole::CancelFinalizer
-                ) {
-                    entry
-                        .start_state
-                        .store(TaskStartState::Running as u8, Ordering::Release);
-                    to_start.push((
-                        std::mem::take(&mut entry.abort_on_start),
-                        entry.superseded_projection.clone(),
-                        std::mem::take(&mut entry.starts),
-                    ));
-                } else {
-                    abort_ids.push(download_id.clone());
-                }
-            }
-            let to_abort = abort_ids
-                .into_iter()
-                .filter_map(|download_id| tasks.remove(&download_id))
-                .collect::<Vec<_>>();
-            (to_start, to_abort)
-        };
-        for (aborts, superseded_projection, starts) in to_start {
-            for abort in aborts {
-                abort.abort();
-            }
-            if let Some(cell) = superseded_projection {
-                cell.settle(ProjectionOutcome::Superseded);
-            }
-            for start in starts {
-                let _ = start.send(());
+        let mut retired_starts = Vec::new();
+        let keys = state
+            .prepared
+            .iter()
+            .filter_map(|(key, entry)| {
+                (TaskStartState::load(&entry.start_state) == TaskStartState::Abandoned)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(entry) = state.prepared.remove(&key) {
+                entry.outer.abort();
+                let (start, started) = oneshot::channel();
+                let observer = tokio::spawn(async move {
+                    let _ = started.await;
+                    drop(entry.start);
+                    let failures =
+                        usize::from(entry.outer.await.is_err_and(|error| error.is_panic()));
+                    if let Some(cell) = entry.projection {
+                        cell.settle(ProjectionOutcome::Shutdown);
+                    }
+                    failures
+                });
+                state.retired.push(RetiredTask { observer });
+                retired_starts.push(start);
             }
         }
-        for entry in to_abort {
-            let TaskEntry {
-                outer,
-                nested,
-                starts,
-                ..
-            } = entry;
-            let outer_abort = outer.abort_handle();
-            let nested_aborts = nested
-                .iter()
-                .map(|nested| nested.handle.abort_handle())
-                .collect::<Vec<_>>();
-            outer_abort.abort();
-            for abort in nested_aborts {
-                abort.abort();
+        let mut starts = Vec::new();
+        let mut removals = Vec::new();
+        for (id, entry) in &state.tasks {
+            if TaskStartState::load(&entry.start_state) != TaskStartState::Abandoned {
+                continue;
             }
-            drop(starts);
-            self.retain_retired(outer, nested);
+            if matches!(
+                entry.role,
+                TaskRole::TerminalProjection | TaskRole::CancelFinalizer
+            ) {
+                starts.push((id.clone(), entry.generation.clone()));
+            } else {
+                removals.push(id.clone());
+            }
         }
-    }
-
-    fn retain_retired(&self, outer: JoinHandle<()>, nested: Vec<NestedTask>) {
-        let observer = tokio::spawn(async move {
-            let _ = outer.await;
-            let _ = observe_nested(nested).await;
-        });
-        self.retired
-            .lock()
-            .expect("HF retired-task owner lock poisoned")
-            .push(RetiredTask { observer });
+        for id in removals {
+            if let Some(entry) = state.tasks.remove(&id) {
+                retired_starts.push(retire_entry(&mut state, entry));
+            }
+        }
+        drop(state);
+        for start in retired_starts {
+            let _ = start.send(());
+        }
+        for (id, generation) in starts {
+            self.start_generation(&id, &generation);
+        }
     }
 
     fn reap_retired(&self) {
-        loop {
-            let task = {
-                let mut retired = self
-                    .retired
-                    .lock()
-                    .expect("HF retired-task owner lock poisoned");
-                retired
-                    .iter()
-                    .position(|task| task.observer.is_finished())
-                    .map(|index| retired.swap_remove(index))
-            };
-            let Some(mut task) = task else {
-                break;
-            };
-            if (&mut task.observer).now_or_never().is_some() {
-                self.retired_observations.fetch_add(1, Ordering::AcqRel);
-            } else {
-                self.retired
-                    .lock()
-                    .expect("HF retired-task owner lock poisoned")
-                    .push(task);
-                break;
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        while let Some(index) = state
+            .retired
+            .iter()
+            .position(|task| task.observer.is_finished())
+        {
+            let mut task = state.retired.swap_remove(index);
+            match (&mut task.observer).now_or_never() {
+                Some(result) => {
+                    state.retired_failures += result.unwrap_or(1);
+                    self.retired_observations.fetch_add(1, Ordering::AcqRel);
+                }
+                None => {
+                    state.retired.push(task);
+                    break;
+                }
             }
         }
     }
@@ -1807,9 +2081,10 @@ impl DownloadTaskOwner {
     #[cfg(test)]
     pub(super) fn outstanding_retired_for_test(&self) -> usize {
         self.reap_retired();
-        self.retired
+        self.state
             .lock()
-            .expect("HF retired-task owner lock poisoned")
+            .expect("HF task owner lock poisoned")
+            .retired
             .len()
     }
 
@@ -1869,7 +2144,11 @@ impl DownloadTaskOwner {
     {
         #[cfg(not(test))]
         let _ = operation;
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+        if state.closed {
+            return Err(BlockingTaskError::StaleGeneration);
+        }
+        let tasks = &mut state.tasks;
         let Some(entry) = tasks.get_mut(download_id) else {
             return Err(BlockingTaskError::StaleGeneration);
         };
@@ -1933,7 +2212,7 @@ impl DownloadTaskOwner {
             completion,
             failure_kind: NestedFailureKind::Effect,
         });
-        drop(tasks);
+        drop(state);
         let _ = start_sender.send(());
         Ok(result_receiver)
     }
@@ -2056,7 +2335,8 @@ impl DownloadTaskOwner {
         generation: &TaskGeneration,
     ) -> std::result::Result<usize, BlockingTaskError> {
         let (_archived_failures, completions) = {
-            let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+            let mut state = self.state.lock().expect("HF task owner lock poisoned");
+            let tasks = &mut state.tasks;
             let Some(entry) = tasks.get_mut(download_id) else {
                 return Err(BlockingTaskError::StaleGeneration);
             };
@@ -2086,7 +2366,8 @@ impl DownloadTaskOwner {
         let _ = wait_for_nested(&completions).await;
         loop {
             let completed = {
-                let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
+                let mut state = self.state.lock().expect("HF task owner lock poisoned");
+                let tasks = &mut state.tasks;
                 let Some(entry) = tasks.get_mut(download_id) else {
                     return Err(BlockingTaskError::StaleGeneration);
                 };
@@ -2111,6 +2392,71 @@ impl DownloadTaskOwner {
 }
 
 impl TaskContext {
+    /// Registers an async effect whose internal work must survive cancellation
+    /// of the invoking future. Like blocking effects, this observer is joined,
+    /// never aborted, by lifecycle shutdown.
+    pub(crate) async fn run_fallible_async_named<T, E, F, Fut>(
+        &self,
+        _operation: &'static str,
+        function: F,
+    ) -> std::result::Result<std::result::Result<T, E>, BlockingTaskError>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+    {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or(BlockingTaskError::StaleGeneration)?;
+        let receiver = {
+            let mut state = owner.state.lock().expect("HF task owner lock poisoned");
+            if state.closed {
+                return Err(BlockingTaskError::StaleGeneration);
+            }
+            let entry = state
+                .tasks
+                .get_mut(&self.download_id)
+                .filter(|entry| entry.generation.matches(&self.generation))
+                .ok_or(BlockingTaskError::StaleGeneration)?;
+            entry.reap_completed_nested();
+            let (start, started) = oneshot::channel();
+            let (sender, receiver) = oneshot::channel();
+            let completion = Arc::new(NestedCompletion {
+                finished: AtomicBool::new(false),
+                failed: AtomicBool::new(false),
+                notify: Notify::new(),
+            });
+            let observed = completion.clone();
+            let handle = tokio::spawn(async move {
+                let _ = started.await;
+                let result = AssertUnwindSafe(async move { function().await })
+                    .catch_unwind()
+                    .await
+                    .map_err(|_| "owned async effect panicked".to_string());
+                if !matches!(&result, Ok(Ok(_))) {
+                    observed.failed.store(true, Ordering::Release);
+                }
+                let _ = sender.send(result);
+                observed.finished.store(true, Ordering::Release);
+                observed.notify.notify_waiters();
+            });
+            entry.nested.push(NestedTask {
+                handle,
+                completion,
+                failure_kind: NestedFailureKind::Effect,
+            });
+            drop(state);
+            let _ = start.send(());
+            receiver
+        };
+        receiver
+            .await
+            .map_err(|_| BlockingTaskError::ResultChannelClosed)?
+            .map_err(BlockingTaskError::Join)
+    }
+
     pub(super) async fn pause_requested(&self, pause_flag: &AtomicBool) {
         loop {
             let notified = self.generation.0.notified();
@@ -2215,7 +2561,7 @@ impl TaskContext {
             .map_err(BlockingTaskError::Join)
     }
 
-    pub(super) async fn run_fallible_blocking_named<T, E, F>(
+    pub(crate) async fn run_fallible_blocking_named<T, E, F>(
         &self,
         operation: &'static str,
         function: F,
@@ -2478,6 +2824,279 @@ async fn wait_for_nested(completions: &[Arc<NestedCompletion>]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_rejects_work_whose_start_gate_was_already_extracted() {
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let ran = Arc::new(AtomicBool::new(false));
+        let marker = ran.clone();
+        let prepared = owner
+            .prepare("in-flight".into(), TaskRole::Worker, move |_| async move {
+                marker.store(true, Ordering::Release);
+            })
+            .unwrap();
+        let installed = owner.install_gated(prepared).unwrap();
+        // This is start_generation's in-flight custody after its coordination
+        // lock is released but before its gate sends reach the outer task.
+        let gates = {
+            let mut state = owner.state.lock().unwrap();
+            let entry = state.tasks.get_mut("in-flight").unwrap();
+            entry
+                .start_state
+                .store(TaskStartState::Running as u8, Ordering::Release);
+            std::mem::take(&mut entry.starts)
+        };
+        let receipt = owner.request_shutdown(|| async { Ok(()) });
+        for gate in gates {
+            gate.start();
+        }
+        drop(installed);
+        receipt.wait().await.unwrap();
+        assert!(!ran.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_starts_gated_predecessor_custody_but_never_cancel_cleanup() {
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = owner
+            .prepare(
+                "worker".into(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let _ = context
+                        .run_fallible_blocking_named("held predecessor", move || {
+                            let _ = entered.send(());
+                            released.recv().unwrap();
+                            Ok::<_, ()>(())
+                        })
+                        .await;
+                },
+            )
+            .unwrap();
+        owner.install_gated(worker).unwrap().start();
+        entered_rx.await.unwrap();
+        let cleanup_ran = Arc::new(AtomicBool::new(false));
+        let cleanup_marker = cleanup_ran.clone();
+        let finalizer = owner
+            .begin_cancel("worker", move |_, _| async move {
+                cleanup_marker.store(true, Ordering::Release);
+            })
+            .unwrap();
+        let receipt = owner.request_shutdown(|| async { Ok(()) });
+        drop(finalizer);
+        let mut waiting = Box::pin(receipt.wait());
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert!(!cleanup_ran.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cleanup_ran.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_async_effect_error_and_panic_after_caller_disappears() {
+        for panic in [false, true] {
+            let owner = Arc::new(DownloadTaskOwner::new());
+            let (entered, entered_rx) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let caller_owner = owner.clone();
+            let caller = tokio::spawn(async move {
+                caller_owner
+                    .run_invocation(move |context| async move {
+                        let _ = context
+                            .run_fallible_async_named("failing async effect", move || async move {
+                                let _ = entered.send(());
+                                released.await.unwrap();
+                                assert!(!panic, "injected async effect panic");
+                                Err::<(), _>("injected async effect error")
+                            })
+                            .await;
+                        Ok(())
+                    })
+                    .await
+            });
+            entered_rx.await.unwrap();
+            caller.abort();
+            let _ = caller.await;
+            let receipt = owner.request_shutdown(|| async { Ok(()) });
+            release.send(()).unwrap();
+            assert!(matches!(
+                receipt.wait().await,
+                Err(crate::PumasError::DownloadShutdownFailed { failures: 1 })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_prepared_and_installed_work_without_starting_it() {
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let ran = Arc::new(AtomicUsize::new(0));
+        let prepared = owner
+            .prepare("prepared".into(), TaskRole::Worker, {
+                let ran = ran.clone();
+                move |_| async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .unwrap();
+        let installed = owner
+            .install_gated(
+                owner
+                    .prepare("installed".into(), TaskRole::Worker, {
+                        let ran = ran.clone();
+                        move |_| async move {
+                            ran.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        let projection = owner
+            .install_projection_gated(
+                owner
+                    .prepare_projection(
+                        "projection".into(),
+                        |_, _| async { panic!("gated projection must not run") },
+                        |_| async { ProjectionOutcome::Failed },
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+        let ticket = projection.ticket.clone();
+        let receipt = owner.request_shutdown(|| async { Ok(()) });
+        assert!(owner.is_closed());
+        assert!(owner.install_gated(prepared).is_err());
+        installed.start();
+        drop(projection);
+        assert!(matches!(
+            owner.prepare("late".into(), TaskRole::Worker, |_| async {}),
+            Err(crate::PumasError::DownloadLifecycleClosed)
+        ));
+        assert!(matches!(
+            owner.begin_cancel("late", |_, _| async {}),
+            Err(crate::PumasError::DownloadLifecycleClosed)
+        ));
+        receipt.wait().await.unwrap();
+        assert_eq!(ticket.wait().await, ProjectionOutcome::Shutdown);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_cancelled_invocation_effect_and_shared_failure_receipt() {
+        for outcome in 0..3 {
+            let owner = Arc::new(DownloadTaskOwner::new());
+            let weak = Arc::downgrade(&owner);
+            let (entered, entered_rx) = oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let completed = Arc::new(AtomicBool::new(false));
+            let effect_completed = completed.clone();
+            let caller_owner = owner.clone();
+            let caller = tokio::spawn(async move {
+                caller_owner
+                    .run_invocation(move |context| async move {
+                        context
+                            .run_fallible_blocking_named("shutdown held effect", move || {
+                                let _ = entered.send(());
+                                released.recv().unwrap();
+                                effect_completed.store(true, Ordering::Release);
+                                match outcome {
+                                    0 => Ok(()),
+                                    1 => Err("effect failed"),
+                                    _ => panic!("effect panicked"),
+                                }
+                            })
+                            .await
+                            .map_err(|_| crate::PumasError::DownloadShutdownFailed { failures: 1 })?
+                            .map_err(|_| crate::PumasError::DownloadShutdownFailed { failures: 1 })
+                    })
+                    .await
+            });
+            entered_rx.await.unwrap();
+            caller.abort();
+            let _ = caller.await;
+            let projected = Arc::new(AtomicUsize::new(0));
+            let final_projected = projected.clone();
+            let final_completed = completed.clone();
+            let receipt = owner.request_shutdown(move || async move {
+                assert!(final_completed.load(Ordering::Acquire));
+                final_projected.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            let repeated =
+                owner.request_shutdown(|| async { panic!("only first projection executes") });
+            let mut waiter = Box::pin(receipt.clone().wait());
+            assert!(futures::poll!(&mut waiter).is_pending());
+            drop(waiter);
+            drop(owner);
+            assert!(
+                weak.upgrade().is_some(),
+                "driver retains the lifecycle owner"
+            );
+            assert!(!completed.load(Ordering::Acquire));
+            release.send(()).unwrap();
+            let result = receipt.wait().await;
+            let repeat_result = repeated.wait().await;
+            if outcome == 0 {
+                result.unwrap();
+                repeat_result.unwrap();
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(crate::PumasError::DownloadShutdownFailed { failures: 1 })
+                ));
+                assert!(matches!(
+                    repeat_result,
+                    Err(crate::PumasError::DownloadShutdownFailed { failures: 1 })
+                ));
+            }
+            assert_eq!(projected.load(Ordering::SeqCst), 1);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while weak.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_owned_async_effect_after_invocation_abort() {
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let caller_owner = owner.clone();
+        let caller = tokio::spawn(async move {
+            caller_owner
+                .run_invocation(move |context| async move {
+                    context
+                        .run_fallible_async_named("held async effect", move || async move {
+                            let _ = entered.send(());
+                            released.await.unwrap();
+                            Ok::<_, ()>(())
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        let receipt = owner.request_shutdown(|| async { Ok(()) });
+        assert!(matches!(
+            caller.await.unwrap(),
+            Err(crate::PumasError::DownloadLifecycleClosed)
+        ));
+        let mut pending = Box::pin(receipt.clone().wait());
+        assert!(futures::poll!(&mut pending).is_pending());
+        release.send(()).unwrap();
+        pending.await.unwrap();
+    }
+
     fn queue_destination() -> (tempfile::TempDir, DestinationIdentity) {
         let root = tempfile::TempDir::new().unwrap();
         let authority =
@@ -2538,14 +3157,16 @@ mod tests {
         );
         assert!(owner.contains(download_id));
         let (acknowledged_sender, acknowledged) = oneshot::channel();
-        let transition = owner.begin_cancel(download_id, move |context, predecessor| async move {
-            let CancelPredecessor::Observed(observation) = predecessor else {
-                panic!("failed projector must remain predecessor custody");
-            };
-            assert!(observation.nested_failures > 0);
-            assert!(context.complete_transferred_projection(true));
-            let _ = acknowledged_sender.send(());
-        });
+        let transition = owner
+            .begin_cancel(download_id, move |context, predecessor| async move {
+                let CancelPredecessor::Observed(observation) = predecessor else {
+                    panic!("failed projector must remain predecessor custody");
+                };
+                assert!(observation.nested_failures > 0);
+                assert!(context.complete_transferred_projection(true));
+                let _ = acknowledged_sender.send(());
+            })
+            .unwrap();
         let finalizer = match transition {
             CancelTransition::Started(finalizer) => finalizer,
             _ => panic!("failed projector must be replaced by one finalizer"),
@@ -2584,13 +3205,15 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let ran = Arc::new(AtomicBool::new(false));
         let ran_in_task = ran.clone();
-        let prepared = owner.prepare(
-            "download".to_string(),
-            TaskRole::Worker,
-            move |_| async move {
-                ran_in_task.store(true, Ordering::SeqCst);
-            },
-        );
+        let prepared = owner
+            .prepare(
+                "download".to_string(),
+                TaskRole::Worker,
+                move |_| async move {
+                    ran_in_task.store(true, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
 
         tokio::task::yield_now().await;
         assert!(!ran.load(Ordering::SeqCst));
@@ -2622,9 +3245,11 @@ mod tests {
             let owner = Arc::new(DownloadTaskOwner::new());
             let ran = Arc::new(AtomicBool::new(false));
             let ran_in_task = ran.clone();
-            let prepared = owner.prepare("download".to_string(), role, move |_| async move {
-                ran_in_task.store(true, Ordering::SeqCst);
-            });
+            let prepared = owner
+                .prepare("download".to_string(), role, move |_| async move {
+                    ran_in_task.store(true, Ordering::SeqCst);
+                })
+                .unwrap();
             let installed = owner.install_gated(prepared).unwrap();
             assert!(owner.contains("download"));
             drop(installed);
@@ -2650,18 +3275,20 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let ran = Arc::new(AtomicBool::new(false));
         let ran_in_projection = ran.clone();
-        let prepared = owner.prepare_projection(
-            "download".to_string(),
-            move |_, predecessor| {
-                let ran = ran_in_projection.clone();
-                async move {
-                    assert!(predecessor.is_none());
-                    ran.store(true, Ordering::SeqCst);
-                    ProjectionOutcome::Committed
-                }
-            },
-            |_| async { ProjectionOutcome::Failed },
-        );
+        let prepared = owner
+            .prepare_projection(
+                "download".to_string(),
+                move |_, predecessor| {
+                    let ran = ran_in_projection.clone();
+                    async move {
+                        assert!(predecessor.is_none());
+                        ran.store(true, Ordering::SeqCst);
+                        ProjectionOutcome::Committed
+                    }
+                },
+                |_| async { ProjectionOutcome::Failed },
+            )
+            .unwrap();
         let InstalledProjection { task, ticket } =
             owner.install_projection_gated(prepared).unwrap();
 
@@ -2688,17 +3315,20 @@ mod tests {
     async fn abandoned_prepared_collision_is_inert_until_explicit_rescue() {
         for rejected_role in [TaskRole::Worker, TaskRole::RecoveryTransition] {
             let owner = Arc::new(DownloadTaskOwner::new());
-            let first = owner.prepare("download".to_string(), TaskRole::Worker, |_| async {
-                std::future::pending::<()>().await;
-            });
+            let first = owner
+                .prepare("download".to_string(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await;
+                })
+                .unwrap();
             owner.install_gated(first).unwrap().start();
 
             let ran = Arc::new(AtomicBool::new(false));
             let ran_in_task = ran.clone();
-            let second =
-                owner.prepare("download".to_string(), rejected_role, move |_| async move {
+            let second = owner
+                .prepare("download".to_string(), rejected_role, move |_| async move {
                     ran_in_task.store(true, Ordering::SeqCst);
-                });
+                })
+                .unwrap();
             let rejected = owner.install_gated(second).unwrap_err();
             drop(rejected);
             tokio::task::yield_now().await;
@@ -2722,11 +3352,13 @@ mod tests {
     #[tokio::test]
     async fn projection_settlement_distinguishes_duplicate_stale_and_missing() {
         let owner = Arc::new(DownloadTaskOwner::new());
-        let prepared = owner.prepare_projection(
-            "projection".to_string(),
-            |_, _| async { ProjectionOutcome::Committed },
-            |_| async { ProjectionOutcome::Failed },
-        );
+        let prepared = owner
+            .prepare_projection(
+                "projection".to_string(),
+                |_, _| async { ProjectionOutcome::Committed },
+                |_| async { ProjectionOutcome::Failed },
+            )
+            .unwrap();
         let ticket = owner.install_projection_gated(prepared).unwrap().start();
         assert_eq!(
             owner.settle_projection(&ticket),
@@ -2760,9 +3392,11 @@ mod tests {
             generation: TaskGeneration::new(),
             cell: stale_cell,
         };
-        let successor = owner.prepare("successor".to_string(), TaskRole::Worker, |_| async {
-            std::future::pending::<()>().await;
-        });
+        let successor = owner
+            .prepare("successor".to_string(), TaskRole::Worker, |_| async {
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
         owner.install_gated(successor).unwrap().start();
         assert_eq!(
             owner.settle_projection(&stale),
@@ -2775,30 +3409,36 @@ mod tests {
     async fn projection_catches_call_and_poll_panics_for_both_constructors() {
         let owner = Arc::new(DownloadTaskOwner::new());
 
-        let call = owner.prepare_projection(
-            "ownerless-call".to_string(),
-            |_, _| {
-                panic!("call-time projection panic");
-                #[allow(unreachable_code)]
-                std::future::ready(ProjectionOutcome::Committed)
-            },
-            |_| async { ProjectionOutcome::Failed },
-        );
+        let call = owner
+            .prepare_projection(
+                "ownerless-call".to_string(),
+                |_, _| {
+                    panic!("call-time projection panic");
+                    #[allow(unreachable_code)]
+                    std::future::ready(ProjectionOutcome::Committed)
+                },
+                |_| async { ProjectionOutcome::Failed },
+            )
+            .unwrap();
         let call_ticket = owner.install_projection_gated(call).unwrap().start();
         assert_eq!(call_ticket.wait().await, ProjectionOutcome::Panicked);
 
-        let poll = owner.prepare_projection(
-            "ownerless-poll".to_string(),
-            |_, _| async {
-                panic!("poll-time projection panic");
-            },
-            |_| async { ProjectionOutcome::Failed },
-        );
+        let poll = owner
+            .prepare_projection(
+                "ownerless-poll".to_string(),
+                |_, _| async {
+                    panic!("poll-time projection panic");
+                },
+                |_| async { ProjectionOutcome::Failed },
+            )
+            .unwrap();
         let poll_ticket = owner.install_projection_gated(poll).unwrap().start();
         assert_eq!(poll_ticket.wait().await, ProjectionOutcome::Panicked);
 
         for (id, call_time) in [("finished-call", true), ("finished-poll", false)] {
-            let predecessor = owner.prepare(id.to_string(), TaskRole::Worker, |_| async {});
+            let predecessor = owner
+                .prepare(id.to_string(), TaskRole::Worker, |_| async {})
+                .unwrap();
             owner.install_gated(predecessor).unwrap().start();
             tokio::time::timeout(Duration::from_secs(1), async {
                 while !owner.snapshot(id).is_some_and(|task| task.finished) {
@@ -2808,25 +3448,29 @@ mod tests {
             .await
             .unwrap();
             let transition = if call_time {
-                owner.begin_finished_projection(
-                    id,
-                    false,
-                    |_, _| {
-                        panic!("call-time finished projection panic");
-                        #[allow(unreachable_code)]
-                        std::future::ready(ProjectionOutcome::Committed)
-                    },
-                    |_| async { ProjectionOutcome::Failed },
-                )
+                owner
+                    .begin_finished_projection(
+                        id,
+                        false,
+                        |_, _| {
+                            panic!("call-time finished projection panic");
+                            #[allow(unreachable_code)]
+                            std::future::ready(ProjectionOutcome::Committed)
+                        },
+                        |_| async { ProjectionOutcome::Failed },
+                    )
+                    .unwrap()
             } else {
-                owner.begin_finished_projection(
-                    id,
-                    false,
-                    |_, _| async {
-                        panic!("poll-time finished projection panic");
-                    },
-                    |_| async { ProjectionOutcome::Failed },
-                )
+                owner
+                    .begin_finished_projection(
+                        id,
+                        false,
+                        |_, _| async {
+                            panic!("poll-time finished projection panic");
+                        },
+                        |_| async { ProjectionOutcome::Failed },
+                    )
+                    .unwrap()
             };
             let ProjectionTransition::Started(projection) = transition else {
                 panic!("finished predecessor should install a projector");
@@ -2840,19 +3484,21 @@ mod tests {
     async fn fallback_panics_remain_owned_until_cancel_acknowledges_failure() {
         let owner = Arc::new(DownloadTaskOwner::new());
 
-        let ownerless = owner.prepare_projection(
-            "ownerless-double-panic".to_string(),
-            |_, _| {
-                panic!("call-time primary projection panic");
-                #[allow(unreachable_code)]
-                std::future::ready(ProjectionOutcome::Committed)
-            },
-            |_| {
-                panic!("call-time fallback projection panic");
-                #[allow(unreachable_code)]
-                std::future::ready(ProjectionOutcome::Failed)
-            },
-        );
+        let ownerless = owner
+            .prepare_projection(
+                "ownerless-double-panic".to_string(),
+                |_, _| {
+                    panic!("call-time primary projection panic");
+                    #[allow(unreachable_code)]
+                    std::future::ready(ProjectionOutcome::Committed)
+                },
+                |_| {
+                    panic!("call-time fallback projection panic");
+                    #[allow(unreachable_code)]
+                    std::future::ready(ProjectionOutcome::Failed)
+                },
+            )
+            .unwrap();
         let InstalledProjection { task, ticket } =
             owner.install_projection_gated(ownerless).unwrap();
         let abandoned_waiter_ticket = ticket.clone();
@@ -2866,11 +3512,13 @@ mod tests {
         acknowledge_failed_projection_through_cancel(&owner, "ownerless-double-panic", &ticket)
             .await;
 
-        let predecessor = owner.prepare(
-            "finished-double-panic".to_string(),
-            TaskRole::Worker,
-            |_| async {},
-        );
+        let predecessor = owner
+            .prepare(
+                "finished-double-panic".to_string(),
+                TaskRole::Worker,
+                |_| async {},
+            )
+            .unwrap();
         owner.install_gated(predecessor).unwrap().start();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !owner
@@ -2882,16 +3530,18 @@ mod tests {
         })
         .await
         .unwrap();
-        let transition = owner.begin_finished_projection(
-            "finished-double-panic",
-            false,
-            |_, _| async {
-                panic!("poll-time primary projection panic");
-            },
-            |_| async {
-                panic!("poll-time fallback projection panic");
-            },
-        );
+        let transition = owner
+            .begin_finished_projection(
+                "finished-double-panic",
+                false,
+                |_, _| async {
+                    panic!("poll-time primary projection panic");
+                },
+                |_| async {
+                    panic!("poll-time fallback projection panic");
+                },
+            )
+            .unwrap();
         let ProjectionTransition::Started(projection) = transition else {
             panic!("finished predecessor should install a projector");
         };
@@ -2906,17 +3556,19 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let (fallback_reached_sender, fallback_reached) = oneshot::channel();
         let (_fallback_release_sender, fallback_release) = oneshot::channel::<()>();
-        let prepared = owner.prepare_projection(
-            "transferred-failure".to_string(),
-            |_, _| async {
-                panic!("primary projection panic");
-            },
-            move |_| async move {
-                let _ = fallback_reached_sender.send(());
-                let _ = fallback_release.await;
-                ProjectionOutcome::RolledBack
-            },
-        );
+        let prepared = owner
+            .prepare_projection(
+                "transferred-failure".to_string(),
+                |_, _| async {
+                    panic!("primary projection panic");
+                },
+                move |_| async move {
+                    let _ = fallback_reached_sender.send(());
+                    let _ = fallback_release.await;
+                    ProjectionOutcome::RolledBack
+                },
+            )
+            .unwrap();
         let ticket = owner.install_projection_gated(prepared).unwrap().start();
         tokio::time::timeout(Duration::from_secs(1), fallback_reached)
             .await
@@ -2926,18 +3578,20 @@ mod tests {
 
         let (finalizer_reached_sender, finalizer_reached) = oneshot::channel();
         let (allow_projection_sender, allow_projection) = oneshot::channel();
-        let transition = owner.begin_cancel(
-            "transferred-failure",
-            move |context, predecessor| async move {
-                let CancelPredecessor::Observed(observation) = predecessor else {
-                    panic!("superseded projector must remain predecessor custody");
-                };
-                assert!(observation.nested_failures > 0);
-                let _ = finalizer_reached_sender.send(());
-                let _ = allow_projection.await;
-                assert!(context.complete_transferred_projection(true));
-            },
-        );
+        let transition = owner
+            .begin_cancel(
+                "transferred-failure",
+                move |context, predecessor| async move {
+                    let CancelPredecessor::Observed(observation) = predecessor else {
+                        panic!("superseded projector must remain predecessor custody");
+                    };
+                    assert!(observation.nested_failures > 0);
+                    let _ = finalizer_reached_sender.send(());
+                    let _ = allow_projection.await;
+                    assert!(context.complete_transferred_projection(true));
+                },
+            )
+            .unwrap();
         let CancelTransition::Started(finalizer) = transition else {
             panic!("projection must be replaced by one finalizer");
         };
@@ -2977,9 +3631,11 @@ mod tests {
     #[tokio::test]
     async fn finished_and_panicked_tasks_are_observed_once() {
         let owner = Arc::new(DownloadTaskOwner::new());
-        let prepared = owner.prepare("panic".to_string(), TaskRole::Worker, |_| async {
-            panic!("sentinel panic");
-        });
+        let prepared = owner
+            .prepare("panic".to_string(), TaskRole::Worker, |_| async {
+                panic!("sentinel panic");
+            })
+            .unwrap();
         owner.install_gated(prepared).unwrap().start();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !owner
@@ -3004,33 +3660,36 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let (blocking_started_sender, blocking_started) = oneshot::channel();
         let (release_sender, release) = std::sync::mpsc::channel();
-        let prepared = owner.prepare(
-            "download".to_string(),
-            TaskRole::Worker,
-            move |context| async move {
-                let _ = context
-                    .run_blocking(move || {
-                        let _ = blocking_started_sender.send(());
-                        let _ = release.recv();
-                    })
-                    .await;
-            },
-        );
+        let prepared = owner
+            .prepare(
+                "download".to_string(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let _ = context
+                        .run_blocking(move || {
+                            let _ = blocking_started_sender.send(());
+                            let _ = release.recv();
+                        })
+                        .await;
+                },
+            )
+            .unwrap();
         owner.install_gated(prepared).unwrap().start();
         blocking_started.await.unwrap();
 
         let finalized = Arc::new(AtomicBool::new(false));
         let finalized_in_task = finalized.clone();
-        assert!(start_cancel(owner.begin_cancel(
-            "download",
-            move |_context, predecessor| async move {
-                let CancelPredecessor::Observed(observation) = predecessor else {
-                    panic!("installed worker must be observed");
-                };
-                assert_eq!(observation.terminal, TaskTerminal::Cancelled);
-                finalized_in_task.store(true, Ordering::SeqCst);
-            },
-        )));
+        assert!(start_cancel(
+            owner
+                .begin_cancel("download", move |_context, predecessor| async move {
+                    let CancelPredecessor::Observed(observation) = predecessor else {
+                        panic!("installed worker must be observed");
+                    };
+                    assert_eq!(observation.terminal, TaskTerminal::Cancelled);
+                    finalized_in_task.store(true, Ordering::SeqCst);
+                },)
+                .unwrap()
+        ));
         tokio::task::yield_now().await;
         assert!(!finalized.load(Ordering::SeqCst));
 
@@ -3047,16 +3706,20 @@ mod tests {
     #[tokio::test]
     async fn stale_generation_cannot_observe_or_remove_cancel_successor() {
         let owner = Arc::new(DownloadTaskOwner::new());
-        let prepared = owner.prepare("download".to_string(), TaskRole::Worker, |_| async {
-            std::future::pending::<()>().await;
-        });
+        let prepared = owner
+            .prepare("download".to_string(), TaskRole::Worker, |_| async {
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
         let installed = owner.install_gated(prepared).unwrap();
         let stale_generation = installed.generation().clone();
         installed.start();
         let (finish_sender, finish_receiver) = oneshot::channel();
-        let transition = owner.begin_cancel("download", move |_context, _| async move {
-            let _ = finish_receiver.await;
-        });
+        let transition = owner
+            .begin_cancel("download", move |_context, _| async move {
+                let _ = finish_receiver.await;
+            })
+            .unwrap();
         let CancelTransition::Started(finalizer) = transition else {
             panic!("worker should transition to a finalizer");
         };
@@ -3079,23 +3742,27 @@ mod tests {
     #[tokio::test]
     async fn repeated_cancel_keeps_one_finalizer_owner() {
         let owner = Arc::new(DownloadTaskOwner::new());
-        let prepared = owner.prepare("download".to_string(), TaskRole::Worker, |_| async {
-            std::future::pending::<()>().await;
-        });
+        let prepared = owner
+            .prepare("download".to_string(), TaskRole::Worker, |_| async {
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
         owner.install_gated(prepared).unwrap().start();
         let count = Arc::new(AtomicUsize::new(0));
         let count_in_finalizer = count.clone();
         let (finish_sender, finish_receiver) = oneshot::channel();
-        let first = owner.begin_cancel("download", move |_context, _| async move {
-            count_in_finalizer.fetch_add(1, Ordering::SeqCst);
-            let _ = finish_receiver.await;
-        });
+        let first = owner
+            .begin_cancel("download", move |_context, _| async move {
+                count_in_finalizer.fetch_add(1, Ordering::SeqCst);
+                let _ = finish_receiver.await;
+            })
+            .unwrap();
         let CancelTransition::Started(finalizer) = first else {
             panic!("first cancellation should install a finalizer");
         };
         finalizer.start();
         let first_generation = owner.generation_for_test("download").unwrap();
-        let second = owner.begin_cancel("download", |_, _| async {});
+        let second = owner.begin_cancel("download", |_, _| async {}).unwrap();
         let CancelTransition::AlreadyRunning = second else {
             panic!("repeat cancellation must not replace the finalizer");
         };
@@ -3112,40 +3779,43 @@ mod tests {
             let owner = Arc::new(DownloadTaskOwner::new());
             let (entered_sender, entered) = oneshot::channel();
             let (release_sender, release) = std::sync::mpsc::channel();
-            let prepared = owner.prepare(
-                "download".into(),
-                TaskRole::Worker,
-                move |context| async move {
-                    let _ = context
-                        .run_fallible_blocking_named(
-                            "held cancellation predecessor",
-                            move || -> Result<(), &'static str> {
-                                entered_sender.send(()).unwrap();
-                                release.recv().unwrap();
-                                match outcome {
-                                    "success" => Ok(()),
-                                    "error" => Err("predecessor failure"),
-                                    _ => panic!("predecessor panic"),
-                                }
-                            },
-                        )
-                        .await;
-                },
-            );
+            let prepared = owner
+                .prepare(
+                    "download".into(),
+                    TaskRole::Worker,
+                    move |context| async move {
+                        let _ = context
+                            .run_fallible_blocking_named(
+                                "held cancellation predecessor",
+                                move || -> Result<(), &'static str> {
+                                    entered_sender.send(()).unwrap();
+                                    release.recv().unwrap();
+                                    match outcome {
+                                        "success" => Ok(()),
+                                        "error" => Err("predecessor failure"),
+                                        _ => panic!("predecessor panic"),
+                                    }
+                                },
+                            )
+                            .await;
+                    },
+                )
+                .unwrap();
             owner.install_gated(prepared).unwrap().start();
             entered.await.unwrap();
             let finished = Arc::new(AtomicBool::new(false));
             let finished_in_finalizer = finished.clone();
-            let CancelTransition::Started(finalizer) =
-                owner.begin_cancel("download", move |_, _| async move {
+            let CancelTransition::Started(finalizer) = owner
+                .begin_cancel("download", move |_, _| async move {
                     finished_in_finalizer.store(true, Ordering::Release);
                 })
+                .unwrap()
             else {
                 panic!("worker must receive a finalizer")
             };
             let generation = finalizer.generation().clone();
             finalizer.start();
-            owner.tasks.lock().unwrap()["download"].outer.abort();
+            owner.state.lock().unwrap().tasks["download"].outer.abort();
             tokio::time::timeout(Duration::from_secs(1), async {
                 while !owner.outer_finished_for_test("download") {
                     tokio::task::yield_now().await;
@@ -3189,28 +3859,30 @@ mod tests {
             let owner = Arc::new(DownloadTaskOwner::new());
             let (entered_sender, entered) = oneshot::channel();
             let (release_sender, release) = std::sync::mpsc::channel();
-            let prepared = owner.prepare(
-                "download".into(),
-                TaskRole::Worker,
-                move |context| async move {
-                    let _ = context
-                        .run_fallible_blocking_named(
-                            "failed predecessor",
-                            move || -> Result<(), &'static str> {
-                                entered_sender.send(()).unwrap();
-                                release.recv().unwrap();
-                                Err("predecessor failed")
-                            },
-                        )
-                        .await;
-                },
-            );
+            let prepared = owner
+                .prepare(
+                    "download".into(),
+                    TaskRole::Worker,
+                    move |context| async move {
+                        let _ = context
+                            .run_fallible_blocking_named(
+                                "failed predecessor",
+                                move || -> Result<(), &'static str> {
+                                    entered_sender.send(()).unwrap();
+                                    release.recv().unwrap();
+                                    Err("predecessor failed")
+                                },
+                            )
+                            .await;
+                    },
+                )
+                .unwrap();
             owner.install_gated(prepared).unwrap().start();
             entered.await.unwrap();
             let (delivered_sender, delivered) = oneshot::channel();
             let (finish_sender, finish) = oneshot::channel();
-            let CancelTransition::Started(finalizer) =
-                owner.begin_cancel("download", move |context, predecessor| async move {
+            let CancelTransition::Started(finalizer) = owner
+                .begin_cancel("download", move |context, predecessor| async move {
                     let CancelPredecessor::Observed(observation) = predecessor else {
                         panic!("predecessor must be observed")
                     };
@@ -3226,6 +3898,7 @@ mod tests {
                     delivered_sender.send(()).unwrap();
                     let _ = finish.await;
                 })
+                .unwrap()
             else {
                 panic!("worker must receive a finalizer")
             };
@@ -3237,7 +3910,7 @@ mod tests {
                 .expect("predecessor failure must not prevent cleanup drain")
                 .unwrap();
             if abort_after_delivery {
-                owner.tasks.lock().unwrap()["download"].outer.abort();
+                owner.state.lock().unwrap().tasks["download"].outer.abort();
             } else {
                 finish_sender.send(()).unwrap();
             }
@@ -3272,21 +3945,29 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let (entered_sender, entered) = oneshot::channel();
         let (release_sender, release) = std::sync::mpsc::channel();
-        let prepared = owner.prepare(
-            "download".into(),
-            TaskRole::Worker,
-            move |context| async move {
-                let _ = context
-                    .run_blocking(move || {
-                        entered_sender.send(()).unwrap();
-                        release.recv().unwrap();
-                    })
-                    .await;
-            },
-        );
+        let prepared = owner
+            .prepare(
+                "download".into(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let _ = context
+                        .run_blocking(move || {
+                            entered_sender.send(()).unwrap();
+                            release.recv().unwrap();
+                        })
+                        .await;
+                },
+            )
+            .unwrap();
         owner.install_gated(prepared).unwrap().start();
         entered.await.unwrap();
-        let mut predecessor = owner.tasks.lock().unwrap().remove("download").unwrap();
+        let mut predecessor = owner
+            .state
+            .lock()
+            .unwrap()
+            .tasks
+            .remove("download")
+            .unwrap();
         let outer_abort = predecessor.outer.abort_handle();
         outer_abort.abort();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3346,29 +4027,32 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let (blocking_started_sender, blocking_started) = oneshot::channel();
         let (release_sender, release) = std::sync::mpsc::channel();
-        let prepared = owner.prepare(
-            "download".to_string(),
-            TaskRole::Worker,
-            move |context| async move {
-                let _ = context
-                    .run_blocking(move || {
-                        let _ = blocking_started_sender.send(());
-                        let _ = release.recv();
-                        panic!("nested sentinel panic");
-                    })
-                    .await;
-            },
-        );
+        let prepared = owner
+            .prepare(
+                "download".to_string(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let _ = context
+                        .run_blocking(move || {
+                            let _ = blocking_started_sender.send(());
+                            let _ = release.recv();
+                            panic!("nested sentinel panic");
+                        })
+                        .await;
+                },
+            )
+            .unwrap();
         owner.install_gated(prepared).unwrap().start();
         blocking_started.await.unwrap();
 
         let (observed_sender, observed) = oneshot::channel();
-        assert!(start_cancel(owner.begin_cancel(
-            "download",
-            move |_context, predecessor| async move {
-                let _ = observed_sender.send(predecessor);
-            },
-        )));
+        assert!(start_cancel(
+            owner
+                .begin_cancel("download", move |_context, predecessor| async move {
+                    let _ = observed_sender.send(predecessor);
+                },)
+                .unwrap()
+        ));
         release_sender.send(()).unwrap();
         let CancelPredecessor::Observed(observation) = observed.await.unwrap() else {
             panic!("installed worker must be observed");
@@ -3380,7 +4064,9 @@ mod tests {
     #[tokio::test]
     async fn finished_unobserved_finalizer_is_replaced_and_observed_once() {
         let owner = Arc::new(DownloadTaskOwner::new());
-        let prepared = owner.prepare("download".to_string(), TaskRole::Worker, |_| async {});
+        let prepared = owner
+            .prepare("download".to_string(), TaskRole::Worker, |_| async {})
+            .unwrap();
         owner.install_gated(prepared).unwrap().start();
         while !owner
             .snapshot("download")
@@ -3390,12 +4076,13 @@ mod tests {
         }
         let count = Arc::new(AtomicUsize::new(0));
         let count_in_finalizer = count.clone();
-        assert!(start_cancel(owner.begin_cancel(
-            "download",
-            move |_, _| async move {
-                count_in_finalizer.fetch_add(1, Ordering::SeqCst);
-            },
-        )));
+        assert!(start_cancel(
+            owner
+                .begin_cancel("download", move |_, _| async move {
+                    count_in_finalizer.fetch_add(1, Ordering::SeqCst);
+                },)
+                .unwrap()
+        ));
         while !owner
             .snapshot("download")
             .is_some_and(|snapshot| snapshot.finished)
@@ -3404,9 +4091,11 @@ mod tests {
         }
 
         let (predecessor_sender, predecessor) = oneshot::channel();
-        let replacement = owner.begin_cancel("download", move |_, predecessor| async move {
-            let _ = predecessor_sender.send(predecessor);
-        });
+        let replacement = owner
+            .begin_cancel("download", move |_, predecessor| async move {
+                let _ = predecessor_sender.send(predecessor);
+            })
+            .unwrap();
         let CancelTransition::Started(replacement) = replacement else {
             panic!("finished finalizer must be replaced by an observing finalizer");
         };
@@ -3438,14 +4127,16 @@ mod tests {
     async fn cancelling_an_outer_drain_keeps_nested_custody_with_the_finalizer() {
         let owner = Arc::new(DownloadTaskOwner::new());
         let (drain_sender, drain_receiver) = oneshot::channel();
-        let prepared = owner.prepare(
-            "download".to_string(),
-            TaskRole::Worker,
-            move |context| async move {
-                let _ = drain_receiver.await;
-                let _ = context.drain_blocking().await;
-            },
-        );
+        let prepared = owner
+            .prepare(
+                "download".to_string(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let _ = drain_receiver.await;
+                    let _ = context.drain_blocking().await;
+                },
+            )
+            .unwrap();
         let installed = owner.install_gated(prepared).unwrap();
         let generation = installed.generation().clone();
         installed.start();
@@ -3478,12 +4169,13 @@ mod tests {
 
         let terminal = Arc::new(AtomicBool::new(false));
         let terminal_in_finalizer = terminal.clone();
-        assert!(start_cancel(owner.begin_cancel(
-            "download",
-            move |_, _| async move {
-                terminal_in_finalizer.store(true, Ordering::SeqCst);
-            },
-        )));
+        assert!(start_cancel(
+            owner
+                .begin_cancel("download", move |_, _| async move {
+                    terminal_in_finalizer.store(true, Ordering::SeqCst);
+                },)
+                .unwrap()
+        ));
         tokio::task::yield_now().await;
         let terminal_before_release = terminal.load(Ordering::SeqCst);
         release_sender.send(()).unwrap();
@@ -3520,13 +4212,15 @@ mod tests {
     async fn finished_outer_is_not_observable_until_registered_blocking_work_finishes() {
         let owner = Arc::new(DownloadTaskOwner::new());
         let (outer_release_sender, outer_release) = oneshot::channel();
-        let prepared = owner.prepare(
-            "download".to_string(),
-            TaskRole::Worker,
-            move |_| async move {
-                let _ = outer_release.await;
-            },
-        );
+        let prepared = owner
+            .prepare(
+                "download".to_string(),
+                TaskRole::Worker,
+                move |_| async move {
+                    let _ = outer_release.await;
+                },
+            )
+            .unwrap();
         let installed = owner.install_gated(prepared).unwrap();
         let generation = installed.generation().clone();
         let (blocking_started_sender, blocking_started) = oneshot::channel();
@@ -3585,35 +4279,37 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let owner_in_task = owner.clone();
         let (metrics_sender, metrics) = oneshot::channel();
-        let prepared = owner.prepare(
-            "download".to_string(),
-            TaskRole::Worker,
-            move |context| async move {
-                let mut retained_max = 0;
-                for index in 0..512 {
-                    let result = context
-                        .run_blocking(move || {
-                            if index == 0 {
-                                panic!("archived nested failure sentinel");
-                            }
-                        })
-                        .await;
-                    if index == 0 {
-                        assert!(matches!(result, Err(BlockingTaskError::Join(_))));
-                    } else {
-                        result.unwrap();
+        let prepared = owner
+            .prepare(
+                "download".to_string(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let mut retained_max = 0;
+                    for index in 0..512 {
+                        let result = context
+                            .run_blocking(move || {
+                                if index == 0 {
+                                    panic!("archived nested failure sentinel");
+                                }
+                            })
+                            .await;
+                        if index == 0 {
+                            assert!(matches!(result, Err(BlockingTaskError::Join(_))));
+                        } else {
+                            result.unwrap();
+                        }
+                        retained_max = retained_max.max(
+                            owner_in_task
+                                .nested_count_for_test("download")
+                                .unwrap_or_default(),
+                        );
                     }
-                    retained_max = retained_max.max(
-                        owner_in_task
-                            .nested_count_for_test("download")
-                            .unwrap_or_default(),
-                    );
-                }
-                let drained_failures = context.drain_blocking().await.unwrap();
-                let _ = metrics_sender.send((retained_max, drained_failures));
-                std::future::pending::<()>().await;
-            },
-        );
+                    let drained_failures = context.drain_blocking().await.unwrap();
+                    let _ = metrics_sender.send((retained_max, drained_failures));
+                    std::future::pending::<()>().await;
+                },
+            )
+            .unwrap();
         owner.install_gated(prepared).unwrap().start();
 
         let (retained_max, drained_failures) = metrics.await.unwrap();
@@ -3624,12 +4320,13 @@ mod tests {
         assert_eq!(drained_failures, 1);
 
         let (predecessor_sender, predecessor) = oneshot::channel();
-        assert!(start_cancel(owner.begin_cancel(
-            "download",
-            move |_, predecessor| async move {
-                let _ = predecessor_sender.send(predecessor);
-            },
-        )));
+        assert!(start_cancel(
+            owner
+                .begin_cancel("download", move |_, predecessor| async move {
+                    let _ = predecessor_sender.send(predecessor);
+                },)
+                .unwrap()
+        ));
         let CancelPredecessor::Observed(observation) = predecessor.await.unwrap() else {
             panic!("the worker remains owned until cancellation");
         };
@@ -3641,13 +4338,14 @@ mod tests {
         let owner = Arc::new(DownloadTaskOwner::new());
         let owner_in_finalizer = owner.clone();
         let (observation_sender, observation) = oneshot::channel();
-        assert!(start_cancel(owner.begin_cancel(
-            "state-only",
-            move |_, observation| async move {
-                assert!(owner_in_finalizer.contains("state-only"));
-                let _ = observation_sender.send(observation);
-            },
-        )));
+        assert!(start_cancel(
+            owner
+                .begin_cancel("state-only", move |_, observation| async move {
+                    assert!(owner_in_finalizer.contains("state-only"));
+                    let _ = observation_sender.send(observation);
+                },)
+                .unwrap()
+        ));
 
         assert_eq!(observation.await.unwrap(), CancelPredecessor::Absent);
     }

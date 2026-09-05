@@ -31,6 +31,7 @@ pub mod download_store;
 mod external_assets;
 mod hashing;
 mod hf;
+pub(crate) use hf::DownloadInvocationContext;
 mod hf_cache;
 mod identifier;
 mod importer;

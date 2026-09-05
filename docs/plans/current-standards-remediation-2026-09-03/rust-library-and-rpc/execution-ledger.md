@@ -21,6 +21,87 @@
 
 ## Slice Log
 
+### 2026-09-05 — Explicit download shutdown accepted on Linux
+
+- Accept the coherent invocation-to-RPC slice admitted at `9907b492`, under
+  standards `3cb165f10dad2e25cebf78748c535bcde8ff10bb`. One existing lifecycle
+  owner closes preparation/task admission, retains real blocking and async
+  effects, drains transferred custody, and publishes one terminal receipt after
+  interrupted-state projection. Rust and IPC delegate shared owned entry points;
+  RPC retains API state and observes both labelled owner outcomes even after a
+  shutdown waiter is cancelled. No-HF shutdown succeeds without initialization.
+- SD-1/SD-2 cover closure/install/transfer races, extracted Work gates, retained
+  Custody observers, actual held writes and async effects, success/error/panic,
+  and weak-reference proof of production ownership. SD-3 covers closed mutations,
+  non-reconciling reads, final state, no-client success, and repeated/cancelled
+  waiters. SD-4 uses the real RPC supervisor, HF invocation owner, and catalog
+  worker with independent held effects and both failure outcomes. Lifecycle/HF
+  and combined consumer reviews found no remaining blockers in this population.
+- Final commands from `rust/`: `cargo test --offline -p pumas-library` with
+  default and `--no-default-features` each pass 1,224 tests, 11 existing ignores.
+  Equivalent `pumas-rpc` runs pass 114 and 74 respectively, 10 existing ignores
+  each. New UniFFI shutdown-error conversion passes its focused `--lib` test.
+  Core/RPC/UniFFI all-target/all-feature Clippy and core/RPC no-default all-target
+  Clippy pass with `-D warnings`; final RPC-only repeats cover its fixture edits.
+  Workspace formatting, diff checks, and all five plan contracts pass.
+- The mixed RPC fixture reproducer passes 30/30 final runs (61 unit tests per
+  run), versus its original DatabaseBusy on run three. Both server fixtures now
+  share the existing registry setup guard with handler fixtures; original HF
+  and process-manager settings remain intact. There is no new global lock,
+  whole-test serialization, retry, production registry fix, or weaker assertion.
+  The earlier three core fixture corrections retain their original guarantees.
+- Deciding core/lint/binding logs remain in `/tmp/pumas-shutdown-final.M73AWV`;
+  final RPC logs are `/tmp/pumas-rpc-fixture-{default,no-default}-final.log`,
+  `/tmp/pumas-rpc-fixture-clippy-{all,no-default}.log`, and the mixed reproducer
+  `/tmp/pumas-rpc-combined-final-{1..30}.log`. The live download store SHA256 is
+  unchanged: `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+  No GUI run, live download mutation, Windows/macOS runtime test, or new
+  cross-platform release claim is made by this automated Linux checkpoint.
+- Next admit C4 ordinary/restored importer finalization before durable terminal
+  settlement, including truthful metadata/index failure and post-release
+  notification ordering. Builder enqueueing and logged importer failure remain
+  insufficient. Pending replay, physical-root grants, relocation, and general
+  runtime/Drop drainage remain unaccepted; full C3/M4 and the program stay open.
+
+### 2026-09-05 — Shutdown implementation consumer population reconciled
+
+- Implementing the admitted slice from `9907b492`, standards `3cb165f1`.
+  Root owns core methods/errors and serial gates; lifecycle and HF owners share
+  the fixed invocation Interface; RPC owns its supervisor and result projection.
+- Source review found duplicate pre-admission start/recover/partial methods in
+  `api/state_hf.rs`, reached by local IPC dispatch. The earlier write population
+  omitted that consumer. Re-plan its disposition to delegate the same owned
+  core functions as the public Rust methods, deleting duplicate implementations.
+  The plan's composed-design probe now records this shared change path.
+- Ticket recovery also performs async model-index refresh before HF handoff.
+  Retain those actual async effects under the same nested observation contract;
+  aborting their parent must not detach underlying blocking index work. This
+  does not admit C4 importer changes or alter recovery policy.
+- The existing explicit `test-support` feature supplies real HF blocking work
+  to RPC's supervisor fixture. No public production testing endpoint, new
+  scheduler, dependency, or schema is added. Runtime acceptance is still pending
+  final integrated gates; focused passing runs are not full-slice acceptance.
+- The first full core run exposed three old fixture scheduling assumptions.
+  Focused reproductions distinguished retained work from active-map membership,
+  acknowledged cancellation from an abort request, and an owned recovery
+  producer from its temporarily unpolled caller. Fixtures now synchronize those
+  actual boundaries; exact durable-settlement, final-state, and AlreadyCompleted
+  assertions remain unchanged. Independent fixture review and all three focused
+  reruns pass. Both final core configurations then pass 1,224 tests each with
+  11 existing ignores. These corrections add no production recovery behavior.
+- Final RPC default passes 114 tests with 10 existing ignores. The no-default
+  run fails during the new real-owner fixture's API initialization with SQLite
+  DatabaseBusy, before shutdown is exercised. Fixture diagnosis and the remaining
+  affected gates must complete before accepting or committing this slice.
+- The exact no-default test and 30 server-only runs pass, but the third mixed
+  suite run reproduces DatabaseBusy in 0.46 seconds. Handler fixtures change the
+  process-wide registry path under their existing setup guard; both server API
+  constructions bypass that coordination. Admit the adjacent test-only helper
+  so server fixtures use the same guarded builder with HF enabled. This changes
+  setup isolation, not shutdown scheduling, and adds no production registry
+  workaround, retry, or whole-test serialization. Verify against the original
+  mixed suite before accepting the diagnosis.
+
 ### 2026-09-05 — Explicit shutdown implementation admitted
 
 - Continued the selected bounded design slice from `86640c60`. Current standards

@@ -3605,6 +3605,20 @@
   Rust ledger owns evidence and Windows/macOS runtime limitations. No broader
   lifecycle or release milestone is closed by this correction.
 
+### 2026-09-05 — Bounded Download Shutdown Accepted
+
+- The Rust invocation-to-RPC shutdown slice is accepted for its Linux owner
+  population. Core and IPC share pre-effect admission; real effects and final
+  state projection precede the retained result. RPC observes both HF and catalog
+  drains, including failures and cancelled/repeated waiters.
+- Independent reviews, dual core suites (1,224 each), dual RPC suites (114/74),
+  strict affected lint, binding conversion, formatting, and plan contracts pass.
+  The focused Rust ledger owns SD-1 through SD-4 and fixture-race evidence. Live
+  download records are unchanged; no GUI or unavailable-platform claim is added.
+- Next admit C4 awaited ordinary/restored importer finalization. Root grants,
+  Pending replay, general runtime/Drop drainage, and full program acceptance
+  remain open. No inference-plugin or importer shutdown promise is added here.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.

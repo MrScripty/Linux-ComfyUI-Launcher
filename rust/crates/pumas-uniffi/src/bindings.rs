@@ -162,6 +162,12 @@ impl From<pumas_library::PumasError> for FfiError {
                 resource: format!("Release: {}", tag),
             },
             PumasError::Config { message } => FfiError::Config { message },
+            PumasError::DownloadLifecycleClosed => FfiError::Config {
+                message: "Download lifecycle is closed".to_string(),
+            },
+            PumasError::DownloadShutdownFailed { failures } => {
+                FfiError::Other(format!("Download shutdown observed {failures} failure(s)"))
+            }
             PumasError::InvalidAppId(id) => FfiError::Validation {
                 message: format!("Invalid app ID: {}", id),
             },
@@ -355,9 +361,21 @@ impl FfiPumasApi {
 mod tests {
     use super::*;
     use pumas_library::models::HuggingFaceModel;
-    use pumas_library::{ModelRecord, SearchResult};
+    use pumas_library::{ModelRecord, PumasError, SearchResult};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn download_shutdown_errors_use_existing_host_error_shapes() {
+        assert!(matches!(
+            FfiError::from(PumasError::DownloadLifecycleClosed),
+            FfiError::Config { message } if message == "Download lifecycle is closed"
+        ));
+        assert!(matches!(
+            FfiError::from(PumasError::DownloadShutdownFailed { failures: 2 }),
+            FfiError::Other(message) if message == "Download shutdown observed 2 failure(s)"
+        ));
+    }
 
     fn create_temp_test_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()

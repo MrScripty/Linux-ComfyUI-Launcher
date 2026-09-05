@@ -126,8 +126,14 @@ impl PublicError {
     }
 
     pub(crate) fn from_pumas(error: &PumasError) -> Self {
-        if matches!(error, PumasError::Config { .. }) {
+        if matches!(
+            error,
+            PumasError::Config { .. } | PumasError::DownloadLifecycleClosed
+        ) {
             return Self::unavailable();
+        }
+        if matches!(error, PumasError::DownloadShutdownFailed { .. }) {
+            return Self::internal();
         }
 
         match error.to_rpc_error_code() {
@@ -2319,6 +2325,13 @@ mod tests {
 
     #[test]
     fn public_error_projection_preserves_stable_failure_codes_and_classes() {
+        let closed = PublicError::from(&PumasError::DownloadLifecycleClosed);
+        assert_eq!(closed.code, -32000);
+        assert_eq!(closed.class, PublicErrorClass::Unavailable);
+        let shutdown = PublicError::from(&PumasError::DownloadShutdownFailed { failures: 17 });
+        assert_eq!(shutdown.code, -32603);
+        assert_eq!(shutdown.class, PublicErrorClass::Internal);
+        assert!(!shutdown.message.contains("17"));
         let unavailable = PublicError::from(&PumasError::Config {
             message: format!("disabled credential {SECRET}"),
         });

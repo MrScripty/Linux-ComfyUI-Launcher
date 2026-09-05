@@ -18,6 +18,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 #[cfg(feature = "inference-plugins")]
 use pumas_app_manager::{SizeCalculator, VersionManager};
 use pumas_library::PumasApi;
@@ -34,7 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(feature = "inference-plugins")]
 use std::time::Duration;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 #[cfg(feature = "inference-plugins")]
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -113,25 +115,56 @@ pub struct AppState {
 /// Owned handle for the running HTTP server task.
 pub struct ServerHandle {
     addr: SocketAddr,
-    task: Option<JoinHandle<anyhow::Result<()>>>,
-    shutdown_signal: Option<oneshot::Sender<()>>,
+    completion: Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>,
+    shutdown_signal: watch::Sender<bool>,
+    #[cfg(test)]
+    catalog_projection: Option<CatalogProjection>,
+    #[cfg(test)]
+    catalog_drained: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(test)]
+    downloads_drained: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ServerHandle {
+    fn new(
+        addr: SocketAddr,
+        task: JoinHandle<anyhow::Result<()>>,
+        shutdown_signal: watch::Sender<bool>,
+    ) -> Self {
+        let completion = async move {
+            match task.await {
+                Ok(result) => result.map_err(Arc::new),
+                Err(error) => Err(Arc::new(anyhow::anyhow!("RPC supervisor failed: {error}"))),
+            }
+        }
+        .boxed()
+        .shared();
+        Self {
+            addr,
+            completion,
+            shutdown_signal,
+            #[cfg(test)]
+            catalog_projection: None,
+            #[cfg(test)]
+            catalog_drained: None,
+            #[cfg(test)]
+            downloads_drained: None,
+        }
+    }
+
     /// Address the server actually bound to.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// Stop the server task and wait until it is no longer running.
-    pub async fn shutdown(mut self) -> anyhow::Result<()> {
-        if let Some(signal) = self.shutdown_signal.take() {
-            let _ = signal.send(());
-        }
-        if let Some(task) = self.task.take() {
-            task.await??;
-        }
-        Ok(())
+    /// Stop serving and observe both owned drains. Cancelling a waiter does not
+    /// cancel the supervisor or consume its result; repeated waiters share it.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.shutdown_signal.send_replace(true);
+        self.completion
+            .clone()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:#}"))
     }
 }
 
@@ -139,9 +172,38 @@ impl Drop for ServerHandle {
     fn drop(&mut self) {
         // Drop requests shutdown but cannot prove its asynchronous completion.
         // Call shutdown() for an observed drain; the supervisor owns its worker.
-        if let Some(signal) = self.shutdown_signal.take() {
-            let _ = signal.send(());
-        }
+        self.shutdown_signal.send_replace(true);
+    }
+}
+
+async fn drain_server_owners(
+    server_result: anyhow::Result<()>,
+    downloads: impl std::future::Future<Output = pumas_library::Result<()>>,
+    catalog: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    // Neither owner may be abandoned merely because the other failed first.
+    let (downloads_result, catalog_result) = tokio::join!(downloads, catalog);
+    let failures = [
+        server_result
+            .err()
+            .map(|error| format!("listener: {error:#}")),
+        downloads_result
+            .err()
+            .map(|error| format!("downloads: {error}")),
+        catalog_result
+            .err()
+            .map(|error| format!("catalog: {error:#}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "RPC shutdown failed: {}",
+            failures.join("; ")
+        ))
     }
 }
 
@@ -245,7 +307,7 @@ pub async fn start_server(
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(ConcurrencyLimitLayer::new(MAX_IN_FLIGHT_RPC_REQUESTS))
         .layer(cors)
-        .with_state(state);
+        .with_state(state.clone());
 
     info!(
         "Server listening on {} with max {} in-flight requests and {} byte request bodies",
@@ -253,22 +315,51 @@ pub async fn start_server(
     );
 
     // Spawn the server in the background and retain ownership of the task.
-    let (shutdown_signal, shutdown) = oneshot::channel();
+    #[cfg(test)]
+    let catalog_for_test = state.catalog_projection.clone();
+    #[cfg(test)]
+    let catalog_drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(test)]
+    let catalog_drain_observed = catalog_drained.clone();
+    #[cfg(test)]
+    let downloads_drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(test)]
+    let downloads_drain_observed = downloads_drained.clone();
+    let (shutdown_signal, mut shutdown) = watch::channel(false);
     let task = tokio::spawn(async move {
         let serving = axum::serve(listener, app).into_future();
         let server_result = tokio::select! {
             result = serving => result.map_err(anyhow::Error::from),
-            _ = shutdown => Ok(()),
+            _ = shutdown.changed() => Ok(()),
         };
-        let projection_result = catalog_worker.shutdown().await;
-        server_result.and(projection_result)
+        drain_server_owners(
+            server_result,
+            async {
+                let result = state.api.shutdown_downloads().await;
+                #[cfg(test)]
+                downloads_drain_observed.store(true, std::sync::atomic::Ordering::Release);
+                result
+            },
+            async move {
+                let result = catalog_worker.shutdown().await;
+                #[cfg(test)]
+                catalog_drain_observed.store(true, std::sync::atomic::Ordering::Release);
+                result
+            },
+        )
+        .await
     });
 
-    Ok(ServerHandle {
-        addr: actual_addr,
-        task: Some(task),
-        shutdown_signal: Some(shutdown_signal),
-    })
+    let handle = ServerHandle::new(actual_addr, task, shutdown_signal);
+    #[cfg(test)]
+    let handle = {
+        let mut handle = handle;
+        handle.catalog_projection = Some(catalog_for_test);
+        handle.catalog_drained = Some(catalog_drained);
+        handle.downloads_drained = Some(downloads_drained);
+        handle
+    };
+    Ok(handle)
 }
 
 #[cfg(feature = "inference-plugins")]
@@ -319,6 +410,122 @@ mod tests {
     use std::io::ErrorKind;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn shutdown_receipt_survives_waiter_cancellation_and_retains_all_failures() {
+        for fail_downloads in [false, true] {
+            for fail_catalog in [false, true] {
+                let (catalog, catalog_worker) = CatalogProjection::start(1);
+                let (catalog_entered, catalog_release) = catalog.hold_for_test().unwrap();
+                catalog_entered.await.unwrap();
+                let (downloads_entered, downloads_ready) = tokio::sync::oneshot::channel();
+                let (downloads_release, downloads_blocked) = tokio::sync::oneshot::channel();
+                let (signal, mut shutdown) = watch::channel(false);
+                let supervisor = tokio::spawn(async move {
+                    shutdown.changed().await.unwrap();
+                    drain_server_owners(
+                        Err(anyhow::anyhow!("listener sentinel")),
+                        async move {
+                            downloads_entered.send(()).unwrap();
+                            downloads_blocked.await.unwrap();
+                            if fail_downloads {
+                                Err(pumas_library::PumasError::DownloadShutdownFailed {
+                                    failures: 1,
+                                })
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        catalog_worker.shutdown(),
+                    )
+                    .await
+                });
+                let server = Arc::new(ServerHandle::new(
+                    "127.0.0.1:1".parse().unwrap(),
+                    supervisor,
+                    signal,
+                ));
+                let waiter = tokio::spawn({
+                    let server = server.clone();
+                    async move { server.shutdown().await }
+                });
+                downloads_ready.await.unwrap();
+                waiter.abort();
+                assert!(waiter.await.unwrap_err().is_cancelled());
+                // This is a real catalog worker; closure must reach it even
+                // while the other drain is pending and the listener failed.
+                assert!(catalog
+                    .models(Vec::new(), std::path::PathBuf::new())
+                    .await
+                    .is_err());
+                let repeated = server.shutdown();
+                tokio::pin!(repeated);
+                assert!(futures::poll!(&mut repeated).is_pending());
+                downloads_release.send(()).unwrap();
+                if fail_catalog {
+                    // The real blocked worker reports its failed job/join.
+                    drop(catalog_release);
+                } else {
+                    catalog_release.send(()).unwrap();
+                }
+                let error = tokio::time::timeout(std::time::Duration::from_secs(3), &mut repeated)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("listener: listener sentinel"));
+                assert_eq!(error.contains("downloads:"), fail_downloads);
+                assert_eq!(error.contains("catalog:"), fail_catalog);
+                assert_eq!(server.shutdown().await.unwrap_err().to_string(), error);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_shutdown_is_repeatedly_observable() {
+        let (_, catalog_worker) = CatalogProjection::start(1);
+        let (signal, mut shutdown) = watch::channel(false);
+        let supervisor = tokio::spawn(async move {
+            shutdown.changed().await.unwrap();
+            drain_server_owners(Ok(()), async { Ok(()) }, catalog_worker.shutdown()).await
+        });
+        let server = ServerHandle::new("127.0.0.1:1".parse().unwrap(), supervisor, signal);
+        server.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_handle_requests_shutdown_without_aborting_owned_catalog_drain() {
+        let (catalog, catalog_worker) = CatalogProjection::start(1);
+        let (entered, release) = catalog.hold_for_test().unwrap();
+        entered.await.unwrap();
+        let (signal, mut shutdown) = watch::channel(false);
+        let (drain_started, started) = tokio::sync::oneshot::channel();
+        let (drained, mut completion) = tokio::sync::oneshot::channel();
+        let supervisor = tokio::spawn(async move {
+            shutdown.changed().await.unwrap();
+            drain_started.send(()).unwrap();
+            let result =
+                drain_server_owners(Ok(()), async { Ok(()) }, catalog_worker.shutdown()).await;
+            drained.send(result.is_ok()).unwrap();
+            result
+        });
+        let server = ServerHandle::new("127.0.0.1:1".parse().unwrap(), supervisor, signal);
+        drop(server);
+        started.await.unwrap();
+        let premature = completion.try_recv();
+        release.send(()).unwrap();
+        assert!(matches!(
+            premature,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), completion)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+    }
+
     #[test]
     fn loopback_host_rejects_every_remote_or_ambiguous_form() {
         assert!(LoopbackHost::parse("127.0.0.1").is_ok());
@@ -341,12 +548,12 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn test_server_starts() {
-        let temp_dir = TempDir::new().unwrap();
-        let launcher_root = temp_dir.path().to_path_buf();
-        let api = PumasApi::new(&launcher_root).await.unwrap();
-
+    async fn start_test_server(
+        api: PumasApi,
+        launcher_root: &std::path::Path,
+    ) -> anyhow::Result<ServerHandle> {
+        #[cfg(not(feature = "inference-plugins"))]
+        let _ = launcher_root;
         #[cfg(feature = "inference-plugins")]
         let mut version_managers = HashMap::new();
         #[cfg(feature = "inference-plugins")]
@@ -364,7 +571,7 @@ mod tests {
         #[cfg(feature = "inference-plugins")]
         let plugin_loader = PluginLoader::new_async(plugins_dir).await.unwrap();
 
-        let result = start_server(
+        start_server(
             api,
             #[cfg(feature = "inference-plugins")]
             version_managers,
@@ -375,7 +582,132 @@ mod tests {
             LoopbackHost::parse("127.0.0.1").unwrap(),
             0,
         )
-        .await;
+        .await
+    }
+
+    #[tokio::test]
+    async fn real_server_shutdown_drains_hf_and_catalog_after_callers_leave() {
+        for outcome in ["success", "error", "panic"] {
+            let temp = TempDir::new().unwrap();
+            let api = crate::handlers::test_support::build_test_api_with_hf(temp.path()).await;
+            let path = temp.path().join("owned-shutdown-write");
+            let written_path = path.clone();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let fixture = pumas_library::model_library::test_support::run_download_blocking_fixture(
+                &api,
+                move || -> pumas_library::Result<()> {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    std::fs::write(written_path, b"owned effect completed")?;
+                    match outcome {
+                        "success" => Ok(()),
+                        "error" => Err(pumas_library::PumasError::Other(
+                            "held fixture failure".into(),
+                        )),
+                        _ => panic!("held fixture panic"),
+                    }
+                },
+            );
+            let caller = tokio::spawn(fixture);
+            ready.await.unwrap();
+            let server = Arc::new(start_test_server(api, temp.path()).await.unwrap());
+            let (catalog_ready, catalog_release) = server
+                .catalog_projection
+                .as_ref()
+                .unwrap()
+                .hold_for_test()
+                .unwrap();
+            catalog_ready.await.unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            let waiter = tokio::spawn({
+                let server = server.clone();
+                async move { server.shutdown().await }
+            });
+            // Polling this independent borrowed receipt requests shutdown too;
+            // neither waiter owns the lifetime of either actual effect.
+            let repeated = server.shutdown();
+            tokio::pin!(repeated);
+            assert!(futures::poll!(&mut repeated).is_pending());
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            assert!(!path.exists());
+            let mut catalog_release = Some(catalog_release);
+            let catalog_observation = if outcome == "success" {
+                catalog_release.take().unwrap().send(()).unwrap();
+                Some(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                        while !server
+                            .catalog_drained
+                            .as_ref()
+                            .unwrap()
+                            .load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
+            let pending_with_hf_held = futures::poll!(&mut repeated).is_pending();
+            release.send(()).unwrap();
+            if let Some(observation) = catalog_observation {
+                observation.expect("the real catalog drain must finish independently of HF");
+                assert!(
+                    pending_with_hf_held,
+                    "held HF work must prevent shutdown completion after catalog drains"
+                );
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !path.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the real HF effect must finish after its caller leaves");
+            if let Some(catalog_release) = catalog_release {
+                let observation = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while !server
+                        .downloads_drained
+                        .as_ref()
+                        .unwrap()
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                // Sample while catalog is held, but release before assertions
+                // so a failing oracle cannot strand a blocking fixture.
+                let pending_with_catalog_held = futures::poll!(&mut repeated).is_pending();
+                drop(catalog_release);
+                observation.expect("HF failure must be observed even while catalog is held");
+                assert!(pending_with_catalog_held);
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), &mut repeated)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), b"owned effect completed");
+            if outcome == "success" {
+                result.unwrap();
+                server.shutdown().await.unwrap();
+            } else {
+                let message = result.unwrap_err().to_string();
+                assert!(message.contains("downloads:"), "{message}");
+                assert!(message.contains("catalog:"), "{message}");
+                assert_eq!(server.shutdown().await.unwrap_err().to_string(), message);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_server_starts() {
+        let temp_dir = TempDir::new().unwrap();
+        let api = crate::handlers::test_support::build_test_api_with_hf(temp_dir.path()).await;
+        let result = start_test_server(api, temp_dir.path()).await;
         let server = match result {
             Ok(server) => server,
             Err(err) if is_socket_bind_permission_error(&err) => {
@@ -386,6 +718,7 @@ mod tests {
         };
         let addr = server.addr();
         assert!(addr.port() > 0);
+        server.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
     }
 

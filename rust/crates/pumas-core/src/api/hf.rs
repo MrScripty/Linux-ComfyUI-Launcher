@@ -127,6 +127,19 @@ impl PumasApi {
     // HuggingFace Methods
     // ========================================
 
+    /// Permanently close download admission and observe owned work through shutdown.
+    ///
+    /// Repeated callers receive the same result; cancelling a waiter does not
+    /// cancel drainage. Recovery data is preserved. This does not shut down
+    /// search, importers, inference plugins, or the application's runtime.
+    /// An API without an HF client has no download work to drain.
+    pub async fn shutdown_downloads(&self) -> Result<()> {
+        match &self.primary().hf_client {
+            Some(client) => client.shutdown_downloads().await,
+            None => Ok(()),
+        }
+    }
+
     /// Search for models on HuggingFace.
     ///
     /// Uses intelligent caching to minimize API calls:
@@ -181,14 +194,38 @@ impl PumasApi {
         &self,
         request: &model_library::DownloadRequest,
     ) -> Result<String> {
-        let primary = self.primary();
-        if let Some(ref client) = primary.hf_client {
+        let primary = self.primary().clone();
+        let client = primary
+            .hf_client
+            .clone()
+            .ok_or_else(|| PumasError::Config {
+                message: "HuggingFace client not initialized".to_string(),
+            })?;
+        Self::start_hf_download_owned(primary.model_library.clone(), client, request).await
+    }
+
+    pub(super) async fn start_hf_download_owned(
+        library: Arc<model_library::ModelLibrary>,
+        client: Arc<model_library::HuggingFaceClient>,
+        request: &model_library::DownloadRequest,
+    ) -> Result<String> {
+        let invocation_client = client.clone();
+        let request = request.clone();
+        client.run_download_invocation(move |context| async move {
+            let client = invocation_client;
             let mut resolved_request = request.clone();
             let mut resolved_pipeline_tag =
                 normalized_download_hint(resolved_request.pipeline_tag.as_deref())
                     .map(ToOwned::to_owned);
             let mut remote_model = None;
-            let mut huggingface_evidence = match client.get_model_snapshot(&request.repo_id).await {
+            let metadata_client = client.clone();
+            let metadata_repo = request.repo_id.clone();
+            // Optional metadata refusal remains a policy outcome, while its
+            // async helper and cache effects stay owned through completion.
+            let snapshot = context.run_fallible_async_named("capture download metadata", move || async move {
+                Ok::<_, PumasError>(metadata_client.get_model_snapshot(&metadata_repo).await)
+            }).await.map_err(|error| PumasError::Other(format!("Download metadata observation failed: {error}")))??;
+            let mut huggingface_evidence = match snapshot {
                 Ok((model, evidence)) => {
                     remote_model = Some(model);
                     Some(evidence)
@@ -208,13 +245,20 @@ impl PumasApi {
                 resolved_pipeline_tag = Some(remote_pipeline_tag.to_string());
             }
             let mut resolved_model_type = if let Some(ref evidence) = huggingface_evidence {
-                let resolved = model_library::resolve_model_type_from_huggingface_evidence(
-                    primary.model_library.index(),
-                    Some(&resolved_request.official_name),
-                    resolved_pipeline_tag.as_deref(),
-                    request.model_type.as_deref(),
-                    Some(evidence),
-                )?;
+                let index = library.index().clone();
+                let official_name = resolved_request.official_name.clone();
+                let pipeline_tag = resolved_pipeline_tag.clone();
+                let model_type = request.model_type.clone();
+                let evidence = evidence.clone();
+                let resolved = context.run_fallible_blocking_named(
+                    "resolve download model type evidence",
+                    move || model_library::resolve_model_type_from_huggingface_evidence(
+                        &index, Some(&official_name), pipeline_tag.as_deref(),
+                        model_type.as_deref(), Some(&evidence),
+                    ),
+                ).await.map_err(|error| PumasError::Other(format!(
+                    "Download model type observation failed: {error}"
+                )))??;
                 (resolved.model_type != model_library::ModelType::Unknown)
                     .then(|| resolved.model_type.as_str().to_string())
             } else {
@@ -225,7 +269,11 @@ impl PumasApi {
                 // Fall back to repo metadata only when the request does not already
                 // carry enough information to place the download safely.
                 if remote_model.is_none() {
-                    remote_model = Some(client.get_model_info(&request.repo_id).await?);
+                    let metadata_client = client.clone();
+                    let metadata_repo = request.repo_id.clone();
+                    remote_model = Some(context.run_fallible_async_named("resolve download repository", move || async move {
+                        metadata_client.get_model_info(&metadata_repo).await
+                    }).await.map_err(|error| PumasError::Other(format!("Download repository observation failed: {error}")))??);
                 }
                 let model_info = remote_model.as_ref().expect("remote model must be present");
                 if resolved_pipeline_tag.is_none() {
@@ -234,17 +282,20 @@ impl PumasApi {
                             .map(ToOwned::to_owned);
                 }
                 if resolved_model_type.is_none() {
-                    resolved_model_type = resolve_model_type_from_hints_async(
-                        primary.model_library.index().clone(),
-                        vec![
+                    let index = library.index().clone();
+                    let hints = vec![
                             normalized_download_hint(request.model_type.as_deref())
                                 .map(ToOwned::to_owned),
                             resolved_pipeline_tag.clone(),
                             normalized_download_hint(Some(model_info.kind.as_str()))
                                 .map(ToOwned::to_owned),
-                        ],
-                    )
-                    .await?;
+                        ];
+                    resolved_model_type = context.run_fallible_blocking_named(
+                        "resolve download model type hints",
+                        move || resolve_owned_model_type_hints(&index, hints),
+                    ).await.map_err(|error| PumasError::Other(format!(
+                        "Download model type observation failed: {error}"
+                    )))??;
                 }
             }
             if let Some(model_info) = remote_model.as_ref() {
@@ -258,7 +309,12 @@ impl PumasApi {
                 .is_none_or(|model_type| model_type == "diffusion")
                 || resolved_pipeline_tag.as_deref() == Some("text-to-image");
             if should_check_bundle {
-                match client.classify_repo_bundle(&request.repo_id).await {
+                let metadata_client = client.clone();
+                let metadata_repo = request.repo_id.clone();
+                let classification = context.run_fallible_async_named("classify download repository", move || async move {
+                    Ok::<_, PumasError>(metadata_client.classify_repo_bundle(&metadata_repo).await)
+                }).await.map_err(|error| PumasError::Other(format!("Download classification observation failed: {error}")))??;
+                match classification {
                     Ok(Some(bundle)) => {
                         if resolved_request.filename.is_some()
                             || resolved_request.filenames.is_some()
@@ -305,13 +361,15 @@ impl PumasApi {
                 None,
             );
             resolved_request.model_type = Some(model_type.clone());
-            let dest_dir = primary
-                .model_library
-                .prepare_artifact_download_destination(
-                    &model_type,
-                    &architecture_family,
-                    &selected_artifact.artifact_id,
-                )?;
+            let destination_type = model_type.clone();
+            let dest_dir = context.run_fallible_blocking_named(
+                "prepare HF artifact destination",
+                move || library.prepare_artifact_download_destination(
+                    &destination_type, &architecture_family, &selected_artifact.artifact_id,
+                ),
+            ).await.map_err(|error| PumasError::Other(format!(
+                "Download destination preparation observation failed: {error}"
+            )))??;
             if model_type == "unknown" {
                 warn!(
                     "Download {} is starting with unknown model_type after HF metadata lookup; destination={}",
@@ -327,11 +385,7 @@ impl PumasApi {
             client
                 .start_download(&resolved_request, &dest_dir, huggingface_evidence)
                 .await
-        } else {
-            Err(PumasError::Config {
-                message: "HuggingFace client not initialized".to_string(),
-            })
-        }
+        }).await
     }
 
     /// Get download progress for a HuggingFace download.
@@ -428,18 +482,57 @@ impl PumasApi {
     /// download system handles `.part` file resume via HTTP Range headers and
     /// skips files that are already complete.
     pub async fn recover_download(&self, repo_id: &str, dest_dir: &str) -> Result<String> {
-        let dest = validate_existing_local_directory_lookup_path(dest_dir, "dest_dir").await?;
-
-        let primary = self.primary();
+        let primary = self.primary().clone();
         let client = primary
             .hf_client
-            .as_ref()
+            .clone()
             .ok_or_else(|| PumasError::Config {
                 message: "HuggingFace client not initialized".to_string(),
             })?;
+        Self::recover_download_owned(primary.model_library.clone(), client, repo_id, dest_dir).await
+    }
+
+    pub(super) async fn recover_download_owned(
+        library: Arc<model_library::ModelLibrary>,
+        client: Arc<model_library::HuggingFaceClient>,
+        repo_id: &str,
+        dest_dir: &str,
+    ) -> Result<String> {
+        let operation_client = client.clone();
+        let repo_id = repo_id.to_string();
+        let dest_dir = dest_dir.to_string();
+        client
+            .run_download_invocation(move |context| async move {
+                Self::recover_download_admitted(
+                    library,
+                    operation_client,
+                    context,
+                    repo_id,
+                    dest_dir,
+                )
+                .await
+            })
+            .await
+    }
+
+    async fn recover_download_admitted(
+        library: Arc<model_library::ModelLibrary>,
+        client: Arc<model_library::HuggingFaceClient>,
+        context: model_library::DownloadInvocationContext,
+        repo_id: String,
+        dest_dir: String,
+    ) -> Result<String> {
+        let dest = context
+            .run_fallible_async_named("resolve recovery directory", move || async move {
+                validate_existing_local_directory_lookup_path(&dest_dir, "dest_dir").await
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!("Recovery directory observation failed: {error}"))
+            })??;
 
         // Determine model_type from directory path relative to library root
-        let library_root = primary.model_library.library_root();
+        let library_root = library.library_root();
         let model_type = dest
             .strip_prefix(library_root)
             .ok()
@@ -447,8 +540,15 @@ impl PumasApi {
             .and_then(|c| c.as_os_str().to_str())
             .map(String::from);
 
-        let metadata =
-            load_model_metadata_or_default(primary.model_library.clone(), dest.clone()).await?;
+        let metadata_dest = dest.clone();
+        let metadata = context
+            .run_fallible_blocking_named("load recovery metadata", move || {
+                Ok::<_, PumasError>(library.load_metadata(&metadata_dest)?.unwrap_or_default())
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!("Recovery metadata observation failed: {error}"))
+            })??;
         let recovery_filenames = metadata
             .selected_artifact_files
             .clone()
@@ -467,7 +567,7 @@ impl PumasApi {
             );
         }
 
-        start_recovered_download(client, repo_id, &dest, model_type, recovery_filenames).await
+        start_recovered_download(&client, &repo_id, &dest, model_type, recovery_filenames).await
     }
 
     /// Resume a partial download from a previously issued model-state ticket.
@@ -486,8 +586,8 @@ impl PumasApi {
         model_id: &model_library::DownloadRecoveryModelId,
         recovery_token: &model_library::DownloadRecoveryToken,
     ) -> Result<models::PartialDownloadAction> {
-        let primary = self.primary();
-        let client = match primary.hf_client.as_ref() {
+        let primary = self.primary().clone();
+        let client = match primary.hf_client.clone() {
             Some(client) => client,
             None => {
                 return Ok(models::PartialDownloadAction {
@@ -500,114 +600,149 @@ impl PumasApi {
             }
         };
 
-        let indexed_record = match primary.model_library.get_model(model_id.as_str()).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return Ok(partial_download_unavailable("model_not_found")),
-            Err(error) => return Ok(partial_download_error(&error)),
-        };
-        let model_dir = match client
-            .inspect_recovery_model_directory(
-                primary.model_library.library_root().to_path_buf(),
-                indexed_record,
-            )
-            .await
-        {
-            Ok(Some(model_dir)) => model_dir,
-            Ok(None) => return Ok(partial_download_unavailable("recovery_unavailable")),
-            Err(error) => return Ok(partial_download_error(&error)),
-        };
-        if let Err(error) = primary.model_library.index_model_dir(&model_dir).await {
-            return Ok(partial_download_error(&error));
-        }
-        let fresh_record = match primary.model_library.get_model(model_id.as_str()).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return Ok(partial_download_unavailable("model_not_found")),
-            Err(error) => return Ok(partial_download_error(&error)),
-        };
-        let verification = match client
-            .verify_recovery_model_snapshot(
-                primary.model_library.library_root().to_path_buf(),
-                fresh_record,
-                recovery_token.clone(),
-            )
-            .await
-        {
-            Ok(verification) => verification,
-            Err(error) => return Ok(partial_download_error(&error)),
-        };
-        let verified = match verification {
-            model_library::DownloadRecoveryVerification::Complete => {
-                return Ok(partial_download_unavailable("model_not_partial"));
-            }
-            model_library::DownloadRecoveryVerification::Unavailable => {
-                return Ok(partial_download_unavailable("recovery_unavailable"));
-            }
-            model_library::DownloadRecoveryVerification::Stale => {
-                return Ok(partial_download_unavailable("recovery_context_stale"));
-            }
-            model_library::DownloadRecoveryVerification::Verified(verified) => verified,
-        };
+        let operation_client = client.clone();
+        let model_id = model_id.clone();
+        let recovery_token = recovery_token.clone();
+        client
+            .run_download_invocation(move |context| async move {
+                let client = operation_client;
+                let library = primary.model_library.clone();
+                let record_id = model_id.as_str().to_string();
+                let indexed_record = match context
+                    .run_fallible_async_named("load ticket recovery model", move || async move {
+                        library.get_model(&record_id).await
+                    })
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!("Recovery model observation failed: {error}"))
+                    })? {
+                    Ok(Some(record)) => record,
+                    Ok(None) => return Ok(partial_download_unavailable("model_not_found")),
+                    Err(error) => return Ok(partial_download_error(&error)),
+                };
+                let model_dir = match client
+                    .inspect_recovery_model_directory(
+                        primary.model_library.library_root().to_path_buf(),
+                        indexed_record,
+                    )
+                    .await
+                {
+                    Ok(Some(model_dir)) => model_dir,
+                    Ok(None) => return Ok(partial_download_unavailable("recovery_unavailable")),
+                    Err(error) => return Ok(partial_download_error(&error)),
+                };
+                let library = primary.model_library.clone();
+                if let Err(error) = context
+                    .run_fallible_async_named("index ticket recovery model", move || async move {
+                        library.index_model_dir(&model_dir).await
+                    })
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!("Recovery index observation failed: {error}"))
+                    })?
+                {
+                    return Ok(partial_download_error(&error));
+                }
+                let library = primary.model_library.clone();
+                let record_id = model_id.as_str().to_string();
+                let fresh_record = match context
+                    .run_fallible_async_named("reload ticket recovery model", move || async move {
+                        library.get_model(&record_id).await
+                    })
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!("Recovery model observation failed: {error}"))
+                    })? {
+                    Ok(Some(record)) => record,
+                    Ok(None) => return Ok(partial_download_unavailable("model_not_found")),
+                    Err(error) => return Ok(partial_download_error(&error)),
+                };
+                let verification = match client
+                    .verify_recovery_model_snapshot(
+                        primary.model_library.library_root().to_path_buf(),
+                        fresh_record,
+                        recovery_token.clone(),
+                    )
+                    .await
+                {
+                    Ok(verification) => verification,
+                    Err(error) => return Ok(partial_download_error(&error)),
+                };
+                let verified = match verification {
+                    model_library::DownloadRecoveryVerification::Complete => {
+                        return Ok(partial_download_unavailable("model_not_partial"));
+                    }
+                    model_library::DownloadRecoveryVerification::Unavailable => {
+                        return Ok(partial_download_unavailable("recovery_unavailable"));
+                    }
+                    model_library::DownloadRecoveryVerification::Stale => {
+                        return Ok(partial_download_unavailable("recovery_context_stale"));
+                    }
+                    model_library::DownloadRecoveryVerification::Verified(verified) => verified,
+                };
 
-        let model_type = model_id.as_str().split('/').next().map(str::to_string);
-        let admission = match client.admit_recovery_download(&verified, model_type).await {
-            Ok(admission) => admission,
-            Err(error) => return Ok(partial_download_error(&error)),
-        };
-        match admission {
-            model_library::RecoveryDownloadAdmission::Recovered { download_id } => {
-                Ok(models::PartialDownloadAction {
-                    action: "recover".to_string(),
-                    download_id: Some(download_id),
-                    status: Some(models::DownloadStatus::Queued),
-                    reason_code: None,
-                    message: None,
-                })
-            }
-            model_library::RecoveryDownloadAdmission::Resumed { download_id } => {
-                Ok(models::PartialDownloadAction {
-                    action: "resume".to_string(),
-                    download_id: Some(download_id),
-                    status: Some(models::DownloadStatus::Queued),
-                    reason_code: None,
-                    message: None,
-                })
-            }
-            model_library::RecoveryDownloadAdmission::Attached {
-                download_id,
-                status,
-            } => Ok(models::PartialDownloadAction {
-                action: "attach".to_string(),
-                download_id: Some(download_id),
-                status: Some(status),
-                reason_code: None,
-                message: None,
-            }),
-            model_library::RecoveryDownloadAdmission::AlreadyCompleted { download_id } => {
-                Ok(models::PartialDownloadAction {
-                    action: "none".to_string(),
-                    download_id: Some(download_id),
-                    status: Some(models::DownloadStatus::Completed),
-                    reason_code: Some("already_completed".to_string()),
-                    message: Some("tracked download is already completed".to_string()),
-                })
-            }
-            model_library::RecoveryDownloadAdmission::AlreadyCancelled { download_id } => {
-                Ok(models::PartialDownloadAction {
-                    action: "none".to_string(),
-                    download_id: Some(download_id),
-                    status: Some(models::DownloadStatus::Cancelled),
-                    reason_code: Some("already_cancelled".to_string()),
-                    message: Some("tracked download was cancelled".to_string()),
-                })
-            }
-            model_library::RecoveryDownloadAdmission::ContextMismatch
-            | model_library::RecoveryDownloadAdmission::BoundFilesUnavailable => {
-                Ok(partial_download_unavailable("recovery_context_stale"))
-            }
-            model_library::RecoveryDownloadAdmission::CapabilityUnavailable => {
-                Ok(partial_download_unavailable("recovery_unavailable"))
-            }
-        }
+                let model_type = model_id.as_str().split('/').next().map(str::to_string);
+                let admission = match client.admit_recovery_download(&verified, model_type).await {
+                    Ok(admission) => admission,
+                    Err(error) => return Ok(partial_download_error(&error)),
+                };
+                match admission {
+                    model_library::RecoveryDownloadAdmission::Recovered { download_id } => {
+                        Ok(models::PartialDownloadAction {
+                            action: "recover".to_string(),
+                            download_id: Some(download_id),
+                            status: Some(models::DownloadStatus::Queued),
+                            reason_code: None,
+                            message: None,
+                        })
+                    }
+                    model_library::RecoveryDownloadAdmission::Resumed { download_id } => {
+                        Ok(models::PartialDownloadAction {
+                            action: "resume".to_string(),
+                            download_id: Some(download_id),
+                            status: Some(models::DownloadStatus::Queued),
+                            reason_code: None,
+                            message: None,
+                        })
+                    }
+                    model_library::RecoveryDownloadAdmission::Attached {
+                        download_id,
+                        status,
+                    } => Ok(models::PartialDownloadAction {
+                        action: "attach".to_string(),
+                        download_id: Some(download_id),
+                        status: Some(status),
+                        reason_code: None,
+                        message: None,
+                    }),
+                    model_library::RecoveryDownloadAdmission::AlreadyCompleted { download_id } => {
+                        Ok(models::PartialDownloadAction {
+                            action: "none".to_string(),
+                            download_id: Some(download_id),
+                            status: Some(models::DownloadStatus::Completed),
+                            reason_code: Some("already_completed".to_string()),
+                            message: Some("tracked download is already completed".to_string()),
+                        })
+                    }
+                    model_library::RecoveryDownloadAdmission::AlreadyCancelled { download_id } => {
+                        Ok(models::PartialDownloadAction {
+                            action: "none".to_string(),
+                            download_id: Some(download_id),
+                            status: Some(models::DownloadStatus::Cancelled),
+                            reason_code: Some("already_cancelled".to_string()),
+                            message: Some("tracked download was cancelled".to_string()),
+                        })
+                    }
+                    model_library::RecoveryDownloadAdmission::ContextMismatch
+                    | model_library::RecoveryDownloadAdmission::BoundFilesUnavailable => {
+                        Ok(partial_download_unavailable("recovery_context_stale"))
+                    }
+                    model_library::RecoveryDownloadAdmission::CapabilityUnavailable => {
+                        Ok(partial_download_unavailable("recovery_unavailable"))
+                    }
+                }
+            })
+            .await
     }
 
     /// Resume a partial download by choosing the correct action:
@@ -622,128 +757,160 @@ impl PumasApi {
         repo_id: &str,
         dest_dir: &str,
     ) -> Result<models::PartialDownloadAction> {
-        let dest = match validate_existing_local_directory_lookup_path(dest_dir, "dest_dir").await {
-            Ok(dest) => dest,
-            Err(PumasError::InvalidParams { .. } | PumasError::NotFound { .. }) => {
-                return Ok(models::PartialDownloadAction {
-                    action: "none".to_string(),
-                    download_id: None,
-                    status: None,
-                    reason_code: Some("dest_dir_missing".to_string()),
-                    message: Some(format!("directory not found: {}", dest_dir)),
-                });
-            }
-            Err(err) => return Err(err),
-        };
-
-        let primary = self.primary();
-        let client = match primary.hf_client.as_ref() {
+        let primary = self.primary().clone();
+        let client = match primary.hf_client.clone() {
             Some(client) => client,
-            None => {
-                return Ok(models::PartialDownloadAction {
-                    action: "none".to_string(),
-                    download_id: None,
-                    status: None,
-                    reason_code: Some("hf_client_unavailable".to_string()),
-                    message: Some("HuggingFace client not initialized".to_string()),
-                });
-            }
+            None => return Ok(partial_download_unavailable("hf_client_unavailable")),
         };
+        Self::resume_partial_download_owned(
+            primary.model_library.clone(),
+            client,
+            repo_id,
+            dest_dir,
+        )
+        .await
+    }
 
-        if let Some(download_id) = client.find_download_id_by_dest_dir(&dest).await {
-            let status = client.get_download_status(&download_id).await;
-            if let Some(status) = status {
-                match status {
-                    models::DownloadStatus::Paused | models::DownloadStatus::Error => {
-                        match client.resume_download(&download_id).await {
-                            Ok(true) => {
+    pub(super) async fn resume_partial_download_owned(
+        library: Arc<model_library::ModelLibrary>,
+        client: Arc<model_library::HuggingFaceClient>,
+        repo_id: &str,
+        dest_dir: &str,
+    ) -> Result<models::PartialDownloadAction> {
+        let operation_client = client.clone();
+        let repo_id = repo_id.to_string();
+        let dest_dir = dest_dir.to_string();
+        client
+            .run_download_invocation(move |context| async move {
+                let client = operation_client;
+                let lookup_dir = dest_dir.clone();
+                let dest = match context
+                    .run_fallible_async_named(
+                        "resolve partial download directory",
+                        move || async move {
+                            validate_existing_local_directory_lookup_path(&lookup_dir, "dest_dir")
+                                .await
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!("Partial directory observation failed: {error}"))
+                    })? {
+                    Ok(dest) => dest,
+                    Err(PumasError::InvalidParams { .. } | PumasError::NotFound { .. }) => {
+                        return Ok(models::PartialDownloadAction {
+                            action: "none".to_string(),
+                            download_id: None,
+                            status: None,
+                            reason_code: Some("dest_dir_missing".to_string()),
+                            message: Some(format!("directory not found: {}", dest_dir)),
+                        });
+                    }
+                    Err(err) => return Err(err),
+                };
+
+                if let Some(download_id) = client.find_download_id_by_dest_dir(&dest).await {
+                    let status = client.get_download_status(&download_id).await;
+                    if let Some(status) = status {
+                        match status {
+                            models::DownloadStatus::Paused | models::DownloadStatus::Error => {
+                                match client.resume_download(&download_id).await {
+                                    Ok(true) => {
+                                        return Ok(models::PartialDownloadAction {
+                                            action: "resume".to_string(),
+                                            download_id: Some(download_id),
+                                            status: Some(models::DownloadStatus::Queued),
+                                            reason_code: None,
+                                            message: None,
+                                        });
+                                    }
+                                    Ok(false) => {
+                                        return Ok(models::PartialDownloadAction {
+                                            action: "none".to_string(),
+                                            download_id: Some(download_id),
+                                            status: Some(status),
+                                            reason_code: Some("resume_rejected".to_string()),
+                                            message: Some(format!(
+                                        "tracked download cannot be resumed from status {:?}",
+                                        status
+                                    )),
+                                        });
+                                    }
+                                    Err(err) => {
+                                        let reason_code =
+                                            partial_download_reason_code(&err).to_string();
+                                        return Ok(models::PartialDownloadAction {
+                                            action: "none".to_string(),
+                                            download_id: Some(download_id),
+                                            status: Some(status),
+                                            reason_code: Some(reason_code),
+                                            message: Some(err.to_string()),
+                                        });
+                                    }
+                                }
+                            }
+                            models::DownloadStatus::Queued
+                            | models::DownloadStatus::Downloading
+                            | models::DownloadStatus::Pausing
+                            | models::DownloadStatus::Cancelling => {
                                 return Ok(models::PartialDownloadAction {
-                                    action: "resume".to_string(),
+                                    action: "attach".to_string(),
                                     download_id: Some(download_id),
-                                    status: Some(models::DownloadStatus::Queued),
+                                    status: Some(status),
                                     reason_code: None,
                                     message: None,
                                 });
                             }
-                            Ok(false) => {
+                            models::DownloadStatus::Completed => {
                                 return Ok(models::PartialDownloadAction {
                                     action: "none".to_string(),
                                     download_id: Some(download_id),
                                     status: Some(status),
-                                    reason_code: Some("resume_rejected".to_string()),
-                                    message: Some(format!(
-                                        "tracked download cannot be resumed from status {:?}",
-                                        status
-                                    )),
+                                    reason_code: Some("already_completed".to_string()),
+                                    message: Some(
+                                        "tracked download is already completed".to_string(),
+                                    ),
                                 });
                             }
-                            Err(err) => {
-                                let reason_code = partial_download_reason_code(&err).to_string();
+                            models::DownloadStatus::Cancelled => {
                                 return Ok(models::PartialDownloadAction {
                                     action: "none".to_string(),
                                     download_id: Some(download_id),
                                     status: Some(status),
-                                    reason_code: Some(reason_code),
-                                    message: Some(err.to_string()),
+                                    reason_code: Some("already_cancelled".to_string()),
+                                    message: Some(
+                                        "tracked download was cancelled; start a new download"
+                                            .to_string(),
+                                    ),
                                 });
                             }
                         }
                     }
-                    models::DownloadStatus::Queued
-                    | models::DownloadStatus::Downloading
-                    | models::DownloadStatus::Pausing
-                    | models::DownloadStatus::Cancelling => {
-                        return Ok(models::PartialDownloadAction {
-                            action: "attach".to_string(),
-                            download_id: Some(download_id),
-                            status: Some(status),
-                            reason_code: None,
-                            message: None,
-                        });
-                    }
-                    models::DownloadStatus::Completed => {
-                        return Ok(models::PartialDownloadAction {
+                }
+
+                match Self::recover_download_admitted(library, client, context, repo_id, dest_dir)
+                    .await
+                {
+                    Ok(download_id) => Ok(models::PartialDownloadAction {
+                        action: "recover".to_string(),
+                        download_id: Some(download_id),
+                        status: Some(models::DownloadStatus::Queued),
+                        reason_code: None,
+                        message: None,
+                    }),
+                    Err(err) => {
+                        let reason_code = partial_download_reason_code(&err).to_string();
+                        Ok(models::PartialDownloadAction {
                             action: "none".to_string(),
-                            download_id: Some(download_id),
-                            status: Some(status),
-                            reason_code: Some("already_completed".to_string()),
-                            message: Some("tracked download is already completed".to_string()),
-                        });
-                    }
-                    models::DownloadStatus::Cancelled => {
-                        return Ok(models::PartialDownloadAction {
-                            action: "none".to_string(),
-                            download_id: Some(download_id),
-                            status: Some(status),
-                            reason_code: Some("already_cancelled".to_string()),
-                            message: Some(
-                                "tracked download was cancelled; start a new download".to_string(),
-                            ),
-                        });
+                            download_id: None,
+                            status: None,
+                            reason_code: Some(reason_code),
+                            message: Some(err.to_string()),
+                        })
                     }
                 }
-            }
-        }
-
-        match self.recover_download(repo_id, dest_dir).await {
-            Ok(download_id) => Ok(models::PartialDownloadAction {
-                action: "recover".to_string(),
-                download_id: Some(download_id),
-                status: Some(models::DownloadStatus::Queued),
-                reason_code: None,
-                message: None,
-            }),
-            Err(err) => {
-                let reason_code = partial_download_reason_code(&err).to_string();
-                Ok(models::PartialDownloadAction {
-                    action: "none".to_string(),
-                    download_id: None,
-                    status: None,
-                    reason_code: Some(reason_code),
-                    message: Some(err.to_string()),
-                })
-            }
-        }
+            })
+            .await
     }
 
     /// Refetch metadata for a library model from HuggingFace.
@@ -1074,26 +1241,31 @@ pub(crate) async fn resolve_model_type_from_hints_async(
     index: crate::index::ModelIndex,
     hints: Vec<Option<String>>,
 ) -> Result<Option<String>> {
-    tokio::task::spawn_blocking(move || {
-        let mut seen = HashSet::new();
-        for raw_hint in hints.into_iter().flatten() {
-            let normalized_hint = raw_hint.trim().to_lowercase();
-            if normalized_hint.is_empty() || !seen.insert(normalized_hint.clone()) {
-                continue;
-            }
-            if let Some(model_type) = index.resolve_model_type_hint(&normalized_hint)? {
-                return Ok(Some(model_type));
-            }
+    tokio::task::spawn_blocking(move || resolve_owned_model_type_hints(&index, hints))
+        .await
+        .map_err(|err| {
+            PumasError::Other(format!(
+                "Failed to join HuggingFace model-type hint resolution task: {}",
+                err
+            ))
+        })?
+}
+
+fn resolve_owned_model_type_hints(
+    index: &crate::index::ModelIndex,
+    hints: Vec<Option<String>>,
+) -> Result<Option<String>> {
+    let mut seen = HashSet::new();
+    for raw_hint in hints.into_iter().flatten() {
+        let normalized_hint = raw_hint.trim().to_lowercase();
+        if normalized_hint.is_empty() || !seen.insert(normalized_hint.clone()) {
+            continue;
         }
-        Ok(None)
-    })
-    .await
-    .map_err(|err| {
-        PumasError::Other(format!(
-            "Failed to join HuggingFace model-type hint resolution task: {}",
-            err
-        ))
-    })?
+        if let Some(model_type) = index.resolve_model_type_hint(&normalized_hint)? {
+            return Ok(Some(model_type));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn normalized_download_hint(hint: Option<&str>) -> Option<&str> {
@@ -1388,6 +1560,66 @@ fn partial_download_error(error: &PumasError) -> models::PartialDownloadAction {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_without_hf_client_is_repeatable() {
+        let root = tempfile::TempDir::new().unwrap();
+        let mut api = recovery_api_fixture(root.path(), None).await;
+        let crate::ApiInner::Primary(primary) = &mut api.inner;
+        let client = Arc::get_mut(primary).unwrap().hf_client.take().unwrap();
+        client.shutdown_downloads().await.unwrap();
+
+        api.shutdown_downloads().await.unwrap();
+        api.shutdown_downloads().await.unwrap();
+        assert!(api.primary().hf_client.is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_download_api_refuses_before_metadata_or_destination_work() {
+        let root = tempfile::TempDir::new().unwrap();
+        let api = recovery_api_fixture(root.path(), None).await;
+        api.shutdown_downloads().await.unwrap();
+        let request = model_library::DownloadRequest {
+            repo_id: "shutdown-fixture/model".into(),
+            family: "shutdown-fixture".into(),
+            official_name: "model".into(),
+            model_type: Some("llm".into()),
+            quant: None,
+            filename: Some("weights.gguf".into()),
+            filenames: None,
+            pipeline_tag: None,
+            bundle_format: None,
+            pipeline_class: None,
+            release_date: None,
+            download_url: None,
+            model_card_json: None,
+            license_status: None,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            api.start_hf_download(&request),
+        )
+        .await
+        .expect("closed admission must not attempt remote metadata resolution");
+        assert!(matches!(result, Err(PumasError::DownloadLifecycleClosed)));
+        assert!(matches!(
+            api.recover_download("shutdown-fixture/model", "/missing-shutdown-fixture")
+                .await,
+            Err(PumasError::DownloadLifecycleClosed)
+        ));
+        assert!(matches!(
+            api.resume_partial_download("shutdown-fixture/model", "/missing-shutdown-fixture")
+                .await,
+            Err(PumasError::DownloadLifecycleClosed)
+        ));
+        assert!(!api
+            .primary()
+            .model_library
+            .library_root()
+            .join("llm")
+            .exists());
+        api.shutdown_downloads().await.unwrap();
+    }
 
     pub(in crate::api) async fn recovery_api_fixture(
         root: &std::path::Path,

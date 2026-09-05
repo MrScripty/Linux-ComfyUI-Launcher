@@ -23,6 +23,7 @@ mod search;
 mod types;
 
 pub use auth::HfAuthStatus;
+pub(crate) use lifecycle::TaskContext as DownloadInvocationContext;
 pub use types::{
     AuxFilesCompleteCallback, AuxFilesCompleteInfo, DownloadCompletionCallback,
     DownloadCompletionInfo,
@@ -66,6 +67,9 @@ pub struct HuggingFaceClient {
     pub(super) download_publications: Arc<DownloadPublicationOwner>,
     /// Owner of background download tasks and their blocking filesystem work.
     download_tasks: Arc<DownloadTaskOwner>,
+    /// Only the public client requests closure on Drop; invocation snapshots
+    /// borrow its configuration while their work belongs to `download_tasks`.
+    owns_lifecycle: bool,
     /// Generation-scoped serialization of shared destination effects.
     destination_executions: Arc<DestinationExecutionOwner>,
     /// Per-destination mutexes so downloads targeting the same model folder
@@ -98,6 +102,39 @@ impl std::fmt::Debug for HuggingFaceClient {
 }
 
 impl HuggingFaceClient {
+    fn clone_for_invocation(&self) -> Self {
+        Self {
+            destination_root: self.destination_root.clone(),
+            client: self.client.clone(),
+            download_client: self.download_client.clone(),
+            cache_dir: self.cache_dir.clone(),
+            downloads: self.downloads.clone(),
+            download_revision: self.download_revision.clone(),
+            download_updates: self.download_updates.clone(),
+            download_publications: self.download_publications.clone(),
+            download_tasks: self.download_tasks.clone(),
+            owns_lifecycle: false,
+            destination_executions: self.destination_executions.clone(),
+            dest_locks: self.dest_locks.clone(),
+            search_cache: self.search_cache.clone(),
+            persistence: self.persistence.clone(),
+            completion_callback: self.completion_callback.clone(),
+            aux_complete_callback: self.aux_complete_callback.clone(),
+            auth_token: self.auth_token.clone(),
+            #[cfg(test)]
+            download_base_url: self.download_base_url.clone(),
+        }
+    }
+
+    pub(crate) async fn run_download_invocation<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(DownloadInvocationContext) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        self.download_tasks.run_invocation(operation).await
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_download_base_url(&mut self, base_url: String) {
         self.download_base_url = Some(base_url);
@@ -177,6 +214,7 @@ impl HuggingFaceClient {
             download_updates,
             download_publications,
             download_tasks: Arc::new(DownloadTaskOwner::new()),
+            owns_lifecycle: true,
             destination_executions: Arc::new(DestinationExecutionOwner::new()),
             dest_locks: Arc::new(RwLock::new(HashMap::new())),
             search_cache: None,
@@ -352,9 +390,13 @@ impl HuggingFaceClient {
 
 impl Drop for HuggingFaceClient {
     fn drop(&mut self) {
-        // Slice B only delegates abort requests to the lifecycle owner. Full
-        // shutdown drain/observation remains Milestone 4 / RUST-A6.
-        self.download_tasks.abort_all();
+        if self.owns_lifecycle {
+            let downloads = self.downloads.clone();
+            let publications = self.download_publications.clone();
+            self.download_tasks.request_shutdown(move || {
+                download::project_download_shutdown(downloads, publications)
+            });
+        }
     }
 }
 
