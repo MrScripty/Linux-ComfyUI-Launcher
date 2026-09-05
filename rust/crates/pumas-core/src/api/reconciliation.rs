@@ -11,12 +11,14 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use serde_json::Value;
-use tokio::{fs, sync::Mutex};
+use tokio::fs;
 use walkdir::WalkDir;
 
 use crate::config::NetworkConfig;
@@ -29,6 +31,37 @@ use crate::model_library::{
 };
 
 use super::state::PrimaryState;
+
+/// The subsystems owned by one reconciliation, independent of its requester.
+struct ReconciliationInputs {
+    model_library: Arc<crate::model_library::ModelLibrary>,
+    model_importer: crate::model_library::ModelImporter,
+    hf_client: Option<Arc<crate::model_library::HuggingFaceClient>>,
+    #[cfg(test)]
+    reconciliation: Arc<ReconciliationCoordinator>,
+}
+
+impl From<&PrimaryState> for ReconciliationInputs {
+    fn from(primary: &PrimaryState) -> Self {
+        Self {
+            model_library: primary.model_library.clone(),
+            model_importer: primary.model_importer.clone(),
+            hf_client: primary.hf_client.clone(),
+            #[cfg(test)]
+            reconciliation: primary.reconciliation.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CleanupPhase {
+    Entered,
+    Finished,
+}
+
+#[cfg(test)]
+type CleanupObserver = Arc<dyn Fn(CleanupPhase) + Send + Sync>;
 
 pub(crate) const WATCHER_WRITE_SUPPRESSION_TTL: Duration = Duration::from_secs(2);
 
@@ -90,8 +123,8 @@ impl WatcherWriteSuppressor {
 struct ScopeRuntimeState {
     last_checked_instant: Option<Instant>,
     last_checked_rfc3339: Option<String>,
-    last_dirty_instant: Option<Instant>,
-    in_flight: bool,
+    dirty: bool,
+    active_run: Option<ActiveRun>,
 }
 
 #[derive(Debug, Default)]
@@ -100,112 +133,255 @@ struct ReconciliationState {
     models: HashMap<String, ScopeRuntimeState>,
 }
 
+#[derive(Debug)]
+struct RunIdentity;
+
+#[derive(Debug, Clone)]
+struct ActiveRun {
+    identity: Arc<RunIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileIntent {
+    Opportunistic,
+    Forced,
+}
+
+pub(crate) enum StartOutcome {
+    Started(ReconciliationRunToken),
+    Clean,
+    InFlight,
+}
+
+pub(crate) struct ReconciliationRunToken {
+    coordinator: Weak<ReconciliationCoordinator>,
+    scope: ReconcileScope,
+    identity: Arc<RunIdentity>,
+    finished: bool,
+}
+
+impl ReconciliationRunToken {
+    pub(crate) async fn finish_success(mut self, completed_at: String) {
+        if let Some(coordinator) = self.coordinator.upgrade() {
+            coordinator.finish_success_if_current(&self.scope, &self.identity, completed_at);
+        }
+        self.finished = true;
+    }
+
+    pub(crate) async fn finish_failure(mut self) {
+        if let Some(coordinator) = self.coordinator.upgrade() {
+            coordinator.abandon_if_current(&self.scope, &self.identity);
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for ReconciliationRunToken {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(coordinator) = self.coordinator.upgrade() {
+            coordinator.abandon_if_current(&self.scope, &self.identity);
+        }
+    }
+}
+
 /// Internal coordinator for throttled, single-flight reconciliation.
 pub(crate) struct ReconciliationCoordinator {
-    state: Mutex<ReconciliationState>,
+    state: StdMutex<ReconciliationState>,
     model_cooldown: Duration,
     all_cooldown: Duration,
+    #[cfg(test)]
+    cleanup_observer: StdMutex<Option<CleanupObserver>>,
 }
 
 impl ReconciliationCoordinator {
     pub(crate) fn new(model_cooldown: Duration, all_cooldown: Duration) -> Self {
         Self {
-            state: Mutex::new(ReconciliationState::default()),
+            state: StdMutex::new(ReconciliationState::default()),
             model_cooldown,
             all_cooldown,
+            #[cfg(test)]
+            cleanup_observer: StdMutex::new(None),
         }
     }
 
     pub(crate) async fn mark_dirty_all(&self) {
-        let mut state = self.state.lock().await;
-        state.all.last_dirty_instant = Some(Instant::now());
+        let mut state = self.lock_state();
+        state.all.dirty = true;
+        for model_state in state.models.values_mut() {
+            model_state.dirty = true;
+        }
     }
 
     pub(crate) async fn mark_dirty_model(&self, model_id: &str) {
-        let mut state = self.state.lock().await;
+        let mut state = self.lock_state();
         let model_state = state.models.entry(model_id.to_string()).or_default();
-        model_state.last_dirty_instant = Some(Instant::now());
+        model_state.dirty = true;
     }
 
-    pub(crate) async fn try_start(&self, scope: &ReconcileScope, force: bool) -> bool {
-        let mut state = self.state.lock().await;
+    pub(crate) async fn try_start(
+        self: &Arc<Self>,
+        scope: &ReconcileScope,
+        intent: ReconcileIntent,
+    ) -> StartOutcome {
+        let mut state = self.lock_state();
+        let blocked = match scope {
+            ReconcileScope::AllModels => {
+                state.all.active_run.is_some()
+                    || state
+                        .models
+                        .values()
+                        .any(|model_state| model_state.active_run.is_some())
+            }
+            ReconcileScope::Model(model_id) => {
+                state.all.active_run.is_some()
+                    || state
+                        .models
+                        .get(model_id)
+                        .is_some_and(|model_state| model_state.active_run.is_some())
+            }
+        };
+        if blocked {
+            return StartOutcome::InFlight;
+        }
+
+        if intent == ReconcileIntent::Opportunistic {
+            let should_start = match scope {
+                ReconcileScope::AllModels => {
+                    should_run(&state.all, self.all_cooldown)
+                        || state.models.values().any(has_unreconciled_dirty)
+                }
+                ReconcileScope::Model(model_id) => state
+                    .models
+                    .get(model_id)
+                    .is_none_or(|model_state| should_run(model_state, self.model_cooldown)),
+            };
+            if !should_start {
+                return StartOutcome::Clean;
+            }
+        }
 
         match scope {
             ReconcileScope::AllModels => {
-                if state.all.in_flight {
-                    return false;
+                state.all.dirty = false;
+                for model_state in state.models.values_mut() {
+                    model_state.dirty = false;
                 }
-                if !should_run(&state.all, self.all_cooldown, force) {
-                    return false;
-                }
-                state.all.in_flight = true;
-                true
             }
             ReconcileScope::Model(model_id) => {
-                // Full-library reconcile supersedes targeted reconcile while active.
-                if state.all.in_flight {
-                    return false;
+                state.models.entry(model_id.clone()).or_default().dirty = false;
+            }
+        }
+
+        let identity = Arc::new(RunIdentity);
+        let active_run = ActiveRun {
+            identity: identity.clone(),
+        };
+        match scope {
+            ReconcileScope::AllModels => state.all.active_run = Some(active_run),
+            ReconcileScope::Model(model_id) => {
+                state.models.entry(model_id.clone()).or_default().active_run = Some(active_run);
+            }
+        }
+
+        StartOutcome::Started(ReconciliationRunToken {
+            coordinator: Arc::downgrade(self),
+            scope: scope.clone(),
+            identity,
+            finished: false,
+        })
+    }
+
+    fn finish_success_if_current(
+        &self,
+        scope: &ReconcileScope,
+        identity: &Arc<RunIdentity>,
+        completed_at: String,
+    ) {
+        let mut state = self.lock_state();
+        let is_current = match scope {
+            ReconcileScope::AllModels => state
+                .all
+                .active_run
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(&active.identity, identity)),
+            ReconcileScope::Model(model_id) => state
+                .models
+                .get(model_id)
+                .and_then(|model_state| model_state.active_run.as_ref())
+                .is_some_and(|active| Arc::ptr_eq(&active.identity, identity)),
+        };
+        if !is_current {
+            return;
+        }
+
+        let now = Instant::now();
+        match scope {
+            ReconcileScope::AllModels => {
+                state.all.active_run = None;
+                state.all.last_checked_instant = Some(now);
+                state.all.last_checked_rfc3339 = Some(completed_at.clone());
+
+                for model_state in state.models.values_mut() {
+                    model_state.last_checked_instant = Some(now);
+                    model_state.last_checked_rfc3339 = Some(completed_at.clone());
                 }
+            }
+            ReconcileScope::Model(model_id) => {
                 let model_state = state.models.entry(model_id.clone()).or_default();
-                if model_state.in_flight {
-                    return false;
-                }
-                if !should_run(model_state, self.model_cooldown, force) {
-                    return false;
-                }
-                model_state.in_flight = true;
-                true
+                model_state.active_run = None;
+                model_state.last_checked_instant = Some(now);
+                model_state.last_checked_rfc3339 = Some(completed_at);
             }
         }
     }
 
-    pub(crate) async fn complete(&self, scope: &ReconcileScope, completed_at: String) {
-        let mut state = self.state.lock().await;
-        let now = Instant::now();
-
+    fn abandon_if_current(&self, scope: &ReconcileScope, identity: &Arc<RunIdentity>) {
+        let mut state = self.lock_state();
         match scope {
             ReconcileScope::AllModels => {
-                state.all.in_flight = false;
-                state.all.last_checked_instant = Some(now);
-                state.all.last_checked_rfc3339 = Some(completed_at);
-                state.all.last_dirty_instant = None;
-                let all_checked = state.all.last_checked_rfc3339.clone();
-
-                // A full-library reconcile refreshes the effective freshness window
-                // for all known model scopes and clears their dirty markers.
-                for model_state in state.models.values_mut() {
-                    model_state.last_checked_instant = Some(now);
-                    model_state.last_checked_rfc3339 = all_checked.clone();
-                    model_state.last_dirty_instant = None;
-                    model_state.in_flight = false;
+                if state
+                    .all
+                    .active_run
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(&active.identity, identity))
+                {
+                    state.all.active_run = None;
+                    state.all.dirty = true;
+                    for model_state in state.models.values_mut() {
+                        model_state.dirty = true;
+                    }
                 }
             }
             ReconcileScope::Model(model_id) => {
                 let model_state = state.models.entry(model_id.clone()).or_default();
-                model_state.in_flight = false;
-                model_state.last_checked_instant = Some(now);
-                model_state.last_checked_rfc3339 = Some(completed_at);
-                model_state.last_dirty_instant = None;
+                if model_state
+                    .active_run
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(&active.identity, identity))
+                {
+                    model_state.active_run = None;
+                    model_state.dirty = true;
+                }
             }
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ReconciliationState> {
+        match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 }
 
 fn has_unreconciled_dirty(scope_state: &ScopeRuntimeState) -> bool {
-    match (
-        scope_state.last_dirty_instant,
-        scope_state.last_checked_instant,
-    ) {
-        (Some(_), None) => true,
-        (Some(dirty), Some(last_checked)) => dirty > last_checked,
-        _ => false,
-    }
+    scope_state.dirty
 }
 
-fn should_run(scope_state: &ScopeRuntimeState, cooldown: Duration, force: bool) -> bool {
-    if force {
-        return true;
-    }
+fn should_run(scope_state: &ScopeRuntimeState, cooldown: Duration) -> bool {
     if has_unreconciled_dirty(scope_state) {
         return true;
     }
@@ -222,28 +398,25 @@ pub(crate) async fn trigger_reconciliation(
     scope: ReconcileScope,
     reason: &'static str,
 ) {
-    if !primary.reconciliation.try_start(&scope, false).await {
-        return;
-    }
+    let run = match primary
+        .reconciliation
+        .try_start(&scope, ReconcileIntent::Opportunistic)
+        .await
+    {
+        StartOutcome::Started(run) => run,
+        StartOutcome::Clean | StartOutcome::InFlight => return,
+    };
 
-    let runtime_tasks = primary.runtime_tasks.clone();
-    runtime_tasks.spawn(async move {
-        tracing::debug!(
-            "Starting reconciliation: scope={:?} reason={}",
-            scope,
-            reason
-        );
-        if let Err(err) = run_scope(primary.as_ref(), &scope).await {
-            tracing::warn!("Reconciliation failed for {:?}: {}", scope, err);
-        }
-        primary
-            .reconciliation
-            .complete(&scope, chrono::Utc::now().to_rfc3339())
-            .await;
-    });
+    // The runtime owner observes failures when there is no waiting requester.
+    drop(start_owned_reconciliation(
+        primary.as_ref(),
+        scope,
+        reason,
+        run,
+    ));
 }
 
-/// Reconcile a scope inline for on-demand read paths.
+/// Await a runtime-owned reconciliation for on-demand read paths.
 ///
 /// Returns `true` if reconciliation ran, `false` if skipped due to cooldown/single-flight.
 pub(crate) async fn reconcile_on_demand(
@@ -251,23 +424,79 @@ pub(crate) async fn reconcile_on_demand(
     scope: ReconcileScope,
     reason: &'static str,
 ) -> Result<bool> {
-    if !primary.reconciliation.try_start(&scope, false).await {
-        return Ok(false);
-    }
-
-    tracing::debug!(
-        "Running on-demand reconciliation: scope={:?} reason={}",
-        scope,
-        reason
-    );
-    let run_result = run_scope(primary, &scope).await;
-
-    primary
+    let run = match primary
         .reconciliation
-        .complete(&scope, chrono::Utc::now().to_rfc3339())
-        .await;
-    run_result?;
+        .try_start(&scope, ReconcileIntent::Opportunistic)
+        .await
+    {
+        StartOutcome::Started(run) => run,
+        StartOutcome::Clean | StartOutcome::InFlight => return Ok(false),
+    };
+
+    await_reconciliation(start_owned_reconciliation(primary, scope, reason, run)).await?;
     Ok(true)
+}
+
+/// Run a required full-model reconciliation or return a typed conflict when
+/// another full/model reconciliation already owns the catalog.
+pub(crate) async fn reconcile_required_model_index(
+    primary: &PrimaryState,
+    reason: &'static str,
+) -> Result<()> {
+    let scope = ReconcileScope::AllModels;
+    let run = match primary
+        .reconciliation
+        .try_start(&scope, ReconcileIntent::Forced)
+        .await
+    {
+        StartOutcome::Started(run) => run,
+        StartOutcome::InFlight => return Err(PumasError::ModelIndexRefreshInProgress),
+        StartOutcome::Clean => {
+            return Err(PumasError::Other(
+                "Forced model index reconciliation was not admitted".to_string(),
+            ));
+        }
+    };
+
+    await_reconciliation(start_owned_reconciliation(primary, scope, reason, run)).await
+}
+
+fn start_owned_reconciliation(
+    primary: &PrimaryState,
+    scope: ReconcileScope,
+    reason: &'static str,
+    run: ReconciliationRunToken,
+) -> tokio::sync::oneshot::Receiver<Result<()>> {
+    let inputs = ReconciliationInputs::from(primary);
+    let (completion, result) = tokio::sync::oneshot::channel();
+    primary.runtime_tasks.spawn(async move {
+        tracing::debug!("Running owned reconciliation: scope={scope:?} reason={reason}");
+        // Request cancellation only drops the receiver. The run and all its
+        // awaited effects retain single-flight ownership until settlement.
+        let outcome = AssertUnwindSafe(run_scope(&inputs, &scope))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(PumasError::Other(
+                    "Model reconciliation task panicked".to_string(),
+                ))
+            });
+        if outcome.is_ok() {
+            run.finish_success(chrono::Utc::now().to_rfc3339()).await;
+        } else {
+            run.finish_failure().await;
+        }
+        if let Err(Err(error)) = completion.send(outcome) {
+            tracing::warn!("Unclaimed reconciliation failed for {scope:?}: {error}");
+        }
+    });
+    result
+}
+
+async fn await_reconciliation(result: tokio::sync::oneshot::Receiver<Result<()>>) -> Result<()> {
+    result.await.map_err(|_| {
+        PumasError::Other("Model reconciliation ended before reporting its outcome".to_string())
+    })?
 }
 
 /// Start a cross-platform model-library watcher and route events into reconciliation.
@@ -569,7 +798,10 @@ fn expected_files_from_repo_tree(tree: &RepoFileTree) -> Vec<String> {
     dedupe_sort(files)
 }
 
-async fn fetch_expected_files_from_hf(primary: &PrimaryState, repo_id: &str) -> Vec<String> {
+async fn fetch_expected_files_from_hf(
+    primary: &ReconciliationInputs,
+    repo_id: &str,
+) -> Vec<String> {
     let Some(ref client) = primary.hf_client else {
         return Vec::new();
     };
@@ -586,7 +818,7 @@ async fn fetch_expected_files_from_hf(primary: &PrimaryState, repo_id: &str) -> 
     }
 }
 
-async fn fetch_model_kind_from_hf(primary: &PrimaryState, repo_id: &str) -> Option<String> {
+async fn fetch_model_kind_from_hf(primary: &ReconciliationInputs, repo_id: &str) -> Option<String> {
     let client = primary.hf_client.as_ref()?;
 
     match client.get_model_info(repo_id).await {
@@ -694,7 +926,7 @@ async fn select_partial_model_type_async(
     })?
 }
 
-async fn load_persisted_downloads(primary: &PrimaryState) -> Vec<PersistedDownload> {
+async fn load_persisted_downloads(primary: &ReconciliationInputs) -> Vec<PersistedDownload> {
     let persistence = primary
         .hf_client
         .as_ref()
@@ -837,7 +1069,7 @@ fn reuse_existing_partial_lookup_hints(
 }
 
 async fn stage_partial_candidate(
-    primary: &PrimaryState,
+    primary: &ReconciliationInputs,
     mut candidate: PartialDownloadCandidate,
 ) -> Result<()> {
     let metadata_path = candidate.model_dir.join("metadata.json");
@@ -943,7 +1175,7 @@ async fn stage_partial_candidate(
     Ok(())
 }
 
-async fn stage_partial_download_rows(primary: &PrimaryState) -> Result<()> {
+async fn stage_partial_download_rows(primary: &ReconciliationInputs) -> Result<()> {
     let library_root = primary.model_library.library_root().to_path_buf();
     let persisted = load_persisted_downloads(primary).await;
     let known_dirs: HashSet<PathBuf> = persisted
@@ -1048,7 +1280,7 @@ async fn candidate_from_marker(
 }
 
 async fn stage_partial_download_row_for_model(
-    primary: &PrimaryState,
+    primary: &ReconciliationInputs,
     model_id: &str,
     model_dir: &Path,
 ) -> Result<()> {
@@ -1129,7 +1361,7 @@ fn is_non_fatal_reclassify_error(message: &str) -> bool {
     message.contains("destination") && message.contains("already exists")
 }
 
-async fn reconcile_model_scope(primary: &PrimaryState, model_id: &str) -> Result<()> {
+async fn reconcile_model_scope(primary: &ReconciliationInputs, model_id: &str) -> Result<()> {
     let model_dir = primary.model_library.library_root().join(model_id);
 
     if !path_exists(&model_dir).await? {
@@ -1195,7 +1427,7 @@ async fn reconcile_model_scope(primary: &PrimaryState, model_id: &str) -> Result
     Ok(())
 }
 
-async fn run_scope(primary: &PrimaryState, scope: &ReconcileScope) -> Result<()> {
+async fn run_scope(primary: &ReconciliationInputs, scope: &ReconcileScope) -> Result<()> {
     match scope {
         ReconcileScope::AllModels => {
             let orphan_result = primary.model_importer.adopt_orphans(false).await;
@@ -1208,7 +1440,25 @@ async fn run_scope(primary: &PrimaryState, scope: &ReconcileScope) -> Result<()>
 
             let pre_cleanup = tokio::task::spawn_blocking({
                 let library = primary.model_library.clone();
-                move || library.cleanup_duplicate_repo_entries()
+                #[cfg(test)]
+                let observer = primary
+                    .reconciliation
+                    .cleanup_observer
+                    .lock()
+                    .unwrap()
+                    .take();
+                move || {
+                    #[cfg(test)]
+                    if let Some(ref observer) = observer {
+                        observer(CleanupPhase::Entered);
+                    }
+                    let result = library.cleanup_duplicate_repo_entries();
+                    #[cfg(test)]
+                    if let Some(ref observer) = observer {
+                        observer(CleanupPhase::Finished);
+                    }
+                    result
+                }
             })
             .await
             .map_err(|err| {
@@ -1269,6 +1519,74 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn cancelled_rebuild_retains_exclusion_until_blocking_cleanup_finishes() {
+        let temp = TempDir::new().unwrap();
+        let api = Arc::new(super::super::hf::tests::recovery_api_fixture(temp.path(), None).await);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let entered_tx = StdMutex::new(Some(entered_tx));
+        let finished_tx = StdMutex::new(Some(finished_tx));
+        let release_rx = StdMutex::new(release_rx);
+        *api.primary()
+            .reconciliation
+            .cleanup_observer
+            .lock()
+            .unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, CleanupPhase::Finished) {
+                let _ = finished_tx.lock().unwrap().take().unwrap().send(());
+            } else {
+                let _ = entered_tx.lock().unwrap().take().unwrap().send(());
+                // Sender drop also releases the fixture on assertion failure.
+                let _ = release_rx.lock().unwrap().recv();
+            }
+        }));
+
+        let requesting = tokio::spawn({
+            let api = api.clone();
+            async move { api.rebuild_model_index().await }
+        });
+        entered_rx.await.unwrap();
+        requesting.abort();
+        assert!(requesting.await.unwrap_err().is_cancelled());
+        let competing = api.rebuild_model_index().await;
+        drop(release_tx);
+        finished_rx.await.unwrap();
+        assert!(matches!(
+            competing,
+            Err(PumasError::ModelIndexRefreshInProgress)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match api.rebuild_model_index().await {
+                    Err(PumasError::ModelIndexRefreshInProgress) => tokio::task::yield_now().await,
+                    outcome => break outcome,
+                }
+            }
+        })
+        .await
+        .expect("the owned reconciliation must settle after cleanup is released")
+        .expect("a later rebuild must make progress after the cancelled request's run settles");
+    }
+
+    #[tokio::test]
+    async fn rebuild_propagates_blocking_cleanup_failure_and_allows_retry() {
+        let temp = TempDir::new().unwrap();
+        let api = super::super::hf::tests::recovery_api_fixture(temp.path(), None).await;
+        *api.primary()
+            .reconciliation
+            .cleanup_observer
+            .lock()
+            .unwrap() = Some(Arc::new(|_| panic!("synthetic blocking cleanup failure")));
+
+        let error = api.rebuild_model_index().await.unwrap_err();
+        assert!(
+            matches!(error, PumasError::Other(message) if message.contains("Failed to join duplicate repo cleanup task"))
+        );
+        api.rebuild_model_index().await.unwrap();
+    }
+
     #[test]
     fn test_internal_library_artifact_path_filtering() {
         let root = Path::new("/library");
@@ -1307,31 +1625,276 @@ mod tests {
     #[test]
     fn test_should_run_event_driven_only() {
         let mut scope = ScopeRuntimeState::default();
-        assert!(should_run(&scope, Duration::from_secs(5), false));
+        assert!(should_run(&scope, Duration::from_secs(5)));
 
         scope.last_checked_instant = Some(Instant::now());
-        assert!(!should_run(&scope, Duration::from_secs(5), false));
+        assert!(!should_run(&scope, Duration::from_secs(5)));
 
-        scope.last_dirty_instant = Some(Instant::now());
-        scope.last_checked_instant = Some(Instant::now() - Duration::from_secs(1));
-        assert!(should_run(&scope, Duration::from_secs(5), false));
+        scope.dirty = true;
+        assert!(should_run(&scope, Duration::from_secs(5)));
     }
 
     #[tokio::test]
-    async fn test_complete_all_scope_suppresses_rerun_until_dirty() {
-        let coordinator =
-            ReconciliationCoordinator::new(Duration::from_secs(5), Duration::from_secs(5));
+    async fn successful_scope_suppresses_rerun_until_dirty() {
+        let coordinator = Arc::new(ReconciliationCoordinator::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
         let scope = ReconcileScope::AllModels;
 
-        assert!(coordinator.try_start(&scope, false).await);
-        coordinator
-            .complete(&scope, "2026-03-11T00:00:00Z".to_string())
-            .await;
+        let run = match coordinator
+            .try_start(&scope, ReconcileIntent::Opportunistic)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("fresh scope must start"),
+        };
+        run.finish_success("2026-03-11T00:00:00Z".to_string()).await;
 
-        assert!(!coordinator.try_start(&scope, false).await);
+        assert!(matches!(
+            coordinator
+                .try_start(&scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Clean
+        ));
 
         coordinator.mark_dirty_all().await;
-        assert!(coordinator.try_start(&scope, false).await);
+        assert!(matches!(
+            coordinator
+                .try_start(&scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_scope_remains_dirty_and_retryable() {
+        let coordinator = Arc::new(ReconciliationCoordinator::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+        let scope = ReconcileScope::AllModels;
+
+        let run = match coordinator
+            .try_start(&scope, ReconcileIntent::Opportunistic)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("fresh scope must start"),
+        };
+        run.finish_failure().await;
+
+        assert!(matches!(
+            coordinator
+                .try_start(&scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dirty_mark_during_in_flight_success_remains_retryable() {
+        let coordinator = Arc::new(ReconciliationCoordinator::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+        let scope = ReconcileScope::AllModels;
+
+        let run = match coordinator.try_start(&scope, ReconcileIntent::Forced).await {
+            StartOutcome::Started(run) => run,
+            _ => panic!("fresh scope must start"),
+        };
+        coordinator.mark_dirty_all().await;
+        assert!(matches!(
+            coordinator.try_start(&scope, ReconcileIntent::Forced).await,
+            StartOutcome::InFlight
+        ));
+        run.finish_success("2026-09-03T00:00:00Z".to_string()).await;
+
+        assert!(matches!(
+            coordinator
+                .try_start(&scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_scope_retries_model_dirtied_during_its_run() {
+        let coordinator = Arc::new(ReconciliationCoordinator::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+        let all_scope = ReconcileScope::AllModels;
+        let model_scope = ReconcileScope::Model("llm/acme/model".to_string());
+
+        let initial = match coordinator
+            .try_start(&all_scope, ReconcileIntent::Opportunistic)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("fresh full scope must start"),
+        };
+        initial
+            .finish_success("2026-09-03T00:00:00Z".to_string())
+            .await;
+
+        let full_run = match coordinator
+            .try_start(&all_scope, ReconcileIntent::Forced)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("forced full scope must start"),
+        };
+        coordinator.mark_dirty_model("llm/acme/model").await;
+        assert!(matches!(
+            coordinator
+                .try_start(&model_scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::InFlight
+        ));
+        full_run
+            .finish_success("2026-09-03T00:00:01Z".to_string())
+            .await;
+
+        assert!(matches!(
+            coordinator
+                .try_start(&all_scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_scope_observes_full_dirty_without_clearing_it() {
+        let coordinator = Arc::new(ReconciliationCoordinator::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+        let all_scope = ReconcileScope::AllModels;
+        let model_scope = ReconcileScope::Model("llm/acme/model".to_string());
+
+        let initial_model = match coordinator
+            .try_start(&model_scope, ReconcileIntent::Opportunistic)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("fresh model scope must start"),
+        };
+        initial_model
+            .finish_success("2026-09-03T00:00:00Z".to_string())
+            .await;
+        coordinator.mark_dirty_all().await;
+
+        let model_run = match coordinator
+            .try_start(&model_scope, ReconcileIntent::Opportunistic)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            StartOutcome::Clean => panic!("full-scope dirtiness must be visible to model reads"),
+            StartOutcome::InFlight => panic!("no reconciliation is in flight"),
+        };
+        model_run
+            .finish_success("2026-09-03T00:00:01Z".to_string())
+            .await;
+
+        assert!(matches!(
+            coordinator
+                .try_start(&model_scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Clean
+        ));
+        assert!(matches!(
+            coordinator
+                .try_start(&all_scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Started(_)
+        ));
+        assert!(matches!(
+            coordinator
+                .try_start(&model_scope, ReconcileIntent::Opportunistic)
+                .await,
+            StartOutcome::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_and_model_scopes_exclude_each_other_and_drop_releases_ownership() {
+        let coordinator = Arc::new(ReconciliationCoordinator::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+        let all_scope = ReconcileScope::AllModels;
+        let model_scope = ReconcileScope::Model("llm/acme/model".to_string());
+
+        let all_run = match coordinator
+            .try_start(&all_scope, ReconcileIntent::Forced)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("full scope must start"),
+        };
+        assert!(matches!(
+            coordinator
+                .try_start(&model_scope, ReconcileIntent::Forced)
+                .await,
+            StartOutcome::InFlight
+        ));
+        drop(all_run);
+
+        let model_run = match coordinator
+            .try_start(&model_scope, ReconcileIntent::Forced)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("dropped full run must release ownership"),
+        };
+        assert!(matches!(
+            coordinator
+                .try_start(&all_scope, ReconcileIntent::Forced)
+                .await,
+            StartOutcome::InFlight
+        ));
+        drop(model_run);
+
+        assert!(matches!(
+            coordinator
+                .try_start(&all_scope, ReconcileIntent::Forced)
+                .await,
+            StartOutcome::Started(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_completion_cannot_finish_a_newer_run() {
+        let coordinator = Arc::new(ReconciliationCoordinator::new(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+        let scope = ReconcileScope::AllModels;
+
+        let stale_run = match coordinator.try_start(&scope, ReconcileIntent::Forced).await {
+            StartOutcome::Started(run) => run,
+            _ => panic!("first run must start"),
+        };
+        let stale_identity = stale_run.identity.clone();
+        drop(stale_run);
+
+        let current_run = match coordinator.try_start(&scope, ReconcileIntent::Forced).await {
+            StartOutcome::Started(run) => run,
+            _ => panic!("replacement run must start"),
+        };
+        coordinator.finish_success_if_current(
+            &scope,
+            &stale_identity,
+            "2026-09-03T00:00:00Z".to_string(),
+        );
+
+        assert!(matches!(
+            coordinator.try_start(&scope, ReconcileIntent::Forced).await,
+            StartOutcome::InFlight
+        ));
+        current_run.finish_failure().await;
     }
 
     #[test]

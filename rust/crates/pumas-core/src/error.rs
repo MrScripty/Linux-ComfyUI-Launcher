@@ -102,6 +102,9 @@ pub enum PumasError {
     #[error("Model import failed: {message}")]
     ImportFailed { message: String },
 
+    #[error("Model index refresh is already in progress")]
+    ModelIndexRefreshInProgress,
+
     #[error("Download failed for {url}: {message}")]
     DownloadFailed { url: String, message: String },
 
@@ -310,7 +313,9 @@ impl PumasError {
             PumasError::TorchInference { .. } => -32008,
             PumasError::SlotNotFound { .. } => -32009,
             PumasError::DeviceNotAvailable { .. } => -32010,
-            PumasError::PrimaryInstanceBusy { .. } => -32011,
+            PumasError::PrimaryInstanceBusy { .. } | PumasError::ModelIndexRefreshInProgress => {
+                -32011
+            }
             PumasError::PrimaryInstanceStartupTimeout { .. } => -32012,
 
             // All other errors are internal errors

@@ -1983,6 +1983,30 @@
   This correction does not close full C3, C4, the
   producer/consumer migration, or cross-platform/release acceptance.
 
+### 2026-09-05 — Reconciliation Caller Ownership Accepted Incrementally
+
+- An actual public rebuild test held blocking duplicate cleanup, cancelled its
+  requester, and reproduced a second rebuild entering before cleanup finished.
+  Reconciliation now runs under the existing runtime task owner. Requester
+  cancellation drops only its result receiver; the run retains exclusion until
+  settlement. Required rebuilds report the new `ModelIndexRefreshInProgress`
+  error when occupied, while dirty marks arriving during a run survive it.
+- Public cancellation and blocking-panic/retry regressions pass. The shared HF
+  client is retained through `Arc`, without cloning its lifecycle implementation.
+  New API fixtures reuse the existing configured, registry-free test owner.
+- Root verified an isolated candidate based on `f61025dd`: exactly eight source
+  files covering reconciliation/API wiring, the public error, and exhaustive
+  UniFFI error projection. Public HF Result changes, staged HF binding adapters,
+  RPC contracts, generator dependencies, and desktop consumers were excluded.
+  Both full core package feature configurations pass 1,179 tests with 11 existing
+  ignores. Strict all-target/all-feature supported-workspace lint (excluding
+  BEAM-loaded `pumas_rustler`) and no-default core all-target lint pass, as do
+  scoped edition-2021 formatting and diff checks.
+- This adds a public Rust error variant; exhaustive external matches must
+  handle it. The candidate keeps existing RPC and native consumers compiling.
+  General application Drop/drain, complete C3/C4, desktop integration, and
+  RUST-I12 collision remediation remain unaccepted by this checkpoint.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):

@@ -1,6 +1,6 @@
 //! Model library methods on PumasApi.
 
-use super::{reconcile_on_demand, ReconcileScope};
+use super::{reconcile_on_demand, reconcile_required_model_index, ReconcileScope};
 use crate::error::{PumasError, Result};
 use crate::index::{ModelRecord, SearchResult};
 use crate::model_library;
@@ -241,13 +241,7 @@ impl PumasApi {
     /// partial downloads staged from persisted/HF download data.
     pub async fn rebuild_model_index(&self) -> Result<usize> {
         let primary = self.primary();
-        primary.reconciliation.mark_dirty_all().await;
-        let _ = reconcile_on_demand(
-            primary.as_ref(),
-            ReconcileScope::AllModels,
-            "api-rebuild-model-index",
-        )
-        .await?;
+        reconcile_required_model_index(primary.as_ref(), "api-rebuild-model-index").await?;
         load_model_count(primary.model_library.clone()).await
     }
 
@@ -750,6 +744,9 @@ impl PumasApi {
 #[cfg(test)]
 mod tests {
     use super::{validate_existing_local_directory_path, validate_existing_local_file_path};
+    use crate::api::reconciliation::{ReconcileIntent, StartOutcome};
+    use crate::api::ReconcileScope;
+    use crate::error::PumasError;
     use crate::models::ModelMetadata;
     use crate::PumasApi;
     use tempfile::TempDir;
@@ -817,5 +814,39 @@ mod tests {
         assert!(items[0].error.is_none());
         assert!(items[1].settings.is_empty());
         assert!(items[1].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn rebuild_model_index_reports_in_flight_reconciliation() {
+        let temp_dir = TempDir::new().unwrap();
+        let api = super::super::hf::tests::recovery_api_fixture(temp_dir.path(), None).await;
+        let scope = ReconcileScope::AllModels;
+        let primary = api.primary();
+        let ready = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let run = match primary
+            .reconciliation
+            .try_start(&scope, ReconcileIntent::Opportunistic)
+            .await
+        {
+            StartOutcome::Started(run) => run,
+            _ => panic!("fresh coordinator must admit the held reconciliation"),
+        };
+        let holder = tokio::spawn({
+            let ready = ready.clone();
+            let release = release.clone();
+            async move {
+                ready.wait().await;
+                release.notified().await;
+                run.finish_failure().await;
+            }
+        });
+        ready.wait().await;
+
+        let error = api.rebuild_model_index().await.unwrap_err();
+        assert!(matches!(error, PumasError::ModelIndexRefreshInProgress));
+
+        release.notify_one();
+        holder.await.unwrap();
     }
 }

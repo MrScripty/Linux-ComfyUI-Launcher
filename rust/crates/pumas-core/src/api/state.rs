@@ -228,7 +228,7 @@ pub(crate) struct PrimaryState {
     pub(crate) status_telemetry: Arc<super::status_telemetry::StatusTelemetryService>,
     pub(crate) system_utils: Arc<system::SystemUtils>,
     pub(crate) model_library: Arc<model_library::ModelLibrary>,
-    pub(crate) hf_client: Option<model_library::HuggingFaceClient>,
+    pub(crate) hf_client: Option<Arc<model_library::HuggingFaceClient>>,
     pub(crate) model_importer: model_library::ModelImporter,
     pub(crate) conversion_manager: Arc<conversion::ConversionManager>,
     pub(crate) runtime_profile_service: Arc<runtime_profiles::RuntimeProfileService>,
@@ -364,9 +364,7 @@ impl ipc::server::IpcDispatch for PrimaryState {
                 Ok(serde_json::to_value(result)?)
             }
             "rebuild_model_index" => {
-                self.reconciliation.mark_dirty_all().await;
-                let _ = reconcile_on_demand(self, ReconcileScope::AllModels, "ipc-rebuild-index")
-                    .await?;
+                super::reconcile_required_model_index(self, "ipc-rebuild-index").await?;
                 let model_count = load_model_count(self.model_library.clone()).await?;
                 Ok(serde_json::to_value(model_count)?)
             }

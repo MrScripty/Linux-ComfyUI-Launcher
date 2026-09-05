@@ -593,7 +593,7 @@ impl PumasApiBuilder {
             status_telemetry,
             system_utils,
             model_library,
-            hf_client,
+            hf_client: hf_client.map(Arc::new),
             model_importer,
             conversion_manager,
             runtime_profile_service: Arc::new(

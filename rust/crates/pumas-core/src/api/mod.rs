@@ -26,8 +26,9 @@ mod system;
 
 pub use builder::PumasApiBuilder;
 pub(crate) use reconciliation::{
-    reconcile_on_demand, start_model_library_watcher, ReconcileScope, ReconciliationCoordinator,
-    WatcherWriteSuppressor, WATCHER_WRITE_SUPPRESSION_TTL,
+    reconcile_on_demand, reconcile_required_model_index, start_model_library_watcher,
+    ReconcileScope, ReconciliationCoordinator, WatcherWriteSuppressor,
+    WATCHER_WRITE_SUPPRESSION_TTL,
 };
 pub(crate) use runtime_tasks::RuntimeTasks;
 pub(crate) use state::PrimaryState;

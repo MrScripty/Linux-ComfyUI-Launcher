@@ -135,6 +135,9 @@ impl From<pumas_library::PumasError> for FfiError {
                 message: format!("Model not found: {}", model_id),
             },
             PumasError::ImportFailed { message } => FfiError::Model { message },
+            PumasError::ModelIndexRefreshInProgress => FfiError::Config {
+                message: "Model index refresh is already in progress".to_string(),
+            },
             PumasError::DownloadFailed { url, message } => FfiError::Download {
                 message: format!("{}: {}", url, message),
             },

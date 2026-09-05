@@ -1431,9 +1431,9 @@ fn partial_download_error(error: &PumasError) -> models::PartialDownloadAction {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    async fn recovery_api_fixture(
+    pub(in crate::api) async fn recovery_api_fixture(
         root: &std::path::Path,
         download_base_url: Option<String>,
     ) -> PumasApi {
@@ -1489,7 +1489,7 @@ mod tests {
                 provider_registry,
             )),
             model_library: library,
-            hf_client: Some(client),
+            hf_client: Some(Arc::new(client)),
             runtime_tasks: tasks.clone(),
             reconciliation: Arc::new(ReconciliationCoordinator::new(
                 Duration::ZERO,
