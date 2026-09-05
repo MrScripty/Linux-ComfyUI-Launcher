@@ -21,6 +21,82 @@
 
 ## Slice Log
 
+### 2026-09-05 — Phase-aware cancellation verification
+
+- Store Interface decisions now include exact active/released attempt and domain
+  validation, refusal of hidden intent or released nonterminal custody, and
+  confirmed terminal disposition. Cancellation consumes that result rather than
+  a stale inventory label; missing admitted snapshots refuse before effects.
+  No new public Interface, schema, dependency, or restore behavior was added.
+- Actual RED: interrupted verification remained Pending after store preparation;
+  old-owner terminal retry invoked two destination deletions; missing-snapshot
+  retry after clean settlement deleted successor bytes. Logs are
+  `/tmp/pumas-terminal-preparation-red.log`,
+  `/tmp/pumas-terminal-cancellation-consumer-red.log`, and
+  `/tmp/pumas-terminal-cancellation-missing-red.log`.
+- Final focused evidence passes: 45 store tests with two existing ignores,
+  two consumer regressions, and the held-cleanup/fresh-client Pending refusal.
+  Store tests use real current-format publication with deterministic fault
+  injection, including unknown visibility/durability and failed retry. Admitted
+  Ambient/Recovery confirmation changes only terminal phase in the whole stored
+  document; retained snapshots, exact attempts, and tombstones remain intact.
+- Consumer tests preserve sentinel part/marker bytes, sticky Error, and exact
+  released admission; a missing-snapshot retry preserves exact store bytes.
+  Fixture cleanup syncs its parent before verification. Independent cross-review
+  and root source review found no remaining blocker within the admitted slice.
+  Focused final logs: `/tmp/pumas-terminal-cancellation-consumer-final-green.log`,
+  `/tmp/pumas-terminal-cancellation-store-final-green.log`, and
+  `/tmp/pumas-terminal-cancellation-pending-overlap-green.log`.
+- Final source SHA-256: `download_store.rs`
+  `688727d548effe5fff469f554ce89e93cbcb10255a36268582aabc8f4727d75f`;
+  `hf/download.rs`
+  `4b8625522979392f9ecb7c0cd964a14d99b18b43a26f636fe8a32beb96390d24`.
+  Broad gate logs are under `/tmp/pumas-phase-preparation.T8Xnvn/`.
+- Final core default and `--no-default-features` package suites each pass 1,205
+  tests (1,102 unit plus 103 integration/doc), with 11 existing ignores. Strict
+  core all-target/all-feature and no-default all-target Clippy both pass without
+  suppression; full workspace formatting and diff checks pass. All five plan
+  contracts pass against standards `aff5b867`; the temporary validator environment
+  was recreated from locally cached packages because the previous one was gone.
+- Accept this bounded cancellation correction. Live download store SHA-256
+  remains `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+  No live payload mutation, GUI rerun, process-crash, Windows/macOS runtime, or
+  full C3/C4 completion claim. Next bound terminal intent restart confirmation;
+  actual Pending replay still needs cross-client/process exclusion through drain.
+
+### 2026-09-05 — Phase-aware cancellation preparation admitted
+
+- Continue from `91935323` against unchanged standards `aff5b867`. Two agents
+  independently found the same consumer defect: cancellation captures public
+  Pending before store publication, even for VerifiedIntent or unconfirmed
+  Verified. Explicit retry can therefore repeat deletion after completed cleanup.
+- Exact source write set: `download_store.rs` and `hf/download.rs`, including
+  their inline tests. Root owns parent/Rust plans and ledgers. Deepen the existing
+  quarantine-begin Interface rather than add an unused preparation method.
+  Validate the expected active or retained released admission attempt in the
+  transaction; absent or mismatched proof refuses before publication. Unadmitted
+  cleanup remains available only without retained admission ownership.
+- Return Verified only after terminal promotion/reconfirmation succeeds through
+  the existing durable publisher; PendingIntent/Pending retain their established
+  barriers. Failed or unknown publication returns its error, never cleanup
+  authority. Preserve snapshot, domain, sticky provenance, queue identity, and
+  revocation. No schema, dependency, restore, or automatic Pending replay change.
+- Deciding evidence: real-store terminal-phase interruption and failed-barrier
+  retries; exact-attempt rejection including released admissions; actual
+  cancellation retry preserving successor sentinel part/marker bytes with zero
+  deletion calls. Reproduce the stale-disposition failure before production
+  edits. Existing held-cleanup/fresh-client refusal must remain passing.
+- Acceptance requires independent source review, focused regressions, both full
+  core feature configurations, strict lint, formatting, and plan validation.
+  Cross-client/process exclusion through cleanup drain remains a prerequisite
+  for Pending replay; this slice does not prove that ownership or full C3/C4.
+- Consumer review also reproduced the same ownership-proof bypass after clean
+  settlement removes the snapshot: admitted cancellation returned no quarantine
+  and repeated deletion without reaching store preparation. Include refusal of
+  admitted cleanup with no retained snapshot in this exact Interface correction;
+  unadmitted behavior is unchanged. The real consumer regression must preserve
+  sentinel files and exact store bytes, with the selected Validation diagnostic.
+
 ### 2026-09-05 — Capability cleanup parent synchronization
 
 - Exact source: `download_recovery.rs` SHA-256

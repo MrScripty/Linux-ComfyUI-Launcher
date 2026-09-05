@@ -215,12 +215,16 @@ preserving revocation, hidden history, and the follower's exact queue position.
 The capability cleanup parent-sync prerequisite is accepted after review, dual
 core suites, strict lint, and formatting on Linux.
 
-**Next slice:** Bound store-owned, exact-attempt preparation that distinguishes
-cleanup intent phases without authorizing filesystem replay. The Rust owner
-must record its publication/error contract and real-store regression before
-implementation. Actual Pending replay also requires cross-client/process
-exclusion through effect drain. No live mutation, schema change, old-format
-support, or C4 expansion. Cargo and commits remain serialized.
+Phase-aware cancellation preparation is accepted after independent review,
+dual core suites, strict lint, and formatting. Terminal retries no longer infer
+deletion authority from a stale Pending projection or missing admitted snapshot.
+
+**Next slice:** Bound terminal VerifiedIntent confirmation during restart
+without filesystem replay. The Rust owner records the exact store/restore write
+set and interrupted-publication regression before implementation. Actual Pending
+replay still requires cross-client/process exclusion through effect drain.
+No live mutation, schema change, old-format support, or C4 expansion. Cargo and
+commits remain serialized.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

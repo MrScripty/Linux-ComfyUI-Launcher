@@ -863,17 +863,71 @@ impl DownloadPersistence {
         })
     }
 
-    /// Atomically remove ordinary resumable state and durably publish a
-    /// fail-closed Pending quarantine before cleanup is attempted.
+    /// Prepare exact-attempt cleanup and return its confirmed persisted phase.
+    /// Terminal intent is confirmed without authorizing filesystem replay;
+    /// incomplete cleanup is durably quarantined before returning Pending.
+    /// Pending does not supply cross-client/process execution exclusion: the
+    /// caller must retain ownership of filesystem effects through their drain.
     pub(crate) fn begin_lifecycle_quarantine(
         &self,
         snapshot: &PersistedDownload,
         domain: LifecycleQuarantineDomain,
         sticky_failure: bool,
-    ) -> Result<()> {
+        expected_attempt: Option<&str>,
+    ) -> Result<LifecycleQuarantine> {
         let transaction = self.transaction(StoreOperation::UpdateStatus)?;
         let mut data = self.load_data_strict(&transaction)?;
         let download_id = snapshot.download_id.clone();
+        let admission = data
+            .queue_admissions
+            .get(&download_id)
+            .or_else(|| data.released_queue_admissions.get(&download_id));
+        if admission.map(|admission| admission.attempt_id.as_str()) != expected_attempt
+            || data
+                .admission_attempts
+                .values()
+                .any(|attempt| attempt.request.snapshot.download_id == download_id)
+        {
+            return Err(crate::PumasError::Validation {
+                field: "downloads.queue_admissions".into(),
+                message: "Cleanup preparation requires the exact retained admission attempt".into(),
+            });
+        }
+        if admission.is_some_and(|admission| {
+            !matches!(
+                (admission.domain, domain),
+                (
+                    DownloadAdmissionDomain::Ambient,
+                    LifecycleQuarantineDomain::Ambient
+                ) | (
+                    DownloadAdmissionDomain::Recovery,
+                    LifecycleQuarantineDomain::Recovery
+                )
+            )
+        }) {
+            return Err(crate::PumasError::Validation {
+                field: "downloads.queue_admissions".into(),
+                message: "Cleanup preparation must preserve the retained admission domain".into(),
+            });
+        }
+        if data.released_queue_admissions.contains_key(&download_id)
+            && !data
+                .lifecycle_quarantines
+                .get(&download_id)
+                .is_some_and(|quarantine| {
+                    matches!(
+                        quarantine.disposition,
+                        PersistedLifecycleCleanupDisposition::VerifiedIntent
+                            | PersistedLifecycleCleanupDisposition::Verified
+                    )
+                })
+        {
+            return Err(crate::PumasError::Validation {
+                field: "downloads.lifecycle_quarantines".into(),
+                message: "Released admission permits only retained terminal cleanup confirmation"
+                    .into(),
+            });
+        }
         if let Some(existing) = data
             .downloads
             .iter()
@@ -964,7 +1018,39 @@ impl DownloadPersistence {
                     | PersistedLifecycleCleanupDisposition::Verified
                     | PersistedLifecycleCleanupDisposition::VerifiedIntent
             ) {
-                return self.write_data(&transaction, &mut data);
+                let terminal = matches!(
+                    disposition,
+                    PersistedLifecycleCleanupDisposition::VerifiedIntent
+                        | PersistedLifecycleCleanupDisposition::Verified
+                );
+                if terminal {
+                    data.lifecycle_quarantines
+                        .get_mut(&download_id)
+                        .expect("quarantine remains present")
+                        .disposition = PersistedLifecycleCleanupDisposition::Verified;
+                }
+                self.write_data(&transaction, &mut data)?;
+                if terminal {
+                    self.confirmed_cleanups
+                        .lock()
+                        .map_err(|_| {
+                            crate::PumasError::Other(
+                                "Download cleanup confirmation lock is poisoned".into(),
+                            )
+                        })?
+                        .insert(download_id.clone());
+                }
+                let quarantine = &data.lifecycle_quarantines[&download_id];
+                return Ok(LifecycleQuarantine {
+                    snapshot: quarantine.snapshot.clone(),
+                    domain: quarantine.domain,
+                    disposition: if terminal {
+                        LifecycleCleanupDisposition::Verified
+                    } else {
+                        LifecycleCleanupDisposition::Pending
+                    },
+                    sticky_failure: quarantine.sticky_failure,
+                });
             }
         }
 
@@ -984,11 +1070,20 @@ impl DownloadPersistence {
             .get_mut(&download_id)
             .expect("quarantine was inserted above")
             .disposition = PersistedLifecycleCleanupDisposition::Pending;
-        self.write_data(&transaction, &mut data)
+        self.write_data(&transaction, &mut data)?;
+        let quarantine = &data.lifecycle_quarantines[&download_id];
+        Ok(LifecycleQuarantine {
+            snapshot: quarantine.snapshot.clone(),
+            domain: quarantine.domain,
+            disposition: LifecycleCleanupDisposition::Pending,
+            sticky_failure: quarantine.sticky_failure,
+        })
     }
 
     /// Confirm cleanup through a two-publication transition. An ambiguous
     /// publication never authorizes the current runtime to release custody.
+    /// The caller must have completed filesystem cleanup and drained its effects
+    /// before calling: `VerifiedIntent` retains that terminal proof for a retry.
     pub(crate) fn verify_lifecycle_quarantine(&self, download_id: &str) -> Result<bool> {
         let transaction = self.transaction(StoreOperation::UpdateStatus)?;
         let mut data = self.load_data_strict(&transaction)?;
@@ -1994,6 +2089,7 @@ mod tests {
                 &request.snapshot,
                 LifecycleQuarantineDomain::Recovery,
                 false,
+                Some(&attempt),
             )
             .unwrap();
         assert!(store
@@ -3004,7 +3100,12 @@ mod tests {
         let attempt = store.admit_test_download(&entry).unwrap();
 
         store
-            .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, true)
+            .begin_lifecycle_quarantine(
+                &entry,
+                LifecycleQuarantineDomain::Ambient,
+                true,
+                Some(&attempt),
+            )
             .unwrap();
         let inventory = store.load_lifecycle_inventory_strict().unwrap();
         assert!(inventory.downloads.is_empty());
@@ -3044,7 +3145,7 @@ mod tests {
         store.revoke("dl-recovery-quarantine").unwrap();
 
         store
-            .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Recovery, true)
+            .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Recovery, true, None)
             .unwrap();
         assert!(store.is_revoked("dl-recovery-quarantine").unwrap());
         assert!(store
@@ -3068,7 +3169,7 @@ mod tests {
     fn quarantine_publication_ambiguity_never_authorizes_the_initiating_owner() {
         let tmp = TempDir::new().unwrap();
         let entry = persisted("dl-quarantine-unknown");
-        DownloadPersistence::new(tmp.path())
+        let attempt = DownloadPersistence::new(tmp.path())
             .admit_test_download(&entry)
             .unwrap();
         let pending_publisher = Arc::new(ScriptedPublisher::new([
@@ -3079,7 +3180,12 @@ mod tests {
             DownloadPersistence::new(tmp.path()).with_test_publisher(pending_publisher.clone());
 
         assert!(pending_store
-            .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, true)
+            .begin_lifecycle_quarantine(
+                &entry,
+                LifecycleQuarantineDomain::Ambient,
+                true,
+                Some(&attempt)
+            )
             .is_err());
         assert_eq!(pending_publisher.calls(), 2);
         let pending = DownloadPersistence::new(tmp.path())
@@ -3106,14 +3212,19 @@ mod tests {
     fn failed_pending_intent_leaves_the_ordinary_row_owned_by_a_fresh_writer() {
         let tmp = TempDir::new().unwrap();
         let entry = persisted("dl-quarantine-not-published");
-        DownloadPersistence::new(tmp.path())
+        let attempt = DownloadPersistence::new(tmp.path())
             .admit_test_download(&entry)
             .unwrap();
         let publisher = Arc::new(ScriptedPublisher::new([ScriptedPublication::NotPublished]));
         let store = DownloadPersistence::new(tmp.path()).with_test_publisher(publisher.clone());
 
         assert!(store
-            .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, false)
+            .begin_lifecycle_quarantine(
+                &entry,
+                LifecycleQuarantineDomain::Ambient,
+                false,
+                Some(&attempt)
+            )
             .is_err());
         assert_eq!(publisher.calls(), 1);
         let reopened = DownloadPersistence::new(tmp.path());
@@ -3130,7 +3241,12 @@ mod tests {
         let entry = persisted("dl-clean-cancel");
         let attempt = store.admit_test_download(&entry).unwrap();
         store
-            .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, false)
+            .begin_lifecycle_quarantine(
+                &entry,
+                LifecycleQuarantineDomain::Ambient,
+                false,
+                Some(&attempt),
+            )
             .unwrap();
         let pending = store.load_lifecycle_inventory_strict().unwrap();
         assert!(!pending.quarantines["dl-clean-cancel"].sticky_failure);
@@ -3150,9 +3266,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
         let entry = persisted("dl-late-failure");
-        store.admit_test_download(&entry).unwrap();
+        let attempt = store.admit_test_download(&entry).unwrap();
         store
-            .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, false)
+            .begin_lifecycle_quarantine(
+                &entry,
+                LifecycleQuarantineDomain::Ambient,
+                false,
+                Some(&attempt),
+            )
             .unwrap();
 
         assert!(store
@@ -3235,7 +3356,12 @@ mod tests {
             .update_admitted_status("status", &attempt, DownloadStatus::Error)
             .unwrap());
         store
-            .begin_lifecycle_quarantine(&request.snapshot, LifecycleQuarantineDomain::Ambient, true)
+            .begin_lifecycle_quarantine(
+                &request.snapshot,
+                LifecycleQuarantineDomain::Ambient,
+                true,
+                Some(&attempt),
+            )
             .unwrap();
         assert!(!store
             .update_admitted_status("status", &attempt, DownloadStatus::Paused)
@@ -3255,10 +3381,10 @@ mod tests {
         ));
         let snapshot = persisted("sticky-intent");
         assert!(store
-            .begin_lifecycle_quarantine(&snapshot, LifecycleQuarantineDomain::Ambient, true)
+            .begin_lifecycle_quarantine(&snapshot, LifecycleQuarantineDomain::Ambient, true, None)
             .is_err());
         store
-            .begin_lifecycle_quarantine(&snapshot, LifecycleQuarantineDomain::Ambient, false)
+            .begin_lifecycle_quarantine(&snapshot, LifecycleQuarantineDomain::Ambient, false, None)
             .unwrap();
         let inventory = store.load_lifecycle_inventory_strict().unwrap();
         assert!(inventory.quarantines["sticky-intent"].sticky_failure);
@@ -3295,6 +3421,7 @@ mod tests {
                         &snapshot,
                         LifecycleQuarantineDomain::Ambient,
                         false,
+                        None,
                     )
                     .unwrap();
             }
@@ -3318,6 +3445,7 @@ mod tests {
                             &snapshot,
                             LifecycleQuarantineDomain::Ambient,
                             false,
+                            None,
                         )
                         .is_err()
                 } else {
@@ -3402,6 +3530,320 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cleanup_preparation_confirms_interrupted_verification() {
+        for domain in [
+            LifecycleQuarantineDomain::Ambient,
+            LifecycleQuarantineDomain::Recovery,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store = DownloadPersistence::new(tmp.path());
+            let snapshot = persisted("terminal-cleanup");
+            let attempt = store.admit_test_download(&snapshot).unwrap();
+            if domain == LifecycleQuarantineDomain::Recovery {
+                store
+                    .revoke_admitted_for_recovery("terminal-cleanup", &attempt, &snapshot)
+                    .unwrap()
+                    .into_result()
+                    .unwrap();
+            }
+            store
+                .begin_lifecycle_quarantine(&snapshot, domain, true, Some(&attempt))
+                .unwrap();
+            let interrupted = store.with_test_publisher(Arc::new(ScriptedPublisher::new([
+                ScriptedPublication::Durable,
+                ScriptedPublication::NotPublished,
+            ])));
+            assert!(interrupted
+                .verify_lifecycle_quarantine("terminal-cleanup")
+                .is_err());
+            let fresh = DownloadPersistence::new(tmp.path());
+            let mut expected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fresh.path).unwrap()).unwrap();
+            assert_eq!(
+                expected["lifecycle_quarantines"]["terminal-cleanup"]["disposition"],
+                "verified_intent"
+            );
+            assert_eq!(
+                expected["queue_admissions"]["terminal-cleanup"]["attempt_id"],
+                attempt
+            );
+            expected["lifecycle_quarantines"]["terminal-cleanup"]["disposition"] =
+                "verified".into();
+            let prepared = fresh
+                .begin_lifecycle_quarantine(&snapshot, domain, false, Some(&attempt))
+                .unwrap();
+            assert_eq!(prepared.disposition, LifecycleCleanupDisposition::Verified);
+            assert_eq!(prepared.domain, domain);
+            assert!(prepared.sticky_failure);
+            let mut failed_snapshot = snapshot.clone();
+            failed_snapshot.status = DownloadStatus::Error;
+            assert_eq!(
+                serde_json::to_value(&prepared.snapshot).unwrap(),
+                serde_json::to_value(failed_snapshot).unwrap()
+            );
+            assert_eq!(
+                fresh.load_lifecycle_inventory_strict().unwrap().quarantines["terminal-cleanup"]
+                    .disposition,
+                LifecycleCleanupDisposition::Verified
+            );
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fresh.path).unwrap()).unwrap();
+            assert_eq!(
+                after, expected,
+                "only terminal phase may change: {domain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_preparation_retains_incomplete_phases_without_verifying_them() {
+        for interrupted in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let snapshot = persisted("incomplete-cleanup");
+            let store = DownloadPersistence::new(tmp.path());
+            let attempt = store.admit_test_download(&snapshot).unwrap();
+            let publisher = Arc::new(ScriptedPublisher::new(if interrupted {
+                vec![
+                    ScriptedPublication::Durable,
+                    ScriptedPublication::NotPublished,
+                ]
+            } else {
+                vec![ScriptedPublication::Durable, ScriptedPublication::Durable]
+            }));
+            let initial = store.with_test_publisher(publisher);
+            assert_eq!(
+                initial
+                    .begin_lifecycle_quarantine(
+                        &snapshot,
+                        LifecycleQuarantineDomain::Ambient,
+                        true,
+                        Some(&attempt)
+                    )
+                    .is_err(),
+                interrupted
+            );
+            let fresh = DownloadPersistence::new(tmp.path());
+            let prepared = fresh
+                .begin_lifecycle_quarantine(
+                    &snapshot,
+                    LifecycleQuarantineDomain::Ambient,
+                    false,
+                    Some(&attempt),
+                )
+                .unwrap();
+            assert_eq!(prepared.disposition, LifecycleCleanupDisposition::Pending);
+            assert!(prepared.sticky_failure);
+            assert_eq!(prepared.snapshot.status, DownloadStatus::Error);
+            let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
+            assert_eq!(
+                inventory.quarantines["incomplete-cleanup"].disposition,
+                LifecycleCleanupDisposition::Pending
+            );
+            assert_eq!(
+                inventory.hidden_admissions["incomplete-cleanup"]
+                    .request
+                    .snapshot
+                    .download_id,
+                snapshot.download_id
+            );
+            assert!(fresh
+                .settle_queue_admission("incomplete-cleanup", &attempt)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_preparation_requires_a_confirmed_publication() {
+        for (failure, expected_error) in [
+            (
+                ScriptedPublication::NotPublished,
+                "injected pre-publication failure",
+            ),
+            (
+                ScriptedPublication::PublishedDurabilityUnknown,
+                "injected parent-sync uncertainty",
+            ),
+            (
+                ScriptedPublication::VisibilityUnknownBeforeEffect,
+                "injected rename visibility uncertainty",
+            ),
+            (
+                ScriptedPublication::VisibilityUnknownAfterEffect,
+                "injected post-effect rename visibility uncertainty",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let snapshot = persisted("terminal-cleanup");
+            let store = DownloadPersistence::new(tmp.path());
+            store
+                .begin_lifecycle_quarantine(
+                    &snapshot,
+                    LifecycleQuarantineDomain::Ambient,
+                    true,
+                    None,
+                )
+                .unwrap();
+            let interrupted = store.with_test_publisher(Arc::new(ScriptedPublisher::new([
+                ScriptedPublication::Durable,
+                ScriptedPublication::NotPublished,
+            ])));
+            assert!(interrupted
+                .verify_lifecycle_quarantine("terminal-cleanup")
+                .is_err());
+            let publisher = Arc::new(ScriptedPublisher::new([
+                failure,
+                ScriptedPublication::NotPublished,
+            ]));
+            let retry = DownloadPersistence::new(tmp.path()).with_test_publisher(publisher.clone());
+            for expected_error in [expected_error, "injected pre-publication failure"] {
+                let error = retry
+                    .begin_lifecycle_quarantine(
+                        &snapshot,
+                        LifecycleQuarantineDomain::Ambient,
+                        false,
+                        None,
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(error, crate::PumasError::Other(message) if message == expected_error)
+                );
+                assert_eq!(
+                    retry.load_lifecycle_inventory_strict().unwrap().quarantines
+                        ["terminal-cleanup"]
+                        .disposition,
+                    LifecycleCleanupDisposition::Pending
+                );
+            }
+            assert_eq!(publisher.calls(), 2);
+            let fresh = DownloadPersistence::new(tmp.path());
+            assert_eq!(
+                fresh
+                    .begin_lifecycle_quarantine(
+                        &snapshot,
+                        LifecycleQuarantineDomain::Ambient,
+                        false,
+                        None
+                    )
+                    .unwrap()
+                    .disposition,
+                LifecycleCleanupDisposition::Verified
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_preparation_rejects_missing_or_wrong_retained_attempt_before_publication() {
+        for released in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let snapshot = persisted("exact-cleanup");
+            let store = DownloadPersistence::new(tmp.path());
+            let attempt = store.admit_test_download(&snapshot).unwrap();
+            store
+                .begin_lifecycle_quarantine(
+                    &snapshot,
+                    LifecycleQuarantineDomain::Ambient,
+                    true,
+                    Some(&attempt),
+                )
+                .unwrap();
+            store.verify_lifecycle_quarantine("exact-cleanup").unwrap();
+            if released {
+                store
+                    .settle_queue_admission("exact-cleanup", &attempt)
+                    .unwrap();
+            }
+            let before = std::fs::read(&store.path).unwrap();
+            let publisher = Arc::new(ScriptedPublisher::new([]));
+            let retry = DownloadPersistence::new(tmp.path()).with_test_publisher(publisher.clone());
+            let wrong = Uuid::new_v4().to_string();
+            for expected in [None, Some(wrong.as_str())] {
+                assert!(
+                    matches!(retry.begin_lifecycle_quarantine(&snapshot, LifecycleQuarantineDomain::Ambient, false, expected), Err(crate::PumasError::Validation { field, message }) if field == "downloads.queue_admissions" && message == "Cleanup preparation requires the exact retained admission attempt")
+                );
+                assert_eq!(std::fs::read(&store.path).unwrap(), before);
+            }
+            assert_eq!(publisher.calls(), 0);
+            assert!(
+                matches!(retry.begin_lifecycle_quarantine(&snapshot, LifecycleQuarantineDomain::Recovery, false, Some(&attempt)), Err(crate::PumasError::Validation { field, message }) if field == "downloads.queue_admissions" && message == "Cleanup preparation must preserve the retained admission domain")
+            );
+            assert_eq!(publisher.calls(), 0);
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+            let prepared = retry
+                .begin_lifecycle_quarantine(
+                    &snapshot,
+                    LifecycleQuarantineDomain::Ambient,
+                    false,
+                    Some(&attempt),
+                )
+                .unwrap();
+            assert_eq!(prepared.disposition, LifecycleCleanupDisposition::Verified);
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn cleanup_preparation_rejects_released_nonterminal_and_missing_owners() {
+        for retained_pending in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let snapshot = persisted("released-cleanup");
+            let store = DownloadPersistence::new(tmp.path());
+            let attempt = store.admit_test_download(&snapshot).unwrap();
+            store
+                .settle_queue_admission("released-cleanup", &attempt)
+                .unwrap();
+            if retained_pending {
+                // This structurally valid negative fixture is not emitted by
+                // settlement: released custody cannot authorize cleanup anew.
+                let transaction = store.transaction(StoreOperation::UpdateStatus).unwrap();
+                let mut data = store.load_data_strict(&transaction).unwrap();
+                let mut failed = snapshot.clone();
+                failed.status = DownloadStatus::Error;
+                data.lifecycle_quarantines.insert(
+                    "released-cleanup".into(),
+                    PersistedLifecycleQuarantine {
+                        snapshot: failed,
+                        domain: LifecycleQuarantineDomain::Ambient,
+                        disposition: PersistedLifecycleCleanupDisposition::Pending,
+                        sticky_failure: true,
+                    },
+                );
+                store.write_data(&transaction, &mut data).unwrap();
+            }
+            let before = std::fs::read(&store.path).unwrap();
+            assert!(
+                matches!(store.begin_lifecycle_quarantine(&snapshot, LifecycleQuarantineDomain::Ambient, true, Some(&attempt)), Err(crate::PumasError::Validation { field, message }) if field == "downloads.lifecycle_quarantines" && message == "Released admission permits only retained terminal cleanup confirmation")
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn cleanup_preparation_cannot_take_over_an_intent_only_admission() {
+        let tmp = TempDir::new().unwrap();
+        let request = admission_request("intent-cleanup");
+        let store = DownloadPersistence::new(tmp.path()).with_test_publisher(Arc::new(
+            ScriptedPublisher::new([
+                ScriptedPublication::Durable,
+                ScriptedPublication::NotPublished,
+            ]),
+        ));
+        let attempt = Uuid::new_v4().to_string();
+        assert!(store
+            .admit_download(&attempt, &request)
+            .unwrap()
+            .into_result()
+            .is_err());
+        let before = std::fs::read(&store.path).unwrap();
+        let fresh = DownloadPersistence::new(tmp.path());
+        for expected in [None, Some(attempt.as_str())] {
+            assert!(
+                matches!(fresh.begin_lifecycle_quarantine(&request.snapshot, LifecycleQuarantineDomain::Ambient, true, expected), Err(crate::PumasError::Validation { field, message }) if field == "downloads.queue_admissions" && message == "Cleanup preparation requires the exact retained admission attempt")
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn cleanup_retry_and_restart_require_a_confirmed_barrier() {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
@@ -3410,6 +3852,7 @@ mod tests {
                 &persisted("cleanup"),
                 LifecycleQuarantineDomain::Ambient,
                 true,
+                None,
             )
             .unwrap();
         let uncertain = store.with_test_publisher(Arc::new(ScriptedPublisher::new([
@@ -3437,9 +3880,8 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let store = DownloadPersistence::new(tmp.path());
             let request = admission_request("queued");
-            store
-                .admit_download(&Uuid::new_v4().to_string(), &request)
-                .unwrap();
+            let attempt = Uuid::new_v4().to_string();
+            store.admit_download(&attempt, &request).unwrap();
             let rejected = match operation {
                 "quarantine_drift" => {
                     let mut stale = request.snapshot.clone();
@@ -3449,6 +3891,7 @@ mod tests {
                             &stale,
                             LifecycleQuarantineDomain::Ambient,
                             false,
+                            Some(&attempt),
                         )
                         .is_err()
                 }
@@ -3464,6 +3907,7 @@ mod tests {
                             &request.snapshot,
                             LifecycleQuarantineDomain::Ambient,
                             false,
+                            Some(&attempt),
                         )
                         .unwrap();
                     store.remove_clean_lifecycle_quarantine("queued").is_err()

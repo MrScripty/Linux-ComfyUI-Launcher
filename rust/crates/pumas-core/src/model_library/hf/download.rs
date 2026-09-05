@@ -396,21 +396,26 @@ impl CancellationPersistence {
             })
             .or_else(|| self.revoked_snapshot.clone());
         let Some(snapshot) = snapshot else {
+            if self.admission_attempt.is_some() {
+                return Err(PumasError::Validation {
+                    field: "download_cleanup".into(),
+                    message: "Admitted cancellation requires a retained cleanup snapshot".into(),
+                });
+            }
             return Ok(None);
         };
         let sticky_failure =
             sticky_failure || existing.is_some_and(|quarantine| quarantine.sticky_failure);
-        let disposition = existing
-            .map(|quarantine| quarantine.disposition)
-            .unwrap_or(LifecycleCleanupDisposition::Pending);
+        // The inventory projection can hide terminal publication phases.
+        // Only the store's confirmed result decides whether cleanup repeats.
         self.store
-            .begin_lifecycle_quarantine(&snapshot, domain, sticky_failure)?;
-        Ok(Some(LifecycleQuarantine {
-            snapshot,
-            domain,
-            disposition,
-            sticky_failure,
-        }))
+            .begin_lifecycle_quarantine(
+                &snapshot,
+                domain,
+                sticky_failure,
+                self.admission_attempt.as_deref(),
+            )
+            .map(Some)
     }
 
     fn mark_failed(&self) -> Result<()> {
@@ -13424,6 +13429,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_retry_without_retained_snapshot_refuses_filesystem_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let (client, source) = admitted_download_fixture(temp.path()).await;
+        let download_id = "admitted-cleanup";
+        let store = client.persistence.as_ref().unwrap();
+        let inventory = store.load_lifecycle_inventory_strict().unwrap();
+        let admission = &inventory.queue_admissions[download_id];
+        let completing_store = DownloadPersistence::new(temp.path());
+        completing_store
+            .begin_lifecycle_quarantine(
+                &inventory.downloads[0],
+                LifecycleQuarantineDomain::Ambient,
+                false,
+                Some(&admission.attempt_id),
+            )
+            .unwrap();
+        std::fs::remove_file(source.join("weights.gguf.part")).unwrap();
+        std::fs::File::open(&source).unwrap().sync_all().unwrap();
+        assert!(completing_store
+            .settle_queue_admission(download_id, &admission.attempt_id)
+            .unwrap());
+        assert!(store
+            .load_lifecycle_inventory_strict()
+            .unwrap()
+            .quarantines
+            .is_empty());
+        let persisted_before = std::fs::read(temp.path().join("downloads.json")).unwrap();
+        let persistence = CancellationPersistence {
+            store: store.clone(),
+            download_id: download_id.into(),
+            domain: LifecycleQuarantineDomain::Ambient,
+            admission_attempt: Some(admission.attempt_id.clone()),
+            revoked_snapshot: None,
+        };
+        assert!(
+            matches!(persistence.begin(true), Err(PumasError::Validation { field, message })
+            if field == "download_cleanup" && message == "Admitted cancellation requires a retained cleanup snapshot")
+        );
+        {
+            let mut states = client.downloads.write().await;
+            let state = states.get_mut(download_id).unwrap();
+            state.status = DownloadStatus::Error;
+            state.lifecycle_failure_unverified = true;
+        }
+        let part = source.join("weights.gguf.part");
+        let marker = source.join(".pumas_download");
+        std::fs::write(&part, b"successor partial bytes").unwrap();
+        std::fs::write(&marker, b"successor marker").unwrap();
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !client.download_tasks.is_empty() {
+                client.observe_finished_download_tasks().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refused cleanup must drain its finalizer");
+        assert_eq!(std::fs::read(part).unwrap(), b"successor partial bytes");
+        assert_eq!(std::fs::read(marker).unwrap(), b"successor marker");
+        assert_eq!(
+            client.get_download_status(download_id).await,
+            Some(DownloadStatus::Error)
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("downloads.json")).unwrap(),
+            persisted_before
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_retry_preserves_successor_files_after_unconfirmed_verified_cleanup() {
+        for released in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let (client, source) = admitted_download_fixture(temp.path()).await;
+            let download_id = "admitted-cleanup";
+            let client_store = client.persistence.as_ref().unwrap();
+            let before = client_store.load_lifecycle_inventory_strict().unwrap();
+            let snapshot = before.downloads.first().unwrap();
+            let admission = &before.queue_admissions[download_id];
+            // A separate store owner confirms cleanup; the old runtime owner
+            // has not confirmed that publication and retains its Error state.
+            let completing_store = DownloadPersistence::new(temp.path());
+            completing_store
+                .begin_lifecycle_quarantine(
+                    snapshot,
+                    LifecycleQuarantineDomain::Ambient,
+                    true,
+                    Some(&admission.attempt_id),
+                )
+                .unwrap();
+            std::fs::remove_file(source.join("weights.gguf.part")).unwrap();
+            std::fs::File::open(&source).unwrap().sync_all().unwrap();
+            assert!(completing_store
+                .verify_lifecycle_quarantine(download_id)
+                .unwrap());
+            if released {
+                assert!(completing_store
+                    .settle_queue_admission(download_id, &admission.attempt_id)
+                    .unwrap());
+            }
+            assert_eq!(
+                client_store
+                    .load_lifecycle_inventory_strict()
+                    .unwrap()
+                    .quarantines[download_id]
+                    .disposition,
+                LifecycleCleanupDisposition::Pending
+            );
+            {
+                let mut states = client.downloads.write().await;
+                let state = states.get_mut(download_id).unwrap();
+                state.status = DownloadStatus::Error;
+                state.lifecycle_failure_unverified = true;
+            }
+            // These bytes represent work after the recorded cleanup, not
+            // permission to repeat deletion from a stale Pending projection.
+            let part = source.join("weights.gguf.part");
+            let marker = source.join(".pumas_download");
+            std::fs::write(&part, b"successor partial bytes").unwrap();
+            std::fs::write(&marker, b"successor marker").unwrap();
+            let deletions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            client.download_tasks.set_blocking_observer(Some(Arc::new({
+                let deletions = deletions.clone();
+                move |operation| {
+                    if matches!(
+                        operation,
+                        "remove ambient partial download file" | "remove ambient download marker"
+                    ) {
+                        deletions.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })));
+            assert!(client.cancel_download(download_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !client.download_tasks.is_empty() {
+                    client.observe_finished_download_tasks().await;
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal retry must drain its owned finalizer");
+            client.download_tasks.set_blocking_observer(None);
+
+            assert_eq!(deletions.load(Ordering::SeqCst), 0, "released={released}");
+            assert_eq!(std::fs::read(part).unwrap(), b"successor partial bytes");
+            assert_eq!(std::fs::read(marker).unwrap(), b"successor marker");
+            assert_eq!(
+                client.get_download_status(download_id).await,
+                Some(DownloadStatus::Error)
+            );
+            let after = client_store.load_lifecycle_inventory_strict().unwrap();
+            assert!(!after.queue_admissions.contains_key(download_id));
+            assert_eq!(
+                after.quarantines[download_id].disposition,
+                LifecycleCleanupDisposition::Verified
+            );
+            assert!(after.quarantines[download_id].sticky_failure);
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(temp.path().join("downloads.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                persisted["released_queue_admissions"][download_id],
+                serde_json::to_value(admission).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn restore_settles_verified_ambient_cleanup_before_restoring_follower() {
         let temp = TempDir::new().unwrap();
         let (head, follower) = ambient_cleanup_cutpoint(temp.path(), true);
@@ -13605,8 +13778,19 @@ mod tests {
         let (head, follower) = admitted_cleanup_queue(root);
         let store = DownloadPersistence::new(root);
         store.reconcile_lifecycle_inventory_strict().unwrap();
+        let attempt = store
+            .load_lifecycle_inventory_strict()
+            .unwrap()
+            .queue_admissions[&head.download_id]
+            .attempt_id
+            .clone();
         store
-            .begin_lifecycle_quarantine(&head, LifecycleQuarantineDomain::Ambient, true)
+            .begin_lifecycle_quarantine(
+                &head,
+                LifecycleQuarantineDomain::Ambient,
+                true,
+                Some(&attempt),
+            )
             .unwrap();
         if verified {
             // Persisted cutpoint after successful cleanup/verification, before
@@ -13669,7 +13853,12 @@ mod tests {
             .unwrap();
         if let Some(cleanup) = cleanup {
             store
-                .begin_lifecycle_quarantine(&head, LifecycleQuarantineDomain::Recovery, true)
+                .begin_lifecycle_quarantine(
+                    &head,
+                    LifecycleQuarantineDomain::Recovery,
+                    true,
+                    Some(&attempt),
+                )
                 .unwrap();
             if cleanup == LifecycleCleanupDisposition::Verified {
                 std::fs::remove_file(head.dest_dir.join("head.gguf.part")).unwrap();

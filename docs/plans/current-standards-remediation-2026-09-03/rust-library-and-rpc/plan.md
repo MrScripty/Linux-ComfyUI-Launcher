@@ -36,16 +36,23 @@ parent before success, including an already-absent entry retry. The bounded
 `download_recovery.rs` correction is accepted after review, dual package tests,
 strict lint, and formatting. Callers retain their existing Interface.
 
-**Next slice:** Bound store-owned cleanup preparation that distinguishes
-persisted intent phases and returns exact-attempt evidence without authorizing
-filesystem replay. Record its failure/publication outcomes and deciding
-real-store regression before implementation. Cross-client/process exclusion
-through cleanup drain remains a separate prerequisite for actual Pending replay.
+Phase-aware cancellation preparation is accepted after independent review,
+dual core suites, strict lint, and formatting. The existing store Interface
+validates exact retained ownership and returns its confirmed cleanup phase;
+terminal retries skip deletion, and missing admitted snapshots refuse effects.
+Restore remains unchanged.
+
+**Next slice:** Bound terminal VerifiedIntent confirmation during restart,
+without filesystem replay. Record the exact store/restore write set and deciding
+interrupted-publication regression before implementation; preserve Pending
+live-worker refusal and exact queue settlement. Cross-client/process exclusion
+through cleanup drain remains separate prerequisite work for Pending replay.
 
 Pending replay remains excluded. Investigation found three prerequisites:
 cross-client/process exclusion through cleanup drain; distinguishing persisted
 intent phases currently projected together as Pending; and parent-sync deletion
-durability. The current checkpoint addresses only the last. Preserve fresh-client
+durability. Parent-sync durability and phase-aware cancellation preparation
+are accepted; restart intent handling remains open. Preserve fresh-client
 refusal while an earlier cleanup is held. No snapshot-derived deletion/resume,
 live library mutation, legacy support, or C4 importer change is admitted.
 

@@ -20,6 +20,22 @@
 
 ## Slice Log
 
+### 2026-09-05 — Phase-aware cancellation preparation
+
+- Continue with the existing cancellation consumer before expanding restore:
+  independent store/lifecycle inspection found that stale public Pending can
+  repeat deletion for completed cleanup. Source ownership is split between
+  the store and HF consumer, with Cargo and integration serialized by root.
+- The [Rust admission](rust-library-and-rpc/execution-ledger.md#2026-09-05--phase-aware-cancellation-preparation-admitted)
+  owns the exact write set, transaction and publication outcomes, regression
+  contract, and exclusions. No live download, schema, or restore replay change.
+- The [verification record](rust-library-and-rpc/execution-ledger.md#2026-09-05--phase-aware-cancellation-verification)
+  accepts the bounded correction after actual deletion REDs, real-store/consumer
+  regressions, independent cross-review, both 1,205-test core configurations,
+  strict lint, formatting, and plan checks. Missing admitted snapshots also
+  refuse cleanup before effects. Next bound terminal intent restart confirmation;
+  Pending replay and full C3/C4 remain open.
+
 ### 2026-09-05 — Cleanup durability prerequisite
 
 - Pending replay investigation found missing cross-client/process exclusion
