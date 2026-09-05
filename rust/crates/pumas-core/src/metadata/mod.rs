@@ -9,4 +9,8 @@ mod atomic;
 mod manager;
 
 pub use atomic::{atomic_read_json, atomic_write_json};
+pub(crate) use atomic::{
+    AtomicJsonTarget, AtomicPublication, AtomicPublishFailure, AtomicPublishFailureKind,
+    AtomicPublishResult, AtomicPublishStage, StagingCleanup,
+};
 pub use manager::{InstalledVersionMetadata, MetadataManager, VersionConfig, VersionsMetadata};

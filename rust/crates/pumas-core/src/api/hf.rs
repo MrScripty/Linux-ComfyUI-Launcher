@@ -515,6 +515,146 @@ impl PumasApi {
         client.start_download(&request, &dest, None).await
     }
 
+    /// Resume a partial download from a previously issued model-state ticket.
+    /// - Resume an existing tracked paused/error download
+    /// - Attach to an already active tracked download
+    /// - Recover an orphan partial download
+    ///
+    /// The ticket binds the caller's observed recovery state; it is not a
+    /// secret or an authentication credential. The core resolves the indexed
+    /// model and repository itself and refuses changed recovery context.
+    /// Callers provide no repository or filesystem authority through this API.
+    /// Returns an action descriptor so callers can distinguish stale context,
+    /// unavailable recovery, and actual lifecycle admission.
+    pub async fn resume_partial_download_with_ticket(
+        &self,
+        model_id: &model_library::DownloadRecoveryModelId,
+        recovery_token: &model_library::DownloadRecoveryToken,
+    ) -> Result<models::PartialDownloadAction> {
+        let primary = self.primary();
+        let client = match primary.hf_client.as_ref() {
+            Some(client) => client,
+            None => {
+                return Ok(models::PartialDownloadAction {
+                    action: "none".to_string(),
+                    download_id: None,
+                    status: None,
+                    reason_code: Some("hf_client_unavailable".to_string()),
+                    message: Some("HuggingFace client not initialized".to_string()),
+                });
+            }
+        };
+
+        let indexed_record = match primary.model_library.get_model(model_id.as_str()).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(partial_download_unavailable("model_not_found")),
+            Err(error) => return Ok(partial_download_error(&error)),
+        };
+        let model_dir = match client
+            .inspect_recovery_model_directory(
+                primary.model_library.library_root().to_path_buf(),
+                indexed_record,
+            )
+            .await
+        {
+            Ok(Some(model_dir)) => model_dir,
+            Ok(None) => return Ok(partial_download_unavailable("recovery_unavailable")),
+            Err(error) => return Ok(partial_download_error(&error)),
+        };
+        if let Err(error) = primary.model_library.index_model_dir(&model_dir).await {
+            return Ok(partial_download_error(&error));
+        }
+        let fresh_record = match primary.model_library.get_model(model_id.as_str()).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(partial_download_unavailable("model_not_found")),
+            Err(error) => return Ok(partial_download_error(&error)),
+        };
+        let verification = match client
+            .verify_recovery_model_snapshot(
+                primary.model_library.library_root().to_path_buf(),
+                fresh_record,
+                recovery_token.clone(),
+            )
+            .await
+        {
+            Ok(verification) => verification,
+            Err(error) => return Ok(partial_download_error(&error)),
+        };
+        let verified = match verification {
+            model_library::DownloadRecoveryVerification::Complete => {
+                return Ok(partial_download_unavailable("model_not_partial"));
+            }
+            model_library::DownloadRecoveryVerification::Unavailable => {
+                return Ok(partial_download_unavailable("recovery_unavailable"));
+            }
+            model_library::DownloadRecoveryVerification::Stale => {
+                return Ok(partial_download_unavailable("recovery_context_stale"));
+            }
+            model_library::DownloadRecoveryVerification::Verified(verified) => verified,
+        };
+
+        let model_type = model_id.as_str().split('/').next().map(str::to_string);
+        let admission = match client.admit_recovery_download(&verified, model_type).await {
+            Ok(admission) => admission,
+            Err(error) => return Ok(partial_download_error(&error)),
+        };
+        match admission {
+            model_library::RecoveryDownloadAdmission::Recovered { download_id } => {
+                Ok(models::PartialDownloadAction {
+                    action: "recover".to_string(),
+                    download_id: Some(download_id),
+                    status: Some(models::DownloadStatus::Queued),
+                    reason_code: None,
+                    message: None,
+                })
+            }
+            model_library::RecoveryDownloadAdmission::Resumed { download_id } => {
+                Ok(models::PartialDownloadAction {
+                    action: "resume".to_string(),
+                    download_id: Some(download_id),
+                    status: Some(models::DownloadStatus::Queued),
+                    reason_code: None,
+                    message: None,
+                })
+            }
+            model_library::RecoveryDownloadAdmission::Attached {
+                download_id,
+                status,
+            } => Ok(models::PartialDownloadAction {
+                action: "attach".to_string(),
+                download_id: Some(download_id),
+                status: Some(status),
+                reason_code: None,
+                message: None,
+            }),
+            model_library::RecoveryDownloadAdmission::AlreadyCompleted { download_id } => {
+                Ok(models::PartialDownloadAction {
+                    action: "none".to_string(),
+                    download_id: Some(download_id),
+                    status: Some(models::DownloadStatus::Completed),
+                    reason_code: Some("already_completed".to_string()),
+                    message: Some("tracked download is already completed".to_string()),
+                })
+            }
+            model_library::RecoveryDownloadAdmission::AlreadyCancelled { download_id } => {
+                Ok(models::PartialDownloadAction {
+                    action: "none".to_string(),
+                    download_id: Some(download_id),
+                    status: Some(models::DownloadStatus::Cancelled),
+                    reason_code: Some("already_cancelled".to_string()),
+                    message: Some("tracked download was cancelled".to_string()),
+                })
+            }
+            model_library::RecoveryDownloadAdmission::ContextMismatch
+            | model_library::RecoveryDownloadAdmission::BoundFilesUnavailable => {
+                Ok(partial_download_unavailable("recovery_context_stale"))
+            }
+            model_library::RecoveryDownloadAdmission::CapabilityUnavailable => {
+                Ok(partial_download_unavailable("recovery_unavailable"))
+            }
+        }
+    }
+
     /// Resume a partial download by choosing the correct action:
     /// - Resume an existing tracked paused/error download
     /// - Attach to an already active tracked download
@@ -1272,9 +1412,298 @@ pub(crate) fn partial_download_reason_code(err: &PumasError) -> &'static str {
     }
 }
 
+fn partial_download_unavailable(reason_code: &str) -> models::PartialDownloadAction {
+    models::PartialDownloadAction {
+        action: "none".to_string(),
+        download_id: None,
+        status: None,
+        reason_code: Some(reason_code.to_string()),
+        message: Some("The partial download recovery context is unavailable.".to_string()),
+    }
+}
+
+fn partial_download_error(error: &PumasError) -> models::PartialDownloadAction {
+    let reason = match error {
+        PumasError::NotFound { .. } => "recovery_unavailable",
+        _ => partial_download_reason_code(error),
+    };
+    partial_download_unavailable(reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn recovery_api_fixture(
+        root: &std::path::Path,
+        download_base_url: Option<String>,
+    ) -> PumasApi {
+        use crate::api::{
+            PrimaryState, ReconciliationCoordinator, RuntimeTasks, WatcherWriteSuppressor,
+        };
+        use std::time::Duration;
+        use tokio::sync::{Mutex, RwLock};
+
+        let library = Arc::new(
+            model_library::ModelLibrary::new(root.join("shared-resources/models"))
+                .await
+                .unwrap(),
+        );
+        let mut client = model_library::HuggingFaceClient::new(root.join("cache")).unwrap();
+        client
+            .configure_download_destination_root(library.library_root())
+            .unwrap();
+        if let Some(base_url) = download_base_url {
+            client.set_test_download_base_url(base_url);
+        }
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        client.set_persistence(Arc::new(model_library::DownloadPersistence::new(
+            &root.join("state"),
+        )));
+        let tasks = RuntimeTasks::default();
+        let provider_registry = crate::providers::ProviderRegistry::builtin();
+        let primary = PrimaryState {
+            _state: Arc::new(RwLock::new(crate::api::state::ApiState {
+                background_fetch_completed: false,
+            })),
+            network_manager: Arc::new(crate::network::NetworkManager::new().unwrap()),
+            process_manager: Arc::new(RwLock::new(None)),
+            resource_tracker: Arc::new(crate::system::ResourceTracker::default()),
+            status_telemetry: Arc::new(
+                crate::api::status_telemetry::StatusTelemetryService::default(),
+            ),
+            system_utils: Arc::new(crate::system::SystemUtils::new(root)),
+            model_importer: model_library::ModelImporter::new(library.clone()),
+            conversion_manager: Arc::new(crate::conversion::ConversionManager::new(
+                root.to_path_buf(),
+                library.clone(),
+                Arc::new(model_library::ModelImporter::new(library.clone())),
+            )),
+            runtime_profile_service: Arc::new(
+                crate::runtime_profiles::RuntimeProfileService::with_provider_registry_and_adapters(
+                    root,
+                    provider_registry.clone(),
+                    crate::runtime_profiles::RuntimeProviderAdapters::builtin(),
+                ),
+            ),
+            serving_service: Arc::new(crate::serving::ServingService::with_provider_registry(
+                provider_registry,
+            )),
+            model_library: library,
+            hf_client: Some(client),
+            runtime_tasks: tasks.clone(),
+            reconciliation: Arc::new(ReconciliationCoordinator::new(
+                Duration::ZERO,
+                Duration::ZERO,
+            )),
+            watcher_write_suppressor: Arc::new(WatcherWriteSuppressor::new(Duration::from_secs(1))),
+            server_handle: Mutex::new(None),
+            registry: None,
+            instance_claim: Mutex::new(None),
+        };
+        // Exercise the production API without a global registry, IPC listener,
+        // filesystem watcher, or background connectivity probe.
+        PumasApi {
+            launcher_root: root.to_path_buf(),
+            inner: crate::ApiInner::Primary(Arc::new(primary)),
+            model_watcher: None,
+            runtime_tasks: tasks,
+        }
+    }
+
+    async fn indexed_partial_ticket(
+        api: &PumasApi,
+    ) -> (
+        model_library::DownloadRecoveryModelId,
+        model_library::DownloadRecoveryToken,
+        model_library::ModelMetadata,
+    ) {
+        let library = &api.primary().model_library;
+        let model_dir = library.library_root().join("llm/acme/model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("weights.gguf.part"), b"partial").unwrap();
+        let metadata = model_library::ModelMetadata {
+            model_id: Some("llm/acme/model".into()),
+            family: Some("acme".into()),
+            model_type: Some("llm".into()),
+            cleaned_name: Some("model".into()),
+            official_name: Some("Model".into()),
+            repo_id: Some("acme/model".into()),
+            selected_artifact_id: Some("acme/model::Q4_K_M".into()),
+            selected_artifact_quant: Some("Q4_K_M".into()),
+            selected_artifact_files: Some(vec!["weights.gguf".into()]),
+            expected_files: Some(vec!["weights.gguf".into()]),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        library.index_model_dir(&model_dir).await.unwrap();
+        let record = api.get_model("llm/acme/model").await.unwrap().unwrap();
+        let ticket = model_library::issue_download_recovery_ticket(library.library_root(), &record)
+            .unwrap()
+            .expect("indexed partial must have a recovery ticket");
+        (
+            model_library::DownloadRecoveryModelId::parse(&record.id).unwrap(),
+            model_library::DownloadRecoveryToken::parse(ticket.token()).unwrap(),
+            metadata,
+        )
+    }
+
+    #[tokio::test]
+    async fn ticket_recovery_refuses_changed_artifact_without_download_mutation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let api = recovery_api_fixture(root.path(), None).await;
+        let (model_id, token, mut metadata) = indexed_partial_ticket(&api).await;
+        let model_dir = api
+            .primary()
+            .model_library
+            .library_root()
+            .join(model_id.as_str());
+        metadata.selected_artifact_id = Some("acme/model::Q5_K_M".into());
+        metadata.selected_artifact_quant = Some("Q5_K_M".into());
+        api.primary()
+            .model_library
+            .save_metadata(&model_dir, &metadata)
+            .await
+            .unwrap();
+
+        let result = api
+            .resume_partial_download_with_ticket(&model_id, &token)
+            .await
+            .unwrap();
+        assert_eq!(result.action, "none");
+        assert_eq!(
+            result.reason_code.as_deref(),
+            Some("recovery_context_stale")
+        );
+        assert!(result.download_id.is_none());
+        assert!(api
+            .primary()
+            .hf_client
+            .as_ref()
+            .unwrap()
+            .list_downloads()
+            .await
+            .is_empty());
+        assert_eq!(
+            std::fs::read(model_dir.join("weights.gguf.part")).unwrap(),
+            b"partial"
+        );
+        assert!(!model_dir.join(".pumas_download").exists());
+
+        let missing = root.path().join("missing-model");
+        let legacy = api
+            .resume_partial_download("acme/model", missing.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(legacy.action, "none");
+        assert_eq!(legacy.reason_code.as_deref(), Some("dest_dir_missing"));
+        assert!(legacy.download_id.is_none());
+        assert!(api
+            .primary()
+            .hf_client
+            .as_ref()
+            .unwrap()
+            .list_downloads()
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn ticket_recovery_admits_exact_partial_and_public_cancel_preserves_other_artifacts() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{timeout, Duration};
+
+        let root = tempfile::TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let api = recovery_api_fixture(root.path(), Some(format!("http://{address}"))).await;
+        let (model_id, token, _) = indexed_partial_ticket(&api).await;
+        let model_dir = api
+            .primary()
+            .model_library
+            .library_root()
+            .join(model_id.as_str());
+        std::fs::write(model_dir.join("unrelated.bin"), b"preserve this artifact").unwrap();
+        let tree = model_library::RepoFileTree {
+            repo_id: "acme/model".into(),
+            lfs_files: vec![model_library::LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 12,
+                sha256: "a".repeat(64),
+            }],
+            regular_files: Vec::new(),
+            cached_at: chrono::Utc::now().to_rfc3339(),
+            last_modified: None,
+            cache_version: 2,
+        };
+        std::fs::write(
+            root.path().join("cache/hf_acme_model_files.json"),
+            serde_json::to_vec(&tree).unwrap(),
+        )
+        .unwrap();
+        let (requested, request_received) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(
+                    header.len() < 4096,
+                    "fixture request header must be bounded"
+                );
+                header.push(socket.read_u8().await.unwrap());
+            }
+            let header = String::from_utf8(header).unwrap();
+            assert!(header.starts_with("GET /acme/model/resolve/main/weights.gguf HTTP/1.1"));
+            assert!(header.to_ascii_lowercase().contains("range: bytes=7-"));
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 7-11/12\r\nConnection: close\r\n\r\n").await.unwrap();
+            requested.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                socket.read(&mut byte).await.unwrap(),
+                0,
+                "cancel must close the owned response"
+            );
+        });
+        let outcome = timeout(Duration::from_secs(10), async {
+            let action = api
+                .resume_partial_download_with_ticket(&model_id, &token)
+                .await
+                .unwrap();
+            assert_eq!(action.action, "recover");
+            let download_id = action
+                .download_id
+                .expect("accepted recovery has an owned download ID");
+            request_received.await.unwrap();
+            assert!(api.cancel_hf_download(&download_id).await.unwrap());
+            loop {
+                let progress = api
+                    .primary()
+                    .hf_client
+                    .as_ref()
+                    .unwrap()
+                    .get_download_progress(&download_id)
+                    .await
+                    .unwrap();
+                if progress.status == models::DownloadStatus::Cancelled {
+                    break;
+                }
+                assert_eq!(progress.status, models::DownloadStatus::Cancelling);
+                tokio::task::yield_now().await;
+            }
+            assert!(!model_dir.join("weights.gguf.part").exists());
+            assert!(!model_dir.join("weights.gguf").exists());
+            assert_eq!(
+                std::fs::read(model_dir.join("unrelated.bin")).unwrap(),
+                b"preserve this artifact"
+            );
+            (&mut server).await.unwrap();
+        })
+        .await;
+        if outcome.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        outcome.expect("recovery and public cancellation must settle within the fixture bound");
+    }
     use crate::models::HuggingFaceModel;
     use tempfile::TempDir;
 
@@ -1284,6 +1713,18 @@ mod tests {
             message: "Invalid repo_id format (expected 'owner/name'): bad".to_string(),
         };
         assert_eq!(partial_download_reason_code(&err), "invalid_repo_id");
+    }
+
+    #[test]
+    fn test_partial_download_reason_code_maps_post_verification_path_race() {
+        let err = PumasError::NotFound {
+            resource: "model directory".to_string(),
+        };
+        assert_eq!(partial_download_reason_code(&err), "dest_dir_missing");
+        assert_eq!(
+            partial_download_error(&err).reason_code.as_deref(),
+            Some("recovery_unavailable")
+        );
     }
 
     #[test]

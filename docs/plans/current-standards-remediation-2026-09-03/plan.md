@@ -2,10 +2,10 @@
 
 **Plan status:** `Active`
 
-**Current phase:** PRG-I19 Slice C remains unaccepted as a whole. Its queue
-candidate is active after the user approved coordinated relocation/migration (PRG-I24).
-The independent shared finalization-policy extraction is committed; no queue
-or relocation acceptance follows from that checkpoint.
+**Current phase:** PRG-I19 Slice C remains unaccepted as a whole. Its core
+recovery, legacy relocation, and cancellation-quarantine checkpoint is verified
+for incremental integration, with dual full-package tests and strict lint green.
+This supersedes PRG-I24's legacy composition gate, not the remaining C3 claims.
 C1's store repair is internally verified: compilation succeeds, independent
 source review accepted the repair, and store, atomic-publication, and HF
 regressions pass in both feature configurations. The September 4 audit's build
@@ -218,11 +218,10 @@ requests or aborts the currently owned async handles; it has no Slice B drain
 or completion claim for running blocking work or finalizer-captured
 predecessors. Its existing test remains narrow unstarted-worker evidence.
 
-**Next slice:** Resolve the isolated C3 candidate's production core recovery
-integration boundary and strict Clippy failures under the focused Rust plan.
-PRG-I24's legacy migration/owned-relocation composition is implemented and
-narrowly reviewed, not accepted for integration. Inventory the held core caller
-and its contracts before admission; RPC, bindings, and UI remain held.
+**Next slice:** Complete C3 stalled-pause ownership under the focused Rust plan,
+preserving the verified core recovery, queue, cancellation, and relocation
+regressions. Ticket recovery is additive; existing transport callers retain
+their old method until explicitly migrated. RPC, bindings, and UI remain held.
 The interrupted-response → fresh-owner restore → cancel path now
 transfers real bytes through loopback HTTP. The narrow admission checkpoint
 now rejects unconfigured starts, retains admitted resume authority, and tests
@@ -241,7 +240,7 @@ preceding contract is verified and the focused owner records the handoff.
 | --- | --- | --- |
 | C1 — Store contract | Accepted (internal checkpoint) | Independent source review accepted; 38 store tests, atomic-publication regressions, and 155 HF regressions pass in both feature configurations. Compilation passes with unused integration warnings. |
 | C2 — Destination authority | Accepted (internal checkpoint) | Independent source review accepted; root reproduced 14 recovery, 22 atomic, 38 store, and 155 HF tests in both feature configurations. One atomic and two store helper tests remain ignored. Both library checks pass with 23 unused-integration warning groups. |
-| C3 — Lifecycle integration | Active | Earlier admission/resume checkpoint reviewed with both feature configurations' targeted tests passing. PRG-I24 legacy relocation and migration are implemented and narrowly reviewed; the isolated source candidate fails strict Clippy and remains unaccepted. Remaining: production core recovery integration, hard process-crash recovery, owned comprehensive restore and quarantine, stalled pause, admitted relocation, and guard-free effects/publication. See the focused Rust ledger for exact verification. |
+| C3 — Lifecycle integration | Active | Core ticket recovery, legacy migration/relocation, and cancellation quarantine are independently reviewed and verified for incremental integration. Full package tests pass in both feature configurations; strict core/workspace lint and unchanged-consumer compilation pass. Remaining: hard process-crash recovery, owned comprehensive unresolved-state restore, stalled pause, admitted relocation, and guard-free effects/publication. See the focused Rust ledger for exact verification. |
 | C4 — Importer integration | Planned | The builder's actual async importer is observed and drained. Held Aux+cancel and Completion+queued-successor tests prove real mutation ownership; failed import retains bytes and resumes without downloading them again. |
 
 Store repair owns `model_library/download_store.rs` and its colocated tests;

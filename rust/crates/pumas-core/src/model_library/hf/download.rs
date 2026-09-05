@@ -3,28 +3,38 @@
 //! Handles multi-file downloads with progress tracking, pause/resume,
 //! cancellation, retry with resume, and crash recovery via persistence.
 
+use super::lifecycle::{
+    CancelPredecessor, DestinationDomain, DestinationExecutionOwner, DownloadTaskOwner,
+    PreparedTask as OwnedPreparedTask, ProjectionOutcome, ProjectionSettlement,
+    ProjectionTransition, TaskContext, TaskObservation, TaskRole, TaskTerminal,
+};
 use super::types::{
     AuxFilesCompleteCallback, AuxFilesCompleteInfo, DownloadCompletionCallback,
-    DownloadCompletionInfo, DownloadState, FileToDownload, HF_HUB_BASE,
+    DownloadCompletionInfo, DownloadDestination, DownloadState, FileToDownload, HF_HUB_BASE,
 };
 use super::HuggingFaceClient;
 use crate::error::{PumasError, Result};
-use crate::model_library::download_store::{DownloadPersistence, PersistedDownload};
+use crate::model_library::download_store::{
+    DownloadAdmissionDomain, DownloadAdmissionRequest, DownloadAdmissionTransition,
+    DownloadPersistence, LegacyRelocationRequest, LifecycleCleanupDisposition, LifecycleQuarantine,
+    LifecycleQuarantineDomain, PersistedDownload,
+};
 use crate::model_library::partial_download::{
-    download_artifact_paths, finalize_download_artifact_if_complete,
-    infer_expected_sizes_from_total,
+    finalize_download_artifact_with_files, infer_expected_sizes_with_files,
 };
 use crate::model_library::sharding;
 use crate::model_library::types::{DownloadRequest, DownloadStatus, ModelDownloadProgress};
 use crate::model_library::SelectedArtifactIdentity;
-use std::collections::{HashMap, HashSet};
+use crate::model_library::{RecoveryDownloadAdmission, VerifiedDownloadRecovery};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, Mutex as TokioMutex, OwnedMutexGuard, RwLock};
 use tracing::{debug, error, info, warn};
 
 /// Regular (non-LFS) filenames that should be automatically fetched alongside
@@ -47,8 +57,134 @@ const AUXILIARY_FILE_PATTERNS: &[&str] = &[
     "scheduler_config.json",
     "model_index.json",
 ];
+
 const DOWNLOAD_UPDATE_CURSOR_PREFIX: &str = "download:";
 const DOWNLOAD_PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+
+struct PendingDownloadPublication {
+    notification: crate::models::ModelDownloadUpdateNotification,
+    completed: tokio::sync::oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+struct DownloadPublicationState {
+    queue: VecDeque<PendingDownloadPublication>,
+    draining: bool,
+}
+
+#[cfg(test)]
+type DownloadDispatchObserver = Arc<dyn Fn(&crate::models::ModelDownloadSnapshot) + Send + Sync>;
+
+pub(crate) struct DownloadPublicationOwner {
+    downloads: Arc<RwLock<HashMap<String, DownloadState>>>,
+    revision: Arc<AtomicU64>,
+    updates: broadcast::Sender<crate::models::ModelDownloadUpdateNotification>,
+    capture: TokioMutex<()>,
+    state: std::sync::Mutex<DownloadPublicationState>,
+    #[cfg(test)]
+    dispatch_observer: std::sync::Mutex<Option<DownloadDispatchObserver>>,
+}
+
+impl DownloadPublicationOwner {
+    pub(super) fn new(
+        downloads: Arc<RwLock<HashMap<String, DownloadState>>>,
+        revision: Arc<AtomicU64>,
+        updates: broadcast::Sender<crate::models::ModelDownloadUpdateNotification>,
+    ) -> Self {
+        Self {
+            downloads,
+            revision,
+            updates,
+            capture: TokioMutex::new(()),
+            state: std::sync::Mutex::new(DownloadPublicationState::default()),
+            #[cfg(test)]
+            dispatch_observer: std::sync::Mutex::new(None),
+        }
+    }
+
+    async fn publish(&self) {
+        let (snapshot, completed, becomes_drainer) = {
+            let capture = self.capture.lock().await;
+            let next_revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+            let snapshot = build_download_snapshot_from_parts(&self.downloads, next_revision).await;
+            let notification = crate::models::ModelDownloadUpdateNotification {
+                cursor: snapshot.cursor.clone(),
+                snapshot: snapshot.clone(),
+                stale_cursor: false,
+                snapshot_required: false,
+            };
+            let (completed_sender, completed) = tokio::sync::oneshot::channel();
+            let becomes_drainer = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("HF download-publication owner lock poisoned");
+                state.queue.push_back(PendingDownloadPublication {
+                    notification,
+                    completed: completed_sender,
+                });
+                if state.draining {
+                    false
+                } else {
+                    state.draining = true;
+                    true
+                }
+            };
+            drop(capture);
+            (snapshot, completed, becomes_drainer)
+        };
+
+        #[cfg(test)]
+        {
+            let observer = self
+                .dispatch_observer
+                .lock()
+                .expect("HF download-dispatch observer lock poisoned")
+                .clone();
+            if let Some(observer) = observer {
+                observer(&snapshot);
+            }
+        }
+        #[cfg(not(test))]
+        let _ = snapshot;
+
+        if becomes_drainer {
+            self.drain();
+        }
+        let _ = completed.await;
+    }
+
+    fn drain(&self) {
+        loop {
+            let pending = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("HF download-publication owner lock poisoned");
+                match state.queue.pop_front() {
+                    Some(pending) => Some(pending),
+                    None => {
+                        state.draining = false;
+                        None
+                    }
+                }
+            };
+            let Some(pending) = pending else {
+                return;
+            };
+            let _ = self.updates.send(pending.notification);
+            let _ = pending.completed.send(());
+        }
+    }
+
+    #[cfg(test)]
+    fn set_dispatch_observer_for_test(&self, observer: Option<DownloadDispatchObserver>) {
+        *self
+            .dispatch_observer
+            .lock()
+            .expect("HF download-dispatch observer lock poisoned") = observer;
+    }
+}
 
 /// Select auxiliary config/tokenizer files from a repo's regular (non-LFS) file list.
 fn select_auxiliary_files(regular_files: &[String]) -> Vec<String> {
@@ -124,6 +260,899 @@ fn select_auxiliary_files_for_download(
     }
 
     aux
+}
+
+/// Resolve the exact producer-bound recovery set against the current remote
+/// tree. Recovery never widens this set with repository auxiliary files and
+/// never accepts a partial intersection.
+fn resolve_exact_recovery_files(
+    tree: &crate::model_library::RepoFileTree,
+    bound_files: &[String],
+) -> Option<Vec<FileToDownload>> {
+    bound_files
+        .iter()
+        .map(|filename| {
+            if let Some(file) = tree
+                .lfs_files
+                .iter()
+                .find(|file| file.filename == *filename)
+            {
+                return Some(FileToDownload {
+                    filename: filename.clone(),
+                    size: Some(file.size),
+                    sha256: Some(file.sha256.clone()),
+                });
+            }
+            tree.regular_files
+                .iter()
+                .any(|file| file == filename)
+                .then(|| FileToDownload {
+                    filename: filename.clone(),
+                    size: None,
+                    sha256: None,
+                })
+        })
+        .collect()
+}
+
+enum DownloadFile {
+    Ambient(Arc<std::sync::Mutex<std::fs::File>>),
+    Recovery(Arc<std::sync::Mutex<std::fs::File>>),
+}
+
+struct DownloadStartSetup {
+    persisted_download: Option<PersistedDownload>,
+    marker_contents: String,
+}
+
+#[derive(Clone)]
+struct CancellationPersistence {
+    store: Arc<DownloadPersistence>,
+    download_id: String,
+    domain: LifecycleQuarantineDomain,
+    admission_attempt: Option<String>,
+    revoked_snapshot: Option<PersistedDownload>,
+}
+
+impl CancellationPersistence {
+    fn begin(&self, sticky_failure: bool) -> Result<Option<LifecycleQuarantine>> {
+        let inventory = self.store.load_lifecycle_inventory_strict()?;
+        let existing = inventory.quarantines.get(&self.download_id);
+        // A cancelled recovery transition may have revoked the ordinary row
+        // without promoting the runtime destination. Select the store domain
+        // after draining that transition. Existence is not durable proof:
+        // begin_lifecycle_quarantine still validates the tombstone below.
+        let domain =
+            if self.revoked_snapshot.is_some() && self.store.is_revoked(&self.download_id)? {
+                LifecycleQuarantineDomain::Recovery
+            } else {
+                self.domain
+            };
+        if existing.is_some_and(|quarantine| quarantine.domain != domain) {
+            return Err(PumasError::Validation {
+                field: "download_cleanup".into(),
+                message: "Cancellation quarantine domain changed".into(),
+            });
+        }
+        let snapshot = existing
+            .map(|quarantine| quarantine.snapshot.clone())
+            .or_else(|| {
+                inventory
+                    .downloads
+                    .into_iter()
+                    .find(|snapshot| snapshot.download_id == self.download_id)
+            })
+            .or_else(|| self.revoked_snapshot.clone());
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let sticky_failure =
+            sticky_failure || existing.is_some_and(|quarantine| quarantine.sticky_failure);
+        let disposition = existing
+            .map(|quarantine| quarantine.disposition)
+            .unwrap_or(LifecycleCleanupDisposition::Pending);
+        self.store
+            .begin_lifecycle_quarantine(&snapshot, domain, sticky_failure)?;
+        Ok(Some(LifecycleQuarantine {
+            snapshot,
+            domain,
+            disposition,
+            sticky_failure,
+        }))
+    }
+
+    fn mark_failed(&self) -> Result<()> {
+        if self
+            .store
+            .mark_lifecycle_quarantine_failed(&self.download_id)?
+        {
+            Ok(())
+        } else {
+            Err(PumasError::Other(
+                "Cancellation quarantine failure was not recorded".into(),
+            ))
+        }
+    }
+
+    fn finish(&self, quarantine: Option<&LifecycleQuarantine>) -> Result<()> {
+        if let Some(quarantine) = quarantine {
+            if quarantine.sticky_failure
+                && !self.store.verify_lifecycle_quarantine(&self.download_id)?
+            {
+                return Err(PumasError::Other(
+                    "Cancellation quarantine cleanup was not verified".into(),
+                ));
+            }
+            if let Some(attempt) = self.admission_attempt.as_ref() {
+                if !self
+                    .store
+                    .settle_queue_admission(&self.download_id, attempt)?
+                {
+                    return Err(PumasError::Other(
+                        "Download queue settlement was not confirmed".into(),
+                    ));
+                }
+            } else if !quarantine.sticky_failure
+                && !self
+                    .store
+                    .remove_clean_lifecycle_quarantine(&self.download_id)?
+            {
+                return Err(PumasError::Other(
+                    "Clean cancellation quarantine was not removed".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(attempt) = self.admission_attempt.as_ref() {
+            if !self
+                .store
+                .settle_queue_admission(&self.download_id, attempt)?
+            {
+                return Err(PumasError::Other(
+                    "Download queue settlement was not confirmed".into(),
+                ));
+            }
+        } else if !self.store.is_revoked(&self.download_id)? {
+            self.store.remove(&self.download_id)?;
+        }
+        Ok(())
+    }
+}
+
+enum RelocationPublication {
+    Durable,
+    NotPublished(PumasError),
+    Indeterminate(PumasError),
+}
+
+async fn publish_relocation_transition<F>(
+    context: &TaskContext,
+    operation: &'static str,
+    publish: F,
+) -> RelocationPublication
+where
+    F: FnOnce() -> Result<crate::metadata::AtomicPublishResult> + Send + 'static,
+{
+    match context.run_blocking_named(operation, publish).await {
+        Ok(Ok(Ok(crate::metadata::AtomicPublication::Durable))) => RelocationPublication::Durable,
+        Ok(Err(error)) => RelocationPublication::NotPublished(error),
+        Ok(Ok(Err(error))) => RelocationPublication::NotPublished(error.into_error()),
+        Ok(Ok(Ok(crate::metadata::AtomicPublication::PublishedDurabilityUnknown { error })))
+        | Ok(Ok(Ok(crate::metadata::AtomicPublication::VisibilityUnknown { error, .. }))) => {
+            RelocationPublication::Indeterminate(error)
+        }
+        Err(error) => RelocationPublication::Indeterminate(PumasError::Other(format!(
+            "Download relocation publication owner failed: {error}"
+        ))),
+    }
+}
+
+enum RelocationResolution {
+    Original(PumasError),
+    Moved(crate::model_library::DownloadRecoveryDestination),
+    Pending(
+        PumasError,
+        Option<crate::model_library::DownloadRecoveryDestination>,
+    ),
+}
+
+struct PreparedLegacyRelocation {
+    persistence: Arc<DownloadPersistence>,
+    attempt: String,
+    expected: PersistedDownload,
+    request: LegacyRelocationRequest,
+    source: crate::model_library::DownloadRecoveryDestination,
+    target: crate::model_library::DownloadRecoveryDestination,
+    marker: Option<serde_json::Value>,
+}
+
+async fn execute_legacy_relocation(
+    context: &TaskContext,
+    operation: PreparedLegacyRelocation,
+) -> RelocationResolution {
+    let PreparedLegacyRelocation {
+        persistence,
+        attempt,
+        expected,
+        request,
+        source,
+        target,
+        marker,
+    } = operation;
+    let id = expected.download_id.clone();
+    let begin = publish_relocation_transition(context, "persist legacy relocation intent", {
+        let persistence = persistence.clone();
+        let attempt = attempt.clone();
+        move || persistence.begin_legacy_relocation(&attempt, &expected, &request)
+    })
+    .await;
+    match begin {
+        RelocationPublication::Durable => {}
+        RelocationPublication::NotPublished(error) => return RelocationResolution::Original(error),
+        RelocationPublication::Indeterminate(error) => {
+            return RelocationResolution::Pending(error, None)
+        }
+    }
+    let moved = match context
+        .run_blocking_named("move legacy download directory", move || {
+            source.move_to_absent(&target)
+        })
+        .await
+    {
+        Ok(Ok(destination)) => destination,
+        Ok(Err(crate::model_library::download_recovery::DestinationMoveError::NotMoved(error))) => {
+            let abort = publish_relocation_transition(context, "abort legacy relocation intent", {
+                let persistence = persistence.clone();
+                let attempt = attempt.clone();
+                let id = id.clone();
+                move || persistence.abort_legacy_relocation(&id, &attempt)
+            })
+            .await;
+            return match abort {
+                RelocationPublication::Durable => RelocationResolution::Original(error.into()),
+                RelocationPublication::NotPublished(error)
+                | RelocationPublication::Indeterminate(error) => {
+                    RelocationResolution::Pending(error, None)
+                }
+            };
+        }
+        Ok(Err(crate::model_library::download_recovery::DestinationMoveError::Indeterminate(
+            error,
+        ))) => return RelocationResolution::Pending(error.into(), None),
+        Err(error) => {
+            return RelocationResolution::Pending(
+                PumasError::Other(format!("Download relocation move owner failed: {error}")),
+                None,
+            )
+        }
+    };
+    if let Some(marker) = marker {
+        match publish_relocation_transition(context, "publish relocated download marker", {
+            let moved = moved.clone();
+            move || Ok(moved.write_marker(&marker))
+        })
+        .await
+        {
+            RelocationPublication::Durable => {}
+            RelocationPublication::NotPublished(error)
+            | RelocationPublication::Indeterminate(error) => {
+                return RelocationResolution::Pending(error, Some(moved))
+            }
+        }
+    }
+    if !matches!(context.drain_blocking().await, Ok(0)) {
+        return RelocationResolution::Pending(
+            PumasError::Other("Download relocation effects did not drain successfully".into()),
+            Some(moved),
+        );
+    }
+    match publish_relocation_transition(context, "finish legacy relocation intent", move || {
+        persistence.finish_legacy_relocation(&id, &attempt)
+    })
+    .await
+    {
+        RelocationPublication::Durable => RelocationResolution::Moved(moved),
+        RelocationPublication::NotPublished(error)
+        | RelocationPublication::Indeterminate(error) => {
+            RelocationResolution::Pending(error, Some(moved))
+        }
+    }
+}
+
+struct PreparedDownloadTask {
+    #[cfg(test)]
+    download_base_url: Option<String>,
+    client: reqwest::Client,
+    downloads: Arc<RwLock<HashMap<String, DownloadState>>>,
+    download_publications: Arc<DownloadPublicationOwner>,
+    destination_executions: Arc<DestinationExecutionOwner>,
+    download_id: String,
+    repo_id: String,
+    files: Vec<FileToDownload>,
+    destination: DownloadDestination,
+    cancel_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
+    completion_callback: Option<DownloadCompletionCallback>,
+    aux_complete_callback: Option<AuxFilesCompleteCallback>,
+    /// Status updates are intentionally disabled for verified recovery work.
+    persistence: Option<Arc<DownloadPersistence>>,
+    /// Terminal cleanup remains required for both ambient and recovery work.
+    terminal_cleanup_persistence: Option<Arc<DownloadPersistence>>,
+    auth_header: Option<String>,
+    destination_lock: Arc<TokioMutex<()>>,
+    start_setup: Option<DownloadStartSetup>,
+    persist_queued_status: bool,
+}
+
+impl PreparedDownloadTask {
+    fn prepare_owned(self, owner: &Arc<DownloadTaskOwner>, role: TaskRole) -> OwnedPreparedTask {
+        let download_id = self.download_id.clone();
+        owner.prepare(download_id, role, move |task_context| {
+            self.run_owned(task_context)
+        })
+    }
+
+    async fn run_owned(self, task_context: TaskContext) {
+        use futures::FutureExt;
+
+        let destination_path = self.destination.identity();
+        let destination_domain = self.destination.domain();
+        let acquired = self
+            .destination_executions
+            .wait_for_turn(
+                &destination_path,
+                task_context.download_id(),
+                destination_domain,
+                task_context.generation(),
+            )
+            .await;
+        let outcome = if acquired {
+            AssertUnwindSafe(HuggingFaceClient::run_download(
+                self.client,
+                self.downloads.clone(),
+                self.download_publications.clone(),
+                &self.download_id,
+                &self.repo_id,
+                &self.files,
+                &self.destination,
+                self.cancel_flag,
+                self.pause_flag,
+                self.persistence.clone(),
+                self.terminal_cleanup_persistence.clone(),
+                self.completion_callback,
+                self.aux_complete_callback,
+                self.auth_header,
+                task_context.clone(),
+                self.destination_lock,
+                self.start_setup,
+                self.persist_queued_status,
+                #[cfg(test)]
+                self.download_base_url,
+            ))
+            .catch_unwind()
+            .await
+        } else {
+            Ok(Err(PumasError::DownloadCancelled))
+        };
+        let mut result = match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        if matches!(result, Err(PumasError::DownloadPaused)) {
+            let pause_still_needs_settlement = {
+                let states = self.downloads.read().await;
+                states
+                    .get(&self.download_id)
+                    .is_some_and(|state| state.status == DownloadStatus::Pausing)
+                    && task_context.is_current_role(TaskRole::Worker)
+            };
+            if pause_still_needs_settlement {
+                let mut no_destination_guard = None;
+                result = HuggingFaceClient::settle_worker_pause(
+                    &self.downloads,
+                    &self.download_publications,
+                    &self.download_id,
+                    &task_context,
+                    self.persistence.as_ref(),
+                    &mut no_destination_guard,
+                )
+                .await;
+            }
+        }
+        // Paused and failed downloads retain destination authority for their
+        // resumable artifacts. Only verified successful completion releases
+        // the reservation; cancellation transfers it to its finalizer.
+        if acquired && result.is_ok() {
+            self.destination_executions.release(
+                &destination_path,
+                task_context.download_id(),
+                destination_domain,
+                task_context.generation(),
+            );
+        }
+
+        // Terminal Error persistence is registered before the final owner
+        // drain. No nested effect may be created after that drain or after the
+        // terminal snapshot is published.
+        let persist_error_ok = if result.as_ref().is_err_and(|error| {
+            !matches!(
+                error,
+                PumasError::DownloadPaused | PumasError::DownloadCancelled
+            )
+        }) {
+            if let Some(ref persistence) = self.persistence {
+                let admission_attempt = self
+                    .downloads
+                    .read()
+                    .await
+                    .get(&self.download_id)
+                    .and_then(|state| {
+                        state
+                            .admission
+                            .as_ref()
+                            .map(|admission| admission.attempt_id.clone())
+                    });
+                matches!(
+                    HuggingFaceClient::persist_status_update_owned(
+                        &task_context,
+                        persistence.clone(),
+                        self.download_id.clone(),
+                        DownloadStatus::Error,
+                        admission_attempt,
+                    )
+                    .await,
+                    Ok(true)
+                )
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+        let nested_failures = task_context.drain_blocking().await.unwrap_or(1);
+
+        if let Err(error) = result {
+            if matches!(error, PumasError::DownloadPaused) {
+                info!("Download paused for {}", self.repo_id);
+                return;
+            }
+            if matches!(error, PumasError::DownloadCancelled) {
+                info!("Download cancelled for {}", self.repo_id);
+                return;
+            }
+            error!("Download failed for {}: {}", self.repo_id, error);
+            let projected = {
+                let mut download_states = self.downloads.write().await;
+                current_worker_state(
+                    &mut download_states,
+                    &self.download_id,
+                    &task_context,
+                    &[
+                        DownloadStatus::Queued,
+                        DownloadStatus::Downloading,
+                        DownloadStatus::Pausing,
+                    ],
+                )
+                .map(|state| {
+                    state.status = DownloadStatus::Error;
+                    state.error = Some(error.to_string());
+                    state.task_registered = false;
+                    if !persist_error_ok || nested_failures > 0 {
+                        state.lifecycle_failure_unverified = true;
+                    }
+                })
+                .is_ok()
+            };
+            if projected {
+                publish_download_snapshot_from_parts(&self.download_publications).await;
+            }
+        }
+        if nested_failures > 0 {
+            error!(
+                "Download task for {} observed {} nested blocking failure(s)",
+                self.repo_id, nested_failures
+            );
+        }
+    }
+}
+
+impl DownloadDestination {
+    async fn prepare(&self, task_context: &TaskContext) -> Result<()> {
+        match self {
+            Self::Managed(destination) => {
+                let destination = destination.clone();
+                recovery_filesystem_operation(
+                    task_context,
+                    "prepare ambient destination",
+                    move || destination.prepare(),
+                )
+                .await
+            }
+            Self::Recovery(destination) => {
+                let destination = destination.clone();
+                recovery_filesystem_operation(task_context, "preflight", move || {
+                    destination.preflight(&[])
+                })
+                .await
+            }
+        }
+    }
+
+    async fn prepare_file(&self, task_context: &TaskContext, filename: &str) -> Result<()> {
+        match self {
+            Self::Recovery(destination) | Self::Managed(destination) => {
+                let destination = destination.clone();
+                let filename = filename.to_string();
+                recovery_filesystem_operation(task_context, "create file parent", move || {
+                    destination.create_parent(&filename)
+                })
+                .await
+            }
+        }
+    }
+
+    async fn file_len(&self, task_context: &TaskContext, filename: &str) -> Result<Option<u64>> {
+        match self {
+            Self::Recovery(destination) | Self::Managed(destination) => {
+                let destination = destination.clone();
+                let filename = filename.to_string();
+                recovery_filesystem_operation(task_context, "inspect download file", move || {
+                    destination.file_len(&filename)
+                })
+                .await
+            }
+        }
+    }
+
+    async fn part_len(&self, task_context: &TaskContext, filename: &str) -> Result<Option<u64>> {
+        match self {
+            Self::Recovery(destination) | Self::Managed(destination) => {
+                let destination = destination.clone();
+                let filename = filename.to_string();
+                recovery_filesystem_operation(
+                    task_context,
+                    "inspect partial download file",
+                    move || destination.part_len(&filename),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn remove_part(&self, task_context: &TaskContext, filename: &str) -> Result<()> {
+        let operation = if self.is_recovery() {
+            "remove partial download file"
+        } else {
+            "remove ambient partial download file"
+        };
+        match self {
+            Self::Recovery(destination) | Self::Managed(destination) => {
+                let destination = destination.clone();
+                let filename = filename.to_string();
+                #[cfg(test)]
+                let inject_failure = task_context.should_fail_blocking_operation(operation);
+                recovery_filesystem_operation(task_context, operation, move || {
+                    #[cfg(test)]
+                    if inject_failure {
+                        return Err(std::io::Error::other(
+                            "injected recovery partial cleanup failure",
+                        ));
+                    }
+                    destination.remove_part(&filename)
+                })
+                .await
+            }
+        }
+    }
+
+    async fn finalize_complete_part_file(
+        &self,
+        task_context: &TaskContext,
+        filename: &str,
+        expected_size: Option<u64>,
+    ) -> Result<bool> {
+        let Some(expected_size) = expected_size else {
+            return Ok(false);
+        };
+        if self.part_len(task_context, filename).await? != Some(expected_size) {
+            return Ok(false);
+        }
+        self.rename_part_to_file(task_context, filename).await?;
+        info!(
+            "Finalized fully downloaded partial file {} ({} bytes)",
+            filename, expected_size
+        );
+        Ok(true)
+    }
+
+    async fn rename_part_to_file(&self, task_context: &TaskContext, filename: &str) -> Result<()> {
+        match self {
+            Self::Recovery(destination) | Self::Managed(destination) => {
+                let destination = destination.clone();
+                let filename = filename.to_string();
+                recovery_filesystem_operation(
+                    task_context,
+                    "promote partial download file",
+                    move || destination.rename_part_to_file(&filename),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn open_part(
+        &self,
+        task_context: &TaskContext,
+        filename: &str,
+        append: bool,
+    ) -> Result<DownloadFile> {
+        match self {
+            Self::Recovery(destination) | Self::Managed(destination) => {
+                let destination = destination.clone();
+                let filename = filename.to_string();
+                let file = recovery_filesystem_operation(
+                    task_context,
+                    "open partial download file",
+                    move || destination.open_part(&filename, append),
+                )
+                .await?;
+                let file = Arc::new(std::sync::Mutex::new(file));
+                Ok(if self.is_recovery() {
+                    DownloadFile::Recovery(file)
+                } else {
+                    DownloadFile::Ambient(file)
+                })
+            }
+        }
+    }
+
+    async fn remove_marker(&self, task_context: &TaskContext) -> Result<()> {
+        let operation = if matches!(self, Self::Managed(_)) {
+            "remove ambient download marker"
+        } else {
+            "remove download marker"
+        };
+        match self {
+            Self::Recovery(destination) | Self::Managed(destination) => {
+                let destination = destination.clone();
+                recovery_filesystem_operation(task_context, operation, move || {
+                    destination.remove_marker()
+                })
+                .await
+            }
+        }
+    }
+
+    async fn write_marker(&self, task_context: &TaskContext, contents: String) -> Result<()> {
+        match self {
+            Self::Managed(destination) => {
+                let destination = destination.clone();
+                let marker =
+                    serde_json::from_str::<serde_json::Value>(&contents).map_err(|error| {
+                        PumasError::Json {
+                            message: "Invalid download marker".into(),
+                            source: Some(error),
+                        }
+                    })?;
+                match task_context
+                    .run_fallible_blocking_named("write managed download marker", move || {
+                        destination.write_marker(&marker)
+                    })
+                    .await
+                {
+                    Ok(Ok(crate::metadata::AtomicPublication::Durable)) => Ok(()),
+                    Ok(Ok(crate::metadata::AtomicPublication::PublishedDurabilityUnknown {
+                        error,
+                    }))
+                    | Ok(Ok(crate::metadata::AtomicPublication::VisibilityUnknown {
+                        error, ..
+                    })) => Err(error),
+                    Ok(Err(failure)) => Err(failure.into_error()),
+                    Err(error) => Err(PumasError::Other(format!(
+                        "Download marker owner failed: {error}"
+                    ))),
+                }
+            }
+            Self::Recovery(_) => Err(PumasError::Other(
+                "recovery work cannot create ambient download authority".to_string(),
+            )),
+        }
+    }
+}
+
+impl DownloadFile {
+    async fn write_all(&mut self, task_context: &TaskContext, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Ambient(file) => {
+                let file = file.clone();
+                let bytes = bytes.to_vec();
+                recovery_filesystem_operation(
+                    task_context,
+                    "write ambient partial download file",
+                    move || {
+                        let mut file = file
+                            .lock()
+                            .map_err(|_| std::io::Error::other("ambient file lock was poisoned"))?;
+                        std::io::Write::write_all(&mut *file, &bytes)
+                    },
+                )
+                .await
+            }
+            Self::Recovery(file) => {
+                let file = file.clone();
+                let bytes = bytes.to_vec();
+                recovery_filesystem_operation(
+                    task_context,
+                    "write partial download file",
+                    move || {
+                        let mut file = file.lock().map_err(|_| {
+                            std::io::Error::other("recovery file lock was poisoned")
+                        })?;
+                        std::io::Write::write_all(&mut *file, &bytes)
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn flush(&mut self, task_context: &TaskContext) -> Result<()> {
+        match self {
+            Self::Ambient(file) => {
+                let file = file.clone();
+                recovery_filesystem_operation(
+                    task_context,
+                    "flush ambient partial download file",
+                    move || {
+                        let mut file = file
+                            .lock()
+                            .map_err(|_| std::io::Error::other("ambient file lock was poisoned"))?;
+                        std::io::Write::flush(&mut *file)
+                    },
+                )
+                .await
+            }
+            Self::Recovery(file) => {
+                let file = file.clone();
+                recovery_filesystem_operation(
+                    task_context,
+                    "flush partial download file",
+                    move || {
+                        let mut file = file.lock().map_err(|_| {
+                            std::io::Error::other("recovery file lock was poisoned")
+                        })?;
+                        std::io::Write::flush(&mut *file)
+                    },
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn recovery_filesystem_operation<T, F>(
+    task_context: &TaskContext,
+    operation: &'static str,
+    function: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    task_context
+        .run_fallible_blocking_named(operation, function)
+        .await
+        .map_err(|error| {
+            PumasError::Other(format!(
+                "download recovery filesystem capability task failed during {operation}: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            PumasError::Other(format!(
+                "download recovery filesystem capability unavailable during {operation}: {error}"
+            ))
+        })
+}
+
+enum RecoveryContext {
+    Exact { download_id: String },
+    Mismatch,
+    Missing,
+}
+
+enum RecoveryLaunchPlan {
+    Existing { download_id: String },
+    New { download_id: String },
+}
+
+impl RecoveryLaunchPlan {
+    fn download_id(&self) -> &str {
+        match self {
+            Self::Existing { download_id } | Self::New { download_id } => download_id,
+        }
+    }
+}
+
+fn recovery_context(
+    downloads: &HashMap<String, DownloadState>,
+    identity: &crate::model_library::download_recovery::DestinationIdentity,
+    repo_id: &str,
+    files: &[String],
+) -> RecoveryContext {
+    let expected_files: BTreeSet<&str> = files.iter().map(String::as_str).collect();
+    let mut exact = None;
+    let mut mismatch = false;
+
+    for state in downloads
+        .values()
+        .filter(|state| state.matches_destination(identity))
+    {
+        let tracked_selection = state.download_request.as_ref().map(|request| {
+            let selected_filenames = state
+                .huggingface_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.selected_filenames.clone());
+            SelectedArtifactIdentity::from_download_request(request, selected_filenames)
+                .selected_filenames
+        });
+        let tracked_files: BTreeSet<&str> = tracked_selection
+            .as_ref()
+            .filter(|files| !files.is_empty())
+            .map(|files| files.iter().map(String::as_str).collect())
+            .unwrap_or_else(|| {
+                state
+                    .files
+                    .iter()
+                    .map(|file| file.filename.as_str())
+                    .collect()
+            });
+        if state.repo_id == repo_id && tracked_files == expected_files && exact.is_none() {
+            exact = Some(state.download_id.clone());
+        } else {
+            mismatch = true;
+        }
+    }
+
+    if mismatch {
+        RecoveryContext::Mismatch
+    } else if let Some(download_id) = exact {
+        RecoveryContext::Exact { download_id }
+    } else {
+        RecoveryContext::Missing
+    }
+}
+
+fn admitted_existing_recovery(
+    state: &DownloadState,
+    task: Option<&super::lifecycle::TaskSnapshot>,
+) -> Option<RecoveryDownloadAdmission> {
+    let download_id = state.download_id.clone();
+    match state.status {
+        DownloadStatus::Queued
+        | DownloadStatus::Downloading
+        | DownloadStatus::Pausing
+        | DownloadStatus::Cancelling
+            if state.recovery_destination().is_some()
+                && state.task_registered
+                && task.is_some_and(|task| {
+                    task.started
+                        && !task.finished
+                        && matches!(task.role, TaskRole::Worker | TaskRole::CancelFinalizer)
+                }) =>
+        {
+            Some(RecoveryDownloadAdmission::Attached {
+                download_id,
+                status: state.status,
+            })
+        }
+        DownloadStatus::Completed => {
+            Some(RecoveryDownloadAdmission::AlreadyCompleted { download_id })
+        }
+        DownloadStatus::Cancelled => {
+            Some(RecoveryDownloadAdmission::AlreadyCancelled { download_id })
+        }
+        _ => None,
+    }
 }
 
 fn retry_limit(max_attempts: u32) -> Option<u32> {
@@ -252,70 +1281,461 @@ async fn build_download_snapshot_from_parts(
     }
 }
 
-async fn publish_download_snapshot_from_parts(
+async fn publish_download_snapshot_from_parts(publications: &Arc<DownloadPublicationOwner>) {
+    publications.publish().await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_worker_snapshot_and_revalidate(
+    publications: &Arc<DownloadPublicationOwner>,
     downloads: &Arc<RwLock<HashMap<String, DownloadState>>>,
-    revision: &Arc<AtomicU64>,
-    updates: &broadcast::Sender<crate::models::ModelDownloadUpdateNotification>,
-) {
-    let next_revision = revision.fetch_add(1, Ordering::SeqCst) + 1;
-    let snapshot = build_download_snapshot_from_parts(downloads, next_revision).await;
-    let notification = crate::models::ModelDownloadUpdateNotification {
-        cursor: snapshot.cursor.clone(),
-        snapshot,
-        stale_cursor: false,
-        snapshot_required: false,
+    download_id: &str,
+    task_context: &TaskContext,
+    destination: &DownloadDestination,
+    destination_lock: &Arc<TokioMutex<()>>,
+    destination_guard: &mut Option<OwnedMutexGuard<()>>,
+    expected_statuses: &[DownloadStatus],
+) -> Result<()> {
+    drop(destination_guard.take());
+    publish_download_snapshot_from_parts(publications).await;
+    *destination_guard = Some(destination_lock.clone().lock_owned().await);
+
+    let revalidated = {
+        let mut states = downloads.write().await;
+        current_worker_state(&mut states, download_id, task_context, expected_statuses).map(
+            |state| {
+                !state.cancel_flag.load(Ordering::Relaxed)
+                    && state.matches_destination(&destination.identity())
+            },
+        )
     };
-    let _ = updates.send(notification);
+    match revalidated {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(PumasError::DownloadCancelled) => Err(PumasError::DownloadCancelled),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns mutable state only while this exact task generation still owns the
+/// Worker role and the state is in one of the caller's expected phases.
+///
+/// Callers hold the download-state write lock while this checks the task
+/// owner. Cancellation and replacement take those locks in the same order, so
+/// a successful check and the immediately following state projection are one
+/// atomic ownership decision.
+fn current_worker_state<'a>(
+    states: &'a mut HashMap<String, DownloadState>,
+    download_id: &str,
+    task_context: &TaskContext,
+    expected: &[DownloadStatus],
+) -> Result<&'a mut DownloadState> {
+    if !task_context.is_current_role(TaskRole::Worker) {
+        return Err(PumasError::DownloadCancelled);
+    }
+    let state = states
+        .get_mut(download_id)
+        .ok_or(PumasError::DownloadCancelled)?;
+    if !expected.contains(&state.status) {
+        if state.status == DownloadStatus::Pausing
+            && expected.contains(&DownloadStatus::Downloading)
+        {
+            return Err(PumasError::DownloadPaused);
+        }
+        return Err(PumasError::DownloadCancelled);
+    }
+    Ok(state)
+}
+
+async fn project_worker_retry_reset(
+    downloads: &Arc<RwLock<HashMap<String, DownloadState>>>,
+    download_id: &str,
+    task_context: &TaskContext,
+    attempt: u32,
+    retry_limit: Option<u32>,
+) -> Result<()> {
+    #[cfg(test)]
+    task_context.observe_worker_projection("retry-reset");
+    let mut states = downloads.write().await;
+    let state = current_worker_state(
+        &mut states,
+        download_id,
+        task_context,
+        &[DownloadStatus::Downloading],
+    )?;
+    state.status = DownloadStatus::Downloading;
+    state.error = None;
+    state.retry_attempt = attempt;
+    state.retry_limit = retry_limit;
+    state.retrying = false;
+    state.next_retry_delay_seconds = None;
+    Ok(())
 }
 
 impl HuggingFaceClient {
-    fn store_download_task(&self, download_id: String, handle: JoinHandle<()>) {
-        let mut tasks = self
-            .download_tasks
-            .lock()
-            .expect("HF download task lock poisoned");
-        tasks.retain(|_, handle| !handle.is_finished());
-        if let Some(previous) = tasks.insert(download_id, handle) {
-            previous.abort();
-        }
+    pub(crate) async fn inspect_recovery_model_directory(
+        &self,
+        library_root: std::path::PathBuf,
+        record: crate::index::ModelRecord,
+    ) -> Result<Option<std::path::PathBuf>> {
+        self.run_recovery_transition(move |context| async move {
+            context
+                .run_fallible_blocking_named("inspect recovery model directory", move || {
+                    crate::model_library::canonical_managed_model_dir(&library_root, &record)
+                })
+                .await
+                .map_err(|error| {
+                    PumasError::Other(format!("Recovery inspection owner failed: {error}"))
+                })?
+        })
+        .await
     }
 
-    fn abort_download_task(&self, download_id: &str) {
-        if let Some(handle) = self
+    pub(crate) async fn verify_recovery_model_snapshot(
+        &self,
+        library_root: std::path::PathBuf,
+        record: crate::index::ModelRecord,
+        token: crate::model_library::DownloadRecoveryToken,
+    ) -> Result<crate::model_library::DownloadRecoveryVerification> {
+        self.run_recovery_transition(move |context| async move {
+            context
+                .run_fallible_blocking_named("verify recovery model snapshot", move || {
+                    crate::model_library::verify_download_recovery_ticket(
+                        &library_root,
+                        &record,
+                        &token,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    PumasError::Other(format!("Recovery verification owner failed: {error}"))
+                })?
+        })
+        .await
+    }
+
+    async fn run_recovery_transition<T, F, Fut>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let transition_id = format!("recovery-transition:{}", uuid::Uuid::new_v4());
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let prepared = self.download_tasks.prepare(
+            transition_id.clone(),
+            TaskRole::RecoveryTransition,
+            move |task_context| async move {
+                let result = operation(task_context).await;
+                let _ = result_sender.send(result);
+            },
+        );
+        let installed = match self.download_tasks.install_gated(prepared) {
+            Ok(installed) => installed,
+            Err(_) => {
+                self.download_tasks.rescue_abandoned();
+                return Err(PumasError::Other(
+                    "recovery transition owner collision".to_string(),
+                ));
+            }
+        };
+        let generation = installed.generation().clone();
+        installed.start();
+        let result = result_receiver.await.map_err(|_| {
+            PumasError::Other("recovery transition owner ended without a result".to_string())
+        })?;
+        while self
             .download_tasks
-            .lock()
-            .expect("HF download task lock poisoned")
-            .remove(download_id)
+            .generation_is_current(&transition_id, &generation)
         {
-            handle.abort();
+            if self
+                .download_tasks
+                .observe_finished_generation(&transition_id, &generation)
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        result
+    }
+
+    async fn project_finished_task_observation(
+        downloads: Arc<RwLock<HashMap<String, DownloadState>>>,
+        download_publications: Arc<DownloadPublicationOwner>,
+        task_context: TaskContext,
+        download_id: String,
+        observation: Option<TaskObservation>,
+    ) -> ProjectionOutcome {
+        #[cfg(test)]
+        task_context.observe_projection("finished-task");
+        let Some(observation) = observation else {
+            let changed = {
+                let mut states = downloads.write().await;
+                if !task_context.is_current_role(TaskRole::TerminalProjection) {
+                    return ProjectionOutcome::RolledBack;
+                }
+                states.get_mut(&download_id).is_some_and(|state| {
+                    state.status = DownloadStatus::Error;
+                    state.error = Some("download task outcome was unavailable".to_string());
+                    state.task_registered = false;
+                    state.lifecycle_failure_unverified = true;
+                    true
+                })
+            };
+            if changed {
+                publish_download_snapshot_from_parts(&download_publications).await;
+            }
+            return ProjectionOutcome::Failed;
+        };
+
+        let failed =
+            observation.terminal == TaskTerminal::Panicked || observation.nested_failures > 0;
+        let changed = {
+            let mut states = downloads.write().await;
+            if !task_context.is_current_role(TaskRole::TerminalProjection) {
+                return ProjectionOutcome::RolledBack;
+            }
+            let Some(state) = states.get_mut(&download_id) else {
+                return ProjectionOutcome::Committed;
+            };
+            let unfinished_finalizer = observation.role == TaskRole::CancelFinalizer
+                && state.status == DownloadStatus::Cancelling;
+            let unfinished_worker = observation.role == TaskRole::Worker
+                && matches!(
+                    state.status,
+                    DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Pausing
+                );
+            let unreported_lifecycle_failure = failed
+                && !matches!(
+                    state.status,
+                    DownloadStatus::Completed | DownloadStatus::Cancelled
+                );
+            if unfinished_worker || unfinished_finalizer || unreported_lifecycle_failure {
+                state.status = DownloadStatus::Error;
+                state.error = Some("download task ended without a verified terminal state".into());
+                state.task_registered = false;
+                state.lifecycle_failure_unverified = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        if failed {
+            warn!(
+                "Observed failed {:?} owner for download {} ({} nested failure(s))",
+                observation.role, download_id, observation.nested_failures
+            );
+        }
+        if changed {
+            publish_download_snapshot_from_parts(&download_publications).await;
+        }
+        ProjectionOutcome::Committed
+    }
+
+    async fn project_terminal_projection_failure(
+        downloads: Arc<RwLock<HashMap<String, DownloadState>>>,
+        download_publications: Arc<DownloadPublicationOwner>,
+        task_context: TaskContext,
+        download_id: String,
+        detail: &'static str,
+    ) -> ProjectionOutcome {
+        let changed = {
+            let mut states = downloads.write().await;
+            if !task_context.is_current_role(TaskRole::TerminalProjection) {
+                return ProjectionOutcome::RolledBack;
+            }
+            states.get_mut(&download_id).is_some_and(|state| {
+                state.status = DownloadStatus::Error;
+                state.error = Some(detail.to_string());
+                state.task_registered = false;
+                state.lifecycle_failure_unverified = true;
+                true
+            })
+        };
+        if changed {
+            warn!("Terminal projection failed for download {}", download_id);
+            publish_download_snapshot_from_parts(&download_publications).await;
+            ProjectionOutcome::Failed
+        } else {
+            ProjectionOutcome::RolledBack
         }
     }
 
-    fn prune_finished_download_tasks(&self) {
-        let mut tasks = self
-            .download_tasks
-            .lock()
-            .expect("HF download task lock poisoned");
-        tasks.retain(|_, handle| !handle.is_finished());
+    async fn project_inactive_download(
+        downloads: Arc<RwLock<HashMap<String, DownloadState>>>,
+        download_publications: Arc<DownloadPublicationOwner>,
+        persistence: Option<Arc<DownloadPersistence>>,
+        task_context: TaskContext,
+        download_id: String,
+        persist: bool,
+    ) -> ProjectionOutcome {
+        #[cfg(test)]
+        task_context.observe_projection("inactive-task");
+        let persistence_ok = if persist {
+            if let Some(persistence) = persistence {
+                let persisted_id = download_id.clone();
+                let attempt = downloads.read().await.get(&download_id).and_then(|state| {
+                    state
+                        .admission
+                        .as_ref()
+                        .map(|entry| entry.attempt_id.clone())
+                });
+                matches!(
+                    task_context
+                        .run_fallible_blocking_named("persist reconciliation pause", move || {
+                            if let Some(attempt) = attempt {
+                                persistence.update_admitted_status(
+                                    &persisted_id,
+                                    &attempt,
+                                    DownloadStatus::Paused,
+                                )
+                            } else {
+                                persistence.update_status(&persisted_id, DownloadStatus::Paused)
+                            }
+                        },)
+                        .await,
+                    Ok(Ok(true))
+                )
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
+        let failed = {
+            let mut states = downloads.write().await;
+            if !task_context.is_current_role(TaskRole::TerminalProjection) {
+                return ProjectionOutcome::RolledBack;
+            }
+            let Some(state) = states.get_mut(&download_id) else {
+                return ProjectionOutcome::RolledBack;
+            };
+            if !matches!(
+                state.status,
+                DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Pausing
+            ) || !state.task_registered
+            {
+                return ProjectionOutcome::RolledBack;
+            }
+            if persistence_ok {
+                state.status = DownloadStatus::Paused;
+                state.speed = 0.0;
+                state.retrying = false;
+                state.next_retry_delay_seconds = None;
+                state.task_registered = false;
+                false
+            } else {
+                state.status = DownloadStatus::Error;
+                state.error =
+                    Some("failed to persist inactive-download reconciliation".to_string());
+                state.task_registered = false;
+                state.lifecycle_failure_unverified = true;
+                true
+            }
+        };
+
+        if failed {
+            warn!(
+                "Failed to persist inactive download {} reconciliation",
+                download_id
+            );
+        } else {
+            warn!(
+                "Marking inactive download {} as paused because no task is running",
+                download_id
+            );
+        }
+        publish_download_snapshot_from_parts(&download_publications).await;
+        if failed {
+            ProjectionOutcome::Failed
+        } else {
+            ProjectionOutcome::Committed
+        }
     }
 
-    async fn mark_download_task_registered(&self, download_id: &str) {
-        let mut downloads = self.downloads.write().await;
-        if let Some(state) = downloads.get_mut(download_id) {
-            state.task_registered = true;
+    async fn observe_finished_download_tasks(&self) {
+        self.download_tasks.rescue_abandoned();
+        let candidate_ids = self.download_tasks.finished_or_projecting_ids();
+        for download_id in candidate_ids {
+            let transition = {
+                // Fixed hierarchy: state first, lifecycle second. The finished
+                // predecessor is replaced by a projector without an ownerless
+                // ABA window; the start gate remains closed under both locks.
+                let states = self.downloads.write().await;
+                let snapshot = self.download_tasks.snapshot(&download_id);
+                let inherit_failure = states.get(&download_id).is_some_and(|state| {
+                    snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| match snapshot.role {
+                            TaskRole::Worker => matches!(
+                                state.status,
+                                DownloadStatus::Queued
+                                    | DownloadStatus::Downloading
+                                    | DownloadStatus::Pausing
+                            ),
+                            TaskRole::CancelFinalizer => state.status == DownloadStatus::Cancelling,
+                            _ => false,
+                        })
+                });
+                let downloads = self.downloads.clone();
+                let download_publications = self.download_publications.clone();
+                let projected_id = download_id.clone();
+                let fallback_downloads = self.downloads.clone();
+                let fallback_publications = self.download_publications.clone();
+                let fallback_id = download_id.clone();
+                self.download_tasks.begin_finished_projection(
+                    &download_id,
+                    inherit_failure,
+                    move |task_context, observation| async move {
+                        Self::project_finished_task_observation(
+                            downloads,
+                            download_publications,
+                            task_context,
+                            projected_id,
+                            observation,
+                        )
+                        .await
+                    },
+                    move |task_context| async move {
+                        Self::project_terminal_projection_failure(
+                            fallback_downloads,
+                            fallback_publications,
+                            task_context,
+                            fallback_id,
+                            "download terminal projection panicked",
+                        )
+                        .await
+                    },
+                )
+            };
+            let ticket = match transition {
+                ProjectionTransition::Started(projector)
+                | ProjectionTransition::Existing(projector) => projector.start(),
+                ProjectionTransition::NotReady => continue,
+            };
+            let _ = ticket.wait().await;
+            while self.download_tasks.settle_projection(&ticket) == ProjectionSettlement::Pending {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
     async fn reconcile_inactive_active_downloads(&self) {
-        self.prune_finished_download_tasks();
+        self.observe_finished_download_tasks().await;
 
         let missing_registered_tasks = {
             let running_task_ids = self
                 .download_tasks
-                .lock()
-                .expect("HF download task lock poisoned")
-                .keys()
-                .cloned()
+                .ids()
+                .into_iter()
+                .filter(|download_id| {
+                    self.download_tasks
+                        .snapshot(download_id)
+                        .is_some_and(|snapshot| snapshot.started && !snapshot.finished)
+                })
                 .collect::<HashSet<_>>();
             let downloads = self.downloads.read().await;
 
@@ -331,7 +1751,7 @@ impl HuggingFaceClient {
                     let has_running_task = running_task_ids.contains(download_id);
 
                     if is_active && state.task_registered && !has_running_task {
-                        Some(download_id.clone())
+                        Some((download_id.clone(), state.recovery_destination().is_some()))
                     } else {
                         None
                     }
@@ -343,116 +1763,276 @@ impl HuggingFaceClient {
             return;
         }
 
-        {
+        let projectors = {
             let mut downloads = self.downloads.write().await;
-            for download_id in &missing_registered_tasks {
+            let mut projectors = Vec::new();
+            for (download_id, is_recovery) in &missing_registered_tasks {
                 if let Some(state) = downloads.get_mut(download_id) {
+                    let has_current_owner = self.download_tasks.snapshot(download_id).is_some();
                     if matches!(
                         state.status,
                         DownloadStatus::Queued
                             | DownloadStatus::Downloading
                             | DownloadStatus::Pausing
-                    ) {
-                        warn!(
-                            "Marking inactive download {} as paused because no task is running",
-                            download_id
+                    ) && state.task_registered
+                        && !has_current_owner
+                    {
+                        let states = self.downloads.clone();
+                        let publications = self.download_publications.clone();
+                        let persistence = self.persistence.clone();
+                        let projected_id = download_id.clone();
+                        let persist = !*is_recovery;
+                        let fallback_states = self.downloads.clone();
+                        let fallback_publications = self.download_publications.clone();
+                        let fallback_id = download_id.clone();
+                        let prepared = self.download_tasks.prepare_projection(
+                            download_id.clone(),
+                            move |task_context, _| async move {
+                                Self::project_inactive_download(
+                                    states,
+                                    publications,
+                                    persistence,
+                                    task_context,
+                                    projected_id,
+                                    persist,
+                                )
+                                .await
+                            },
+                            move |task_context| async move {
+                                Self::project_terminal_projection_failure(
+                                    fallback_states,
+                                    fallback_publications,
+                                    task_context,
+                                    fallback_id,
+                                    "inactive-download reconciliation panicked",
+                                )
+                                .await
+                            },
                         );
-                        state.status = DownloadStatus::Paused;
-                        state.speed = 0.0;
-                        state.retrying = false;
-                        state.next_retry_delay_seconds = None;
+                        if let Ok(projector) =
+                            self.download_tasks.install_projection_gated(prepared)
+                        {
+                            projectors.push(projector);
+                        }
                     }
                 }
             }
+            projectors
+        };
+        self.download_tasks.rescue_abandoned();
+
+        if projectors.is_empty() {
+            return;
         }
 
-        if let Some(ref persistence) = self.persistence {
-            for download_id in missing_registered_tasks {
-                Self::persist_status_update(
-                    persistence.clone(),
-                    download_id,
-                    DownloadStatus::Paused,
-                )
-                .await;
+        let tickets = projectors
+            .into_iter()
+            .map(super::lifecycle::InstalledProjection::start)
+            .collect::<Vec<_>>();
+        for ticket in tickets {
+            let _ = ticket.wait().await;
+            while self.download_tasks.settle_projection(&ticket) == ProjectionSettlement::Pending {
+                tokio::task::yield_now().await;
             }
         }
-
-        self.publish_download_snapshot().await;
     }
 
     /// Restore persisted downloads from disk.
     ///
-    /// Called during startup to recover paused/errored downloads from a previous session.
-    /// Byte-complete entries are finalized immediately instead of being restored as errors.
-    pub async fn restore_persisted_downloads(&self) -> Vec<DownloadCompletionInfo> {
+    /// Returns an error for corrupt or unresolved authoritative inventory;
+    /// these failures must not be interpreted as an empty download list.
+    ///
+    /// Reconciles durable admission inventory and restores queue-owned entries
+    /// in recorded order, including entries that have not written any bytes.
+    /// Legacy entries still use the existing byte-complete finalization path.
+    /// Invalid or unresolved authoritative inventory is returned as an error.
+    pub async fn restore_persisted_downloads(&self) -> Result<Vec<DownloadCompletionInfo>> {
         let persistence = match &self.persistence {
             Some(p) => p.clone(),
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
-        let entries = match tokio::task::spawn_blocking({
+        let inventory = tokio::task::spawn_blocking({
             let persistence = persistence.clone();
-            move || persistence.load_all()
+            move || {
+                persistence.reconcile_lifecycle_inventory_strict()?;
+                persistence.load_lifecycle_inventory_strict()
+            }
         })
         .await
+        .map_err(|error| PumasError::Other(format!("Download restore owner failed: {error}")))??;
+        if !inventory.hidden_admissions.is_empty()
+            || inventory.quarantines.iter().any(|(id, quarantine)| {
+                quarantine.disposition != LifecycleCleanupDisposition::Verified
+                    || inventory.queue_admissions.contains_key(id)
+            })
         {
-            Ok(entries) => entries,
-            Err(err) => {
-                error!("Failed to join persisted download restore task: {}", err);
-                return Vec::new();
+            return Err(PumasError::Other(
+                "Download restore requires unresolved admission or quarantine reconciliation"
+                    .into(),
+            ));
+        }
+        let verified_failures = inventory
+            .quarantines
+            .values()
+            .filter(|quarantine| quarantine.domain == LifecycleQuarantineDomain::Ambient)
+            .map(|quarantine| DownloadState::from_verified_cleanup(&quarantine.snapshot))
+            .collect::<Vec<_>>();
+        for (download_id, pending) in &inventory.pending_relocations {
+            let root = self
+                .destination_root
+                .clone()
+                .ok_or_else(|| PumasError::Config {
+                    message: "Pending relocation restore authority is unavailable".into(),
+                })?;
+            let pending = pending.clone();
+            let (source, target) = tokio::task::spawn_blocking(move || -> Result<_> {
+                let source = root.resolve(&pending.snapshot.dest_dir)?.identity();
+                let target = root.resolve(&pending.request.target_dir)?.identity();
+                if source.persisted() != pending.request.source
+                    || target.persisted() != pending.request.target
+                {
+                    return Err(PumasError::Validation {
+                        field: "download_relocation".into(),
+                        message: "Pending relocation destination identity changed".into(),
+                    });
+                }
+                Ok((source, target))
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!(
+                    "Pending relocation restore inspection failed: {error}"
+                ))
+            })??;
+            if !self.destination_executions.reserve_dormant(
+                source,
+                download_id.clone(),
+                DestinationDomain::Ambient,
+            ) || !self.destination_executions.reserve_dormant(
+                target,
+                download_id.clone(),
+                DestinationDomain::Ambient,
+            ) {
+                return Err(PumasError::Validation {
+                    field: "download_relocation".into(),
+                    message: "Pending relocation reservation could not be restored".into(),
+                });
             }
-        };
+        }
+        let mut entries = inventory.downloads;
+        entries.sort_by_key(|entry| {
+            inventory
+                .queue_admissions
+                .get(&entry.download_id)
+                .map(|admission| admission.position.ordinal)
+                .unwrap_or(u64::MAX)
+        });
 
         let mut restored_entries = Vec::new();
         let mut completed_entries = Vec::new();
 
         for entry in entries {
+            let root = self
+                .destination_root
+                .clone()
+                .ok_or_else(|| PumasError::Config {
+                    message: "Download restore destination authority unavailable".into(),
+                })?;
+            let target = entry.dest_dir.clone();
+            let destination = tokio::task::spawn_blocking(move || root.resolve(&target))
+                .await
+                .map_err(|error| {
+                    PumasError::Other(format!("Download restore authority owner failed: {error}"))
+                })??;
+            if let Some(admission) = inventory.queue_admissions.get(&entry.download_id) {
+                if admission.domain != DownloadAdmissionDomain::Ambient {
+                    return Err(PumasError::Other(
+                        "Recovery admission requires ticket reconciliation".into(),
+                    ));
+                }
+                let expected = admission.destination.clone();
+                let files = admission.execution_files.clone();
+                let (destination, downloaded_bytes) =
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        if destination.identity().persisted() != expected {
+                            return Err(PumasError::Other(
+                                "Persisted download destination identity changed".into(),
+                            ));
+                        }
+                        let mut bytes = 0u64;
+                        for file in files {
+                            bytes = bytes
+                                .checked_add(
+                                    destination
+                                        .file_len(&file)?
+                                        .or(destination.part_len(&file)?)
+                                        .unwrap_or(0),
+                                )
+                                .ok_or_else(|| {
+                                    PumasError::Other("Download byte count overflow".into())
+                                })?;
+                        }
+                        Ok((destination, bytes))
+                    })
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!(
+                            "Download restore authority owner failed: {error}"
+                        ))
+                    })??;
+                restored_entries.push((
+                    entry,
+                    downloaded_bytes,
+                    Some(super::types::AdmittedDownload {
+                        attempt_id: admission.attempt_id.clone(),
+                    }),
+                    DownloadDestination::Managed(destination),
+                ));
+                continue;
+            }
             let all_filenames = if entry.filenames.is_empty() {
                 vec![entry.filename.clone()]
             } else {
                 entry.filenames.clone()
             };
             let mut expected_sizes = match tokio::task::spawn_blocking({
-                let dest_dir = entry.dest_dir.clone();
+                let destination = destination.clone();
                 let filenames = all_filenames.clone();
                 let total_size = entry.total_bytes;
-                move || infer_expected_sizes_from_total(&dest_dir, &filenames, total_size)
+                move || infer_expected_sizes_with_files(&destination, &filenames, total_size)
             })
             .await
             {
                 Ok(Ok(sizes)) => sizes,
                 Ok(Err(error)) => {
-                    warn!(
-                        "Failed to inspect persisted download {} for finalization: {}",
-                        entry.download_id, error
-                    );
-                    HashMap::new()
+                    return Err(error);
                 }
                 Err(error) => {
-                    warn!(
-                        "Failed to join persisted download inspection for {}: {}",
-                        entry.download_id, error
-                    );
-                    HashMap::new()
+                    return Err(PumasError::Other(format!(
+                        "Download restore inspection failed: {error}"
+                    )));
                 }
             };
             if all_filenames.len() > 1 {
                 let has_unfinalized_part = tokio::task::spawn_blocking({
-                    let dest_dir = entry.dest_dir.clone();
+                    let destination = destination.clone();
                     let filenames = all_filenames.clone();
-                    move || {
-                        filenames.iter().any(|filename| {
-                            let Some((final_path, part_path)) =
-                                download_artifact_paths(&dest_dir, filename)
-                            else {
-                                return false;
-                            };
-                            !final_path.is_file() && part_path.is_file()
-                        })
+                    move || -> Result<bool> {
+                        for filename in filenames {
+                            if destination.file_len(&filename)?.is_none()
+                                && destination.part_len(&filename)?.is_some()
+                            {
+                                return Ok(true);
+                            }
+                        }
+                        Ok(false)
                     }
                 })
                 .await
-                .unwrap_or(false);
+                .map_err(|error| {
+                    PumasError::Other(format!("Download restore inspection failed: {error}"))
+                })??;
                 if has_unfinalized_part {
                     match self.get_repo_files(&entry.repo_id).await {
                         Ok(tree) => {
@@ -473,28 +2053,22 @@ impl HuggingFaceClient {
             }
 
             let finalization = match tokio::task::spawn_blocking({
-                let dest_dir = entry.dest_dir.clone();
+                let destination = destination.clone();
                 let filenames = all_filenames.clone();
                 move || {
-                    finalize_download_artifact_if_complete(&dest_dir, &filenames, &expected_sizes)
+                    finalize_download_artifact_with_files(&destination, &filenames, &expected_sizes)
                 }
             })
             .await
             {
                 Ok(Ok(finalization)) => finalization,
                 Ok(Err(error)) => {
-                    warn!(
-                        "Failed to auto-finalize persisted download {}: {}",
-                        entry.download_id, error
-                    );
-                    Default::default()
+                    return Err(error);
                 }
                 Err(error) => {
-                    warn!(
-                        "Failed to join persisted download finalization task for {}: {}",
-                        entry.download_id, error
-                    );
-                    Default::default()
+                    return Err(PumasError::Other(format!(
+                        "Download restore finalization failed: {error}"
+                    )));
                 }
             };
 
@@ -516,47 +2090,30 @@ impl HuggingFaceClient {
             }
 
             let disk_state = tokio::task::spawn_blocking({
-                let dest_dir = entry.dest_dir.clone();
+                let destination = destination.clone();
                 let filenames = all_filenames.clone();
-                move || {
-                    filenames.iter().fold(
-                        (false, 0_u64),
-                        |(has_any_file, downloaded_bytes), filename| {
-                            let Some((completed, part)) =
-                                download_artifact_paths(&dest_dir, filename)
-                            else {
-                                return (has_any_file, downloaded_bytes);
-                            };
-                            if completed.is_file() {
-                                (
-                                    true,
-                                    downloaded_bytes.saturating_add(
-                                        std::fs::metadata(completed).map(|m| m.len()).unwrap_or(0),
-                                    ),
-                                )
-                            } else if part.is_file() {
-                                (
-                                    true,
-                                    downloaded_bytes.saturating_add(
-                                        std::fs::metadata(part).map(|m| m.len()).unwrap_or(0),
-                                    ),
-                                )
-                            } else {
-                                (has_any_file, downloaded_bytes)
-                            }
-                        },
-                    )
+                move || -> Result<_> {
+                    let mut found = false;
+                    let mut bytes = 0u64;
+                    for filename in filenames {
+                        if let Some(length) = destination
+                            .file_len(&filename)?
+                            .or(destination.part_len(&filename)?)
+                        {
+                            found = true;
+                            bytes = bytes.checked_add(length).ok_or_else(|| {
+                                PumasError::Other("Download byte count overflow".into())
+                            })?;
+                        }
+                    }
+                    Ok((found, bytes))
                 }
             })
-            .await;
-
-            let Ok((has_any_file, downloaded_bytes)) = disk_state else {
-                warn!(
-                    "Failed to inspect persisted download files for {}",
-                    entry.download_id
-                );
-                continue;
-            };
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!("Download restore inspection failed: {error}"))
+            })??;
+            let (has_any_file, downloaded_bytes) = disk_state;
             if !has_any_file {
                 info!(
                     "Removing stale persisted download {} (no files on disk)",
@@ -566,7 +2123,12 @@ impl HuggingFaceClient {
                     .await;
                 continue;
             }
-            restored_entries.push((entry, downloaded_bytes));
+            restored_entries.push((
+                entry,
+                downloaded_bytes,
+                None,
+                DownloadDestination::Managed(destination),
+            ));
         }
 
         let completion_infos = completed_entries
@@ -589,14 +2151,17 @@ impl HuggingFaceClient {
             })
             .collect::<Vec<_>>();
 
-        if restored_entries.is_empty() {
-            return completion_infos;
+        if restored_entries.is_empty() && verified_failures.is_empty() {
+            return Ok(completion_infos);
         }
 
         info!("Restoring {} persisted downloads", restored_entries.len());
         let mut downloads = self.downloads.write().await;
 
-        for (entry, downloaded_bytes) in restored_entries {
+        for state in verified_failures {
+            downloads.entry(state.download_id.clone()).or_insert(state);
+        }
+        for (entry, downloaded_bytes, admission, destination) in restored_entries {
             // Log status transitions for visibility
             match entry.status {
                 DownloadStatus::Queued | DownloadStatus::Downloading => {
@@ -608,18 +2173,27 @@ impl HuggingFaceClient {
                 _ => {}
             }
 
-            let state = DownloadState::from_persisted(&entry, downloaded_bytes);
+            let identity = destination.identity();
+            let mut state = DownloadState::from_persisted(&entry, downloaded_bytes, destination);
+            state.admission = admission;
 
             info!(
                 "Restoring download {}: {} ({} bytes on disk, status {:?})",
                 entry.download_id, entry.repo_id, downloaded_bytes, state.status
             );
 
+            if !self.destination_executions.reserve_dormant(
+                identity,
+                entry.download_id.clone(),
+                DestinationDomain::Ambient,
+            ) {
+                continue;
+            }
             downloads.insert(entry.download_id.clone(), state);
         }
         drop(downloads);
         self.publish_download_snapshot().await;
-        completion_infos
+        Ok(completion_infos)
     }
 
     /// Start a model download (supports multi-file models).
@@ -633,7 +2207,23 @@ impl HuggingFaceClient {
         dest_dir: &Path,
         remote_evidence: Option<crate::models::HuggingFaceEvidence>,
     ) -> Result<String> {
-        self.prune_finished_download_tasks();
+        let root = self
+            .destination_root
+            .clone()
+            .ok_or_else(|| PumasError::Config {
+                message: "Download destination authority is unavailable".into(),
+            })?;
+        let persistence = self.persistence.clone().ok_or_else(|| PumasError::Config {
+            message: "Durable download admission is unavailable".into(),
+        })?;
+        let requested_destination = dest_dir.to_path_buf();
+        let destination = tokio::task::spawn_blocking(move || root.resolve(&requested_destination))
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!("Download authority resolution failed: {error}"))
+            })??;
+        let dest_dir = destination.display_path();
+        self.observe_finished_download_tasks().await;
 
         let download_id = uuid::Uuid::new_v4().to_string();
         let cancel_flag = Arc::new(AtomicBool::new(false));
@@ -715,11 +2305,6 @@ impl HuggingFaceClient {
                     .collect()
             };
 
-        // SHA256 of the primary (largest) weight file for import metadata
-        // (must be computed before auxiliary files are appended)
-        let primary_file = files.iter().max_by_key(|f| f.size.unwrap_or(0));
-        let known_sha256 = primary_file.and_then(|f| f.sha256.clone());
-
         // Prepend auxiliary files so they download first.
         // When an explicit file list (filenames) is used, apply scope-aware
         // auxiliary selection that includes non-weight LFS files and
@@ -745,165 +2330,165 @@ impl HuggingFaceClient {
                 request.repo_id
             );
         }
+        let requested_payload_files = files
+            .iter()
+            .map(|file| file.filename.clone())
+            .collect::<Vec<_>>();
         aux_files.extend(files);
-        let mut files = aux_files;
+        let files = aux_files;
 
-        // Allow additional downloads for the same repo directory by removing
-        // filenames already tracked by queued/running/paused downloads.
-        // If everything requested is already tracked, return that existing ID.
-        let (tracked_filenames, tracked_download_id) = {
-            let downloads = self.downloads.read().await;
-            let mut tracked = HashSet::new();
-            let mut tracked_id: Option<String> = None;
+        // Await every fallible/cancellable prerequisite before acquiring the
+        // state/task admission critical section. From this point onward task
+        // construction is pure until the gated owner and state are committed
+        // together.
+        #[cfg(test)]
+        self.download_tasks
+            .observe_ambient_admission("prepare-download-task", &download_id);
+        let auth_header = self.auth_header_value().await;
+        let destination_lock = self.destination_lock(&destination.identity()).await;
+        let pause_flag = Arc::new(AtomicBool::new(false));
 
-            for (id, state) in downloads.iter() {
-                if state.dest_dir != dest_dir
-                    || state.cancel_flag.load(Ordering::Relaxed)
-                    || !matches!(
+        let (admission_sender, admission_receiver) = tokio::sync::oneshot::channel();
+        let (admission_completed, admission_completion) = tokio::sync::watch::channel(false);
+        let admission_identity = super::lifecycle::PendingAdmissionIdentity {
+            destination: destination.identity(),
+            repo_id: request.repo_id.clone(),
+            files: files
+                .iter()
+                .map(|file| (file.filename.clone(), file.size, file.sha256.clone()))
+                .collect(),
+        };
+        let installed = {
+            let downloads = self.downloads.write().await;
+            if let Some((existing_id, mut completion)) =
+                self.download_tasks.pending_admission(&admission_identity)
+            {
+                drop(downloads);
+                completion
+                    .wait_for(|completed| *completed)
+                    .await
+                    .map_err(|_| {
+                        PumasError::Other("Concurrent download admission failed".into())
+                    })?;
+                let downloads = self.downloads.read().await;
+                if downloads.get(&existing_id).is_some_and(|state| {
+                    state.admission.is_some()
+                        && matches!(
+                            state.status,
+                            DownloadStatus::Queued
+                                | DownloadStatus::Downloading
+                                | DownloadStatus::Pausing
+                        )
+                        && !state.cancel_flag.load(Ordering::Relaxed)
+                }) {
+                    return Ok(existing_id);
+                }
+                return Err(PumasError::Other(
+                    "Concurrent download admission no longer active".into(),
+                ));
+            }
+
+            // Inactive resumable states still own their partial files and the
+            // shared marker. Restore those dormant reservations before the
+            // new admission takes its ordered position.
+            let mut dormant_ids = downloads
+                .iter()
+                .filter(|(_, state)| {
+                    state.matches_destination(&destination.identity())
+                        && matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                })
+                .map(|(id, state)| {
+                    (
+                        id.clone(),
+                        if state.recovery_destination().is_some() {
+                            DestinationDomain::Recovery
+                        } else {
+                            DestinationDomain::Ambient
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            dormant_ids.sort_by(|left, right| left.0.cmp(&right.0));
+            for (dormant_id, domain) in dormant_ids {
+                self.destination_executions.reserve_dormant(
+                    destination.identity(),
+                    dormant_id,
+                    domain,
+                );
+            }
+
+            // Revalidate destination/file dedupe at the exact commit point.
+            // A concurrent start may have appeared after the earlier scan.
+            if let Some(existing_id) = downloads.iter().find_map(|(id, state)| {
+                let same_files = state.files.len() == files.len()
+                    && state.files.iter().zip(&files).all(|(left, right)| {
+                        left.filename == right.filename
+                            && left.size == right.size
+                            && left.sha256 == right.sha256
+                    });
+                let exact_started_worker = self.download_tasks.snapshot(id).is_some_and(|task| {
+                    task.role == TaskRole::Worker && task.started && !task.outer_finished
+                });
+                (state.matches_destination(&destination.identity())
+                    && state.repo_id == request.repo_id
+                    && same_files
+                    && !state.cancel_flag.load(Ordering::Relaxed)
+                    && matches!(
                         state.status,
                         DownloadStatus::Queued
                             | DownloadStatus::Downloading
                             | DownloadStatus::Pausing
-                            | DownloadStatus::Paused
-                            | DownloadStatus::Cancelling
                     )
-                {
-                    continue;
-                }
-
-                if tracked_id.is_none() {
-                    tracked_id = Some(id.clone());
-                }
-
-                tracked.extend(state.files.iter().map(|f| f.filename.clone()));
+                    && state.recovery_destination().is_none()
+                    && !state.ambient_authority_blocked
+                    && exact_started_worker)
+                    .then(|| id.clone())
+            }) {
+                return Ok(existing_id);
             }
 
-            (tracked, tracked_id)
-        };
-
-        if !tracked_filenames.is_empty() {
-            let before = files.len();
-            files.retain(|f| !tracked_filenames.contains(&f.filename));
-
-            if files.is_empty() {
-                if let Some(id) = tracked_download_id {
-                    info!(
-                        "Skipping duplicate download for {}: already tracked as {}",
-                        request.repo_id, id
-                    );
-                    return Ok(id);
-                }
-            } else if before != files.len() {
-                info!(
-                    "Skipping {} already-tracked file(s) for {}",
-                    before - files.len(),
-                    request.repo_id
+            let known_sum: u64 = files.iter().filter_map(|file| file.size).sum();
+            let total_bytes = (known_sum > 0).then_some(known_sum);
+            let first_filename = files[0].filename.clone();
+            let final_filenames = files
+                .iter()
+                .map(|file| file.filename.clone())
+                .collect::<Vec<_>>();
+            let selected_filenames = files
+                .iter()
+                .filter(|file| file.size.is_some())
+                .map(|file| file.filename.clone())
+                .collect::<Vec<_>>();
+            let known_sha256 = files
+                .iter()
+                .filter(|file| file.size.is_some())
+                .max_by_key(|file| file.size.unwrap_or(0))
+                .and_then(|file| file.sha256.clone());
+            let selected_artifact =
+                SelectedArtifactIdentity::from_download_request(request, Some(selected_filenames));
+            let mut huggingface_evidence = remote_evidence.clone();
+            if let Some(ref mut evidence) = huggingface_evidence {
+                Self::enrich_huggingface_evidence_for_download(
+                    evidence,
+                    &tree,
+                    request,
+                    &final_filenames,
                 );
             }
-        }
-
-        // Total bytes across all files (sum known sizes; auxiliary files
-        // lack LFS size metadata but are small enough to not materially
-        // affect progress accuracy)
-        let total_bytes: Option<u64> = {
-            let known_sum: u64 = files.iter().filter_map(|f| f.size).sum();
-            if known_sum > 0 {
-                Some(known_sum)
-            } else {
-                None
-            }
-        };
-        let first_filename = files[0].filename.clone();
-        let final_filenames: Vec<String> = files.iter().map(|f| f.filename.clone()).collect();
-        let selected_artifact = SelectedArtifactIdentity::from_download_request(request, None);
-        let mut huggingface_evidence = remote_evidence;
-        if let Some(ref mut evidence) = huggingface_evidence {
-            Self::enrich_huggingface_evidence_for_download(
-                evidence,
-                &tree,
-                request,
-                &final_filenames,
-            );
-        }
-
-        let pause_flag = Arc::new(AtomicBool::new(false));
-
-        // Create download state
-        let state = DownloadState {
-            download_id: download_id.clone(),
-            repo_id: request.repo_id.clone(),
-            status: DownloadStatus::Queued,
-            progress: 0.0,
-            downloaded_bytes: 0,
-            total_bytes,
-            speed: 0.0,
-            cancel_flag: cancel_flag.clone(),
-            pause_flag: pause_flag.clone(),
-            error: None,
-            retry_attempt: 0,
-            retry_limit: None,
-            retrying: false,
-            next_retry_delay_seconds: None,
-            task_registered: false,
-            dest_dir: dest_dir.to_path_buf(),
-            filename: first_filename.clone(),
-            files: files.clone(),
-            files_completed: 0,
-            download_request: Some(request.clone()),
-            known_sha256: known_sha256.clone(),
-            huggingface_evidence: huggingface_evidence.clone(),
-        };
-
-        self.downloads
-            .write()
-            .await
-            .insert(download_id.clone(), state);
-        self.publish_download_snapshot().await;
-
-        // Ensure destination exists so early metadata projection can be written
-        // immediately at download start.
-        tokio::fs::create_dir_all(dest_dir).await?;
-
-        // Persist download metadata for crash recovery
-        if let Some(ref persistence) = self.persistence {
-            Self::save_persisted_download(
-                persistence.clone(),
-                PersistedDownload {
-                    download_id: download_id.clone(),
-                    repo_id: request.repo_id.clone(),
-                    filename: first_filename.clone(),
-                    filenames: files.iter().map(|f| f.filename.clone()).collect(),
-                    dest_dir: dest_dir.to_path_buf(),
-                    total_bytes,
-                    status: DownloadStatus::Queued,
-                    download_request: request.clone(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    known_sha256: known_sha256.clone(),
-                    huggingface_evidence: huggingface_evidence.clone(),
-                },
-            )
-            .await;
-        }
-
-        // Fire early callback immediately so metadata is available in SQLite
-        // as soon as the download is created (before file transfer begins).
-        if let Some(ref callback) = self.aux_complete_callback {
-            callback(AuxFilesCompleteInfo {
+            let persisted_download = self.persistence.as_ref().map(|_| PersistedDownload {
                 download_id: download_id.clone(),
+                repo_id: request.repo_id.clone(),
+                filename: first_filename.clone(),
+                filenames: final_filenames,
                 dest_dir: dest_dir.to_path_buf(),
-                filenames: files.iter().map(|f| f.filename.clone()).collect(),
-                download_request: request.clone(),
                 total_bytes,
+                status: DownloadStatus::Queued,
+                download_request: request.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                known_sha256: known_sha256.clone(),
                 huggingface_evidence: huggingface_evidence.clone(),
             });
-        }
-
-        // Write marker file with repo_id so interrupted downloads can be recovered
-        // even if downloads.json is lost (e.g. crash before persistence flush).
-        let marker_path = dest_dir.join(".pumas_download");
-        if let Err(e) = tokio::fs::write(
-            &marker_path,
-            serde_json::to_string_pretty(&serde_json::json!({
+            let marker_contents = serde_json::to_string_pretty(&serde_json::json!({
                 "repo_id": request.repo_id,
                 "family": request.family,
                 "official_name": request.official_name,
@@ -914,12 +2499,211 @@ impl HuggingFaceClient {
                 "selected_artifact": selected_artifact,
                 "huggingface_evidence": huggingface_evidence,
             }))
-            .unwrap_or_default(),
-        )
-        .await
-        {
-            info!("Failed to write download marker (non-fatal): {}", e);
-        }
+            .map_err(|error| PumasError::Json {
+                message: "failed to serialize download marker".to_string(),
+                source: Some(error),
+            })?;
+            let admission_request = DownloadAdmissionRequest {
+                snapshot: persisted_download.clone().ok_or_else(|| {
+                    PumasError::Other("Durable download snapshot unavailable".into())
+                })?,
+                domain: DownloadAdmissionDomain::Ambient,
+                destination: destination.identity().persisted(),
+                requested_payload_files,
+                execution_files: files.iter().map(|file| file.filename.clone()).collect(),
+            };
+            let prepared_download = PreparedDownloadTask {
+                #[cfg(test)]
+                download_base_url: self.download_base_url.clone(),
+                client: self.download_client.clone(),
+                downloads: self.downloads.clone(),
+                download_publications: self.download_publications.clone(),
+                destination_executions: self.destination_executions.clone(),
+                download_id: download_id.clone(),
+                repo_id: request.repo_id.clone(),
+                files: files.clone(),
+                destination: DownloadDestination::Managed(destination.clone()),
+                cancel_flag: cancel_flag.clone(),
+                pause_flag: pause_flag.clone(),
+                completion_callback: self.completion_callback.clone(),
+                aux_complete_callback: self.aux_complete_callback.clone(),
+                persistence: self.persistence.clone(),
+                terminal_cleanup_persistence: self.persistence.clone(),
+                auth_header,
+                destination_lock,
+                start_setup: Some(DownloadStartSetup {
+                    persisted_download: None,
+                    marker_contents,
+                }),
+                persist_queued_status: false,
+            };
+            let state = DownloadState {
+                download_id: download_id.clone(),
+                repo_id: request.repo_id.clone(),
+                status: DownloadStatus::Queued,
+                progress: 0.0,
+                downloaded_bytes: 0,
+                total_bytes,
+                speed: 0.0,
+                cancel_flag: cancel_flag.clone(),
+                pause_flag: pause_flag.clone(),
+                error: None,
+                retry_attempt: 0,
+                retry_limit: None,
+                retrying: false,
+                next_retry_delay_seconds: None,
+                task_registered: true,
+                lifecycle_failure_unverified: false,
+                dest_dir: dest_dir.to_path_buf(),
+                ambient_authority_blocked: false,
+                admission: None,
+                pending_relocation: None,
+                revoked_snapshot: None,
+                destination: Some(DownloadDestination::Managed(destination.clone())),
+                filename: first_filename,
+                files: files.clone(),
+                files_completed: 0,
+                download_request: Some(request.clone()),
+                known_sha256: known_sha256.clone(),
+                huggingface_evidence,
+            };
+            let owner = self.download_tasks.clone();
+            let states = self.downloads.clone();
+            let executions = self.destination_executions.clone();
+            let held_destination = destination.clone();
+            let attempt_id = uuid::Uuid::new_v4().to_string();
+            let prepared = self.download_tasks.prepare(
+                download_id.clone(),
+                TaskRole::AdmissionTransition,
+                move |task_context| async move {
+                    let attempt = attempt_id.clone();
+                    #[cfg(test)]
+                    let admission_observer = owner.clone();
+                    let outcome = task_context
+                        .run_fallible_blocking_named(
+                            "durably admit download",
+                            move || -> Result<_> {
+                                let before = persistence.load_lifecycle_inventory_strict()?;
+                                if before.hidden_admissions.values().any(|hidden| {
+                                    hidden.request.destination == admission_request.destination
+                                }) {
+                                    return Err(PumasError::Other(
+                                        "Destination has an unresolved durable admission".into(),
+                                    ));
+                                }
+                                #[cfg(test)]
+                                admission_observer.observe_ambient_admission("admission-inventory-checked", &admission_request.snapshot.download_id);
+                                let transition =
+                                    persistence.admit_download(&attempt, &admission_request)?;
+                                let inventory = persistence.load_lifecycle_inventory_strict()?;
+                                if let DownloadAdmissionTransition::Durable { admission, .. } = &transition {
+                                    if inventory.hidden_admissions.values().any(|hidden|
+                                        hidden.request.destination == admission_request.destination
+                                            && hidden.position.ordinal < admission.position.ordinal)
+                                    {
+                                        return Err(PumasError::Other("Destination has an unresolved earlier durable admission".into()));
+                                    }
+                                }
+                                Ok((transition, inventory))
+                            },
+                        )
+                        .await;
+                    let confirmed = match outcome {
+                        Ok(Ok((transition, inventory))) => transition.into_result().map(|_| inventory),
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(PumasError::Other(format!(
+                            "Download admission owner failed: {error}"
+                        ))),
+                    };
+                    let inventory = match confirmed {
+                        Ok(confirmed) => confirmed,
+                        Err(error) => {
+                            let _ = admission_sender.send(Err(error));
+                            let _ = task_context.drain_blocking().await;
+                            return;
+                        }
+                    };
+                    {
+                        let mut states = states.write().await;
+                        let identity = held_destination.identity().persisted();
+                        let mut predecessors = inventory
+                            .queue_admissions
+                            .iter()
+                            .filter(|(_, entry)| entry.destination == identity)
+                            .collect::<Vec<_>>();
+                        predecessors.sort_by_key(|(_, entry)| entry.position.ordinal);
+                        for (id, entry) in predecessors {
+                            executions.reserve_dormant(
+                                held_destination.identity(),
+                                id.clone(),
+                                match entry.domain {
+                                    DownloadAdmissionDomain::Ambient => DestinationDomain::Ambient,
+                                    DownloadAdmissionDomain::Recovery => {
+                                        DestinationDomain::Recovery
+                                    }
+                                },
+                            );
+                        }
+                        if !owner.promote_admission(
+                            task_context.download_id(),
+                            task_context.generation(),
+                        ) {
+                            let _ = admission_sender.send(Err(PumasError::Other(
+                                "Download admission lost its owner".into(),
+                            )));
+                            return;
+                        }
+                        if !executions.reserve(
+                            held_destination.identity(),
+                            task_context.download_id().to_string(),
+                            DestinationDomain::Ambient,
+                            task_context.generation().clone(),
+                        ) {
+                            let _ = admission_sender.send(Err(PumasError::Other("Download destination reservation was refused".into())));
+                            return;
+                        }
+                        let mut state = state;
+                        state.admission = Some(super::types::AdmittedDownload {
+                            attempt_id,
+                        });
+                        states.insert(state.download_id.clone(), state);
+                    }
+                    let _ = admission_sender.send(Ok(()));
+                    admission_completed.send_replace(true);
+                    drop(admission_completed);
+                    prepared_download.run_owned(task_context).await;
+                },
+            );
+            match self.download_tasks.install_gated(prepared) {
+                Ok(installed) => {
+                    self.download_tasks.bind_pending_admission(
+                        &download_id,
+                        installed.generation(),
+                        admission_identity,
+                        admission_completion,
+                    );
+                    Some(installed)
+                }
+                Err(rejected) => {
+                    drop(rejected);
+                    None
+                }
+            }
+        };
+        let Some(installed) = installed else {
+            self.download_tasks.rescue_abandoned();
+            return Err(PumasError::Other(
+                "download task owner collision during admission".to_string(),
+            ));
+        };
+        installed.start();
+        admission_receiver.await.map_err(|error| {
+            PumasError::Other(format!("Download admission owner ended: {error}"))
+        })??;
+        #[cfg(test)]
+        self.download_tasks
+            .observe_ambient_admission("ordinary-start-started", &download_id);
+        self.publish_download_snapshot().await;
 
         info!(
             "Starting download {} for {} ({} file{})",
@@ -929,87 +2713,126 @@ impl HuggingFaceClient {
             if files.len() == 1 { "" } else { "s" }
         );
 
-        // Spawn download task (uses download_client which has no total timeout)
-        let client = self.download_client.clone();
-        let downloads = self.downloads.clone();
-        let download_revision = self.download_revision.clone();
-        let download_updates = self.download_updates.clone();
-        let download_id_clone = download_id.clone();
-        let repo_id = request.repo_id.clone();
-        let dest_dir = dest_dir.to_path_buf();
-        let persistence = self.persistence.clone();
-        let completion_callback = self.completion_callback.clone();
-        let aux_complete_callback = self.aux_complete_callback.clone();
-        let auth_header = self.auth_header_value().await;
-        let dest_lock = self.destination_lock(&dest_dir).await;
-
-        let task_handle = tokio::spawn(async move {
-            // Serialize downloads targeting the same destination directory.
-            let _destination_guard = dest_lock.lock().await;
-
-            let result = Self::run_download(
-                client,
-                downloads.clone(),
-                download_revision.clone(),
-                download_updates.clone(),
-                &download_id_clone,
-                &repo_id,
-                &files,
-                &dest_dir,
-                cancel_flag,
-                pause_flag,
-                persistence.clone(),
-                completion_callback,
-                aux_complete_callback,
-                auth_header,
-            )
-            .await;
-
-            if let Err(e) = result {
-                // DownloadPaused is not a real error -- status already set by run_download
-                if matches!(e, PumasError::DownloadPaused) {
-                    info!("Download paused for {}", repo_id);
-                    // Persistence already updated in run_download
-                    return;
-                }
-                error!("Download failed for {}: {}", repo_id, e);
-                let mut download_states = downloads.write().await;
-                if let Some(state) = download_states.get_mut(&download_id_clone) {
-                    state.status = DownloadStatus::Error;
-                    state.error = Some(e.to_string());
-                }
-                drop(download_states);
-                publish_download_snapshot_from_parts(
-                    &downloads,
-                    &download_revision,
-                    &download_updates,
-                )
-                .await;
-                // Update persistence with error status (preserve for resume)
-                if let Some(ref persistence) = persistence {
-                    Self::persist_status_update(
-                        persistence.clone(),
-                        download_id_clone.clone(),
-                        DownloadStatus::Error,
-                    )
-                    .await;
-                }
-            }
-        });
-        self.store_download_task(download_id.clone(), task_handle);
-        self.mark_download_task_registered(&download_id).await;
-
         Ok(download_id)
     }
 
-    async fn destination_lock(&self, dest_dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    async fn destination_lock(
+        &self,
+        identity: &crate::model_library::download_recovery::DestinationIdentity,
+    ) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.dest_locks.write().await;
         locks
-            .entry(dest_dir.to_path_buf())
+            .entry(identity.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_download_task(
+        &self,
+        download_id: String,
+        repo_id: String,
+        files: Vec<FileToDownload>,
+        destination: DownloadDestination,
+        cancel_flag: Arc<AtomicBool>,
+        pause_flag: Arc<AtomicBool>,
+        completion_callback: Option<DownloadCompletionCallback>,
+        aux_complete_callback: Option<AuxFilesCompleteCallback>,
+        persistence: Option<Arc<DownloadPersistence>>,
+        terminal_cleanup_persistence: Option<Arc<DownloadPersistence>>,
+    ) -> PreparedDownloadTask {
+        #[cfg(test)]
+        self.download_tasks
+            .observe_ambient_admission("prepare-download-task", &download_id);
+        let auth_header = self.auth_header_value().await;
+        let destination_lock = self.destination_lock(&destination.identity()).await;
+        PreparedDownloadTask {
+            #[cfg(test)]
+            download_base_url: self.download_base_url.clone(),
+            client: self.download_client.clone(),
+            downloads: self.downloads.clone(),
+            download_publications: self.download_publications.clone(),
+            destination_executions: self.destination_executions.clone(),
+            download_id,
+            repo_id,
+            files,
+            destination,
+            cancel_flag,
+            pause_flag,
+            completion_callback,
+            aux_complete_callback,
+            persistence,
+            terminal_cleanup_persistence,
+            auth_header,
+            destination_lock,
+            start_setup: None,
+            persist_queued_status: false,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_download_task(
+        &self,
+        download_id: String,
+        repo_id: String,
+        files: Vec<FileToDownload>,
+        destination: DownloadDestination,
+        cancel_flag: Arc<AtomicBool>,
+        pause_flag: Arc<AtomicBool>,
+        completion_callback: Option<DownloadCompletionCallback>,
+        aux_complete_callback: Option<AuxFilesCompleteCallback>,
+        persistence: Option<Arc<DownloadPersistence>>,
+    ) -> bool {
+        let destination_path = destination.identity();
+        let destination_domain = destination.domain();
+        let prepared = self
+            .prepare_download_task(
+                download_id.clone(),
+                repo_id,
+                files,
+                destination,
+                cancel_flag,
+                pause_flag,
+                completion_callback,
+                aux_complete_callback,
+                persistence.clone(),
+                persistence,
+            )
+            .await;
+        let prepared = prepared.prepare_owned(&self.download_tasks, TaskRole::Worker);
+        let installed = {
+            let mut downloads = self.downloads.write().await;
+            if let Some(state) = downloads.get_mut(&download_id) {
+                if state.status == DownloadStatus::Queued {
+                    if let Ok(installed) = self.download_tasks.install_gated(prepared) {
+                        self.destination_executions.reserve(
+                            destination_path,
+                            download_id.clone(),
+                            destination_domain,
+                            installed.generation().clone(),
+                        );
+                        state.task_registered = true;
+                        Some(installed)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let Some(installed) = installed else {
+            self.download_tasks.rescue_abandoned();
+            return false;
+        };
+        installed.start();
+        true
+    }
+
+    #[cfg(test)]
     async fn remove_stale_part_for_completed_file(dest_path: &Path, part_path: &Path) {
         let final_exists = tokio::fs::try_exists(dest_path).await.unwrap_or(false);
         let part_exists = tokio::fs::try_exists(part_path).await.unwrap_or(false);
@@ -1028,6 +2851,7 @@ impl HuggingFaceClient {
         }
     }
 
+    #[cfg(test)]
     async fn finalize_complete_part_file(
         dest_path: &Path,
         part_path: &Path,
@@ -1057,54 +2881,251 @@ impl HuggingFaceClient {
         Ok(true)
     }
 
-    async fn remove_download_marker(dest_dir: &Path) {
-        let marker_path = dest_dir.join(".pumas_download");
-        if let Err(err) = tokio::fs::remove_file(&marker_path).await {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    "Failed to remove completed download marker {}: {}",
-                    marker_path.display(),
-                    err
-                );
-            }
-        }
-    }
-
     /// Run the download in the background with retry and resume support.
     ///
     /// Downloads all files sequentially. Files that already exist on disk
     /// (from a previous partial download) are skipped automatically.
     #[allow(clippy::too_many_arguments)]
+    async fn settle_worker_pause(
+        downloads: &Arc<RwLock<HashMap<String, DownloadState>>>,
+        download_publications: &Arc<DownloadPublicationOwner>,
+        download_id: &str,
+        task_context: &TaskContext,
+        persistence: Option<&Arc<DownloadPersistence>>,
+        destination_guard: &mut Option<OwnedMutexGuard<()>>,
+    ) -> Result<()> {
+        let persistence_ok = if let Some(persistence) = persistence {
+            let persistence = persistence.clone();
+            let persisted_id = download_id.to_string();
+            let attempt = downloads.read().await.get(download_id).and_then(|state| {
+                state
+                    .admission
+                    .as_ref()
+                    .map(|entry| entry.attempt_id.clone())
+            });
+            matches!(
+                task_context
+                    .run_fallible_blocking_named("persist download pause", move || {
+                        if let Some(attempt) = attempt {
+                            persistence.update_admitted_status(
+                                &persisted_id,
+                                &attempt,
+                                DownloadStatus::Paused,
+                            )
+                        } else {
+                            persistence.update_status(&persisted_id, DownloadStatus::Paused)
+                        }
+                    })
+                    .await,
+                Ok(Ok(true))
+            )
+        } else {
+            true
+        };
+
+        let projected = {
+            let mut states = downloads.write().await;
+            let state = current_worker_state(
+                &mut states,
+                download_id,
+                task_context,
+                &[DownloadStatus::Downloading, DownloadStatus::Pausing],
+            )?;
+            state.speed = 0.0;
+            state.task_registered = false;
+            if persistence_ok {
+                state.status = DownloadStatus::Paused;
+                state.retrying = false;
+                state.next_retry_delay_seconds = None;
+            } else {
+                state.status = DownloadStatus::Error;
+                state.error = Some("failed to persist download pause".to_string());
+                state.lifecycle_failure_unverified = true;
+            }
+            true
+        };
+
+        drop(destination_guard.take());
+        if projected {
+            publish_download_snapshot_from_parts(download_publications).await;
+        }
+        if persistence_ok {
+            Err(PumasError::DownloadPaused)
+        } else {
+            Err(PumasError::Other(
+                "failed to persist download pause".to_string(),
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_download(
         client: reqwest::Client,
         downloads: Arc<RwLock<HashMap<String, DownloadState>>>,
-        download_revision: Arc<AtomicU64>,
-        download_updates: broadcast::Sender<crate::models::ModelDownloadUpdateNotification>,
+        download_publications: Arc<DownloadPublicationOwner>,
         download_id: &str,
         repo_id: &str,
         files: &[FileToDownload],
-        dest_dir: &Path,
+        destination: &DownloadDestination,
         cancel_flag: Arc<AtomicBool>,
         pause_flag: Arc<AtomicBool>,
         persistence: Option<Arc<DownloadPersistence>>,
+        terminal_cleanup_persistence: Option<Arc<DownloadPersistence>>,
         completion_callback: Option<DownloadCompletionCallback>,
         aux_complete_callback: Option<AuxFilesCompleteCallback>,
         auth_header: Option<String>,
+        task_context: TaskContext,
+        destination_lock: Arc<TokioMutex<()>>,
+        start_setup: Option<DownloadStartSetup>,
+        persist_queued_status: bool,
+        #[cfg(test)] download_base_url: Option<String>,
     ) -> Result<()> {
         use crate::config::NetworkConfig;
         use crate::network::RetryConfig;
 
-        // Update status to downloading
-        {
+        #[cfg(test)]
+        task_context.observe_worker_projection("worker-entry");
+        let mut destination_guard = Some(destination_lock.clone().lock_owned().await);
+
+        // Start only while the task registration still owns the queued state.
+        // A concurrent cancellation may have won after registration but before
+        // this future was first polled.
+        let start_disposition = {
             let mut downloads = downloads.write().await;
-            if let Some(state) = downloads.get_mut(download_id) {
+            current_worker_state(
+                &mut downloads,
+                download_id,
+                &task_context,
+                &[DownloadStatus::Queued, DownloadStatus::Pausing],
+            )
+            .ok()
+            .and_then(|state| {
+                if state.cancel_flag.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if state.pause_flag.load(Ordering::Relaxed) {
+                    state.status = DownloadStatus::Pausing;
+                    return Some(true);
+                }
                 state.status = DownloadStatus::Downloading;
+                Some(false)
+            })
+        };
+        let Some(pause_before_start) = start_disposition else {
+            return Err(PumasError::DownloadCancelled);
+        };
+        if pause_before_start {
+            #[cfg(test)]
+            task_context.observe_worker_projection("pause-before-destination");
+            return Self::settle_worker_pause(
+                &downloads,
+                &download_publications,
+                download_id,
+                &task_context,
+                persistence.as_ref(),
+                &mut destination_guard,
+            )
+            .await;
+        }
+        publish_worker_snapshot_and_revalidate(
+            &download_publications,
+            &downloads,
+            download_id,
+            &task_context,
+            destination,
+            &destination_lock,
+            &mut destination_guard,
+            &[DownloadStatus::Downloading],
+        )
+        .await?;
+
+        destination.prepare(&task_context).await?;
+
+        if let Some(start_setup) = start_setup {
+            if let Some(persisted_download) = start_setup.persisted_download {
+                let persistence = persistence.clone().ok_or_else(|| {
+                    PumasError::Other(
+                        "download setup lost its configured persistence owner".to_string(),
+                    )
+                })?;
+                match task_context
+                    .run_fallible_blocking_named("persist admitted download", move || {
+                        persistence.save(&persisted_download)
+                    })
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(PumasError::Other(format!(
+                            "failed to observe admitted-download persistence: {error}"
+                        )));
+                    }
+                }
+            }
+            destination
+                .write_marker(&task_context, start_setup.marker_contents)
+                .await?;
+        }
+        if persist_queued_status {
+            let persistence = persistence.clone().ok_or_else(|| {
+                PumasError::Other(
+                    "download resume lost its configured persistence owner".to_string(),
+                )
+            })?;
+            let persisted_id = download_id.to_string();
+            let attempt = downloads
+                .read()
+                .await
+                .get(download_id)
+                .and_then(|state| state.admission.as_ref())
+                .map(|admission| admission.attempt_id.clone());
+            match task_context
+                .run_fallible_blocking_named("persist admitted download resume", move || {
+                    if let Some(attempt) = attempt {
+                        persistence.update_admitted_status(
+                            &persisted_id,
+                            &attempt,
+                            DownloadStatus::Queued,
+                        )
+                    } else {
+                        persistence.update_status(&persisted_id, DownloadStatus::Queued)
+                    }
+                })
+                .await
+            {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => {
+                    return Err(PumasError::Other(
+                        "persisted download resume row was unavailable".to_string(),
+                    ));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(error) => {
+                    return Err(PumasError::Other(format!(
+                        "failed to observe admitted download resume persistence: {error}"
+                    )));
+                }
             }
         }
-        publish_download_snapshot_from_parts(&downloads, &download_revision, &download_updates)
-            .await;
 
-        tokio::fs::create_dir_all(dest_dir).await?;
+        // A pause requested while a recovery preflight is in blocking I/O
+        // must settle before any further filesystem or network operation.
+        // The generation/role check prevents an old Worker from overwriting a
+        // concurrently installed cancellation finalizer.
+        if pause_flag.load(Ordering::Relaxed) {
+            #[cfg(test)]
+            task_context.observe_worker_projection("pause-after-preflight");
+            return Self::settle_worker_pause(
+                &downloads,
+                &download_publications,
+                download_id,
+                &task_context,
+                persistence.as_ref(),
+                &mut destination_guard,
+            )
+            .await;
+        }
 
         let max_attempts = NetworkConfig::hf_download_max_retries();
         let retry_limit = retry_limit(max_attempts);
@@ -1119,26 +3140,25 @@ impl HuggingFaceClient {
 
         for (file_idx, file_info) in files.iter().enumerate() {
             let filename = &file_info.filename;
-            let dest_path = dest_dir.join(filename);
-            let part_path = dest_dir.join(format!(
-                "{}{}",
-                filename,
-                NetworkConfig::DOWNLOAD_TEMP_SUFFIX
-            ));
 
             // Ensure parent directory exists (needed for subdirectory files
             // like transformer/model.safetensors in diffusion repos)
-            if let Some(parent) = dest_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+            destination.prepare_file(&task_context, filename).await?;
 
             // Skip files that already exist (completed from previous run)
-            if tokio::fs::try_exists(&dest_path).await.unwrap_or(false) {
-                Self::remove_stale_part_for_completed_file(&dest_path, &part_path).await;
-                let existing_size = tokio::fs::metadata(&dest_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+            if let Some(existing_size) = destination.file_len(&task_context, filename).await? {
+                if destination
+                    .part_len(&task_context, filename)
+                    .await?
+                    .is_some()
+                {
+                    if let Err(error) = destination.remove_part(&task_context, filename).await {
+                        warn!(
+                            "Failed to remove stale partial file for {}/{}: {}",
+                            repo_id, filename, error
+                        );
+                    }
+                }
                 bytes_offset += existing_size;
                 info!(
                     "Skipping already-downloaded file {}/{} ({} bytes)",
@@ -1146,22 +3166,37 @@ impl HuggingFaceClient {
                 );
 
                 // Update state
+                #[cfg(test)]
+                task_context.observe_worker_projection("before-existing-file-projection");
                 {
                     let mut downloads = downloads.write().await;
-                    if let Some(state) = downloads.get_mut(download_id) {
-                        state.files_completed = file_idx + 1;
-                        state.downloaded_bytes = bytes_offset;
-                        if let Some(total) = state.total_bytes {
-                            state.progress = bytes_offset as f32 / total as f32;
-                        }
+                    let state = current_worker_state(
+                        &mut downloads,
+                        download_id,
+                        &task_context,
+                        &[DownloadStatus::Downloading],
+                    )?;
+                    state.files_completed = file_idx + 1;
+                    state.downloaded_bytes = bytes_offset;
+                    if let Some(total) = state.total_bytes {
+                        state.progress = bytes_offset as f32 / total as f32;
                     }
                 }
-                publish_download_snapshot_from_parts(
+                #[cfg(test)]
+                if file_idx + 1 == files.len() {
+                    task_context.observe_worker_projection("terminal-cleanup-committed");
+                }
+                publish_worker_snapshot_and_revalidate(
+                    &download_publications,
                     &downloads,
-                    &download_revision,
-                    &download_updates,
+                    download_id,
+                    &task_context,
+                    destination,
+                    &destination_lock,
+                    &mut destination_guard,
+                    &[DownloadStatus::Downloading],
                 )
-                .await;
+                .await?;
                 continue;
             }
 
@@ -1187,7 +3222,50 @@ impl HuggingFaceClient {
                         })
                     };
                     if let Some(info) = info {
-                        callback(info);
+                        let callback = callback.clone();
+                        drop(destination_guard.take());
+                        let callback_outcome = task_context
+                            .run_fallible_blocking_named(
+                                "invoke auxiliary-files-complete callback",
+                                move || {
+                                    std::panic::catch_unwind(AssertUnwindSafe(|| callback(info)))
+                                        .map_err(|_| {
+                                            "auxiliary-files-complete callback panicked".to_string()
+                                        })
+                                },
+                            )
+                            .await;
+                        destination_guard = Some(destination_lock.clone().lock_owned().await);
+
+                        let still_current = {
+                            let mut download_states = downloads.write().await;
+                            current_worker_state(
+                                &mut download_states,
+                                download_id,
+                                &task_context,
+                                &[DownloadStatus::Downloading],
+                            )
+                            .is_ok_and(|state| {
+                                !state.cancel_flag.load(Ordering::Relaxed)
+                                    && state.matches_destination(&destination.identity())
+                            })
+                        };
+                        if !still_current {
+                            return Err(PumasError::DownloadCancelled);
+                        }
+                        match callback_outcome {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                return Err(PumasError::Other(format!(
+                                    "auxiliary-files-complete callback failed: {error}"
+                                )));
+                            }
+                            Err(error) => {
+                                return Err(PumasError::Other(format!(
+                                    "failed to observe auxiliary-files-complete callback: {error}"
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -1195,18 +3273,34 @@ impl HuggingFaceClient {
             // Update current filename in state
             {
                 let mut downloads = downloads.write().await;
-                if let Some(state) = downloads.get_mut(download_id) {
-                    state.filename = filename.clone();
-                    state.retry_attempt = 0;
-                    state.retry_limit = retry_limit;
-                    state.retrying = false;
-                    state.next_retry_delay_seconds = None;
-                }
+                let state = current_worker_state(
+                    &mut downloads,
+                    download_id,
+                    &task_context,
+                    &[DownloadStatus::Downloading],
+                )?;
+                state.filename = filename.clone();
+                state.retry_attempt = 0;
+                state.retry_limit = retry_limit;
+                state.retrying = false;
+                state.next_retry_delay_seconds = None;
             }
-            publish_download_snapshot_from_parts(&downloads, &download_revision, &download_updates)
-                .await;
+            publish_worker_snapshot_and_revalidate(
+                &download_publications,
+                &downloads,
+                download_id,
+                &task_context,
+                destination,
+                &destination_lock,
+                &mut destination_guard,
+                &[DownloadStatus::Downloading],
+            )
+            .await?;
 
-            let url = format!("{}/{}/resolve/main/{}", HF_HUB_BASE, repo_id, filename);
+            let download_base = HF_HUB_BASE;
+            #[cfg(test)]
+            let download_base = download_base_url.as_deref().unwrap_or(download_base);
+            let url = format!("{}/{}/resolve/main/{}", download_base, repo_id, filename);
 
             let mut last_error: Option<PumasError> = None;
 
@@ -1217,69 +3311,54 @@ impl HuggingFaceClient {
                 attempt += 1;
                 {
                     let mut downloads = downloads.write().await;
-                    if let Some(state) = downloads.get_mut(download_id) {
-                        state.retry_attempt = attempt;
-                        state.retry_limit = retry_limit;
-                        state.retrying = false;
-                        state.next_retry_delay_seconds = None;
-                    }
+                    let state = current_worker_state(
+                        &mut downloads,
+                        download_id,
+                        &task_context,
+                        &[DownloadStatus::Downloading],
+                    )?;
+                    state.retry_attempt = attempt;
+                    state.retry_limit = retry_limit;
+                    state.retrying = false;
+                    state.next_retry_delay_seconds = None;
                 }
 
                 // Check cancellation before each attempt
+                #[cfg(test)]
+                task_context.observe_cancellation_check();
                 if cancel_flag.load(Ordering::Relaxed) {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    let mut download_states = downloads.write().await;
-                    if let Some(state) = download_states.get_mut(download_id) {
-                        state.status = DownloadStatus::Cancelled;
-                    }
-                    drop(download_states);
-                    publish_download_snapshot_from_parts(
-                        &downloads,
-                        &download_revision,
-                        &download_updates,
-                    )
-                    .await;
-                    if let Some(ref persistence) = persistence {
-                        Self::remove_persisted_download(
-                            persistence.clone(),
-                            download_id.to_string(),
-                        )
-                        .await;
-                    }
+                    let _ = destination.remove_part(&task_context, filename).await;
+                    // `cancel_download` has already generation-replaced this
+                    // worker. Its caller-independent finalizer exclusively
+                    // owns terminal state, persistence cleanup, and recovery
+                    // capability release after observing this worker.
                     return Err(PumasError::DownloadCancelled);
                 }
 
                 // Check pause before each attempt
                 if pause_flag.load(Ordering::Relaxed) {
-                    let mut download_states = downloads.write().await;
-                    if let Some(state) = download_states.get_mut(download_id) {
-                        state.status = DownloadStatus::Paused;
-                    }
-                    drop(download_states);
-                    publish_download_snapshot_from_parts(
+                    #[cfg(test)]
+                    task_context.observe_worker_projection("pause-before-attempt");
+                    return Self::settle_worker_pause(
                         &downloads,
-                        &download_revision,
-                        &download_updates,
+                        &download_publications,
+                        download_id,
+                        &task_context,
+                        persistence.as_ref(),
+                        &mut destination_guard,
                     )
                     .await;
-                    if let Some(ref persistence) = persistence {
-                        Self::persist_status_update(
-                            persistence.clone(),
-                            download_id.to_string(),
-                            DownloadStatus::Paused,
-                        )
-                        .await;
-                    }
-                    return Err(PumasError::DownloadPaused);
                 }
 
                 // Determine resume offset from existing .part file
-                let resume_from_byte = tokio::fs::metadata(&part_path)
-                    .await
-                    .map(|m| m.len())
+                let resume_from_byte = destination
+                    .part_len(&task_context, filename)
+                    .await?
                     .unwrap_or(0);
 
-                if Self::finalize_complete_part_file(&dest_path, &part_path, file_info.size).await?
+                if destination
+                    .finalize_complete_part_file(&task_context, filename, file_info.size)
+                    .await?
                 {
                     file_completed = true;
                     break;
@@ -1296,44 +3375,67 @@ impl HuggingFaceClient {
                     );
 
                     // Reset status to Downloading for the retry
-                    let mut download_states = downloads.write().await;
-                    if let Some(state) = download_states.get_mut(download_id) {
-                        state.status = DownloadStatus::Downloading;
-                        state.error = None;
-                        state.retry_attempt = attempt;
-                        state.retry_limit = retry_limit;
-                        state.retrying = false;
-                        state.next_retry_delay_seconds = None;
-                    }
-                    drop(download_states);
-                    publish_download_snapshot_from_parts(
+                    project_worker_retry_reset(
                         &downloads,
-                        &download_revision,
-                        &download_updates,
+                        download_id,
+                        &task_context,
+                        attempt,
+                        retry_limit,
                     )
-                    .await;
+                    .await?;
+                    publish_worker_snapshot_and_revalidate(
+                        &download_publications,
+                        &downloads,
+                        download_id,
+                        &task_context,
+                        destination,
+                        &destination_lock,
+                        &mut destination_guard,
+                        &[DownloadStatus::Downloading],
+                    )
+                    .await?;
                 }
 
                 match Self::download_attempt(
                     &client,
                     &downloads,
-                    &download_revision,
-                    &download_updates,
+                    &download_publications,
+                    &destination_lock,
+                    &mut destination_guard,
                     download_id,
                     &url,
-                    &part_path,
+                    destination,
+                    filename,
                     file_info.size,
                     resume_from_byte,
                     bytes_offset,
                     &cancel_flag,
                     &pause_flag,
+                    persistence.as_ref(),
                     auth_header.as_deref(),
+                    &task_context,
                 )
                 .await
                 {
                     Ok(_) => {
+                        #[cfg(test)]
+                        task_context.observe_worker_projection("before-rename-pause-check");
+                        if pause_flag.load(Ordering::Relaxed) {
+                            #[cfg(test)]
+                            task_context.observe_worker_projection("pause-before-rename");
+                            return Self::settle_worker_pause(
+                                &downloads,
+                                &download_publications,
+                                download_id,
+                                &task_context,
+                                persistence.as_ref(),
+                                &mut destination_guard,
+                            )
+                            .await;
+                        }
                         // Rename .part to final path atomically
-                        tokio::fs::rename(&part_path, &dest_path)
+                        destination
+                            .rename_part_to_file(&task_context, filename)
                             .await
                             .map_err(|e| PumasError::DownloadFailed {
                                 url: url.clone(),
@@ -1346,22 +3448,15 @@ impl HuggingFaceClient {
                     Err(e) => {
                         // Paused -- .part preserved, not a real error
                         if matches!(e, PumasError::DownloadPaused) {
-                            if let Some(ref persistence) = persistence {
-                                Self::persist_status_update(
-                                    persistence.clone(),
-                                    download_id.to_string(),
-                                    DownloadStatus::Paused,
-                                )
-                                .await;
-                            }
                             return Err(e);
                         }
 
                         if !e.is_retryable() || cancel_flag.load(Ordering::Relaxed) {
                             if cancel_flag.load(Ordering::Relaxed) {
-                                let _ = tokio::fs::remove_file(&part_path).await;
+                                let _ = destination.remove_part(&task_context, filename).await;
                                 if let Some(ref persistence) = persistence {
-                                    Self::remove_persisted_download(
+                                    Self::remove_persisted_download_owned(
+                                        &task_context,
                                         persistence.clone(),
                                         download_id.to_string(),
                                     )
@@ -1392,26 +3487,35 @@ impl HuggingFaceClient {
                         let next_attempt = attempt + 1;
                         {
                             let mut downloads = downloads.write().await;
-                            if let Some(state) = downloads.get_mut(download_id) {
-                                state.retry_attempt = attempt;
-                                state.retry_limit = retry_limit;
-                                state.retrying = true;
-                                state.next_retry_delay_seconds = Some(delay.as_secs_f64());
-                                state.error = Some(format!(
-                                    "Transient network error, retrying attempt {}/{} in {:.1}s: {}",
-                                    next_attempt,
-                                    limit_text,
-                                    delay.as_secs_f64(),
-                                    error_text
-                                ));
-                            }
+                            let state = current_worker_state(
+                                &mut downloads,
+                                download_id,
+                                &task_context,
+                                &[DownloadStatus::Downloading],
+                            )?;
+                            state.retry_attempt = attempt;
+                            state.retry_limit = retry_limit;
+                            state.retrying = true;
+                            state.next_retry_delay_seconds = Some(delay.as_secs_f64());
+                            state.error = Some(format!(
+                                "Transient network error, retrying attempt {}/{} in {:.1}s: {}",
+                                next_attempt,
+                                limit_text,
+                                delay.as_secs_f64(),
+                                error_text
+                            ));
                         }
-                        publish_download_snapshot_from_parts(
+                        publish_worker_snapshot_and_revalidate(
+                            &download_publications,
                             &downloads,
-                            &download_revision,
-                            &download_updates,
+                            download_id,
+                            &task_context,
+                            destination,
+                            &destination_lock,
+                            &mut destination_guard,
+                            &[DownloadStatus::Downloading],
                         )
-                        .await;
+                        .await?;
                         debug!("Waiting {:?} before retry", delay);
                         tokio::time::sleep(delay).await;
                     }
@@ -1439,24 +3543,41 @@ impl HuggingFaceClient {
             }
 
             // File completed -- use actual file size for accurate offset
-            let actual_size = tokio::fs::metadata(&dest_path)
-                .await
-                .map(|m| m.len())
+            let actual_size = destination
+                .file_len(&task_context, filename)
+                .await?
                 .unwrap_or(file_info.size.unwrap_or(0));
             bytes_offset += actual_size;
             {
                 let mut downloads = downloads.write().await;
-                if let Some(state) = downloads.get_mut(download_id) {
-                    state.files_completed = file_idx + 1;
-                    state.downloaded_bytes = bytes_offset;
-                    state.retry_attempt = 0;
-                    state.retrying = false;
-                    state.next_retry_delay_seconds = None;
-                    state.error = None;
-                }
+                let state = current_worker_state(
+                    &mut downloads,
+                    download_id,
+                    &task_context,
+                    &[DownloadStatus::Downloading],
+                )?;
+                state.files_completed = file_idx + 1;
+                state.downloaded_bytes = bytes_offset;
+                state.retry_attempt = 0;
+                state.retrying = false;
+                state.next_retry_delay_seconds = None;
+                state.error = None;
             }
-            publish_download_snapshot_from_parts(&downloads, &download_revision, &download_updates)
-                .await;
+            #[cfg(test)]
+            if file_idx + 1 == files.len() {
+                task_context.observe_worker_projection("terminal-cleanup-committed");
+            }
+            publish_worker_snapshot_and_revalidate(
+                &download_publications,
+                &downloads,
+                download_id,
+                &task_context,
+                destination,
+                &destination_lock,
+                &mut destination_guard,
+                &[DownloadStatus::Downloading],
+            )
+            .await?;
 
             info!(
                 "File {}/{} complete ({}/{})",
@@ -1467,49 +3588,138 @@ impl HuggingFaceClient {
             );
         }
 
+        // Remove the marker through the same destination authority before
+        // releasing a recovery capability from state. If this fails, the
+        // download remains recoverable instead of becoming a false success.
+        destination.remove_marker(&task_context).await?;
+
+        // A durable queue release is an assertion about completed effects.
+        // Observe their joins (including retained failures) before writing it.
+        match task_context.drain_blocking().await {
+            Ok(0) => {}
+            Ok(failures) => {
+                return Err(PumasError::Other(format!(
+                    "Download effects failed before settlement: {failures}"
+                )))
+            }
+            Err(error) => {
+                return Err(PumasError::Other(format!(
+                    "Download effect drain failed before settlement: {error}"
+                )))
+            }
+        }
+
+        // Persistence cleanup is part of successful completion. It is
+        // registered with the same task owner and must finish before the final
+        // drain, Completed projection, or recovery-capability release.
+        if let Some(ref persistence) = terminal_cleanup_persistence {
+            let persistence = persistence.clone();
+            let persisted_id = download_id.to_string();
+            let attempt = downloads.read().await.get(download_id).and_then(|state| {
+                state
+                    .admission
+                    .as_ref()
+                    .map(|entry| entry.attempt_id.clone())
+            });
+            match task_context
+                .run_fallible_blocking_named("remove completed persisted download", move || {
+                    if let Some(attempt) = attempt {
+                        if persistence.settle_queue_admission(&persisted_id, &attempt)? {
+                            Ok(())
+                        } else {
+                            Err(PumasError::Other(
+                                "Completed download queue settlement was not confirmed".into(),
+                            ))
+                        }
+                    } else {
+                        persistence.remove(&persisted_id)
+                    }
+                })
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return Err(error),
+                Err(error) => {
+                    return Err(PumasError::Other(format!(
+                        "failed to observe completed-download persistence cleanup: {error}"
+                    )));
+                }
+            }
+        }
+
+        let nested_failures = task_context.drain_blocking().await.map_err(|error| {
+            PumasError::Other(format!(
+                "failed to drain recovery filesystem operations before completion: {error}"
+            ))
+        })?;
+        if nested_failures > 0 {
+            return Err(PumasError::Other(format!(
+                "recovery filesystem operations completed with {nested_failures} task failure(s)"
+            )));
+        }
+
         // All files completed -- update status and fire callback
         let completion_info = {
             let mut downloads = downloads.write().await;
-            if let Some(state) = downloads.get_mut(download_id) {
-                state.status = DownloadStatus::Completed;
-                state.progress = 1.0;
-                state.files_completed = files.len();
+            let state = current_worker_state(
+                &mut downloads,
+                download_id,
+                &task_context,
+                &[DownloadStatus::Downloading],
+            )?;
+            state.status = DownloadStatus::Completed;
+            state.progress = 1.0;
+            state.files_completed = files.len();
+            state.task_registered = false;
+            state.destination = None;
+            state.lifecycle_failure_unverified = false;
 
-                state.download_request.as_ref().map(|req| {
-                    // Use the primary (largest) filename for the completion info
-                    let primary_filename = files
-                        .iter()
-                        .max_by_key(|f| f.size.unwrap_or(0))
-                        .map(|f| f.filename.clone())
-                        .unwrap_or_else(|| state.filename.clone());
+            state.download_request.as_ref().map(|req| {
+                // Use the primary (largest) filename for the completion info
+                let primary_filename = files
+                    .iter()
+                    .max_by_key(|f| f.size.unwrap_or(0))
+                    .map(|f| f.filename.clone())
+                    .unwrap_or_else(|| state.filename.clone());
 
-                    DownloadCompletionInfo {
-                        download_id: download_id.to_string(),
-                        dest_dir: state.dest_dir.clone(),
-                        filename: primary_filename,
-                        filenames: files.iter().map(|f| f.filename.clone()).collect(),
-                        download_request: req.clone(),
-                        known_sha256: state.known_sha256.clone(),
-                        huggingface_evidence: state.huggingface_evidence.clone(),
-                    }
-                })
-            } else {
-                None
-            }
+                DownloadCompletionInfo {
+                    download_id: download_id.to_string(),
+                    dest_dir: state.dest_dir.clone(),
+                    filename: primary_filename,
+                    filenames: files.iter().map(|f| f.filename.clone()).collect(),
+                    download_request: req.clone(),
+                    known_sha256: state.known_sha256.clone(),
+                    huggingface_evidence: state.huggingface_evidence.clone(),
+                }
+            })
         };
-        publish_download_snapshot_from_parts(&downloads, &download_revision, &download_updates)
-            .await;
+        drop(destination_guard.take());
+        publish_download_snapshot_from_parts(&download_publications).await;
 
-        // Invoke completion callback for in-place import
+        // Terminal state and persistence are settled before external
+        // notification. The callback runs as owner-visible blocking work and
+        // only after the per-destination lease has been released.
         if let (Some(ref callback), Some(info)) = (&completion_callback, completion_info) {
-            callback(info);
+            let callback = callback.clone();
+            drop(destination_guard.take());
+            match task_context
+                .run_fallible_blocking_named("invoke download-completion callback", move || {
+                    std::panic::catch_unwind(AssertUnwindSafe(|| callback(info)))
+                        .map_err(|_| "download completion callback panicked".to_string())
+                })
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!("Download completion callback failed after terminal settlement: {error}");
+                }
+                Err(error) => {
+                    warn!(
+                        "Failed to observe download completion callback after terminal settlement: {error}"
+                    );
+                }
+            }
         }
-
-        // Remove from persistence -- download is done
-        if let Some(ref persistence) = persistence {
-            Self::remove_persisted_download(persistence.clone(), download_id.to_string()).await;
-        }
-        Self::remove_download_marker(dest_dir).await;
 
         Ok(())
     }
@@ -1523,17 +3733,21 @@ impl HuggingFaceClient {
     async fn download_attempt(
         client: &reqwest::Client,
         downloads: &Arc<RwLock<HashMap<String, DownloadState>>>,
-        download_revision: &Arc<AtomicU64>,
-        download_updates: &broadcast::Sender<crate::models::ModelDownloadUpdateNotification>,
+        download_publications: &Arc<DownloadPublicationOwner>,
+        destination_lock: &Arc<TokioMutex<()>>,
+        destination_guard: &mut Option<OwnedMutexGuard<()>>,
         download_id: &str,
         url: &str,
-        part_path: &Path,
+        destination: &DownloadDestination,
+        filename: &str,
         file_size_expected: Option<u64>,
         resume_from_byte: u64,
         bytes_offset: u64,
         cancel_flag: &Arc<AtomicBool>,
         pause_flag: &Arc<AtomicBool>,
+        persistence: Option<&Arc<DownloadPersistence>>,
         auth_header: Option<&str>,
+        task_context: &TaskContext,
     ) -> Result<()> {
         use futures::StreamExt;
 
@@ -1575,14 +3789,9 @@ impl HuggingFaceClient {
         };
 
         // Open file: append for resume, create for fresh start
-        let mut file = if is_resuming {
-            tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(part_path)
-                .await?
-        } else {
-            tokio::fs::File::create(part_path).await?
-        };
+        let mut file = destination
+            .open_part(task_context, filename, is_resuming)
+            .await?;
 
         let mut downloaded: u64 = if is_resuming { resume_from_byte } else { 0 };
         let mut stream = response.bytes_stream();
@@ -1590,43 +3799,32 @@ impl HuggingFaceClient {
         let mut last_publish = Instant::now();
 
         while let Some(chunk) = stream.next().await {
+            #[cfg(test)]
+            task_context.observe_cancellation_check();
             if cancel_flag.load(Ordering::Relaxed) {
                 drop(file);
-                let _ = tokio::fs::remove_file(part_path).await;
-
-                let mut download_states = downloads.write().await;
-                if let Some(state) = download_states.get_mut(download_id) {
-                    state.status = DownloadStatus::Cancelled;
-                }
-                drop(download_states);
-                publish_download_snapshot_from_parts(
-                    downloads,
-                    download_revision,
-                    download_updates,
-                )
-                .await;
-
+                let _ = destination.remove_part(task_context, filename).await;
+                // Terminal cancellation belongs to the generation-replacing
+                // finalizer, which observes this worker and its nested work.
                 return Err(PumasError::DownloadCancelled);
             }
 
             if pause_flag.load(Ordering::Relaxed) {
-                file.flush().await?;
+                file.flush(task_context).await?;
                 drop(file);
                 // Preserve .part file for resume
 
-                let mut download_states = downloads.write().await;
-                if let Some(state) = download_states.get_mut(download_id) {
-                    state.status = DownloadStatus::Paused;
-                }
-                drop(download_states);
-                publish_download_snapshot_from_parts(
+                #[cfg(test)]
+                task_context.observe_worker_projection("pause-during-stream");
+                return Self::settle_worker_pause(
                     downloads,
-                    download_revision,
-                    download_updates,
+                    download_publications,
+                    download_id,
+                    task_context,
+                    persistence,
+                    destination_guard,
                 )
                 .await;
-
-                return Err(PumasError::DownloadPaused);
             }
 
             let chunk = chunk.map_err(|e| PumasError::Network {
@@ -1634,7 +3832,7 @@ impl HuggingFaceClient {
                 cause: Some(e.to_string()),
             })?;
 
-            file.write_all(&chunk).await?;
+            file.write_all(task_context, &chunk).await?;
             downloaded += chunk.len() as u64;
 
             // Update overall progress (bytes_offset accounts for completed files)
@@ -1648,29 +3846,38 @@ impl HuggingFaceClient {
             let overall_downloaded = bytes_offset + downloaded;
 
             let mut download_states = downloads.write().await;
-            if let Some(state) = download_states.get_mut(download_id) {
-                state.downloaded_bytes = overall_downloaded;
-                state.speed = speed;
-                state.progress = if let Some(total) = state.total_bytes {
-                    overall_downloaded as f32 / total as f32
-                } else {
-                    0.0
-                };
-            }
+            let state = current_worker_state(
+                &mut download_states,
+                download_id,
+                task_context,
+                &[DownloadStatus::Downloading],
+            )?;
+            state.downloaded_bytes = overall_downloaded;
+            state.speed = speed;
+            state.progress = if let Some(total) = state.total_bytes {
+                overall_downloaded as f32 / total as f32
+            } else {
+                0.0
+            };
             drop(download_states);
 
             if last_publish.elapsed() >= DOWNLOAD_PROGRESS_PUBLISH_INTERVAL {
-                publish_download_snapshot_from_parts(
+                publish_worker_snapshot_and_revalidate(
+                    download_publications,
                     downloads,
-                    download_revision,
-                    download_updates,
+                    download_id,
+                    task_context,
+                    destination,
+                    destination_lock,
+                    destination_guard,
+                    &[DownloadStatus::Downloading],
                 )
-                .await;
+                .await?;
                 last_publish = Instant::now();
             }
         }
 
-        file.flush().await?;
+        file.flush(task_context).await?;
         drop(file);
 
         // Verify this file's download completeness
@@ -1686,30 +3893,28 @@ impl HuggingFaceClient {
         Ok(())
     }
 
-    /// Helper: update status in persistence store (best-effort).
-    async fn persist_status_update(
+    async fn persist_status_update_owned(
+        task_context: &TaskContext,
         persistence: Arc<DownloadPersistence>,
         download_id: String,
         status: DownloadStatus,
-    ) {
-        let _ = tokio::task::spawn_blocking(move || {
-            let entries = persistence.load_all();
-            if let Some(mut entry) = entries.into_iter().find(|d| d.download_id == download_id) {
-                entry.status = status;
-                let _ = persistence.save(&entry);
-            }
-        })
-        .await;
-    }
-
-    async fn save_persisted_download(
-        persistence: Arc<DownloadPersistence>,
-        entry: PersistedDownload,
-    ) {
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = persistence.save(&entry);
-        })
-        .await;
+        admission_attempt: Option<String>,
+    ) -> Result<bool> {
+        match task_context
+            .run_fallible_blocking_named("persist download status", move || {
+                if let Some(attempt) = admission_attempt {
+                    persistence.update_admitted_status(&download_id, &attempt, status)
+                } else {
+                    persistence.update_status(&download_id, status)
+                }
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(PumasError::Other(format!(
+                "failed to observe persisted download status: {error}"
+            ))),
+        }
     }
 
     async fn remove_persisted_download(persistence: Arc<DownloadPersistence>, download_id: String) {
@@ -1719,34 +3924,29 @@ impl HuggingFaceClient {
         .await;
     }
 
-    async fn relocate_persisted_download(
+    async fn remove_persisted_download_owned(
+        task_context: &TaskContext,
         persistence: Arc<DownloadPersistence>,
         download_id: String,
-        new_dest_dir: std::path::PathBuf,
-        new_model_type: Option<String>,
-        new_family: Option<String>,
-    ) -> Result<()> {
-        tokio::task::spawn_blocking(move || {
-            let mut persisted = persistence.load_all();
-            if let Some(entry) = persisted
-                .iter_mut()
-                .find(|entry| entry.download_id == download_id)
-            {
-                entry.dest_dir = new_dest_dir;
-                if let Some(model_type) = new_model_type {
-                    entry.download_request.model_type = Some(model_type);
-                }
-                if let Some(family) = new_family {
-                    entry.download_request.family = family;
-                }
-                persistence.save(entry)?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|err| {
-            PumasError::Other(format!("Failed to join persisted relocation task: {err}"))
-        })?
+    ) {
+        let _ = task_context
+            .run_fallible_blocking_named("remove persisted download", move || {
+                persistence.remove(&download_id)
+            })
+            .await;
+    }
+
+    async fn persisted_download_is_revoked(
+        persistence: Arc<DownloadPersistence>,
+        download_id: String,
+    ) -> Result<bool> {
+        tokio::task::spawn_blocking(move || persistence.is_revoked(&download_id))
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!(
+                    "Failed to join persisted recovery authority check: {error}"
+                ))
+            })?
     }
 
     /// Get download progress.
@@ -1758,28 +3958,270 @@ impl HuggingFaceClient {
 
     /// Cancel a download.
     pub async fn cancel_download(&self, download_id: &str) -> Result<bool> {
-        let mut downloads = self.downloads.write().await;
-        if let Some(state) = downloads.get_mut(download_id) {
-            state.cancel_flag.store(true, Ordering::Relaxed);
-            state.status = DownloadStatus::Cancelling;
-            state.speed = 0.0;
-            drop(downloads);
-            self.publish_download_snapshot().await;
-            self.abort_download_task(download_id);
-            // Remove from persistence -- cancelled downloads don't survive restart
-            if let Some(ref persistence) = self.persistence {
-                Self::remove_persisted_download(persistence.clone(), download_id.to_string()).await;
+        let finalizer = loop {
+            let mut download_states = self.downloads.write().await;
+            if let Some(mut completion) = self.download_tasks.relocation_completion(download_id) {
+                if !*completion.borrow() {
+                    drop(download_states);
+                    completion.wait_for(|settled| *settled).await.map_err(|_| {
+                        PumasError::Other("Download relocation did not settle".into())
+                    })?;
+                    continue;
+                }
             }
-            let mut downloads = self.downloads.write().await;
-            if let Some(state) = downloads.get_mut(download_id) {
-                state.status = DownloadStatus::Cancelled;
+            let Some(state) = download_states.get_mut(download_id) else {
+                return Ok(false);
+            };
+            if state.pending_relocation.is_some() {
+                return Err(PumasError::Other(
+                    "Download relocation requires reconciliation before cancellation".into(),
+                ));
             }
-            drop(downloads);
-            self.publish_download_snapshot().await;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+            if matches!(
+                state.status,
+                DownloadStatus::Completed | DownloadStatus::Cancelled
+            ) {
+                return Ok(false);
+            }
+            if state.status == DownloadStatus::Cancelling
+                && state.task_registered
+                && self
+                    .download_tasks
+                    .snapshot(download_id)
+                    .is_some_and(|task| {
+                        task.started && task.role == TaskRole::CancelFinalizer && !task.finished
+                    })
+            {
+                return Ok(true);
+            }
+
+            let worker_requires_terminal_projection = matches!(
+                state.status,
+                DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Pausing
+            );
+            let unverified_lifecycle_failure = state.lifecycle_failure_unverified;
+            let admission_attempt = state
+                .admission
+                .as_ref()
+                .map(|admission| admission.attempt_id.clone());
+            let cleanup_destination =
+                state
+                    .destination
+                    .clone()
+                    .ok_or_else(|| PumasError::Config {
+                        message: "Download cancellation authority is unavailable".into(),
+                    })?;
+            let cleanup_identity = cleanup_destination.identity();
+            let cleanup_domain = cleanup_destination.domain();
+            let cleanup_files = state
+                .files
+                .iter()
+                .map(|file| file.filename.clone())
+                .collect::<Vec<_>>();
+            let downloads = self.downloads.clone();
+            let download_publications = self.download_publications.clone();
+            let destination_executions = self.destination_executions.clone();
+            let persistence = self.persistence.clone();
+            let finalizer_id = download_id.to_string();
+            let cancellation_persistence = persistence.map(|store| CancellationPersistence {
+                store,
+                download_id: finalizer_id.clone(),
+                domain: match cleanup_domain {
+                    DestinationDomain::Ambient => LifecycleQuarantineDomain::Ambient,
+                    DestinationDomain::Recovery => LifecycleQuarantineDomain::Recovery,
+                },
+                admission_attempt,
+                revoked_snapshot: state.revoked_snapshot.clone(),
+            });
+            let transition = self.download_tasks.begin_cancel(
+                download_id,
+                move |task_context, predecessor| async move {
+                    use futures::FutureExt;
+
+                    if !destination_executions
+                        .wait_for_turn(
+                            &cleanup_destination.identity(),
+                            &finalizer_id,
+                            cleanup_domain,
+                            task_context.generation(),
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    let destination_identity = cleanup_destination.identity();
+                    let finalizer_generation = task_context.generation().clone();
+                    let finalizer_outcome = std::panic::AssertUnwindSafe(async {
+                        let predecessor_failed = matches!(
+                            &predecessor,
+                            CancelPredecessor::Observed(observation)
+                                if observation.role == TaskRole::CancelFinalizer
+                                    || (observation.role == TaskRole::Worker
+                                        && observation.outer_finished_before_replacement
+                                        && worker_requires_terminal_projection)
+                                    || observation.terminal == TaskTerminal::Panicked
+                                    || observation.nested_failures > 0
+                        );
+                        let quarantine = if let Some(persistence) = cancellation_persistence.as_ref() {
+                            let persistence = persistence.clone();
+                            task_context.run_fallible_blocking_named("quarantine download before cancellation", move || persistence.begin(unverified_lifecycle_failure || predecessor_failed)).await
+                                .map_err(|error| PumasError::Other(format!("Cancellation quarantine owner failed: {error}"))).and_then(|result| result)
+                        } else { Ok(None) };
+                        let quarantine_failed = quarantine.is_err();
+                        let quarantine = quarantine.ok().flatten();
+                        let already_verified = quarantine.as_ref().is_some_and(|quarantine| quarantine.disposition == LifecycleCleanupDisposition::Verified);
+                        let sticky_failure = unverified_lifecycle_failure || predecessor_failed || quarantine.as_ref().is_some_and(|quarantine| quarantine.sticky_failure);
+                        let mut filesystem_cleanup_failed = false;
+                        if !quarantine_failed && !already_verified {
+                        for filename in &cleanup_files {
+                            if cleanup_destination
+                                .remove_part(&task_context, filename)
+                                .await
+                                .is_err()
+                            {
+                                filesystem_cleanup_failed = true;
+                            }
+                        }
+                        if cleanup_destination
+                            .remove_marker(&task_context)
+                            .await
+                            .is_err()
+                        {
+                            filesystem_cleanup_failed = true;
+                        }
+                        }
+
+                        let effect_drain_failed = !matches!(task_context.drain_blocking().await, Ok(0));
+                        let persistence_cleanup_failed = if !quarantine_failed && !filesystem_cleanup_failed && !effect_drain_failed {
+                            if let Some(persistence) = cancellation_persistence.as_ref() {
+                                let persistence = persistence.clone();
+                                let quarantine = quarantine.clone();
+                                !matches!(
+                                    task_context
+                                        .run_fallible_blocking_named(
+                                            "remove persisted download during cancellation",
+                                            move || persistence.finish(quarantine.as_ref()),
+                                        )
+                                        .await,
+                                    Ok(Ok(()))
+                                )
+                            } else {
+                                false
+                            }
+                        } else {
+                            quarantine_failed
+                        };
+                        if quarantine.is_some() && (filesystem_cleanup_failed || effect_drain_failed || persistence_cleanup_failed) {
+                            if let Some(persistence) = cancellation_persistence.as_ref() {
+                                let persistence = persistence.clone();
+                                let _ = task_context.run_fallible_blocking_named("mark cancelled download cleanup failure", move || persistence.mark_failed()).await;
+                            }
+                        }
+                        // Join registered finalizer blocking work before exposing
+                        // Cancelled or releasing the recovery capability.
+                        let finalizer_drain = task_context.drain_blocking().await;
+                        let finalizer_failed = effect_drain_failed || !matches!(finalizer_drain, Ok(0));
+                        let cleanup_verified = !filesystem_cleanup_failed
+                            && !persistence_cleanup_failed
+                            && !finalizer_failed
+                            && !quarantine_failed;
+                        let failed = sticky_failure
+                            || filesystem_cleanup_failed
+                            || persistence_cleanup_failed
+                            || finalizer_failed;
+
+                        let projected = {
+                            let mut states = downloads.write().await;
+                            if let Some(state) = states.get_mut(&finalizer_id) {
+                                if state.status == DownloadStatus::Cancelling {
+                                    state.status = if failed {
+                                        DownloadStatus::Error
+                                    } else {
+                                        DownloadStatus::Cancelled
+                                    };
+                                    state.task_registered = false;
+                                    if failed {
+                                        state.lifecycle_failure_unverified = true;
+                                        state.error = Some(
+                                            "download cancellation could not verify terminal cleanup"
+                                                .to_string(),
+                                        );
+                                    } else {
+                                        state.destination = None;
+                                    }
+                                    Some(failed)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        let projected_failure = projected == Some(true);
+                        #[cfg(test)]
+                        if projected_failure {
+                            task_context.observe_projection("cancel-finalizer-error");
+                        }
+                        publish_download_snapshot_from_parts(&download_publications).await;
+                        let _ = task_context.complete_transferred_projection(projected_failure);
+                        // Lifecycle provenance is intentionally sticky: a retry
+                        // can verify idempotent cleanup and release destination
+                        // authority without rewriting Error to Cancelled.
+                        projected.is_some() && cleanup_verified
+                    })
+                    .catch_unwind()
+                    .await;
+
+                    match finalizer_outcome {
+                        Ok(true) => {
+                            destination_executions.release(
+                                &destination_identity,
+                                &finalizer_id,
+                                cleanup_domain,
+                                &finalizer_generation,
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }
+                },
+            );
+            let finalizer = match transition {
+                super::lifecycle::CancelTransition::Started(finalizer)
+                | super::lifecycle::CancelTransition::Existing(finalizer) => finalizer,
+                super::lifecycle::CancelTransition::AlreadyRunning => return Ok(true),
+                super::lifecycle::CancelTransition::Relocating(mut completion) => {
+                    drop(download_states);
+                    completion.wait_for(|settled| *settled).await.map_err(|_| {
+                        PumasError::Other("Download relocation did not settle".into())
+                    })?;
+                    continue;
+                }
+            };
+            let reservation_bound = self.destination_executions.reserve(
+                cleanup_identity,
+                download_id.to_string(),
+                cleanup_domain,
+                finalizer.generation().clone(),
+            );
+            if !reservation_bound {
+                drop(finalizer);
+                break None;
+            } else {
+                state.cancel_flag.store(true, Ordering::Relaxed);
+                state.status = DownloadStatus::Cancelling;
+                state.speed = 0.0;
+                state.task_registered = true;
+                break Some(finalizer);
+            }
+        };
+        let Some(finalizer) = finalizer else {
+            self.download_tasks.rescue_abandoned();
+            return Ok(false);
+        };
+        finalizer.start();
+        self.publish_download_snapshot().await;
+        Ok(true)
     }
 
     /// List all downloads (active, paused, completed, etc.).
@@ -1828,21 +4270,480 @@ impl HuggingFaceClient {
     }
 
     async fn publish_download_snapshot(&self) {
-        publish_download_snapshot_from_parts(
-            &self.downloads,
-            &self.download_revision,
-            &self.download_updates,
-        )
-        .await;
+        publish_download_snapshot_from_parts(&self.download_publications).await;
     }
 
     /// Find the download ID whose destination directory matches `dest_dir`.
     pub async fn find_download_id_by_dest_dir(&self, dest_dir: &Path) -> Option<String> {
+        let root = self.destination_root.clone()?;
+        let path = dest_dir.to_path_buf();
+        let destination = tokio::task::spawn_blocking(move || root.resolve(&path))
+            .await
+            .ok()?
+            .ok()?;
         let downloads = self.downloads.read().await;
         downloads
             .values()
-            .find(|state| state.dest_dir == dest_dir)
+            .find(|state| state.matches_destination(&destination.identity()))
             .map(|state| state.download_id.clone())
+    }
+
+    /// Atomically admit a producer-verified partial-download recovery.
+    ///
+    /// This is the sole mutation owner for recovery: it either attaches to an
+    /// exact tracked context, resumes that exact context, or inserts a new
+    /// exact-set task while holding the download-state write lock. It never
+    /// delegates to the generic destination-only dedupe path.
+    pub(crate) async fn admit_recovery_download(
+        &self,
+        verified: &VerifiedDownloadRecovery,
+        model_type: Option<String>,
+    ) -> Result<RecoveryDownloadAdmission> {
+        self.observe_finished_download_tasks().await;
+        let dest_dir = verified.destination.display_path();
+
+        let destination = verified.destination.clone();
+        let bound_files = verified.files.clone();
+        if self
+            .run_recovery_transition(move |task_context| async move {
+                recovery_filesystem_operation(
+                    &task_context,
+                    "recovery admission preflight",
+                    move || destination.preflight(&bound_files),
+                )
+                .await
+            })
+            .await
+            .is_err()
+        {
+            return Ok(RecoveryDownloadAdmission::CapabilityUnavailable);
+        }
+
+        let tree = self.get_repo_files(&verified.repo_id).await?;
+        let Some(files) = resolve_exact_recovery_files(&tree, &verified.files) else {
+            return Ok(RecoveryDownloadAdmission::BoundFilesUnavailable);
+        };
+        let Some((family, official_name)) = verified.repo_id.split_once('/') else {
+            return Ok(RecoveryDownloadAdmission::ContextMismatch);
+        };
+        let request = DownloadRequest {
+            repo_id: verified.repo_id.clone(),
+            family: family.to_string(),
+            official_name: official_name.to_string(),
+            model_type,
+            quant: None,
+            filename: None,
+            filenames: Some(verified.files.clone()),
+            pipeline_tag: None,
+            bundle_format: None,
+            pipeline_class: None,
+            release_date: None,
+            download_url: None,
+            model_card_json: None,
+            license_status: None,
+        };
+        let first_filename = files
+            .first()
+            .expect("verified recovery file set is nonempty")
+            .filename
+            .clone();
+        let total_bytes = match files
+            .iter()
+            .filter_map(|file| file.size)
+            .try_fold(0_u64, u64::checked_add)
+        {
+            Some(total) => (total > 0).then_some(total),
+            None => return Ok(RecoveryDownloadAdmission::BoundFilesUnavailable),
+        };
+        let known_sha256 = files
+            .iter()
+            .max_by_key(|file| file.size.unwrap_or(0))
+            .and_then(|file| file.sha256.clone());
+
+        let launch_plan = {
+            let downloads = self.downloads.read().await;
+            if downloads.values().any(|state| {
+                state.pending_relocation.as_ref().is_some_and(|pending| {
+                    state.matches_destination(&verified.destination.identity())
+                        || pending.target.identity() == verified.destination.identity()
+                })
+            }) {
+                return Ok(RecoveryDownloadAdmission::ContextMismatch);
+            }
+            match recovery_context(
+                &downloads,
+                &verified.destination.identity(),
+                &verified.repo_id,
+                &verified.files,
+            ) {
+                RecoveryContext::Exact { download_id, .. } => {
+                    let state = downloads
+                        .get(&download_id)
+                        .expect("recovery context was resolved from this map");
+                    let task = self.download_tasks.snapshot(&download_id);
+                    if let Some(admission) = admitted_existing_recovery(state, task.as_ref()) {
+                        return Ok(admission);
+                    }
+                    if !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error) {
+                        return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                    }
+                    RecoveryLaunchPlan::Existing { download_id }
+                }
+                RecoveryContext::Mismatch => {
+                    return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                }
+                RecoveryContext::Missing => RecoveryLaunchPlan::New {
+                    download_id: uuid::Uuid::new_v4().to_string(),
+                },
+            }
+        };
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let prepared_download = self
+            .prepare_download_task(
+                launch_plan.download_id().to_string(),
+                verified.repo_id.clone(),
+                files.clone(),
+                DownloadDestination::Recovery(verified.destination.clone()),
+                cancel_flag.clone(),
+                pause_flag.clone(),
+                None,
+                None,
+                None,
+                self.persistence.clone(),
+            )
+            .await;
+
+        if let RecoveryLaunchPlan::Existing { download_id } = &launch_plan {
+            let transition_download_id = download_id.clone();
+            let transition_repo_id = verified.repo_id.clone();
+            let transition_bound_files = verified.files.clone();
+            let transition_destination = verified.destination.clone();
+            let transition_files = files.clone();
+            let transition_first_filename = first_filename.clone();
+            let transition_request = request.clone();
+            let transition_known_sha256 = known_sha256.clone();
+            let transition_cancel_flag = cancel_flag.clone();
+            let transition_pause_flag = pause_flag.clone();
+            let downloads = self.downloads.clone();
+            let download_publications = self.download_publications.clone();
+            let destination_executions = self.destination_executions.clone();
+            let persistence = self.persistence.clone();
+            let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+            let prepared_transition = self.download_tasks.prepare(
+                download_id.clone(),
+                TaskRole::RecoveryTransition,
+                move |task_context| async move {
+                    let result = async {
+                        if let Some(persistence) = persistence {
+                            let persisted_id = transition_download_id.clone();
+                            let inspection_store = persistence.clone();
+                            let snapshot = task_context
+                                .run_fallible_blocking_named(
+                                    "capture persisted recovery snapshot",
+                                    move || {
+                                        Ok::<_, PumasError>(
+                                            inspection_store
+                                                .load_lifecycle_inventory_strict()?
+                                                .downloads
+                                                .into_iter()
+                                                .find(|snapshot| {
+                                                    snapshot.download_id == persisted_id
+                                                }),
+                                        )
+                                    },
+                                )
+                                .await
+                                .map_err(|error| {
+                                    PumasError::Other(format!(
+                                        "download recovery persistence task failed: {error}"
+                                    ))
+                                })??;
+                            {
+                                let mut states = downloads.write().await;
+                                if !task_context.is_current_role(TaskRole::RecoveryTransition) {
+                                    return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                                }
+                                let Some(state) = states.get_mut(&transition_download_id) else {
+                                    return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                                };
+                                if !state.matches_destination(&transition_destination.identity()) {
+                                    return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                                }
+                                if snapshot.is_some() {
+                                    state.revoked_snapshot = snapshot;
+                                }
+                            }
+                            let persisted_id = transition_download_id.clone();
+                            task_context
+                                .run_fallible_blocking_named(
+                                    "revoke persisted recovery authority",
+                                    move || persistence.revoke(&persisted_id),
+                                )
+                                .await
+                                .map_err(|error| {
+                                    PumasError::Other(format!(
+                                        "download recovery persistence task failed: {error}"
+                                    ))
+                                })??;
+                        }
+
+                        {
+                            let mut states = downloads.write().await;
+                            let exact = matches!(
+                                recovery_context(
+                                    &states,
+                                    &transition_destination.identity(),
+                                    &transition_repo_id,
+                                    &transition_bound_files,
+                                ),
+                                RecoveryContext::Exact {
+                                    download_id: current_id
+                                } if current_id == transition_download_id
+                            );
+                            let inactive =
+                                states.get(&transition_download_id).is_some_and(|state| {
+                                    state.pending_relocation.is_none()
+                                        && matches!(
+                                            state.status,
+                                            DownloadStatus::Paused | DownloadStatus::Error
+                                        )
+                                });
+                            if !exact || !inactive || !task_context.promote_role(TaskRole::Worker) {
+                                return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                            }
+                            let reservation_promoted = destination_executions.promote_domain(
+                                &transition_destination.identity(),
+                                &transition_download_id,
+                                DestinationDomain::Recovery,
+                                DestinationDomain::Recovery,
+                                task_context.generation(),
+                            ) || destination_executions.promote_domain(
+                                &transition_destination.identity(),
+                                &transition_download_id,
+                                DestinationDomain::Ambient,
+                                DestinationDomain::Recovery,
+                                task_context.generation(),
+                            );
+                            if !reservation_promoted {
+                                return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                            }
+                            let state = states
+                                .get_mut(&transition_download_id)
+                                .expect("exact recovery context remains present");
+                            state.pause_flag = transition_pause_flag;
+                            state.cancel_flag = transition_cancel_flag;
+                            state.status = DownloadStatus::Queued;
+                            state.error = None;
+                            state.speed = 0.0;
+                            state.retry_attempt = 0;
+                            state.retrying = false;
+                            state.next_retry_delay_seconds = None;
+                            state.task_registered = true;
+                            state.destination =
+                                Some(DownloadDestination::Recovery(transition_destination));
+                            state.filename = transition_first_filename;
+                            state.files = transition_files;
+                            state.files_completed = 0;
+                            state.total_bytes = total_bytes;
+                            state.download_request = Some(transition_request);
+                            state.known_sha256 = transition_known_sha256;
+                            state.huggingface_evidence = None;
+                        }
+                        publish_download_snapshot_from_parts(&download_publications).await;
+                        Ok(RecoveryDownloadAdmission::Resumed {
+                            download_id: transition_download_id.clone(),
+                        })
+                    }
+                    .await;
+
+                    let run_worker =
+                        matches!(&result, Ok(RecoveryDownloadAdmission::Resumed { .. }));
+                    let _ = result_sender.send(result);
+                    if run_worker {
+                        prepared_download.run_owned(task_context).await;
+                    }
+                },
+            );
+
+            let transition_install = {
+                let mut states = self.downloads.write().await;
+                let exact = matches!(
+                    recovery_context(&states, &verified.destination.identity(), &verified.repo_id, &verified.files),
+                    RecoveryContext::Exact {
+                        download_id: current_id
+                    } if current_id == *download_id
+                );
+                let inactive = states.get(download_id).is_some_and(|state| {
+                    state.pending_relocation.is_none()
+                        && matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                });
+                if exact && inactive {
+                    if let Ok(installed) = self.download_tasks.install_gated(prepared_transition) {
+                        let current_domain = if states
+                            .get(download_id)
+                            .is_some_and(|state| state.recovery_destination().is_some())
+                        {
+                            DestinationDomain::Recovery
+                        } else {
+                            DestinationDomain::Ambient
+                        };
+                        let reserved = self.destination_executions.reserve(
+                            verified.destination.identity(),
+                            download_id.clone(),
+                            current_domain,
+                            installed.generation().clone(),
+                        );
+                        if reserved {
+                            states
+                                .get_mut(download_id)
+                                .expect("exact recovery state remains present")
+                                .ambient_authority_blocked = true;
+                            let generation = installed.generation().clone();
+                            Some((generation, installed))
+                        } else {
+                            drop(installed);
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            let Some((transition_generation, installed_transition)) = transition_install else {
+                self.download_tasks.rescue_abandoned();
+                return Ok(RecoveryDownloadAdmission::ContextMismatch);
+            };
+            installed_transition.start();
+
+            let result = result_receiver.await.map_err(|_| {
+                PumasError::Other(
+                    "download recovery transition ended without a terminal result".to_string(),
+                )
+            })?;
+            if !matches!(&result, Ok(RecoveryDownloadAdmission::Resumed { .. })) {
+                while self
+                    .download_tasks
+                    .generation_is_current(download_id, &transition_generation)
+                {
+                    // Route the transition through the same owner-held
+                    // TerminalProjection as every other finished task. A
+                    // semantic revocation failure is archived by the nested
+                    // blocking owner and must not be discarded here.
+                    self.observe_finished_download_tasks().await;
+                    tokio::task::yield_now().await;
+                }
+            }
+            return result;
+        }
+
+        let RecoveryLaunchPlan::New { download_id } = launch_plan else {
+            unreachable!("existing recovery returned from its transition owner")
+        };
+        if let Some(persistence) = self.persistence.clone() {
+            let identity = verified.destination.identity().persisted();
+            let pending = tokio::task::spawn_blocking(move || -> Result<bool> {
+                Ok(persistence
+                    .load_lifecycle_inventory_strict()?
+                    .pending_relocations
+                    .values()
+                    .any(|pending| {
+                        pending.request.source == identity || pending.request.target == identity
+                    }))
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!("Recovery relocation inspection failed: {error}"))
+            })??;
+            if pending {
+                return Ok(RecoveryDownloadAdmission::ContextMismatch);
+            }
+        }
+        let prepared = prepared_download.prepare_owned(&self.download_tasks, TaskRole::Worker);
+        let installed = {
+            let mut downloads = self.downloads.write().await;
+            if downloads.values().any(|state| {
+                state.pending_relocation.as_ref().is_some_and(|pending| {
+                    state.matches_destination(&verified.destination.identity())
+                        || pending.target.identity() == verified.destination.identity()
+                })
+            }) {
+                return Ok(RecoveryDownloadAdmission::ContextMismatch);
+            }
+            if matches!(
+                recovery_context(
+                    &downloads,
+                    &verified.destination.identity(),
+                    &verified.repo_id,
+                    &verified.files
+                ),
+                RecoveryContext::Missing
+            ) {
+                if let Ok(installed) = self.download_tasks.install_gated(prepared) {
+                    if !self.destination_executions.reserve(
+                        verified.destination.identity(),
+                        download_id.clone(),
+                        DestinationDomain::Recovery,
+                        installed.generation().clone(),
+                    ) {
+                        drop(installed);
+                        drop(downloads);
+                        self.download_tasks.rescue_abandoned();
+                        return Ok(RecoveryDownloadAdmission::ContextMismatch);
+                    }
+                    downloads.insert(
+                        download_id.clone(),
+                        DownloadState {
+                            download_id: download_id.clone(),
+                            repo_id: verified.repo_id.clone(),
+                            status: DownloadStatus::Queued,
+                            progress: 0.0,
+                            downloaded_bytes: 0,
+                            total_bytes,
+                            speed: 0.0,
+                            cancel_flag,
+                            pause_flag,
+                            error: None,
+                            retry_attempt: 0,
+                            retry_limit: None,
+                            retrying: false,
+                            next_retry_delay_seconds: None,
+                            task_registered: true,
+                            lifecycle_failure_unverified: false,
+                            dest_dir: dest_dir.to_path_buf(),
+                            ambient_authority_blocked: true,
+                            admission: None,
+                            pending_relocation: None,
+                            revoked_snapshot: None,
+                            destination: Some(DownloadDestination::Recovery(
+                                verified.destination.clone(),
+                            )),
+                            filename: first_filename,
+                            files,
+                            files_completed: 0,
+                            download_request: Some(request),
+                            known_sha256,
+                            huggingface_evidence: None,
+                        },
+                    );
+                    Some(installed)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let Some(installed) = installed else {
+            self.download_tasks.rescue_abandoned();
+            return Ok(RecoveryDownloadAdmission::ContextMismatch);
+        };
+        installed.start();
+        self.publish_download_snapshot().await;
+        Ok(RecoveryDownloadAdmission::Recovered { download_id })
     }
 
     /// Get the current in-memory status for a download ID.
@@ -1853,8 +4754,10 @@ impl HuggingFaceClient {
 
     /// Relocate a tracked download destination directory.
     ///
-    /// Updates both in-memory state and persisted download metadata so resume
-    /// continues from the new path after migration/reclassification moves.
+    /// Owns the physical move, marker publication and persisted legacy metadata
+    /// update. Callers must not move first or roll back an uncertain result.
+    /// Only dormant legacy downloads are supported; admitted and recovery
+    /// destinations are refused before any filesystem effect.
     pub async fn relocate_download_destination(
         &self,
         download_id: &str,
@@ -1862,176 +4765,8337 @@ impl HuggingFaceClient {
         new_model_type: Option<&str>,
         new_family: Option<&str>,
     ) -> Result<bool> {
-        {
-            let mut downloads = self.downloads.write().await;
-            let Some(state) = downloads.get_mut(download_id) else {
-                return Ok(false);
-            };
-            state.dest_dir = new_dest_dir.to_path_buf();
-            if let Some(request) = state.download_request.as_mut() {
-                if let Some(model_type) = new_model_type {
-                    request.model_type = Some(model_type.to_string());
-                }
-                if let Some(family) = new_family {
-                    request.family = family.to_string();
+        self.relocate_download_destination_owned(
+            download_id,
+            None,
+            new_dest_dir,
+            new_model_type,
+            new_family,
+        )
+        .await
+    }
+
+    pub(crate) async fn relocate_download_destination_from(
+        &self,
+        download_id: &str,
+        expected_source: &Path,
+        new_dest_dir: &Path,
+        new_model_type: Option<&str>,
+        new_family: Option<&str>,
+    ) -> Result<bool> {
+        let root = self
+            .destination_root
+            .clone()
+            .ok_or_else(|| PumasError::Config {
+                message: "Download relocation root authority is unavailable".into(),
+            })?;
+        let expected_source = expected_source.to_path_buf();
+        let expected = tokio::task::spawn_blocking(move || {
+            root.resolve(&expected_source)
+                .map(|source| source.identity())
+        })
+        .await
+        .map_err(|error| {
+            PumasError::Other(format!(
+                "Download relocation source inspection failed: {error}"
+            ))
+        })??;
+        self.relocate_download_destination_owned(
+            download_id,
+            Some(expected),
+            new_dest_dir,
+            new_model_type,
+            new_family,
+        )
+        .await
+    }
+
+    pub(crate) async fn download_owner_for_move(
+        &self,
+        source_dir: &Path,
+    ) -> Result<Option<String>> {
+        let root = self
+            .destination_root
+            .clone()
+            .ok_or_else(|| PumasError::Config {
+                message: "Download relocation root authority is unavailable".into(),
+            })?;
+        let persistence = self.persistence.clone().ok_or_else(|| PumasError::Config {
+            message: "Download relocation persistence is unavailable".into(),
+        })?;
+        let source_dir = source_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let source = root.resolve(&source_dir)?.identity().persisted();
+            let inventory = persistence.load_lifecycle_inventory_strict()?;
+            if inventory
+                .pending_relocations
+                .values()
+                .any(|pending| pending.request.source == source || pending.request.target == source)
+            {
+                return Err(PumasError::Validation {
+                    field: "download_relocation".into(),
+                    message: "An unresolved relocation owns this destination".into(),
+                });
+            }
+            let mut owner = None;
+            for entry in inventory
+                .downloads
+                .iter()
+                .chain(inventory.quarantines.values().map(|entry| &entry.snapshot))
+                .chain(
+                    inventory
+                        .hidden_admissions
+                        .values()
+                        .map(|entry| &entry.request.snapshot),
+                )
+            {
+                if root.resolve(&entry.dest_dir)?.identity().persisted() == source {
+                    if owner.is_some() {
+                        return Err(PumasError::Validation {
+                            field: "download_relocation".into(),
+                            message: "Multiple downloads own this destination".into(),
+                        });
+                    }
+                    owner = Some(entry.download_id.clone());
                 }
             }
-        }
+            Ok(owner)
+        })
+        .await
+        .map_err(|error| {
+            PumasError::Other(format!(
+                "Failed to inspect migration download ownership: {error}"
+            ))
+        })?
+    }
 
-        if let Some(ref persistence) = self.persistence {
-            Self::relocate_persisted_download(
-                persistence.clone(),
+    async fn relocate_download_destination_owned(
+        &self,
+        download_id: &str,
+        expected_source: Option<crate::model_library::download_recovery::DestinationIdentity>,
+        new_dest_dir: &Path,
+        new_model_type: Option<&str>,
+        new_family: Option<&str>,
+    ) -> Result<bool> {
+        use futures::FutureExt;
+        self.observe_finished_download_tasks().await;
+        if self
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| task.role == TaskRole::RecoveryTransition)
+        {
+            return Ok(false);
+        }
+        if let Some(persistence) = self.persistence.clone() {
+            if Self::persisted_download_is_revoked(persistence, download_id.to_string()).await? {
+                return Ok(false);
+            }
+        }
+        #[cfg(test)]
+        self.download_tasks
+            .observe_ambient_admission("relocate", download_id);
+        let source = {
+            let downloads = self.downloads.read().await;
+            if self.download_tasks.contains(download_id) {
+                return Ok(false);
+            }
+            let Some(state) = downloads.get(download_id) else {
+                return Ok(false);
+            };
+            if expected_source
+                .as_ref()
+                .is_some_and(|expected| !state.matches_destination(expected))
+            {
+                return Ok(false);
+            }
+            if state.admission.is_some() {
+                return Err(PumasError::Other(
+                    "Queue-admitted download relocation is not supported".into(),
+                ));
+            }
+            if state.recovery_destination().is_some()
+                || state.ambient_authority_blocked
+                || state.pending_relocation.is_some()
+                || !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+            {
+                return Ok(false);
+            }
+            state
+                .destination
+                .as_ref()
+                .ok_or_else(|| PumasError::Config {
+                    message: "Download relocation source authority is unavailable".into(),
+                })?
+                .capability()
+                .clone()
+        };
+        let root = self
+            .destination_root
+            .clone()
+            .ok_or_else(|| PumasError::Config {
+                message: "Download relocation root authority is unavailable".into(),
+            })?;
+        let persistence = self.persistence.clone().ok_or_else(|| PumasError::Config {
+            message: "Download relocation persistence is unavailable".into(),
+        })?;
+        let target_path = new_dest_dir.to_path_buf();
+        let (target, expected, mut marker) = tokio::task::spawn_blocking({
+            let source = source.clone();
+            let persistence = persistence.clone();
+            let id = download_id.to_string();
+            move || -> Result<_> {
+                let target = root.resolve(&target_path)?;
+                source.preflight_move_to_absent(&target)?;
+                let marker = source.read_marker()?;
+                let inventory = persistence.load_lifecycle_inventory_strict()?;
+                for entry in inventory
+                    .downloads
+                    .iter()
+                    .chain(inventory.quarantines.values().map(|entry| &entry.snapshot))
+                    .chain(
+                        inventory
+                            .hidden_admissions
+                            .values()
+                            .map(|entry| &entry.request.snapshot),
+                    )
+                {
+                    if entry.download_id != id {
+                        let identity = root.resolve(&entry.dest_dir)?.identity();
+                        if identity == source.identity() || identity == target.identity() {
+                            return Err(PumasError::Validation {
+                                field: "download_relocation".into(),
+                                message:
+                                    "Another persisted download owns the relocation destination"
+                                        .into(),
+                            });
+                        }
+                    }
+                }
+                let expected = inventory
+                    .downloads
+                    .into_iter()
+                    .find(|entry| entry.download_id == id)
+                    .ok_or_else(|| PumasError::NotFound {
+                        resource: "persisted legacy download relocation source".into(),
+                    })?;
+                if root.resolve(&expected.dest_dir)?.identity() != source.identity() {
+                    return Err(PumasError::Other(
+                        "Persisted relocation source disagrees with held authority".into(),
+                    ));
+                }
+                Ok((target, expected, marker))
+            }
+        })
+        .await
+        .map_err(|error| {
+            PumasError::Other(format!(
+                "Download relocation preflight owner failed: {error}"
+            ))
+        })??;
+        let model_type = new_model_type.map(str::to_string);
+        let family = new_family.map(str::to_string);
+        if let Some(marker) = marker.as_mut() {
+            let object = marker
+                .as_object_mut()
+                .ok_or_else(|| PumasError::Validation {
+                    field: "download_marker".into(),
+                    message: "Expected a marker object".into(),
+                })?;
+            if let Some(model_type) = model_type.as_ref() {
+                object.insert("model_type".into(), model_type.clone().into());
+            }
+            if let Some(family) = family.as_ref() {
+                object.insert("family".into(), family.clone().into());
+                object.insert("architecture_family".into(), family.clone().into());
+            }
+        }
+        let request = LegacyRelocationRequest {
+            source: source.identity().persisted(),
+            target: target.identity().persisted(),
+            target_dir: target.display_path().to_path_buf(),
+            model_type: model_type.clone(),
+            family: family.clone(),
+        };
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let source_identity = source.identity();
+        let target_identity = target.identity();
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let (completed, completion) = tokio::sync::watch::channel(false);
+        let prepared =
+            self.download_tasks
+                .prepare(download_id.to_string(), TaskRole::RelocationTransition, {
+                    let states = self.downloads.clone();
+                    let publications = self.download_publications.clone();
+                    let queues = self.destination_executions.clone();
+                    let id = download_id.to_string();
+                    let attempt = attempt.clone();
+                    let target = target.clone();
+                    let source_identity = source_identity.clone();
+                    let target_identity = target_identity.clone();
+                    move |context| async move {
+                        let resolution = AssertUnwindSafe(execute_legacy_relocation(
+                            &context,
+                            PreparedLegacyRelocation {
+                                persistence,
+                                attempt: attempt.clone(),
+                                expected,
+                                request,
+                                source,
+                                target,
+                                marker,
+                            },
+                        ))
+                        .catch_unwind()
+                        .await;
+                        let mut resolution = match resolution {
+                            Ok(resolution) => resolution,
+                            Err(_) => RelocationResolution::Pending(
+                                PumasError::Other("Download relocation owner panicked".into()),
+                                None,
+                            ),
+                        };
+                        if !matches!(context.drain_blocking().await, Ok(0)) {
+                            let moved = match resolution {
+                                RelocationResolution::Moved(target)
+                                | RelocationResolution::Pending(_, Some(target)) => Some(target),
+                                _ => None,
+                            };
+                            resolution = RelocationResolution::Pending(
+                                PumasError::Other(
+                                    "Download relocation work did not drain successfully".into(),
+                                ),
+                                moved,
+                            );
+                        }
+                        let mut released = None;
+                        let result = {
+                            let mut states = states.write().await;
+                            let state = states.get_mut(&id).filter(|state| {
+                                context.is_current_role(TaskRole::RelocationTransition)
+                                    && state
+                                        .pending_relocation
+                                        .as_ref()
+                                        .is_some_and(|pending| pending.attempt_id == attempt)
+                            });
+                            if let Some(state) = state {
+                                state.task_registered = false;
+                                match resolution {
+                                    RelocationResolution::Original(error) => {
+                                        released = queues.release_deferred(
+                                            &target_identity,
+                                            &id,
+                                            DestinationDomain::Ambient,
+                                            context.generation(),
+                                        );
+                                        if released.is_some() {
+                                            state.pending_relocation = None;
+                                            state.ambient_authority_blocked = false;
+                                        } else {
+                                            state.status = DownloadStatus::Error;
+                                            state.lifecycle_failure_unverified = true;
+                                        }
+                                        Err(error)
+                                    }
+                                    RelocationResolution::Moved(destination) => {
+                                        state.dest_dir = destination.display_path().to_path_buf();
+                                        state.destination =
+                                            Some(DownloadDestination::Managed(destination.clone()));
+                                        if let Some(request) = state.download_request.as_mut() {
+                                            if let Some(model_type) = model_type {
+                                                request.model_type = Some(model_type);
+                                            }
+                                            if let Some(family) = family {
+                                                request.family = family;
+                                            }
+                                        }
+                                        released = queues.release_deferred(
+                                            &source_identity,
+                                            &id,
+                                            DestinationDomain::Ambient,
+                                            context.generation(),
+                                        );
+                                        if released.is_some() {
+                                            state.pending_relocation = None;
+                                            state.ambient_authority_blocked = false;
+                                            Ok(true)
+                                        } else {
+                                            state.status = DownloadStatus::Error;
+                                            state.lifecycle_failure_unverified = true;
+                                            Err(PumasError::Other(
+                                            "Relocated download source reservation did not settle"
+                                                .into(),
+                                        ))
+                                        }
+                                    }
+                                    RelocationResolution::Pending(error, moved) => {
+                                        if let (Some(pending), Some(moved)) =
+                                            (state.pending_relocation.as_mut(), moved)
+                                        {
+                                            pending.target = moved;
+                                        }
+                                        state.status = DownloadStatus::Error;
+                                        state.error = Some(
+                                            "Download relocation requires reconciliation".into(),
+                                        );
+                                        state.lifecycle_failure_unverified = true;
+                                        Err(error)
+                                    }
+                                }
+                            } else {
+                                Err(PumasError::Other(
+                                    "Download relocation lost its state owner".into(),
+                                ))
+                            }
+                        };
+                        publish_download_snapshot_from_parts(&publications).await;
+                        if let Some(released) = released {
+                            released.wake();
+                        }
+                        completed.send_replace(true);
+                        let _ = result_sender.send(result);
+                    }
+                });
+        let installed = {
+            let mut states = self.downloads.write().await;
+            let Some(state) = states.get_mut(download_id) else {
+                return Ok(false);
+            };
+            if self.download_tasks.contains(download_id)
+                || !state.matches_destination(&source_identity)
+                || state.admission.is_some()
+                || state.recovery_destination().is_some()
+                || state.pending_relocation.is_some()
+                || state.ambient_authority_blocked
+                || !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+            {
+                return Ok(false);
+            }
+            let installed = match self.download_tasks.install_gated(prepared) {
+                Ok(installed) => installed,
+                Err(_) => return Ok(false),
+            };
+            if !self.download_tasks.bind_relocation_completion(
+                download_id,
+                installed.generation(),
+                completion,
+            ) || !self.destination_executions.reserve_relocation(
+                source_identity,
+                target_identity,
                 download_id.to_string(),
-                new_dest_dir.to_path_buf(),
-                new_model_type.map(|value| value.to_string()),
-                new_family.map(|value| value.to_string()),
-            )
-            .await?;
-        }
-
-        self.publish_download_snapshot().await;
-        Ok(true)
+                installed.generation().clone(),
+            ) {
+                drop(installed);
+                drop(states);
+                self.download_tasks.rescue_abandoned();
+                return Err(PumasError::Other(
+                    "Download relocation destination is already owned".into(),
+                ));
+            }
+            state.pending_relocation = Some(super::types::PendingDownloadRelocation {
+                attempt_id: attempt,
+                target,
+            });
+            state.ambient_authority_blocked = true;
+            state.task_registered = true;
+            installed
+        };
+        installed.start();
+        result_receiver
+            .await
+            .map_err(|_| PumasError::Other("Download relocation result was unavailable".into()))?
     }
 
     /// Pause an active download. Preserves the `.part` file for later resume.
     pub async fn pause_download(&self, download_id: &str) -> Result<bool> {
-        let downloads = self.downloads.read().await;
-        if let Some(state) = downloads.get(download_id) {
-            if state.status == DownloadStatus::Downloading || state.status == DownloadStatus::Queued
-            {
-                state.pause_flag.store(true, Ordering::Relaxed);
-                drop(downloads);
-                // Set transitional Pausing status
-                let mut downloads = self.downloads.write().await;
-                if let Some(state) = downloads.get_mut(download_id) {
-                    state.status = DownloadStatus::Pausing;
-                }
-                drop(downloads);
-                self.publish_download_snapshot().await;
-                Ok(true)
-            } else {
-                Ok(false)
+        let paused = {
+            let mut downloads = self.downloads.write().await;
+            let current_worker = self
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| {
+                    task.role == TaskRole::Worker && task.started && !task.outer_finished
+                });
+            if !current_worker {
+                return Ok(false);
             }
-        } else {
-            Ok(false)
-        }
+            let Some(state) = downloads.get_mut(download_id) else {
+                return Ok(false);
+            };
+            if !matches!(
+                state.status,
+                DownloadStatus::Downloading | DownloadStatus::Queued
+            ) || state.files_completed >= state.files.len()
+            {
+                return Ok(false);
+            }
+            state.pause_flag.store(true, Ordering::Relaxed);
+            state.status = DownloadStatus::Pausing;
+            true
+        };
+        self.publish_download_snapshot().await;
+        Ok(paused)
     }
 
     /// Resume a paused or errored download from its `.part` file.
     pub async fn resume_download(&self, download_id: &str) -> Result<bool> {
-        self.prune_finished_download_tasks();
+        self.observe_finished_download_tasks().await;
+        if self
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| task.role == TaskRole::RecoveryTransition)
+        {
+            return Ok(false);
+        }
 
-        let (repo_id, files, dest_dir, cancel_flag, pause_flag) = {
-            let mut downloads = self.downloads.write().await;
-            let state = match downloads.get_mut(download_id) {
-                Some(s) => s,
-                None => return Ok(false),
+        let recovery_resume = {
+            let downloads = self.downloads.read().await;
+            downloads.get(download_id).and_then(|state| {
+                if matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error) {
+                    state.recovery_destination().cloned().map(|destination| {
+                        (state.repo_id.clone(), state.files.clone(), destination)
+                    })
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some((repo_id, files, recovery_destination)) = recovery_resume {
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let pause_flag = Arc::new(AtomicBool::new(false));
+            let prepared_download = self
+                .prepare_download_task(
+                    download_id.to_string(),
+                    repo_id.clone(),
+                    files.clone(),
+                    DownloadDestination::Recovery(recovery_destination.clone()),
+                    cancel_flag.clone(),
+                    pause_flag.clone(),
+                    None,
+                    None,
+                    None,
+                    self.persistence.clone(),
+                )
+                .await;
+            let installed = {
+                let mut downloads = self.downloads.write().await;
+                if let Some(state) = downloads.get_mut(download_id) {
+                    let same_files = state.files.len() == files.len()
+                        && state.files.iter().zip(&files).all(|(left, right)| {
+                            left.filename == right.filename
+                                && left.size == right.size
+                                && left.sha256 == right.sha256
+                        });
+                    let same_recovery = state.repo_id == repo_id
+                        && same_files
+                        && state.recovery_destination().is_some_and(|destination| {
+                            destination.identity() == recovery_destination.identity()
+                        });
+                    if matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                        && same_recovery
+                        && !self.download_tasks.contains(download_id)
+                    {
+                        let prepared =
+                            prepared_download.prepare_owned(&self.download_tasks, TaskRole::Worker);
+                        if let Ok(installed) = self.download_tasks.install_gated(prepared) {
+                            if !self.destination_executions.reserve(
+                                recovery_destination.identity(),
+                                download_id.to_string(),
+                                DestinationDomain::Recovery,
+                                installed.generation().clone(),
+                            ) {
+                                drop(installed);
+                                drop(downloads);
+                                self.download_tasks.rescue_abandoned();
+                                return Ok(false);
+                            }
+                            state.pause_flag = pause_flag;
+                            state.cancel_flag = cancel_flag;
+                            state.status = DownloadStatus::Queued;
+                            state.error = None;
+                            state.speed = 0.0;
+                            state.task_registered = true;
+                            Some(installed)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             };
+            let Some(installed) = installed else {
+                self.download_tasks.rescue_abandoned();
+                return Ok(false);
+            };
+            installed.start();
+            #[cfg(test)]
+            self.download_tasks
+                .observe_ambient_admission("resume-started", download_id);
+            self.publish_download_snapshot().await;
+            return Ok(true);
+        }
 
-            if state.status != DownloadStatus::Paused && state.status != DownloadStatus::Error {
+        if let Some(persistence) = self.persistence.clone() {
+            if Self::persisted_download_is_revoked(persistence, download_id.to_string()).await? {
                 return Ok(false);
             }
+        }
+        #[cfg(test)]
+        self.download_tasks
+            .observe_ambient_admission("resume", download_id);
 
-            // Reset flags and status for re-download
-            state.pause_flag.store(false, Ordering::Relaxed);
-            state.cancel_flag.store(false, Ordering::Relaxed);
-            state.status = DownloadStatus::Queued;
-            state.error = None;
-            state.speed = 0.0;
-
+        let (repo_id, files, admission, destination) = {
+            let downloads = self.downloads.read().await;
+            let Some(state) = downloads.get(download_id) else {
+                return Ok(false);
+            };
+            if state.ambient_authority_blocked
+                || !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                || state.recovery_destination().is_some()
+            {
+                return Ok(false);
+            }
             (
                 state.repo_id.clone(),
                 state.files.clone(),
-                state.dest_dir.clone(),
-                state.cancel_flag.clone(),
-                state.pause_flag.clone(),
+                state.admission.clone(),
+                state
+                    .destination
+                    .clone()
+                    .ok_or_else(|| PumasError::Config {
+                        message: "Download resume authority is unavailable".into(),
+                    })?,
             )
         };
-        self.publish_download_snapshot().await;
-
-        // Update persistence to Queued status
-        if let Some(ref persistence) = self.persistence {
-            Self::persist_status_update(
-                persistence.clone(),
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let mut prepared_download = self
+            .prepare_download_task(
                 download_id.to_string(),
-                DownloadStatus::Queued,
+                repo_id.clone(),
+                files.clone(),
+                destination.clone(),
+                cancel_flag.clone(),
+                pause_flag.clone(),
+                self.completion_callback.clone(),
+                self.aux_complete_callback.clone(),
+                self.persistence.clone(),
+                self.persistence.clone(),
             )
             .await;
-        }
-
-        // Re-spawn the download task
-        let client = self.download_client.clone();
-        let downloads = self.downloads.clone();
-        let download_revision = self.download_revision.clone();
-        let download_updates = self.download_updates.clone();
-        let download_id_clone = download_id.to_string();
-        let persistence = self.persistence.clone();
-        let completion_callback = self.completion_callback.clone();
-        let aux_complete_callback = self.aux_complete_callback.clone();
-        let auth_header = self.auth_header_value().await;
-        let dest_lock = self.destination_lock(&dest_dir).await;
-
-        let task_handle = tokio::spawn(async move {
-            let _destination_guard = dest_lock.lock().await;
-
-            let result = Self::run_download(
-                client,
-                downloads.clone(),
-                download_revision.clone(),
-                download_updates.clone(),
-                &download_id_clone,
-                &repo_id,
-                &files,
-                &dest_dir,
-                cancel_flag,
-                pause_flag,
-                persistence.clone(),
-                completion_callback,
-                aux_complete_callback,
-                auth_header,
-            )
-            .await;
-
-            if let Err(e) = result {
-                if matches!(e, PumasError::DownloadPaused) {
-                    info!("Download paused for {}", repo_id);
-                    return;
+        prepared_download.persist_queued_status = self.persistence.is_some();
+        let installed = {
+            let mut downloads = self.downloads.write().await;
+            let Some(state) = downloads.get_mut(download_id) else {
+                return Ok(false);
+            };
+            let same_files = state.files.len() == files.len()
+                && state.files.iter().zip(&files).all(|(left, right)| {
+                    left.filename == right.filename
+                        && left.size == right.size
+                        && left.sha256 == right.sha256
+                });
+            let same_context = state.repo_id == repo_id
+                && state.matches_destination(&destination.identity())
+                && state.admission.as_ref().map(|value| &value.attempt_id)
+                    == admission.as_ref().map(|value| &value.attempt_id)
+                && same_files
+                && state.recovery_destination().is_none();
+            if matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                && !state.ambient_authority_blocked
+                && same_context
+                && !self.download_tasks.contains(download_id)
+            {
+                let prepared =
+                    prepared_download.prepare_owned(&self.download_tasks, TaskRole::Worker);
+                match self.download_tasks.install_gated(prepared) {
+                    Ok(installed) => {
+                        if !self.destination_executions.reserve(
+                            destination.identity(),
+                            download_id.to_string(),
+                            DestinationDomain::Ambient,
+                            installed.generation().clone(),
+                        ) {
+                            drop(installed);
+                            drop(downloads);
+                            self.download_tasks.rescue_abandoned();
+                            return Ok(false);
+                        }
+                        state.pause_flag = pause_flag;
+                        state.cancel_flag = cancel_flag;
+                        state.status = DownloadStatus::Queued;
+                        state.error = None;
+                        state.speed = 0.0;
+                        state.task_registered = true;
+                        Some(installed)
+                    }
+                    Err(rejected) => {
+                        drop(rejected);
+                        None
+                    }
                 }
-                error!("Download failed for {}: {}", repo_id, e);
-                let mut download_states = downloads.write().await;
-                if let Some(state) = download_states.get_mut(&download_id_clone) {
-                    state.status = DownloadStatus::Error;
-                    state.error = Some(e.to_string());
-                }
-                drop(download_states);
-                publish_download_snapshot_from_parts(
-                    &downloads,
-                    &download_revision,
-                    &download_updates,
-                )
-                .await;
-                // Update persistence with error status
-                if let Some(ref persistence) = persistence {
-                    Self::persist_status_update(
-                        persistence.clone(),
-                        download_id_clone.clone(),
-                        DownloadStatus::Error,
-                    )
-                    .await;
-                }
+            } else {
+                None
             }
-        });
-        self.store_download_task(download_id.to_string(), task_handle);
-        self.mark_download_task_registered(download_id).await;
-
+        };
+        let Some(installed) = installed else {
+            self.download_tasks.rescue_abandoned();
+            return Ok(false);
+        };
+        installed.start();
+        #[cfg(test)]
+        self.download_tasks
+            .observe_ambient_admission("resume-started", download_id);
+        self.publish_download_snapshot().await;
         Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    fn destination_identity(
+        client: &HuggingFaceClient,
+        path: &Path,
+    ) -> crate::model_library::download_recovery::DestinationIdentity {
+        client
+            .destination_root
+            .as_ref()
+            .expect("fixture must configure its download root")
+            .resolve(path)
+            .unwrap()
+            .identity()
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restored_legacy_root_alias_blocks_a_canonical_successor() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("library");
+        let alias = temp.path().join("library-alias");
+        let destination = root.join("model");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        std::fs::write(destination.join("first.gguf.part"), b"old").unwrap();
+        // Stops an incorrectly admitted successor before any network access.
+        std::fs::create_dir(destination.join(".pumas_download")).unwrap();
+        let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+        client.configure_download_destination_root(&root).unwrap();
+        let legacy_id = uuid::Uuid::new_v4().to_string();
+        client
+            .persistence
+            .as_ref()
+            .unwrap()
+            .save(&PersistedDownload {
+                download_id: legacy_id.clone(),
+                repo_id: "acme/first".into(),
+                filename: "first.gguf".into(),
+                filenames: vec!["first.gguf".into()],
+                dest_dir: alias.join("model"),
+                total_bytes: Some(8),
+                status: DownloadStatus::Paused,
+                download_request: recovery_test_request("acme/first", &["first.gguf".into()]),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                known_sha256: None,
+                huggingface_evidence: None,
+            })
+            .unwrap();
+        client.restore_persisted_downloads().await.unwrap();
+        assert_eq!(
+            client.get_download_status(&legacy_id).await,
+            Some(DownloadStatus::Paused)
+        );
+        cache_repo_tree(
+            &client,
+            "acme/second",
+            vec![LfsFileInfo {
+                filename: "second.gguf".into(),
+                size: 8,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let (entered, entered_receiver) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered));
+        client
+            .download_tasks
+            .set_blocking_observer(Some(Arc::new(move |operation| {
+                if operation == "prepare ambient destination" {
+                    if let Some(sender) = entered.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                }
+            })));
+        let successor = client
+            .start_download(
+                &recovery_test_request("acme/second", &["second.gguf".into()]),
+                &destination,
+                None,
+            )
+            .await
+            .unwrap();
+        let bypassed = tokio::time::timeout(Duration::from_millis(250), entered_receiver)
+            .await
+            .is_ok();
+        client.download_tasks.set_blocking_observer(None);
+        assert!(
+            !bypassed,
+            "a supported root alias must not bypass the restored dormant owner"
+        );
+        assert_eq!(
+            client.get_download_status(&successor).await,
+            Some(DownloadStatus::Queued)
+        );
+        assert_eq!(
+            std::fs::read(destination.join("first.gguf.part")).unwrap(),
+            b"old"
+        );
+        std::fs::remove_dir(destination.join(".pumas_download")).unwrap();
+        // Known final bytes keep this queue-order oracle independent of HTTP.
+        std::fs::write(destination.join("second.gguf"), b"complete").unwrap();
+        assert!(client.cancel_download(&legacy_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_download_status(&legacy_id).await == Some(DownloadStatus::Cancelled)
+                    && client.get_download_status(&successor).await
+                        == Some(DownloadStatus::Completed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exact incumbent cancellation must release the canonical successor");
+        assert!(!destination.join("first.gguf.part").exists());
+    }
+    #[tokio::test]
+    async fn transferred_partial_survives_interrupted_response_and_fresh_owner_cancel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 4096, "fixture request exceeded header limit");
+                header.push(socket.read_u8().await.unwrap());
+            }
+            String::from_utf8(header).unwrap()
+        }
+        let temp = TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (interrupt, interrupted) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut socket)
+                .await
+                .starts_with("GET /acme/model/resolve/main/weights.gguf HTTP/1.1"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\npartial",
+                )
+                .await
+                .unwrap();
+            interrupted.await.unwrap();
+            socket.shutdown().await.unwrap();
+            drop(socket);
+            // A terminal HTTP refusal ends retries after the interrupted body.
+            let (mut retry, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut retry)
+                .await
+                .to_ascii_lowercase()
+                .contains("range: bytes=7-"));
+            retry
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            retry.shutdown().await.unwrap();
+        });
+        let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+        client.download_base_url = Some(format!("http://{address}"));
+        *client.auth_token.write().await = None;
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 12,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let destination = temp.path().join("library/model");
+        let id = client
+            .start_download(
+                &recovery_test_request("acme/model", &["weights.gguf".into()]),
+                &destination,
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client
+                    .list_downloads()
+                    .await
+                    .iter()
+                    .any(|entry| entry.download_id == id && entry.downloaded_bytes == Some(7))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        interrupt.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if client
+                    .list_downloads()
+                    .await
+                    .iter()
+                    .any(|entry| entry.download_id == id && entry.status == DownloadStatus::Error)
+                    && !client.download_tasks.contains(&id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("weights.gguf.part")).unwrap(),
+            b"partial"
+        );
+        assert!(!destination.join("weights.gguf").exists());
+        drop(client);
+        let restarted = configured_download_client(temp.path().join("cache")).unwrap();
+        assert!(restarted
+            .restore_persisted_downloads()
+            .await
+            .unwrap()
+            .is_empty());
+        let progress = restarted
+            .list_downloads()
+            .await
+            .into_iter()
+            .find(|entry| entry.download_id == id)
+            .unwrap();
+        assert_eq!(progress.downloaded_bytes, Some(7));
+        assert_eq!(progress.total_bytes, Some(12));
+        assert!(restarted.cancel_download(&id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if restarted.get_download_status(&id).await == Some(DownloadStatus::Cancelled) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!destination.join("weights.gguf.part").exists());
+        assert!(!destination.join(".pumas_download").exists());
+        drop(restarted);
+        let after_cancel = configured_download_client(temp.path().join("cache")).unwrap();
+        assert!(after_cancel
+            .restore_persisted_downloads()
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(after_cancel.list_downloads().await.is_empty());
+    }
+    #[tokio::test]
+    async fn admitted_error_resumes_with_exact_authority_before_and_after_restart() {
+        for restart in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+            let destination = temp.path().join("library/model");
+            std::fs::create_dir_all(destination.join(".pumas_download")).unwrap();
+            cache_repo_tree(
+                &client,
+                "acme/model",
+                vec![LfsFileInfo {
+                    filename: "weights.gguf".into(),
+                    size: 4,
+                    sha256: "a".repeat(64),
+                }],
+                Vec::new(),
+            );
+            let id = client
+                .start_download(
+                    &recovery_test_request("acme/model", &["weights.gguf".to_string()]),
+                    &destination,
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if client.list_downloads().await.iter().any(|entry| {
+                        entry.download_id == id && entry.status == DownloadStatus::Error
+                    }) && !client.download_tasks.contains(&id)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::remove_dir(destination.join(".pumas_download")).unwrap();
+            std::fs::write(destination.join("weights.gguf"), b"done").unwrap();
+            if restart {
+                drop(client);
+                client = configured_download_client(temp.path().join("cache")).unwrap();
+                client.restore_persisted_downloads().await.unwrap();
+            }
+            assert!(client.resume_download(&id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if client.list_downloads().await.iter().any(|entry| {
+                        entry.download_id == id && entry.status == DownloadStatus::Completed
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resuming an admitted request must use its exact persistence attempt");
+            assert!(!client
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_lifecycle_inventory_strict()
+                .unwrap()
+                .queue_admissions
+                .contains_key(&id));
+        }
+    }
+    #[tokio::test]
+    async fn admission_rechecks_hidden_predecessors_after_its_store_transaction() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        let destination = temp.path().join("library/model");
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let guard = client
+            .destination_lock(&destination_identity(&client, &destination))
+            .await
+            .lock_owned()
+            .await;
+        let (checked_sender, checked) = tokio::sync::oneshot::channel();
+        let checked_sender = std::sync::Mutex::new(Some(checked_sender));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = std::sync::Mutex::new(release);
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new(move |operation, _| {
+                if operation == "admission-inventory-checked" {
+                    if let Some(sender) = checked_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                }
+            })));
+        let start = tokio::spawn({
+            let client = client.clone();
+            let request = request.clone();
+            let destination = destination.clone();
+            async move { client.start_download(&request, &destination, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), checked)
+            .await
+            .unwrap()
+            .unwrap();
+        let independent_store = DownloadPersistence::new(temp.path());
+        let predecessor = DownloadAdmissionRequest {
+            snapshot: PersistedDownload {
+                download_id: uuid::Uuid::new_v4().to_string(),
+                repo_id: "acme/model".into(),
+                filename: "weights.gguf".into(),
+                filenames: vec!["weights.gguf".into()],
+                dest_dir: destination.clone(),
+                total_bytes: Some(4),
+                status: DownloadStatus::Queued,
+                download_request: request,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                known_sha256: Some("a".repeat(64)),
+                huggingface_evidence: None,
+            },
+            domain: DownloadAdmissionDomain::Ambient,
+            destination: client
+                .destination_root
+                .as_ref()
+                .unwrap()
+                .resolve(&destination)
+                .unwrap()
+                .identity()
+                .persisted(),
+            requested_payload_files: vec!["weights.gguf".into()],
+            execution_files: vec!["weights.gguf".into()],
+        };
+        assert!(matches!(
+            independent_store
+                .admit_download(&uuid::Uuid::new_v4().to_string(), &predecessor)
+                .unwrap(),
+            DownloadAdmissionTransition::Durable { .. }
+        ));
+        release_sender.send(()).unwrap();
+        let refused = start.await.unwrap().is_err();
+        assert!(
+            refused,
+            "a newly observed unresolved predecessor must block Worker promotion"
+        );
+        assert!(client.downloads.read().await.is_empty());
+        assert!(!destination.exists());
+        drop(guard);
+    }
+    #[test]
+    fn admitted_terminal_settlement_waits_for_effect_drain() {
+        for cancel in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+            cache_repo_tree(
+                &client,
+                "acme/model",
+                vec![LfsFileInfo {
+                    filename: "weights.gguf".into(),
+                    size: 4,
+                    sha256: "a".repeat(64),
+                }],
+                Vec::new(),
+            );
+            let destination = temp.path().join("library/model");
+            std::fs::create_dir_all(&destination).unwrap();
+            std::fs::write(destination.join("weights.gguf"), b"done").unwrap();
+            let (id_sender, id_receiver) = std::sync::mpsc::channel();
+            let (entered_sender, entered) = std::sync::mpsc::channel();
+            let entered_sender = std::sync::Mutex::new(Some(entered_sender));
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let release = std::sync::Mutex::new(release);
+            client
+                .download_tasks
+                .set_drain_observer(Some(Arc::new(move || {
+                    if let Some(sender) = entered_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                })));
+            let worker = std::thread::spawn({
+                let client = client.clone();
+                move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let physical_guard = client
+                                .destination_lock(&destination_identity(&client, &destination))
+                                .await
+                                .lock_owned()
+                                .await;
+                            let id = client
+                                .start_download(
+                                    &recovery_test_request(
+                                        "acme/model",
+                                        &["weights.gguf".to_string()],
+                                    ),
+                                    &destination,
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            id_sender.send(id.clone()).unwrap();
+                            if cancel {
+                                client.cancel_download(&id).await.unwrap();
+                            }
+                            drop(physical_guard);
+                            tokio::time::timeout(Duration::from_secs(2), async {
+                                loop {
+                                    if client.list_downloads().await.iter().any(|entry| {
+                                        entry.download_id == id
+                                            && entry.status
+                                                == if cancel {
+                                                    DownloadStatus::Cancelled
+                                                } else {
+                                                    DownloadStatus::Completed
+                                                }
+                                    }) {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                        })
+                }
+            });
+            let id = id_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            let still_owned = client
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_lifecycle_inventory_strict()
+                .unwrap()
+                .queue_admissions
+                .contains_key(&id);
+            release_sender.send(()).unwrap();
+            client.download_tasks.set_drain_observer(None);
+            worker.join().unwrap();
+            assert!(
+                still_owned,
+                "durable release must wait for effect drain for cancel={cancel}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn unconfigured_download_refuses_before_remote_or_destination_effects() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("missing");
+        assert!(matches!(
+            client.start_download(&request, &destination, None).await,
+            Err(PumasError::Config { .. })
+        ));
+        assert!(!destination.exists());
+        assert!(client.list_downloads().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_restore_inventory_is_an_error_and_preserves_store_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("downloads.json");
+        std::fs::write(&path, b"not-json").unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+        assert!(matches!(
+            client.restore_persisted_downloads().await,
+            Err(PumasError::Json { .. })
+        ));
+        assert!(client.list_downloads().await.is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), b"not-json");
+    }
+    fn configured_download_client(cache_dir: impl Into<PathBuf>) -> Result<HuggingFaceClient> {
+        let cache_dir = cache_dir.into();
+        let root = if cache_dir.file_name().is_some_and(|name| name == "cache") {
+            cache_dir.parent().unwrap().to_path_buf()
+        } else {
+            cache_dir.clone()
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        let mut client = HuggingFaceClient::new(cache_dir)?;
+        client.configure_download_destination_root(&root)?;
+        client.set_persistence(Arc::new(DownloadPersistence::new(&root)));
+        Ok(client)
+    }
+    #[tokio::test]
+    async fn admitted_download_survives_restart_and_cancels_with_exact_queue_settlement() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let library = temp.path().join("library");
+        let destination = library.join("model");
+        std::fs::create_dir_all(destination.join(".pumas_download")).unwrap();
+        std::fs::write(destination.join("weights.gguf.part"), b"x").unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+        client
+            .configure_download_destination_root(&library)
+            .unwrap();
+        client.set_persistence(persistence.clone());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let guard = client
+            .destination_lock(&destination_identity(&client, &destination))
+            .await
+            .lock_owned()
+            .await;
+        let id = client
+            .start_download(&request, &destination, None)
+            .await
+            .unwrap();
+        let inventory = persistence.load_lifecycle_inventory_strict().unwrap();
+        assert!(
+            inventory.queue_admissions.contains_key(&id),
+            "returned download ID must already have confirmed durable admission"
+        );
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client
+                    .list_downloads()
+                    .await
+                    .iter()
+                    .any(|entry| entry.download_id == id && entry.status == DownloadStatus::Error)
+                    && !client.download_tasks.contains(&id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(client);
+        std::fs::remove_dir(destination.join(".pumas_download")).unwrap();
+        let reopened = Arc::new(DownloadPersistence::new(temp.path()));
+        let mut restarted = configured_download_client(temp.path().join("cache")).unwrap();
+        restarted
+            .configure_download_destination_root(&library)
+            .unwrap();
+        restarted.set_persistence(reopened.clone());
+        restarted.restore_persisted_downloads().await.unwrap();
+        assert!(restarted
+            .list_downloads()
+            .await
+            .iter()
+            .any(|entry| entry.download_id == id));
+        assert!(restarted.cancel_download(&id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if restarted.list_downloads().await.iter().any(|entry| {
+                    entry.download_id == id && entry.status == DownloadStatus::Cancelled
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let inventory = reopened.load_lifecycle_inventory_strict().unwrap();
+        assert!(!inventory.queue_admissions.contains_key(&id));
+        assert!(!destination.join("weights.gguf.part").exists());
+    }
     use super::*;
+    use crate::model_library::{
+        issue_download_recovery_ticket, verify_download_recovery_ticket,
+        DownloadRecoveryVerification, LfsFileInfo, RepoFileTree,
+    };
+    use crate::ModelRecord;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::TempDir;
+
+    fn verified_recovery(
+        library_root: &Path,
+        repo_id: &str,
+        files: &[&str],
+    ) -> VerifiedDownloadRecovery {
+        let model_dir = library_root.join("llm/acme/model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let record = ModelRecord {
+            id: "llm/acme/model".to_string(),
+            path: model_dir.display().to_string(),
+            cleaned_name: "model".to_string(),
+            official_name: "Model".to_string(),
+            model_type: "llm".to_string(),
+            tags: Vec::new(),
+            hashes: HashMap::new(),
+            metadata: json!({
+                "download_incomplete": true,
+                "repo_id": repo_id,
+                "selected_artifact_files": files,
+            }),
+            updated_at: "2026-09-03T00:00:00Z".to_string(),
+        };
+        let ticket = issue_download_recovery_ticket(library_root, &record)
+            .unwrap()
+            .unwrap();
+        let token = crate::model_library::DownloadRecoveryToken::parse(ticket.token()).unwrap();
+        match verify_download_recovery_ticket(library_root, &record, &token).unwrap() {
+            DownloadRecoveryVerification::Verified(verified) => verified,
+            _ => panic!("recovery fixture must verify"),
+        }
+    }
+
+    fn cache_repo_tree(
+        client: &HuggingFaceClient,
+        repo_id: &str,
+        lfs_files: Vec<LfsFileInfo>,
+        regular_files: Vec<String>,
+    ) {
+        let tree = RepoFileTree {
+            repo_id: repo_id.to_string(),
+            lfs_files,
+            regular_files,
+            cached_at: chrono::Utc::now().to_rfc3339(),
+            last_modified: None,
+            cache_version: 2,
+        };
+        std::fs::write(
+            client.get_cache_path(repo_id, "files"),
+            serde_json::to_vec(&tree).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn recovery_test_request(repo_id: &str, files: &[String]) -> DownloadRequest {
+        let (family, official_name) = repo_id.split_once('/').unwrap();
+        DownloadRequest {
+            repo_id: repo_id.to_string(),
+            family: family.to_string(),
+            official_name: official_name.to_string(),
+            model_type: Some("llm".to_string()),
+            quant: None,
+            filename: None,
+            filenames: Some(files.to_vec()),
+            pipeline_tag: None,
+            bundle_format: None,
+            pipeline_class: None,
+            release_date: None,
+            download_url: None,
+            model_card_json: None,
+            license_status: None,
+        }
+    }
+
+    fn recovery_test_state(
+        verified: &VerifiedDownloadRecovery,
+        download_id: &str,
+        status: DownloadStatus,
+        task_registered: bool,
+    ) -> DownloadState {
+        let files = verified
+            .files
+            .iter()
+            .map(|filename| FileToDownload {
+                filename: filename.clone(),
+                size: Some(4),
+                sha256: None,
+            })
+            .collect::<Vec<_>>();
+        DownloadState {
+            download_id: download_id.to_string(),
+            repo_id: verified.repo_id.clone(),
+            status,
+            progress: 0.5,
+            downloaded_bytes: 2,
+            total_bytes: Some(4),
+            speed: 0.0,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            pause_flag: Arc::new(AtomicBool::new(false)),
+            error: None,
+            retry_attempt: 0,
+            retry_limit: None,
+            retrying: false,
+            next_retry_delay_seconds: None,
+            task_registered,
+            lifecycle_failure_unverified: false,
+            dest_dir: verified.destination.display_path().to_path_buf(),
+            ambient_authority_blocked: false,
+            admission: None,
+            pending_relocation: None,
+            revoked_snapshot: None,
+            destination: Some(DownloadDestination::Recovery(verified.destination.clone())),
+            filename: verified.files[0].clone(),
+            files,
+            files_completed: 0,
+            download_request: Some(recovery_test_request(&verified.repo_id, &verified.files)),
+            known_sha256: None,
+            huggingface_evidence: None,
+        }
+    }
+
+    fn persisted_recovery_test_state(state: &DownloadState) -> PersistedDownload {
+        PersistedDownload {
+            download_id: state.download_id.clone(),
+            repo_id: state.repo_id.clone(),
+            filename: state.filename.clone(),
+            filenames: state
+                .files
+                .iter()
+                .map(|file| file.filename.clone())
+                .collect(),
+            dest_dir: state.dest_dir.clone(),
+            total_bytes: state.total_bytes,
+            status: state.status,
+            download_request: state.download_request.clone().unwrap(),
+            created_at: "2026-09-03T00:00:00Z".to_string(),
+            known_sha256: None,
+            huggingface_evidence: None,
+        }
+    }
+
+    fn install_promotable_recovery_transition(
+        client: &Arc<HuggingFaceClient>,
+        download_id: &str,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (promote_sender, promote_receiver) = tokio::sync::oneshot::channel();
+        let (promoted_sender, promoted_receiver) = tokio::sync::oneshot::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::RecoveryTransition,
+            move |context| async move {
+                let _ = promote_receiver.await;
+                assert!(context.promote_role(TaskRole::Worker));
+                let _ = promoted_sender.send(());
+                std::future::pending::<()>().await;
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        (promote_sender, promoted_receiver)
+    }
+
+    #[tokio::test]
+    async fn ordinary_start_invalid_destination_is_refused_before_admission() {
+        let temp = TempDir::new().unwrap();
+        let client = configured_download_client(temp.path().join("cache")).unwrap();
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("not-a-directory");
+        std::fs::write(&destination, b"occupied").unwrap();
+
+        assert!(client
+            .start_download(&request, &destination, None)
+            .await
+            .is_err());
+        assert!(client.list_downloads().await.is_empty());
+        assert!(client.download_tasks.ids().is_empty());
+        assert_eq!(std::fs::read(destination).unwrap(), b"occupied");
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_destination_starts_commit_one_owner_and_one_id() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = Arc::new(recovery_test_request(
+            "acme/model",
+            &["weights.gguf".to_string()],
+        ));
+        let destination = temp.path().join("library").join("model");
+        let destination_guard = client
+            .destination_lock(&destination_identity(&client, &destination))
+            .await
+            .lock_owned()
+            .await;
+        let admissions = Arc::new(std::sync::Barrier::new(2));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let admissions = admissions.clone();
+                move |operation, _| {
+                    if operation == "prepare-download-task" {
+                        admissions.wait();
+                    }
+                }
+            })));
+
+        let start = |client: Arc<HuggingFaceClient>| {
+            let request = request.clone();
+            let destination = destination.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(client.start_download(&request, &destination, None))
+                    .unwrap()
+            })
+        };
+        let first = start(client.clone());
+        let second = start(client.clone());
+        let first_id = first.join().expect("first start should settle");
+        let second_id = second.join().expect("second start should settle");
+
+        assert_eq!(first_id, second_id);
+        let downloads = client.downloads.read().await;
+        assert_eq!(downloads.len(), 1);
+        let state = downloads.get(&first_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.task_registered);
+        drop(downloads);
+        assert!(client.download_tasks.contains(&first_id));
+
+        client.download_tasks.set_ambient_admission_observer(None);
+        drop(destination_guard);
+        assert!(client.cancel_download(&first_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_destination_owner_cannot_clean_the_incumbent() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        cache_repo_tree(
+            &client,
+            "acme/first",
+            vec![LfsFileInfo {
+                filename: "first.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        cache_repo_tree(
+            &client,
+            "acme/second",
+            vec![LfsFileInfo {
+                filename: "second.gguf".to_string(),
+                size: 4,
+                sha256: "b".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let first_request = recovery_test_request("acme/first", &["first.gguf".to_string()]);
+        let second_request = recovery_test_request("acme/second", &["second.gguf".to_string()]);
+        let destination = temp.path().join("library").join("shared-model");
+        std::fs::create_dir_all(&destination).unwrap();
+        let physical_guard = client
+            .destination_lock(&destination_identity(&client, &destination))
+            .await
+            .lock_owned()
+            .await;
+
+        let first_id = client
+            .start_download(&first_request, &destination, None)
+            .await
+            .unwrap();
+        let second_id = client
+            .start_download(&second_request, &destination, None)
+            .await
+            .unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&destination_identity(&client, &destination)),
+            2
+        );
+        std::fs::write(destination.join("first.gguf.part"), b"first").unwrap();
+        std::fs::write(destination.join("second.gguf.part"), b"second").unwrap();
+        std::fs::write(destination.join(".pumas_download"), b"incumbent").unwrap();
+
+        assert!(client.cancel_download(&second_id).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            client.downloads.read().await[&second_id].status,
+            DownloadStatus::Cancelling
+        );
+        assert_eq!(
+            std::fs::read(destination.join("first.gguf.part")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("second.gguf.part")).unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            std::fs::read(destination.join(".pumas_download")).unwrap(),
+            b"incumbent"
+        );
+
+        assert!(client.cancel_download(&first_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let states = client.downloads.read().await;
+                let terminal = [first_id.as_str(), second_id.as_str()].iter().all(|id| {
+                    states
+                        .get(*id)
+                        .is_some_and(|state| state.status == DownloadStatus::Cancelled)
+                });
+                drop(states);
+                if terminal
+                    && !client.download_tasks.contains(&first_id)
+                    && !client.download_tasks.contains(&second_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("incumbent cleanup must release the queued finalizer in FIFO order");
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&destination_identity(&client, &destination)),
+            0
+        );
+        assert!(!destination.join("first.gguf.part").exists());
+        assert!(!destination.join("second.gguf.part").exists());
+        assert!(!destination.join(".pumas_download").exists());
+        drop(physical_guard);
+    }
+
+    #[tokio::test]
+    async fn partial_overlap_gets_a_truthful_full_request_behind_the_incumbent() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![
+                LfsFileInfo {
+                    filename: "a.gguf".to_string(),
+                    size: 4,
+                    sha256: "a".repeat(64),
+                },
+                LfsFileInfo {
+                    filename: "b.gguf".to_string(),
+                    size: 8,
+                    sha256: "b".repeat(64),
+                },
+            ],
+            Vec::new(),
+        );
+        let first_request = recovery_test_request("acme/model", &["a.gguf".to_string()]);
+        let full_request =
+            recovery_test_request("acme/model", &["a.gguf".to_string(), "b.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        let physical_guard = client
+            .destination_lock(&destination_identity(&client, &destination))
+            .await
+            .lock_owned()
+            .await;
+
+        let first_id = client
+            .start_download(&first_request, &destination, None)
+            .await
+            .unwrap();
+        let full_id = client
+            .start_download(&full_request, &destination, None)
+            .await
+            .unwrap();
+        assert_ne!(first_id, full_id);
+        let states = client.downloads.read().await;
+        let full = &states[&full_id];
+        assert_eq!(
+            full.files
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.gguf", "b.gguf"]
+        );
+        assert_eq!(full.known_sha256.clone(), Some("b".repeat(64)));
+        assert_eq!(
+            full.download_request
+                .as_ref()
+                .and_then(|request| request.filenames.as_ref())
+                .cloned(),
+            Some(vec!["a.gguf".to_string(), "b.gguf".to_string()])
+        );
+        drop(states);
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&destination_identity(&client, &destination)),
+            2
+        );
+
+        assert!(client.cancel_download(&full_id).await.unwrap());
+        assert!(client.cancel_download(&first_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let states = client.downloads.read().await;
+                let terminal = [first_id.as_str(), full_id.as_str()].iter().all(|id| {
+                    states
+                        .get(*id)
+                        .is_some_and(|state| state.status == DownloadStatus::Cancelled)
+                });
+                drop(states);
+                if terminal {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&destination_identity(&client, &destination)),
+            0
+        );
+        drop(physical_guard);
+    }
+
+    #[tokio::test]
+    async fn ordinary_start_never_reuses_or_crosses_live_recovery_authority() {
+        for requested in [
+            vec!["a.gguf".to_string()],
+            vec!["a.gguf".to_string(), "b.gguf".to_string()],
+            vec!["b.gguf".to_string()],
+        ] {
+            let temp = TempDir::new().unwrap();
+            let library_root = temp.path().join("library");
+            std::fs::create_dir_all(&library_root).unwrap();
+            let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+            client
+                .configure_download_destination_root(&library_root)
+                .unwrap();
+            let client = Arc::new(client);
+            cache_repo_tree(
+                &client,
+                "acme/model",
+                vec![
+                    LfsFileInfo {
+                        filename: "a.gguf".to_string(),
+                        size: 4,
+                        sha256: "a".repeat(64),
+                    },
+                    LfsFileInfo {
+                        filename: "b.gguf".to_string(),
+                        size: 8,
+                        sha256: "b".repeat(64),
+                    },
+                ],
+                Vec::new(),
+            );
+            let verified = verified_recovery(&library_root, "acme/model", &["a.gguf"]);
+            let recovery_id = "held-recovery";
+            client.downloads.write().await.insert(
+                recovery_id.to_string(),
+                recovery_test_state(&verified, recovery_id, DownloadStatus::Paused, false),
+            );
+            let marker = verified.destination.display_path().join(".pumas_download");
+            std::fs::write(&marker, b"recovery-marker").unwrap();
+            let marker_before = std::fs::read(&marker).unwrap();
+            let request = recovery_test_request("acme/model", &requested);
+
+            let ordinary_id = client
+                .start_download(&request, verified.destination.display_path(), None)
+                .await
+                .unwrap();
+            assert_ne!(ordinary_id, recovery_id);
+            let states = client.downloads.read().await;
+            assert!(states[recovery_id].recovery_destination().is_some());
+            assert_eq!(states[recovery_id].status, DownloadStatus::Paused);
+            assert_eq!(states[&ordinary_id].status, DownloadStatus::Queued);
+            assert!(states[&ordinary_id].recovery_destination().is_none());
+            drop(states);
+            assert_eq!(
+                client
+                    .destination_executions
+                    .claim_count(&verified.destination.identity()),
+                2
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+            assert!(!verified
+                .destination
+                .display_path()
+                .join("b.gguf.part")
+                .exists());
+
+            assert!(client.cancel_download(&ordinary_id).await.unwrap());
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+            assert!(client.cancel_download(recovery_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    client.observe_finished_download_tasks().await;
+                    let states = client.downloads.read().await;
+                    let terminal = [recovery_id, ordinary_id.as_str()].iter().all(|id| {
+                        states
+                            .get(*id)
+                            .is_some_and(|state| state.status == DownloadStatus::Cancelled)
+                    });
+                    drop(states);
+                    if terminal {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("recovery cleanup must release the queued Ambient finalizer");
+            assert_eq!(
+                client
+                    .destination_executions
+                    .claim_count(&verified.destination.identity()),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn incumbent_disappearance_cannot_return_a_stale_id_or_drop_overlap_files() {
+        for second_files in [
+            vec!["a.gguf".to_string()],
+            vec!["a.gguf".to_string(), "b.gguf".to_string()],
+        ] {
+            let temp = TempDir::new().unwrap();
+            let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+            cache_repo_tree(
+                &client,
+                "acme/model",
+                vec![
+                    LfsFileInfo {
+                        filename: "a.gguf".to_string(),
+                        size: 4,
+                        sha256: "a".repeat(64),
+                    },
+                    LfsFileInfo {
+                        filename: "b.gguf".to_string(),
+                        size: 8,
+                        sha256: "b".repeat(64),
+                    },
+                ],
+                Vec::new(),
+            );
+            let destination = temp.path().join("library").join("model");
+            let physical_guard = client
+                .destination_lock(&destination_identity(&client, &destination))
+                .await
+                .lock_owned()
+                .await;
+            let first_request = recovery_test_request("acme/model", &["a.gguf".to_string()]);
+            let first_id = client
+                .start_download(&first_request, &destination, None)
+                .await
+                .unwrap();
+
+            let (scanned_sender, scanned) = std::sync::mpsc::channel();
+            let scanned_sender = Arc::new(std::sync::Mutex::new(Some(scanned_sender)));
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let release = Arc::new(std::sync::Mutex::new(release));
+            client
+                .download_tasks
+                .set_ambient_admission_observer(Some(Arc::new({
+                    let scanned_sender = scanned_sender.clone();
+                    let release = release.clone();
+                    move |operation, _| {
+                        if operation == "prepare-download-task" {
+                            if let Some(sender) = scanned_sender.lock().unwrap().take() {
+                                sender.send(()).unwrap();
+                                release.lock().unwrap().recv().unwrap();
+                            }
+                        }
+                    }
+                })));
+            let expected_second_files = second_files.clone();
+            let (second_id_sender, second_id_receiver) = std::sync::mpsc::channel();
+            let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+            let second = std::thread::spawn({
+                let client = client.clone();
+                let destination = destination.clone();
+                move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let second_id = client
+                                .start_download(
+                                    &recovery_test_request("acme/model", &second_files),
+                                    &destination,
+                                    None,
+                                )
+                                .await
+                                .unwrap();
+                            second_id_sender.send(second_id).unwrap();
+                            let _ = shutdown_receiver.await;
+                        });
+                }
+            });
+            scanned
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second admission must pause before its exact commit");
+            assert!(client.cancel_download(&first_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while client.downloads.read().await[&first_id].status != DownloadStatus::Cancelled {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            release_sender.send(()).unwrap();
+            let second_id = second_id_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second admission must return its new ID");
+            assert_ne!(second_id, first_id);
+            let states = client.downloads.read().await;
+            assert_eq!(
+                states[&second_id]
+                    .files
+                    .iter()
+                    .map(|file| file.filename.clone())
+                    .collect::<Vec<_>>(),
+                expected_second_files
+            );
+            drop(states);
+            client.download_tasks.set_ambient_admission_observer(None);
+            assert!(client.cancel_download(&second_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while client.downloads.read().await[&second_id].status != DownloadStatus::Cancelled
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                client
+                    .destination_executions
+                    .claim_count(&destination_identity(&client, &destination)),
+                0
+            );
+            let _ = shutdown_sender.send(());
+            second.join().unwrap();
+            drop(physical_guard);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_start_install_collision_never_commits_state_or_starts_rejected_work() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        let collided_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        let owner = client.download_tasks.clone();
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let collided_id = collided_id.clone();
+                move |operation, download_id| {
+                    if operation == "prepare-download-task" {
+                        *collided_id.lock().unwrap() = Some(download_id.to_string());
+                        let collision = owner.prepare(
+                            download_id.to_string(),
+                            TaskRole::RecoveryTransition,
+                            |_| async {},
+                        );
+                        owner.install_gated(collision).unwrap().start();
+                    }
+                }
+            })));
+        let rejected_work_started = Arc::new(AtomicBool::new(false));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let rejected_work_started = rejected_work_started.clone();
+            move |operation| {
+                if operation == "prepare ambient destination" {
+                    rejected_work_started.store(true, Ordering::SeqCst);
+                }
+            }
+        })));
+
+        assert!(client
+            .start_download(&request, &destination, None)
+            .await
+            .is_err());
+        let collided_id = collided_id.lock().unwrap().clone().unwrap();
+        assert!(!client.downloads.read().await.contains_key(&collided_id));
+        assert!(!rejected_work_started.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.download_tasks.contains(&collided_id) {
+                client.observe_finished_download_tasks().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("collision owner and rejected prepared task must both settle");
+        client.download_tasks.set_ambient_admission_observer(None);
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn cancelling_start_caller_after_commit_cannot_detach_the_started_worker() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        let destination_guard = client
+            .destination_lock(&destination_identity(&client, &destination))
+            .await
+            .lock_owned()
+            .await;
+        let publication_guard = client.download_publications.capture.lock().await;
+        let (committed_sender, committed_receiver) = tokio::sync::oneshot::channel();
+        let committed_sender = Arc::new(std::sync::Mutex::new(Some(committed_sender)));
+        let committed_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let committed_sender = committed_sender.clone();
+                let committed_id = committed_id.clone();
+                move |operation, download_id| {
+                    if operation == "ordinary-start-started" {
+                        *committed_id.lock().unwrap() = Some(download_id.to_string());
+                        if let Some(sender) = committed_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                    }
+                }
+            })));
+
+        let start = {
+            let client = client.clone();
+            let destination = destination.clone();
+            tokio::spawn(async move { client.start_download(&request, &destination, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), committed_receiver)
+            .await
+            .expect("start should synchronously start its committed owner")
+            .unwrap();
+        start.abort();
+        let _ = start.await;
+        drop(publication_guard);
+
+        let download_id = committed_id.lock().unwrap().clone().unwrap();
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(&download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.task_registered);
+        drop(downloads);
+        assert!(client
+            .download_tasks
+            .snapshot(&download_id)
+            .is_some_and(|task| {
+                task.role == TaskRole::Worker && task.started && !task.outer_finished
+            }));
+
+        client.download_tasks.set_ambient_admission_observer(None);
+        drop(destination_guard);
+        assert!(client.cancel_download(&download_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelling_start_caller_before_commit_leaves_no_state_or_owner() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        let (preparing_sender, preparing_receiver) = tokio::sync::oneshot::channel();
+        let preparing_sender = Arc::new(std::sync::Mutex::new(Some(preparing_sender)));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let preparing_sender = preparing_sender.clone();
+                move |operation, _| {
+                    if operation == "prepare-download-task" {
+                        if let Some(sender) = preparing_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                    }
+                }
+            })));
+        let auth_guard = client.auth_token.write().await;
+        let start = {
+            let client = client.clone();
+            tokio::spawn(async move { client.start_download(&request, &destination, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), preparing_receiver)
+            .await
+            .expect("start should reach cancellable pre-admission auth preparation")
+            .unwrap();
+        assert!(client.downloads.read().await.is_empty());
+        assert!(client.download_tasks.ids().is_empty());
+        start.abort();
+        let _ = start.await;
+        drop(auth_guard);
+        assert!(client.downloads.read().await.is_empty());
+        assert!(client.download_tasks.ids().is_empty());
+        client.download_tasks.set_ambient_admission_observer(None);
+    }
+
+    #[tokio::test]
+    async fn failing_initial_persistence_is_owned_and_never_publishes_a_marker_or_live_row() {
+        let temp = TempDir::new().unwrap();
+        let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        let (save_started_sender, save_started) = tokio::sync::oneshot::channel();
+        let save_started_sender = Arc::new(std::sync::Mutex::new(Some(save_started_sender)));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = Arc::new(std::sync::Mutex::new(Some(release_receiver)));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let save_started_sender = save_started_sender.clone();
+            let release_receiver = release_receiver.clone();
+            move |operation| {
+                if operation == "durably admit download" {
+                    if let Some(sender) = save_started_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        release_receiver
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .recv()
+                            .unwrap();
+                    }
+                }
+            }
+        })));
+
+        let client = Arc::new(client);
+        let start = tokio::spawn({
+            let client = client.clone();
+            let destination = destination.clone();
+            async move { client.start_download(&request, &destination, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), save_started)
+            .await
+            .expect("owned admission should reach persistence before returning")
+            .unwrap();
+        assert!(!start.is_finished());
+        assert!(client.downloads.read().await.is_empty());
+        assert_eq!(client.download_tasks.ids().len(), 1);
+        assert!(!destination.join(".pumas_download").exists());
+        let store_path = temp.path().join("downloads.json");
+        std::fs::write(&store_path, b"not-json").unwrap();
+        release_sender.send(()).unwrap();
+        assert!(matches!(start.await.unwrap(), Err(PumasError::Json { .. })));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                if client.download_tasks.ids().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed admission must settle without a public active state");
+        assert!(client.downloads.read().await.is_empty());
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&destination_identity(&client, &destination)),
+            0
+        );
+        assert!(!destination.join(".pumas_download").exists());
+        std::fs::remove_file(store_path).unwrap();
+        assert!(persistence.load_all().is_empty());
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn marker_creation_failure_persists_error_before_terminal_publication() {
+        let temp = TempDir::new().unwrap();
+        let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        std::fs::create_dir_all(destination.join(".pumas_download")).unwrap();
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        client.set_completion_callback(Arc::new({
+            let callback_count = callback_count.clone();
+            move |_| {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let client = Arc::new(client);
+
+        let (persist_started_sender, persist_started) = tokio::sync::oneshot::channel();
+        let persist_started_sender = Arc::new(std::sync::Mutex::new(Some(persist_started_sender)));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = Arc::new(std::sync::Mutex::new(Some(release_receiver)));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let persist_started_sender = persist_started_sender.clone();
+            let release_receiver = release_receiver.clone();
+            move |operation| {
+                if operation == "persist download status" {
+                    if let Some(sender) = persist_started_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        release_receiver
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .recv()
+                            .unwrap();
+                    }
+                }
+            }
+        })));
+        let mut updates = client.subscribe_download_updates();
+
+        let download_id = client
+            .start_download(&request, &destination, None)
+            .await
+            .expect("marker creation failure occurs in admitted work");
+        tokio::time::timeout(Duration::from_secs(1), persist_started)
+            .await
+            .expect("terminal Error persistence must be owner-registered")
+            .unwrap();
+        let state = client.downloads.read().await;
+        assert!(matches!(
+            state[&download_id].status,
+            DownloadStatus::Queued | DownloadStatus::Downloading
+        ));
+        assert!(state[&download_id].task_registered);
+        drop(state);
+        while let Ok(notification) = updates.try_recv() {
+            assert!(!notification.snapshot.downloads.iter().any(|download| {
+                download.download_id == download_id && download.status == DownloadStatus::Error
+            }));
+        }
+        assert_eq!(persistence.load_all()[0].status, DownloadStatus::Queued);
+
+        release_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let state = client.downloads.read().await;
+                let settled = state.get(&download_id).is_some_and(|state| {
+                    state.status == DownloadStatus::Error && !state.task_registered
+                });
+                drop(state);
+                if settled && !client.download_tasks.contains(&download_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("marker failure must settle only after Error persistence");
+        assert_eq!(persistence.load_all()[0].status, DownloadStatus::Error);
+        assert!(destination.join(".pumas_download").is_dir());
+        assert!(!destination.join("weights.gguf.part").exists());
+        assert_eq!(callback_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&destination_identity(&client, &destination)),
+            1
+        );
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn missing_resume_row_fails_closed_without_late_queued_persistence() {
+        let temp = TempDir::new().unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
+        let library_root = temp.path().join("library");
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "ambient-resume-missing-row";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (persist_started_sender, persist_started) = tokio::sync::oneshot::channel();
+        let persist_started_sender = Arc::new(std::sync::Mutex::new(Some(persist_started_sender)));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = Arc::new(std::sync::Mutex::new(Some(release_receiver)));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let persist_started_sender = persist_started_sender.clone();
+            let release_receiver = release_receiver.clone();
+            move |operation| {
+                if operation == "persist admitted download resume" {
+                    if let Some(sender) = persist_started_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        release_receiver
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .recv()
+                            .unwrap();
+                    }
+                }
+            }
+        })));
+
+        assert!(client.resume_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(1), persist_started)
+            .await
+            .expect("resumed Worker must own the Queued persistence update")
+            .unwrap();
+        persistence.remove(download_id).unwrap();
+        release_sender.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let state = client.downloads.read().await;
+                let settled = state.get(download_id).is_some_and(|state| {
+                    state.status == DownloadStatus::Error
+                        && state.lifecycle_failure_unverified
+                        && !state.task_registered
+                });
+                drop(state);
+                if settled && !client.download_tasks.contains(download_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("missing resume row must settle sticky Error");
+        assert!(persistence.load_all().is_empty());
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&verified.destination.identity()),
+            1,
+            "unverified Error must park its destination reservation"
+        );
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn ordinary_worker_panic_is_observed_and_projects_sticky_error() {
+        let temp = TempDir::new().unwrap();
+        let client = configured_download_client(temp.path().join("cache")).unwrap();
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        client
+            .download_tasks
+            .set_worker_projection_observer(Some(Arc::new(|projection| {
+                if projection == "worker-entry" {
+                    panic!("ordinary Worker panic sentinel");
+                }
+            })));
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        let download_id = client
+            .start_download(&request, &destination, None)
+            .await
+            .expect("the Worker panic occurs after atomic admission");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let failed = client
+                    .downloads
+                    .read()
+                    .await
+                    .get(&download_id)
+                    .is_some_and(|state| {
+                        state.status == DownloadStatus::Error
+                            && state.lifecycle_failure_unverified
+                            && !state.task_registered
+                    });
+                if failed && !client.download_tasks.contains(&download_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panicked ordinary Worker must settle through terminal projection");
+        assert!(!destination.exists());
+        client.download_tasks.set_worker_projection_observer(None);
+    }
+
+    #[tokio::test]
+    async fn ordinary_start_aux_callback_panic_is_owned_once_and_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let mut client = configured_download_client(temp.path().join("cache")).unwrap();
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let callback_count = Arc::new(AtomicU64::new(0));
+        client.set_aux_complete_callback(Arc::new({
+            let callback_count = callback_count.clone();
+            move |_| {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+                panic!("ordinary auxiliary callback panic sentinel");
+            }
+        }));
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let destination = temp.path().join("library").join("model");
+        let download_id = client
+            .start_download(&request, &destination, None)
+            .await
+            .expect("callback belongs to the admitted Worker");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let failed = client
+                    .downloads
+                    .read()
+                    .await
+                    .get(&download_id)
+                    .is_some_and(|state| {
+                        state.status == DownloadStatus::Error
+                            && state.lifecycle_failure_unverified
+                            && !state.task_registered
+                    });
+                if failed && !client.download_tasks.contains(&download_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("auxiliary callback panic must settle sticky Error");
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+        assert!(!destination.join("weights.gguf.part").exists());
+    }
+
+    #[test]
+    fn exact_recovery_selection_requires_every_bound_file_and_never_adds_auxiliary_files() {
+        let tree = RepoFileTree {
+            repo_id: "acme/model".to_string(),
+            lfs_files: vec![LfsFileInfo {
+                filename: "weights-1.gguf".to_string(),
+                size: 10,
+                sha256: "a".repeat(64),
+            }],
+            regular_files: vec!["config.json".to_string()],
+            cached_at: "2026-09-03T00:00:00Z".to_string(),
+            last_modified: None,
+            cache_version: 2,
+        };
+
+        assert!(resolve_exact_recovery_files(
+            &tree,
+            &["weights-1.gguf".to_string(), "weights-2.gguf".to_string()]
+        )
+        .is_none());
+        let files = resolve_exact_recovery_files(&tree, &["weights-1.gguf".to_string()])
+            .expect("the complete bound set is available");
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["weights-1.gguf"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_refuses_an_incomplete_remote_set_without_task_or_target_write() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let cache = temp.path().join("cache");
+        let client = HuggingFaceClient::new(&cache).unwrap();
+        let verified = verified_recovery(
+            &library_root,
+            "acme/model",
+            &["weights-1.gguf", "weights-2.gguf"],
+        );
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights-1.gguf".to_string(),
+                size: 10,
+                sha256: "a".repeat(64),
+            }],
+            vec!["config.json".to_string()],
+        );
+
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::BoundFilesUnavailable
+        ));
+        assert!(client.downloads.read().await.is_empty());
+        assert!(client.download_tasks.is_empty());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join(".pumas_download")
+            .exists());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join("weights-1.gguf.part")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_refuses_remote_size_overflow_without_task_or_target_write() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let cache = temp.path().join("cache");
+        let client = HuggingFaceClient::new(&cache).unwrap();
+        let verified = verified_recovery(
+            &library_root,
+            "acme/model",
+            &["weights-1.gguf", "weights-2.gguf"],
+        );
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![
+                LfsFileInfo {
+                    filename: "weights-1.gguf".to_string(),
+                    size: u64::MAX,
+                    sha256: "a".repeat(64),
+                },
+                LfsFileInfo {
+                    filename: "weights-2.gguf".to_string(),
+                    size: 1,
+                    sha256: "b".repeat(64),
+                },
+            ],
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::BoundFilesUnavailable
+        ));
+        assert!(client.downloads.read().await.is_empty());
+        assert!(client.download_tasks.is_empty());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join(".pumas_download")
+            .exists());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join("weights-1.gguf.part")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_unrelated_recovery_context_cannot_attach_or_filter() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let first = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let second = verified_recovery(&library_root, "other/model", &["other.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 10,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        cache_repo_tree(
+            &client,
+            "other/model",
+            vec![LfsFileInfo {
+                filename: "other.gguf".to_string(),
+                size: 10,
+                sha256: "b".repeat(64),
+            }],
+            Vec::new(),
+        );
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let run = |verified: VerifiedDownloadRecovery| {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                client
+                    .admit_recovery_download(&verified, Some("llm".to_string()))
+                    .await
+                    .unwrap()
+            })
+        };
+        let first_task = run(first);
+        let second_task = run(second);
+        barrier.wait().await;
+        let outcomes = [first_task.await.unwrap(), second_task.await.unwrap()];
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RecoveryDownloadAdmission::Recovered { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, RecoveryDownloadAdmission::ContextMismatch))
+                .count(),
+            1
+        );
+        assert_eq!(client.downloads.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_atomically_registers_task_with_held_capability() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let destination_guard = destination_lock.lock().await;
+
+        let download_id = match client
+            .admit_recovery_download(&verified, Some("llm".to_string()))
+            .await
+            .unwrap()
+        {
+            RecoveryDownloadAdmission::Recovered { download_id } => download_id,
+            _ => panic!("new recovery must be admitted"),
+        };
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(&download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.recovery_destination().is_some());
+        assert!(state.task_registered);
+        assert!(client.download_tasks.contains(&download_id));
+        drop(downloads);
+
+        assert!(client.cancel_download(&download_id).await.unwrap());
+        drop(destination_guard);
+    }
+
+    #[tokio::test]
+    async fn cancelling_recovery_admission_before_commit_leaves_no_state_or_task() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let auth_guard = client.auth_token.write().await;
+        let admission = {
+            let client = client.clone();
+            let verified = verified.clone();
+            tokio::spawn(async move {
+                client
+                    .admit_recovery_download(&verified, Some("llm".to_string()))
+                    .await
+            })
+        };
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !client.downloads.read().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        admission.abort();
+        let _ = admission.await;
+        drop(auth_guard);
+
+        assert!(client.downloads.read().await.is_empty());
+        assert!(client.download_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_recovery_admission_after_commit_keeps_registered_owner() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let destination_guard = destination_lock.lock().await;
+        let admission = {
+            let client = client.clone();
+            let verified = verified.clone();
+            tokio::spawn(async move {
+                client
+                    .admit_recovery_download(&verified, Some("llm".to_string()))
+                    .await
+            })
+        };
+        let download_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = client.downloads.read().await;
+                if let Some((download_id, state)) = downloads.iter().next() {
+                    if state.task_registered {
+                        break download_id.clone();
+                    }
+                }
+                drop(downloads);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery commit should synchronously register its worker");
+        admission.abort();
+        let _ = admission.await;
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(&download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.recovery_destination().is_some());
+        assert!(state.task_registered);
+        drop(downloads);
+        assert!(client
+            .download_tasks
+            .snapshot(&download_id)
+            .is_some_and(|task| !task.finished));
+
+        assert!(client.cancel_download(&download_id).await.unwrap());
+        drop(destination_guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_download_status(&download_id).await == Some(DownloadStatus::Cancelled)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancel finalizer should settle the committed recovery");
+    }
+
+    #[tokio::test]
+    async fn recovery_attach_requires_registered_capability_backed_owner() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "attach-owner";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Queued, false),
+        );
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::ContextMismatch
+        ));
+
+        {
+            let mut downloads = client.downloads.write().await;
+            downloads.get_mut(download_id).unwrap().task_registered = true;
+        }
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await
+                });
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::Attached { download_id: id, status: DownloadStatus::Queued }
+                if id == download_id
+        ));
+
+        {
+            let mut downloads = client.downloads.write().await;
+            downloads
+                .get_mut(download_id)
+                .unwrap()
+                .make_managed_for_test();
+        }
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::ContextMismatch
+        ));
+        assert!(client.cancel_download(download_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tracked_recovery_resume_replaces_ambient_path_with_held_nonpersistent_capability() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "tracked-recovery";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let destination_guard = destination_lock.lock().await;
+
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::Resumed { download_id: id } if id == download_id
+        ));
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.recovery_destination().is_some());
+        assert!(state.task_registered);
+        drop(downloads);
+        assert!(persistence.load_all().is_empty());
+        assert!(DownloadPersistence::new(temp.path()).load_all().is_empty());
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        drop(destination_guard);
+    }
+
+    #[tokio::test]
+    async fn recovery_revocation_reserves_actual_download_from_generic_resume_and_relocate() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "reserved-revocation";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let lock_file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(temp.path().join(".downloads.lock"))
+            .unwrap();
+        lock_file.lock().unwrap();
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let destination_guard = destination_lock.lock().await;
+        let admission = {
+            let client = client.clone();
+            let verified = verified.clone();
+            tokio::spawn(async move {
+                client
+                    .admit_recovery_download(&verified, Some("llm".to_string()))
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.download_tasks.snapshot(download_id).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery revocation should install its transition owner");
+        let reservation = client.download_tasks.snapshot(download_id);
+
+        let resume = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.resume_download(download_id),
+        )
+        .await;
+        let relocated = temp.path().join("relocated");
+        let relocate = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.relocate_download_destination(download_id, &relocated, None, None),
+        )
+        .await;
+        lock_file.unlock().unwrap();
+
+        assert!(reservation
+            .is_some_and(|task| { task.role == TaskRole::RecoveryTransition && !task.finished }));
+        assert!(matches!(resume, Ok(Ok(false))));
+        assert!(matches!(relocate, Ok(Ok(false))));
+
+        assert!(matches!(
+            admission.await.unwrap().unwrap(),
+            RecoveryDownloadAdmission::Resumed { download_id: id } if id == download_id
+        ));
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| { task.role == TaskRole::Worker && !task.finished }));
+        assert!(client.cancel_download(download_id).await.unwrap());
+        drop(destination_guard);
+    }
+
+    #[tokio::test]
+    async fn generic_relocate_rechecks_transition_installed_after_its_initial_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "relocate-stale-transition-check";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        let original_dest = state.dest_dir.clone();
+        let mut downloads_guard = client.downloads.write().await;
+        downloads_guard.insert(download_id.to_string(), state);
+
+        let (checked_sender, checked) = tokio::sync::oneshot::channel();
+        let checked_sender = Arc::new(std::sync::Mutex::new(Some(checked_sender)));
+        client.download_tasks.set_snapshot_observer(Some(Arc::new({
+            let checked_sender = checked_sender.clone();
+            move |observed_id, snapshot| {
+                if observed_id == download_id && snapshot.is_none() {
+                    if let Some(sender) = checked_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        })));
+        let relocated = temp.path().join("relocated");
+        let relocation = {
+            let client = client.clone();
+            let relocated = relocated.clone();
+            tokio::spawn(async move {
+                client
+                    .relocate_download_destination(download_id, &relocated, None, None)
+                    .await
+            })
+        };
+        checked.await.unwrap();
+        client.download_tasks.set_snapshot_observer(None);
+        let (promote, promoted) = install_promotable_recovery_transition(&client, download_id);
+        drop(downloads_guard);
+
+        assert!(!relocation.await.unwrap().unwrap());
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.dest_dir, original_dest);
+        assert_eq!(state.status, DownloadStatus::Paused);
+        drop(downloads);
+        promote.send(()).unwrap();
+        promoted.await.unwrap();
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| { task.role == TaskRole::Worker && !task.finished }));
+        assert!(client.cancel_download(download_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn generic_resume_rechecks_transition_installed_after_its_initial_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "resume-stale-transition-check";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        let mut downloads_guard = client.downloads.write().await;
+        downloads_guard.insert(download_id.to_string(), state);
+
+        let (checked_sender, checked) = tokio::sync::oneshot::channel();
+        let checked_sender = Arc::new(std::sync::Mutex::new(Some(checked_sender)));
+        client.download_tasks.set_snapshot_observer(Some(Arc::new({
+            let checked_sender = checked_sender.clone();
+            move |observed_id, snapshot| {
+                if observed_id == download_id && snapshot.is_none() {
+                    if let Some(sender) = checked_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        })));
+        let resume = {
+            let client = client.clone();
+            tokio::spawn(async move { client.resume_download(download_id).await })
+        };
+        checked.await.unwrap();
+        client.download_tasks.set_snapshot_observer(None);
+        let (promote, promoted) = install_promotable_recovery_transition(&client, download_id);
+        drop(downloads_guard);
+
+        assert!(!resume.await.unwrap().unwrap());
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Paused);
+        assert!(!state.task_registered);
+        drop(downloads);
+        promote.send(()).unwrap();
+        promoted.await.unwrap();
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| { task.role == TaskRole::Worker && !task.finished }));
+        assert!(client.cancel_download(download_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn generic_relocate_refuses_after_transition_durably_revokes_and_disappears() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "relocate-after-revoked-transition";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        let original_dest = state.dest_dir.clone();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (admission_sender, admission_reached) = std::sync::mpsc::channel();
+        let admission_sender = Arc::new(std::sync::Mutex::new(Some(admission_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let admission_sender = admission_sender.clone();
+                let release = release.clone();
+                move |operation, observed_id| {
+                    if operation == "relocate" && observed_id == download_id {
+                        if let Some(sender) = admission_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let transition_client = client.clone();
+        let transition_persistence = persistence.clone();
+        let transition_thread = std::thread::spawn(move || {
+            admission_reached.recv().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let prepared = transition_client.download_tasks.prepare(
+                    download_id.to_string(),
+                    TaskRole::RecoveryTransition,
+                    |_| async {},
+                );
+                let installed = {
+                    let mut downloads = transition_client.downloads.write().await;
+                    let installed = transition_client
+                        .download_tasks
+                        .install_gated(prepared)
+                        .unwrap();
+                    downloads
+                        .get_mut(download_id)
+                        .unwrap()
+                        .ambient_authority_blocked = true;
+                    installed
+                };
+                installed.start();
+                tokio::task::spawn_blocking(move || transition_persistence.revoke(download_id))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                loop {
+                    if transition_client
+                        .download_tasks
+                        .observe_finished(download_id)
+                        .await
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(!transition_client.download_tasks.contains(download_id));
+                release_sender.send(()).unwrap();
+            });
+        });
+
+        let relocated = temp.path().join("relocated");
+        assert!(!client
+            .relocate_download_destination(download_id, &relocated, None, None)
+            .await
+            .unwrap());
+        transition_thread.join().unwrap();
+        client.download_tasks.set_ambient_admission_observer(None);
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.dest_dir, original_dest);
+        assert!(state.ambient_authority_blocked);
+        assert_eq!(state.status, DownloadStatus::Paused);
+        drop(downloads);
+        assert!(persistence.is_revoked(download_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn generic_resume_refuses_after_transition_durably_revokes_and_disappears() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "resume-after-revoked-transition";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (admission_sender, admission_reached) = std::sync::mpsc::channel();
+        let admission_sender = Arc::new(std::sync::Mutex::new(Some(admission_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let admission_sender = admission_sender.clone();
+                let release = release.clone();
+                move |operation, observed_id| {
+                    if operation == "resume" && observed_id == download_id {
+                        if let Some(sender) = admission_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let transition_client = client.clone();
+        let transition_persistence = persistence.clone();
+        let transition_thread = std::thread::spawn(move || {
+            admission_reached.recv().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let prepared = transition_client.download_tasks.prepare(
+                    download_id.to_string(),
+                    TaskRole::RecoveryTransition,
+                    |_| async {},
+                );
+                let installed = {
+                    let mut downloads = transition_client.downloads.write().await;
+                    let installed = transition_client
+                        .download_tasks
+                        .install_gated(prepared)
+                        .unwrap();
+                    downloads
+                        .get_mut(download_id)
+                        .unwrap()
+                        .ambient_authority_blocked = true;
+                    installed
+                };
+                installed.start();
+                tokio::task::spawn_blocking(move || transition_persistence.revoke(download_id))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                loop {
+                    if transition_client
+                        .download_tasks
+                        .observe_finished(download_id)
+                        .await
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(!transition_client.download_tasks.contains(download_id));
+                release_sender.send(()).unwrap();
+            });
+        });
+
+        assert!(!client.resume_download(download_id).await.unwrap());
+        transition_thread.join().unwrap();
+        client.download_tasks.set_ambient_admission_observer(None);
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Paused);
+        assert!(!state.task_registered);
+        assert!(state.ambient_authority_blocked);
+        drop(downloads);
+        assert!(persistence.is_revoked(download_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn generic_relocate_refuses_transition_replaced_by_cancel_finalizer() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "relocate-cancel-finalizer-reservation";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        let original_dest = state.dest_dir.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (admission_sender, admission_reached) = std::sync::mpsc::channel();
+        let admission_sender = Arc::new(std::sync::Mutex::new(Some(admission_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let admission_sender = admission_sender.clone();
+                let release = release.clone();
+                move |operation, observed_id| {
+                    if operation == "relocate" && observed_id == download_id {
+                        if let Some(sender) = admission_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let cancel_client = client.clone();
+        let (settled_sender, settled) = tokio::sync::oneshot::channel();
+        let cancel_thread = std::thread::spawn(move || {
+            admission_reached.recv().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let prepared = cancel_client.download_tasks.prepare(
+                    download_id.to_string(),
+                    TaskRole::RecoveryTransition,
+                    |_| async {
+                        std::future::pending::<()>().await;
+                    },
+                );
+                cancel_client
+                    .download_tasks
+                    .install_gated(prepared)
+                    .unwrap()
+                    .start();
+                assert!(cancel_client.cancel_download(download_id).await.unwrap());
+                assert!(cancel_client
+                    .download_tasks
+                    .snapshot(download_id)
+                    .is_some_and(|task| task.role == TaskRole::CancelFinalizer));
+                release_sender.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let terminal = cancel_client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| state.status != DownloadStatus::Cancelling);
+                        if terminal {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let _ = settled_sender.send(());
+            });
+        });
+
+        let relocated = temp.path().join("relocated");
+        assert!(!client
+            .relocate_download_destination(download_id, &relocated, None, None)
+            .await
+            .unwrap());
+        settled.await.unwrap();
+        cancel_thread.join().unwrap();
+        client.download_tasks.set_ambient_admission_observer(None);
+        let downloads = client.downloads.read().await;
+        assert_eq!(downloads.get(download_id).unwrap().dest_dir, original_dest);
+    }
+
+    #[tokio::test]
+    async fn dropped_recovery_caller_cannot_detach_revocation_to_worker_handoff() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "dropped-revocation-caller";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let lock_file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(temp.path().join(".downloads.lock"))
+            .unwrap();
+        lock_file.lock().unwrap();
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let destination_guard = destination_lock.lock().await;
+        let admission = {
+            let client = client.clone();
+            let verified = verified.clone();
+            tokio::spawn(async move {
+                client
+                    .admit_recovery_download(&verified, Some("llm".to_string()))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.role == TaskRole::RecoveryTransition && !task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual download ID must own the blocked revocation");
+
+        admission.abort();
+        let _ = admission.await;
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| { task.role == TaskRole::RecoveryTransition && !task.finished }));
+        lock_file.unlock().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.role == TaskRole::Worker && !task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller-independent transition must promote to its worker");
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.task_registered);
+        assert!(state.recovery_destination().is_some());
+        drop(downloads);
+        assert!(client.cancel_download(download_id).await.unwrap());
+        drop(destination_guard);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_recovery_revocation_is_owned_until_terminal() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "cancel-revocation";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let lock_file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(temp.path().join(".downloads.lock"))
+            .unwrap();
+        lock_file.lock().unwrap();
+        let admission = {
+            let client = client.clone();
+            let verified = verified.clone();
+            tokio::spawn(async move {
+                client
+                    .admit_recovery_download(&verified, Some("llm".to_string()))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.role == TaskRole::RecoveryTransition && !task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("revocation must be owned under the actual download ID");
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| { task.role == TaskRole::CancelFinalizer && !task.finished }));
+        lock_file.unlock().unwrap();
+        assert!(admission.await.unwrap().is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = client.downloads.read().await;
+                let state = downloads.get(download_id).unwrap();
+                if state.status == DownloadStatus::Cancelled {
+                    assert!(!state.task_registered);
+                    assert!(state.recovery_destination().is_none());
+                    break;
+                }
+                drop(downloads);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller-independent finalizer must settle after revocation drains");
+        assert!(persistence.load_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_strict_revocation_leaves_ambient_state_and_target_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence);
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "revocation-failure";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(temp.path().join("downloads.json"), b"not-json").unwrap();
+
+        assert!(client
+            .admit_recovery_download(&verified, Some("llm".to_string()))
+            .await
+            .is_err());
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.recovery_destination().is_none());
+        assert!(!state.task_registered);
+        assert!(state.lifecycle_failure_unverified);
+        assert!(state.ambient_authority_blocked);
+        drop(downloads);
+        assert!(client.download_tasks.is_empty());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join("weights.gguf.part")
+            .exists());
+
+        // Remove the injected corruption so finalizer cleanup is otherwise
+        // healthy; the sticky transition failure alone must keep cancellation
+        // fail-closed.
+        std::fs::remove_file(temp.path().join("downloads.json")).unwrap();
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let settled = client
+                    .downloads
+                    .read()
+                    .await
+                    .get(download_id)
+                    .is_some_and(|state| {
+                        state.status == DownloadStatus::Error
+                            && state.lifecycle_failure_unverified
+                            && !state.task_registered
+                    });
+                if settled {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later cancellation must preserve unresolved transition failure");
+    }
+
+    #[tokio::test]
+    async fn revoked_ambient_state_cannot_resume_without_fresh_recovery_capability() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "revoked-ambient";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        persistence.revoke(download_id).unwrap();
+
+        assert!(!client.resume_download(download_id).await.unwrap());
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Paused);
+        assert!(state.recovery_destination().is_none());
+        assert!(!state.task_registered);
+        drop(downloads);
+        assert!(client.download_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_completion_clears_capability_without_callbacks_or_persistence() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let completion_called = Arc::new(AtomicBool::new(false));
+        let completion_observer = completion_called.clone();
+        client.set_completion_callback(Arc::new(move |_| {
+            completion_observer.store(true, Ordering::SeqCst);
+        }));
+        let aux_called = Arc::new(AtomicBool::new(false));
+        let aux_observer = aux_called.clone();
+        client.set_aux_complete_callback(Arc::new(move |_| {
+            aux_observer.store(true, Ordering::SeqCst);
+        }));
+
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            vec!["config.json".to_string()],
+        );
+        std::fs::write(
+            verified
+                .destination
+                .display_path()
+                .join("weights.gguf.part"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+        let mut updates = client.subscribe_download_updates();
+
+        let download_id = match client
+            .admit_recovery_download(&verified, Some("llm".to_string()))
+            .await
+            .unwrap()
+        {
+            RecoveryDownloadAdmission::Recovered { download_id } => download_id,
+            _ => panic!("a new exact recovery must be admitted"),
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let update = updates.recv().await.unwrap();
+                if update.snapshot.downloads.iter().any(|download| {
+                    download.download_id == download_id
+                        && download.status == DownloadStatus::Completed
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("byte-complete recovery should finish without network access");
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(&download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Completed);
+        assert!(!state.task_registered);
+        assert!(state.recovery_destination().is_none());
+        assert_eq!(
+            state
+                .files
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["weights.gguf"]
+        );
+        drop(downloads);
+        assert!(!completion_called.load(Ordering::SeqCst));
+        assert!(!aux_called.load(Ordering::SeqCst));
+        assert!(persistence.load_all().is_empty());
+        assert!(!temp.path().join("downloads.json").exists());
+        assert_eq!(
+            std::fs::read(verified.destination.display_path().join("weights.gguf")).unwrap(),
+            b"done"
+        );
+        assert!(!verified
+            .destination
+            .display_path()
+            .join(".pumas_download")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn tracked_recovery_completion_waits_for_persisted_cleanup_before_capability_release() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "tracked-recovery-completion";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified
+                .destination
+                .display_path()
+                .join("weights.gguf.part"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+
+        let (cleanup_sender, cleanup_started) = tokio::sync::oneshot::channel();
+        let cleanup_sender = Arc::new(std::sync::Mutex::new(Some(cleanup_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let cleanup_sender = cleanup_sender.clone();
+            let release = release.clone();
+            move |operation| {
+                if operation == "remove completed persisted download" {
+                    if let Some(sender) = cleanup_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                }
+            }
+        })));
+
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::Resumed { download_id: resumed }
+                if resumed == download_id
+        ));
+        tokio::time::timeout(Duration::from_secs(2), cleanup_started)
+            .await
+            .expect("verified recovery must reach owned persistence cleanup")
+            .unwrap();
+        {
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert_ne!(state.status, DownloadStatus::Completed);
+            assert!(state.task_registered);
+            assert!(state.recovery_destination().is_some());
+        }
+        assert!(persistence.load_all().is_empty());
+        assert!(persistence.is_revoked(download_id).unwrap());
+
+        release_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.get_download_status(download_id).await != Some(DownloadStatus::Completed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Completed must follow persistence cleanup");
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert!(!state.task_registered);
+        assert!(state.recovery_destination().is_none());
+        drop(downloads);
+        assert!(persistence.load_all().is_empty());
+        assert!(persistence.is_revoked(download_id).unwrap());
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn tracked_recovery_persistence_cleanup_failure_retains_capability() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "tracked-recovery-cleanup-failure";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified
+                .destination
+                .display_path()
+                .join("weights.gguf.part"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+
+        let downloads_path = temp.path().join("downloads.json");
+        let corrupted = Arc::new(AtomicBool::new(false));
+        let corrupted_in_observer = corrupted.clone();
+        client
+            .download_tasks
+            .set_blocking_observer(Some(Arc::new(move |operation| {
+                if operation == "remove completed persisted download"
+                    && !corrupted_in_observer.swap(true, Ordering::SeqCst)
+                {
+                    std::fs::write(&downloads_path, b"not-json").unwrap();
+                }
+            })));
+
+        assert!(matches!(
+            client
+                .admit_recovery_download(&verified, Some("llm".to_string()))
+                .await
+                .unwrap(),
+            RecoveryDownloadAdmission::Resumed { .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed = client
+                    .downloads
+                    .read()
+                    .await
+                    .get(download_id)
+                    .is_some_and(|state| {
+                        state.status == DownloadStatus::Error
+                            && !state.task_registered
+                            && state.recovery_destination().is_some()
+                    });
+                if failed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("persistence cleanup failure must not publish Completed");
+        client.observe_finished_download_tasks().await;
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.recovery_destination().is_some());
+        assert!(state.lifecycle_failure_unverified);
+        drop(downloads);
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn tracked_recovery_cleanup_retry_preserves_revoked_snapshot_and_failure_history() {
+        assert_tracked_recovery_cleanup_snapshot(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_durable_revocation_preserves_snapshot_before_handoff() {
+        assert_tracked_recovery_cleanup_snapshot(true).await;
+    }
+
+    async fn assert_tracked_recovery_cleanup_snapshot(cancel_before_handoff: bool) {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let destination = verified.destination.display_path();
+        std::fs::write(destination.join("weights.gguf.part"), b"abc").unwrap();
+        std::fs::write(destination.join(".pumas_download"), b"{}").unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        let original = PersistedDownload {
+            download_id: "tracked-revoked-snapshot".into(),
+            repo_id: "acme/model".into(),
+            filename: "weights.gguf".into(),
+            filenames: vec!["weights.gguf".into()],
+            dest_dir: destination.to_path_buf(),
+            total_bytes: Some(8),
+            status: DownloadStatus::Paused,
+            download_request: recovery_test_request("acme/model", &["weights.gguf".into()]),
+            created_at: "2021-02-03T04:05:06Z".into(),
+            known_sha256: Some("b".repeat(64)),
+            huggingface_evidence: None,
+        };
+        persistence.save(&original).unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
+        client.set_persistence(persistence);
+        client.restore_persisted_downloads().await.unwrap();
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 8,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let client = Arc::new(client);
+        // The worker cannot reach remote transfer while the public recovery
+        // admission and cancellation exchange ownership.
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let transfer_guard = destination_lock.lock().await;
+        let fail_once = Arc::new(AtomicBool::new(true));
+        client
+            .download_tasks
+            .set_blocking_failure_observer(Some(Arc::new(move |operation| {
+                matches!(
+                    operation,
+                    "remove partial download file" | "remove ambient partial download file"
+                ) && fail_once.swap(false, Ordering::SeqCst)
+            })));
+        let cancel_thread = if cancel_before_handoff {
+            let (ready_sender, ready) = std::sync::mpsc::channel();
+            let ready_sender = std::sync::Mutex::new(Some(ready_sender));
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let release = std::sync::Mutex::new(release);
+            client
+                .download_tasks
+                .set_blocking_result_observer(Some(Arc::new(move |operation| {
+                    if operation == "revoke persisted recovery authority" {
+                        if let Some(sender) = ready_sender.lock().unwrap().take() {
+                            sender.send(()).unwrap();
+                            release.lock().unwrap().recv().unwrap();
+                        }
+                    }
+                })));
+            let cancel_client = client.clone();
+            let id = original.download_id.clone();
+            Some(std::thread::spawn(move || {
+                ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        assert!(cancel_client.cancel_download(&id).await.unwrap());
+                        release_sender.send(()).unwrap();
+                        tokio::time::timeout(Duration::from_secs(3), async {
+                            while cancel_client.get_download_status(&id).await
+                                == Some(DownloadStatus::Cancelling)
+                                || cancel_client
+                                    .download_tasks
+                                    .snapshot(&id)
+                                    .is_some_and(|task| !task.finished)
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    });
+            }))
+        } else {
+            None
+        };
+        let admission = client
+            .admit_recovery_download(&verified, Some("llm".into()))
+            .await;
+        if cancel_before_handoff {
+            assert!(!matches!(
+                admission,
+                Ok(RecoveryDownloadAdmission::Resumed { .. })
+            ));
+        } else {
+            assert!(
+                matches!(admission.unwrap(), RecoveryDownloadAdmission::Resumed { download_id } if download_id == original.download_id)
+            );
+            assert!(client.cancel_download(&original.download_id).await.unwrap());
+        }
+        drop(transfer_guard);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client.get_download_status(&original.download_id).await
+                    == Some(DownloadStatus::Error)
+                    && client
+                        .download_tasks
+                        .snapshot(&original.download_id)
+                        .is_none_or(|task| task.finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed cleanup must settle without releasing resumable authority");
+        if let Some(cancel_thread) = cancel_thread {
+            cancel_thread.join().unwrap();
+        }
+        client.download_tasks.set_blocking_result_observer(None);
+        assert_eq!(
+            std::fs::read(destination.join("weights.gguf.part")).unwrap(),
+            b"abc"
+        );
+        let reopened_store = Arc::new(DownloadPersistence::new(temp.path()));
+        let inventory = reopened_store.load_lifecycle_inventory_strict().unwrap();
+        let quarantine = &inventory.quarantines[&original.download_id];
+        assert_eq!(quarantine.domain, LifecycleQuarantineDomain::Recovery);
+        assert_eq!(quarantine.disposition, LifecycleCleanupDisposition::Pending);
+        assert!(quarantine.sticky_failure);
+        let mut expected_quarantine = serde_json::to_value(&original).unwrap();
+        expected_quarantine["status"] = serde_json::to_value(DownloadStatus::Error).unwrap();
+        assert_eq!(serde_json::to_value(&quarantine.snapshot).unwrap(), expected_quarantine,
+            "quarantine must preserve the exact pre-revocation fields, not refreshed remote metadata or a new timestamp");
+        let mut reopened = HuggingFaceClient::new(temp.path().join("reopened")).unwrap();
+        reopened
+            .configure_download_destination_root(&library_root)
+            .unwrap();
+        reopened.set_persistence(reopened_store);
+        assert!(reopened.restore_persisted_downloads().await.is_err());
+        client.download_tasks.set_blocking_failure_observer(None);
+        assert!(client.cancel_download(&original.download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client.get_download_status(&original.download_id).await
+                    == Some(DownloadStatus::Error)
+                    && client
+                        .download_tasks
+                        .snapshot(&original.download_id)
+                        .is_none_or(|task| task.finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup retry must settle while retaining Error history");
+        assert!(!destination.join("weights.gguf.part").exists());
+        reopened.restore_persisted_downloads().await.unwrap();
+        assert!(reopened.list_downloads().await.is_empty());
+        assert_eq!(
+            client.get_download_status(&original.download_id).await,
+            Some(DownloadStatus::Error)
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_completion_callback_follows_persisted_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "ambient-completion-order";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        let files = state.files.clone();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("weights.gguf"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_in_task = callback_called.clone();
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let callback_saw_released_destination = Arc::new(AtomicBool::new(false));
+        let callback_saw_released_destination_in_task = callback_saw_released_destination.clone();
+        let callback_reentered_terminal_cancel = Arc::new(AtomicBool::new(false));
+        let callback_reentered_terminal_cancel_in_task = callback_reentered_terminal_cancel.clone();
+        let callback_runtime = tokio::runtime::Handle::current();
+        let callback_client = Arc::new(client);
+        let callback_client_in_task = callback_client.clone();
+        let callback_download_id = download_id.to_string();
+        let callback: DownloadCompletionCallback = Arc::new(move |_| {
+            callback_saw_released_destination_in_task
+                .store(destination_lock.try_lock().is_ok(), Ordering::SeqCst);
+            let client = callback_client_in_task.clone();
+            let download_id = callback_download_id.clone();
+            let (cancelled_sender, cancelled_receiver) = std::sync::mpsc::channel();
+            callback_runtime.spawn(async move {
+                let cancelled = client.cancel_download(&download_id).await.unwrap();
+                let _ = cancelled_sender.send(cancelled);
+            });
+            let cancelled = cancelled_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("terminal callback must be able to reenter cancellation");
+            callback_reentered_terminal_cancel_in_task.store(!cancelled, Ordering::SeqCst);
+            callback_called_in_task.store(true, Ordering::SeqCst);
+        });
+        let client = callback_client;
+        let (cleanup_sender, cleanup_started) = tokio::sync::oneshot::channel();
+        let cleanup_sender = Arc::new(std::sync::Mutex::new(Some(cleanup_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let cleanup_sender = cleanup_sender.clone();
+            let release = release.clone();
+            move |operation| {
+                if operation == "remove completed persisted download" {
+                    if let Some(sender) = cleanup_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                }
+            }
+        })));
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    Some(callback),
+                    None,
+                    Some(persistence.clone()),
+                )
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), cleanup_started)
+            .await
+            .expect("ambient worker must reach persistence cleanup")
+            .unwrap();
+        assert!(!callback_called.load(Ordering::SeqCst));
+        assert_ne!(
+            client.get_download_status(download_id).await,
+            Some(DownloadStatus::Completed)
+        );
+
+        release_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.get_download_status(download_id).await != Some(DownloadStatus::Completed)
+                || !callback_called.load(Ordering::SeqCst)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambient completion must follow persistence cleanup");
+        assert!(callback_called.load(Ordering::SeqCst));
+        assert!(callback_saw_released_destination.load(Ordering::SeqCst));
+        assert!(callback_reentered_terminal_cancel.load(Ordering::SeqCst));
+        assert!(persistence.load_all().is_empty());
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_callback_runs_without_destination_lease_and_cancel_stops_continuation() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(
+            &library_root,
+            "acme/model",
+            &["config.json", "weights.gguf"],
+        );
+        let download_id = "aux-callback-reentrant-cancel";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        state.files = vec![
+            FileToDownload {
+                filename: "config.json".to_string(),
+                size: None,
+                sha256: None,
+            },
+            FileToDownload {
+                filename: "weights.gguf".to_string(),
+                size: Some(4),
+                sha256: None,
+            },
+        ];
+        state.filename = "config.json".to_string();
+        state.total_bytes = Some(4);
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        let files = state.files.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("config.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let callback_saw_released_destination = Arc::new(AtomicBool::new(false));
+        let callback_saw_released_destination_in_task = callback_saw_released_destination.clone();
+        let callback_client = client.clone();
+        let callback_download_id = download_id.to_string();
+        let callback_runtime = tokio::runtime::Handle::current();
+        let callback: AuxFilesCompleteCallback = Arc::new(move |_| {
+            callback_saw_released_destination_in_task
+                .store(destination_lock.try_lock().is_ok(), Ordering::SeqCst);
+            let client = callback_client.clone();
+            let download_id = callback_download_id.clone();
+            let (cancelled_sender, cancelled_receiver) = std::sync::mpsc::channel();
+            callback_runtime.spawn(async move {
+                let cancelled = client.cancel_download(&download_id).await.unwrap();
+                let _ = cancelled_sender.send(cancelled);
+            });
+            let cancelled = cancelled_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reentrant cancellation must return while callback owns no guard");
+            assert!(cancelled);
+        });
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    Some(callback),
+                    None,
+                )
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_download_status(download_id).await == Some(DownloadStatus::Cancelled)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reentrant cancellation must settle the auxiliary callback worker");
+
+        assert!(callback_saw_released_destination.load(Ordering::SeqCst));
+        assert!(!verified
+            .destination
+            .display_path()
+            .join("weights.gguf.part")
+            .exists());
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Cancelled);
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn auxiliary_callback_panic_survives_cancelled_waiter_and_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(
+            &library_root,
+            "acme/model",
+            &["config.json", "weights.gguf"],
+        );
+        let download_id = "aux-callback-panic-cancel";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.files = vec![
+            FileToDownload {
+                filename: "config.json".to_string(),
+                size: None,
+                sha256: None,
+            },
+            FileToDownload {
+                filename: "weights.gguf".to_string(),
+                size: Some(4),
+                sha256: None,
+            },
+        ];
+        state.filename = "config.json".to_string();
+        state.total_bytes = Some(4);
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        let files = state.files.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("config.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+
+        let (result_sender, result_ready) = std::sync::mpsc::channel();
+        let result_sender = Arc::new(std::sync::Mutex::new(Some(result_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_blocking_result_observer(Some(Arc::new({
+                let result_sender = result_sender.clone();
+                let release = release.clone();
+                move |operation| {
+                    if operation == "invoke auxiliary-files-complete callback" {
+                        if let Some(sender) = result_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+
+        let (during_sender, during_receiver) = tokio::sync::oneshot::channel();
+        let (settled_sender, settled_receiver) = tokio::sync::oneshot::channel();
+        let cancel_client = client.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            result_ready
+                .recv_timeout(Duration::from_secs(2))
+                .expect("callback semantic failure must be recorded before result delivery");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    assert!(cancel_client.cancel_download(download_id).await.unwrap());
+                    let during = {
+                        let states = cancel_client.downloads.read().await;
+                        let state = states.get(download_id).unwrap();
+                        (
+                            state.status,
+                            state.task_registered,
+                            state.recovery_destination().is_some(),
+                        )
+                    };
+                    let _ = during_sender.send(during);
+                    release_sender.send(()).unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while cancel_client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| state.status == DownloadStatus::Cancelling)
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let _ = settled_sender.send(());
+                });
+        });
+        let callback: AuxFilesCompleteCallback = Arc::new(|_| {
+            panic!("auxiliary callback panic sentinel");
+        });
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Recovery(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    Some(callback),
+                    None,
+                )
+                .await
+        );
+        assert_eq!(
+            during_receiver.await.unwrap(),
+            (DownloadStatus::Cancelling, true, true)
+        );
+        settled_receiver.await.unwrap();
+        cancel_thread.join().unwrap();
+        client.download_tasks.set_blocking_result_observer(None);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(!state.task_registered);
+        assert!(state.lifecycle_failure_unverified);
+        assert!(state.recovery_destination().is_some());
+    }
+
+    #[tokio::test]
+    async fn completion_callback_panic_is_observed_without_rolling_back_completed() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "completion-callback-panic";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        let files = state.files.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("weights.gguf"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_in_task = callback_called.clone();
+        let callback: DownloadCompletionCallback = Arc::new(move |_| {
+            assert!(destination_lock.try_lock().is_ok());
+            callback_called_in_task.store(true, Ordering::SeqCst);
+            panic!("completion callback panic sentinel");
+        });
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    Some(callback),
+                    None,
+                    None,
+                )
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !callback_called.load(Ordering::SeqCst)
+                || !client
+                    .download_tasks
+                    .snapshot(download_id)
+                    .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion callback panic must be caught and owner-observed");
+        let _ = client.list_downloads().await;
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Completed);
+        assert!(!state.task_registered);
+        assert!(!state.lifecycle_failure_unverified);
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn ambient_completion_cleanup_failure_is_error_without_success_callback() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "ambient-completion-failure";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        let files = state.files.clone();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("weights.gguf"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_in_task = callback_called.clone();
+        let callback: DownloadCompletionCallback = Arc::new(move |_| {
+            callback_called_in_task.store(true, Ordering::SeqCst);
+        });
+        let downloads_path = temp.path().join("downloads.json");
+        let corrupted = Arc::new(AtomicBool::new(false));
+        let corrupted_in_observer = corrupted.clone();
+        client
+            .download_tasks
+            .set_blocking_observer(Some(Arc::new(move |operation| {
+                if operation == "remove completed persisted download"
+                    && !corrupted_in_observer.swap(true, Ordering::SeqCst)
+                {
+                    std::fs::write(&downloads_path, b"not-json").unwrap();
+                }
+            })));
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    Some(callback),
+                    None,
+                    Some(persistence),
+                )
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.get_download_status(download_id).await != Some(DownloadStatus::Error) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambient persistence cleanup failure must project Error");
+        assert!(!callback_called.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let _ = client.list_downloads().await;
+                if client
+                    .downloads
+                    .read()
+                    .await
+                    .get(download_id)
+                    .is_some_and(|state| state.lifecycle_failure_unverified)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished cleanup failure must become sticky lifecycle provenance");
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert!(state.lifecycle_failure_unverified);
+        assert!(!state.task_registered);
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn ambient_marker_cleanup_failure_is_error_and_retains_persisted_recovery_truth() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "ambient-marker-cleanup-failure";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        let files = state.files.clone();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("weights.gguf"),
+            b"done",
+        )
+        .unwrap();
+        let marker = verified.destination.display_path().join(".pumas_download");
+        std::fs::create_dir(&marker).unwrap();
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback: DownloadCompletionCallback = Arc::new({
+            let callback_called = callback_called.clone();
+            move |_| callback_called.store(true, Ordering::SeqCst)
+        });
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    Some(callback),
+                    None,
+                    Some(persistence.clone()),
+                )
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let failed = client
+                    .downloads
+                    .read()
+                    .await
+                    .get(download_id)
+                    .is_some_and(|state| {
+                        state.status == DownloadStatus::Error
+                            && state.lifecycle_failure_unverified
+                            && !state.task_registered
+                    });
+                if failed && !client.download_tasks.contains(download_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("marker cleanup failure must settle sticky Error");
+        assert!(marker.is_dir());
+        assert!(!callback_called.load(Ordering::SeqCst));
+        let persisted = persistence.load_all();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].download_id, download_id);
+        assert_eq!(persisted[0].status, DownloadStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn recovery_error_and_inactive_pause_retain_capability_without_persistence() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let pausing_id = "recovery-pausing";
+        client.downloads.write().await.insert(
+            pausing_id.to_string(),
+            recovery_test_state(&verified, pausing_id, DownloadStatus::Downloading, true),
+        );
+        let pausing_worker =
+            client
+                .download_tasks
+                .prepare(pausing_id.to_string(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await
+                });
+        client
+            .download_tasks
+            .install_gated(pausing_worker)
+            .unwrap()
+            .start();
+        assert!(client.pause_download(pausing_id).await.unwrap());
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(pausing_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Pausing);
+        assert!(state.recovery_destination().is_some());
+        drop(downloads);
+        assert!(client.cancel_download(pausing_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.get_download_status(pausing_id).await != Some(DownloadStatus::Cancelled) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test pause owner should settle before reusing the destination");
+
+        let paused_id = "recovery-paused";
+        client.downloads.write().await.insert(
+            paused_id.to_string(),
+            recovery_test_state(&verified, paused_id, DownloadStatus::Downloading, true),
+        );
+
+        let progress = client
+            .list_downloads()
+            .await
+            .into_iter()
+            .find(|download| download.download_id == paused_id)
+            .unwrap();
+        assert_eq!(progress.status, DownloadStatus::Paused);
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(paused_id).unwrap();
+        assert!(state.recovery_destination().is_some());
+        assert!(!state.task_registered);
+        drop(downloads);
+        assert!(persistence.load_all().is_empty());
+        assert!(!temp.path().join("downloads.json").exists());
+
+        let error_id = "recovery-error";
+        client.downloads.write().await.insert(
+            error_id.to_string(),
+            recovery_test_state(&verified, error_id, DownloadStatus::Queued, false),
+        );
+        std::fs::remove_dir(verified.destination.display_path()).unwrap();
+        std::fs::write(verified.destination.display_path(), b"not a directory").unwrap();
+        let (cancel_flag, pause_flag) = {
+            let downloads = client.downloads.read().await;
+            let error_state = downloads.get(error_id).unwrap();
+            (
+                error_state.cancel_flag.clone(),
+                error_state.pause_flag.clone(),
+            )
+        };
+        let spawned = client
+            .spawn_download_task(
+                error_id.to_string(),
+                verified.repo_id.clone(),
+                vec![FileToDownload {
+                    filename: "weights.gguf".to_string(),
+                    size: Some(4),
+                    sha256: None,
+                }],
+                DownloadDestination::Recovery(verified.destination.clone()),
+                cancel_flag,
+                pause_flag,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(spawned);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_download_status(error_id).await == Some(DownloadStatus::Error) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capability failure should become a typed download error");
+        assert!(client
+            .downloads
+            .read()
+            .await
+            .get(error_id)
+            .unwrap()
+            .recovery_destination()
+            .is_some());
+        assert!(persistence.load_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordinary_resume_preserves_ambient_callbacks_and_persistence_contract() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let completion_called = Arc::new(AtomicBool::new(false));
+        let completion_observer = completion_called.clone();
+        client.set_completion_callback(Arc::new(move |_| {
+            completion_observer.store(true, Ordering::SeqCst);
+        }));
+        let aux_called = Arc::new(AtomicBool::new(false));
+        let aux_observer = aux_called.clone();
+        client.set_aux_complete_callback(Arc::new(move |_| {
+            aux_observer.store(true, Ordering::SeqCst);
+        }));
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "ordinary-resume";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified
+                .destination
+                .display_path()
+                .join("weights.gguf.part"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+        let mut updates = client.subscribe_download_updates();
+
+        assert!(client.resume_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let update = updates.recv().await.unwrap();
+                if update.snapshot.downloads.iter().any(|download| {
+                    download.download_id == download_id
+                        && download.status == DownloadStatus::Completed
+                }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("byte-complete ordinary resume should finish without network access");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if completion_called.load(Ordering::SeqCst) && persistence.load_all().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary completion callback and persistence cleanup should finish");
+        assert!(aux_called.load(Ordering::SeqCst));
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Completed);
+        assert!(state.recovery_destination().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_ordinary_resume_before_commit_preserves_paused_state() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancelled-ordinary-resume";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (preparing_sender, preparing_receiver) = tokio::sync::oneshot::channel();
+        let preparing_sender = Arc::new(std::sync::Mutex::new(Some(preparing_sender)));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let preparing_sender = preparing_sender.clone();
+                move |operation, observed_id| {
+                    if operation == "prepare-download-task" && observed_id == download_id {
+                        if let Some(sender) = preparing_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                    }
+                }
+            })));
+        let auth_guard = client.auth_token.write().await;
+        let resume = {
+            let client = client.clone();
+            tokio::spawn(async move { client.resume_download(download_id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), preparing_receiver)
+            .await
+            .expect("resume should reach its pre-admission preparation")
+            .unwrap();
+        assert_eq!(
+            client.get_download_status(download_id).await,
+            Some(DownloadStatus::Paused)
+        );
+        resume.abort();
+        let _ = resume.await;
+        drop(auth_guard);
+        client.download_tasks.set_ambient_admission_observer(None);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Paused);
+        assert!(!state.task_registered);
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_resume_caller_after_commit_keeps_started_owner_in_both_modes() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+
+        for recovery in [false, true] {
+            let mode = if recovery { "recovery" } else { "ambient" };
+            let library_root = temp.path().join(mode).join("library");
+            let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+            let download_id = format!("cancelled-{mode}-resume-after-commit");
+            let mut state =
+                recovery_test_state(&verified, &download_id, DownloadStatus::Paused, false);
+            if !recovery {
+                state.make_managed_for_test();
+            }
+            client
+                .downloads
+                .write()
+                .await
+                .insert(download_id.clone(), state);
+            let destination_guard = client
+                .destination_lock(&verified.destination.identity())
+                .await
+                .lock_owned()
+                .await;
+            let publication_guard = client.download_publications.capture.lock().await;
+            let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+            let started_sender = Arc::new(std::sync::Mutex::new(Some(started_sender)));
+            let observed_id = download_id.clone();
+            client
+                .download_tasks
+                .set_ambient_admission_observer(Some(Arc::new(move |operation, download_id| {
+                    if operation == "resume-started" && download_id == observed_id {
+                        if let Some(sender) = started_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                        }
+                    }
+                })));
+            let resume = {
+                let client = client.clone();
+                let download_id = download_id.clone();
+                tokio::spawn(async move { client.resume_download(&download_id).await })
+            };
+            tokio::time::timeout(Duration::from_secs(1), started_receiver)
+                .await
+                .expect("resume should synchronously start its committed owner")
+                .unwrap();
+            resume.abort();
+            let _ = resume.await;
+            drop(publication_guard);
+
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(&download_id).unwrap();
+            assert_eq!(state.status, DownloadStatus::Queued);
+            assert!(state.task_registered);
+            drop(downloads);
+            assert!(client
+                .download_tasks
+                .snapshot(&download_id)
+                .is_some_and(|task| {
+                    task.role == TaskRole::Worker && task.started && !task.outer_finished
+                }));
+            client.download_tasks.set_ambient_admission_observer(None);
+            drop(destination_guard);
+            assert!(client.cancel_download(&download_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while client.get_download_status(&download_id).await
+                    != Some(DownloadStatus::Cancelled)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("owned resume must remain cancellable after its caller is aborted");
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_cannot_overwrite_concurrent_completion() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "pause-complete";
+        let mut state =
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, false);
+        state.progress = 1.0;
+        let mut downloads = client.downloads.write().await;
+        downloads.insert(download_id.to_string(), state);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let pause_task = {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                client.pause_download(download_id).await.unwrap()
+            })
+        };
+        barrier.wait().await;
+        tokio::task::yield_now().await;
+        let state = downloads.get_mut(download_id).unwrap();
+        state.status = DownloadStatus::Completed;
+        state.make_managed_for_test();
+        drop(downloads);
+
+        assert!(!pause_task.await.unwrap());
+        assert_eq!(
+            client.get_download_status(download_id).await,
+            Some(DownloadStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_before_destination_work_fails_closed_when_the_row_is_absent() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "pause-before-destination-missing-row";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        let files = state.files.clone();
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let destination_guard = destination_lock.lock().await;
+        let destination_work = Arc::new(AtomicU64::new(0));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let destination_work = destination_work.clone();
+            move |operation| {
+                if operation == "prepare ambient destination" {
+                    destination_work.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })));
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    Some(persistence.clone()),
+                )
+                .await
+        );
+        assert!(client.pause_download(download_id).await.unwrap());
+        assert_eq!(
+            client.get_download_status(download_id).await,
+            Some(DownloadStatus::Pausing)
+        );
+        drop(destination_guard);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                if client.get_download_status(download_id).await == Some(DownloadStatus::Error)
+                    && !client.download_tasks.contains(download_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("missing durable row must settle the pause as a sticky error");
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(!state.task_registered);
+        assert!(state.lifecycle_failure_unverified);
+        drop(downloads);
+        assert_eq!(destination_work.load(Ordering::SeqCst), 0);
+        assert!(persistence.load_all().is_empty());
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn pause_persistence_error_is_sticky_and_never_projects_paused() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "pause-corrupt-persistence";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        let files = state.files.clone();
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let destination_guard = client
+            .destination_lock(&verified.destination.identity())
+            .await
+            .lock_owned()
+            .await;
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    Some(persistence),
+                )
+                .await
+        );
+        assert!(client.pause_download(download_id).await.unwrap());
+        let store_path = temp.path().join("downloads.json");
+        std::fs::write(&store_path, b"not-json").unwrap();
+        drop(destination_guard);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let failed = client
+                    .downloads
+                    .read()
+                    .await
+                    .get(download_id)
+                    .is_some_and(|state| {
+                        state.status == DownloadStatus::Error
+                            && state.lifecycle_failure_unverified
+                            && !state.task_registered
+                    });
+                if failed && !client.download_tasks.contains(download_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause persistence error must settle sticky Error");
+        assert_ne!(
+            client.get_download_status(download_id).await,
+            Some(DownloadStatus::Paused)
+        );
+        std::fs::remove_file(store_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_rejects_absent_gated_finished_and_non_worker_owners() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        assert!(!client.pause_download("absent").await.unwrap());
+
+        let gated_id = "pause-gated-worker";
+        client.downloads.write().await.insert(
+            gated_id.to_string(),
+            recovery_test_state(&verified, gated_id, DownloadStatus::Queued, true),
+        );
+        let gated =
+            client
+                .download_tasks
+                .prepare(gated_id.to_string(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await
+                });
+        let gated = client.download_tasks.install_gated(gated).unwrap();
+        assert!(!client.pause_download(gated_id).await.unwrap());
+        assert_eq!(
+            client.get_download_status(gated_id).await,
+            Some(DownloadStatus::Queued)
+        );
+        drop(gated);
+        client.download_tasks.rescue_abandoned();
+        client.downloads.write().await.remove(gated_id);
+
+        let finished_id = "pause-finished-worker";
+        client.downloads.write().await.insert(
+            finished_id.to_string(),
+            recovery_test_state(&verified, finished_id, DownloadStatus::Downloading, true),
+        );
+        let finished =
+            client
+                .download_tasks
+                .prepare(finished_id.to_string(), TaskRole::Worker, |_| async {});
+        client
+            .download_tasks
+            .install_gated(finished)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(finished_id)
+                .is_some_and(|task| task.outer_finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!client.pause_download(finished_id).await.unwrap());
+        client.observe_finished_download_tasks().await;
+
+        let transition_id = "pause-recovery-transition";
+        client.downloads.write().await.insert(
+            transition_id.to_string(),
+            recovery_test_state(&verified, transition_id, DownloadStatus::Downloading, true),
+        );
+        let transition = client.download_tasks.prepare(
+            transition_id.to_string(),
+            TaskRole::RecoveryTransition,
+            |_| async { std::future::pending::<()>().await },
+        );
+        client
+            .download_tasks
+            .install_gated(transition)
+            .unwrap()
+            .start();
+        assert!(!client.pause_download(transition_id).await.unwrap());
+        assert_eq!(
+            client.get_download_status(transition_id).await,
+            Some(DownloadStatus::Downloading)
+        );
+        assert!(client.cancel_download(transition_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pause_after_a_worker_check_is_settled_by_the_same_generation() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".to_string(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let destination = temp.path().join("library").join("model");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("weights.gguf"), b"done").unwrap();
+        let physical_guard = client
+            .destination_lock(&destination_identity(&client, &destination))
+            .await
+            .lock_owned()
+            .await;
+        let (reached_sender, reached) = std::sync::mpsc::channel();
+        let reached_sender = Arc::new(std::sync::Mutex::new(Some(reached_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_worker_projection_observer(Some(Arc::new({
+                let reached_sender = reached_sender.clone();
+                let release = release.clone();
+                move |projection| {
+                    if projection == "before-existing-file-projection" {
+                        if let Some(sender) = reached_sender.lock().unwrap().take() {
+                            sender.send(()).unwrap();
+                            release.lock().unwrap().recv().unwrap();
+                        }
+                    }
+                }
+            })));
+        let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+        let (id_sender, id_receiver) = std::sync::mpsc::channel();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let worker_runtime = std::thread::spawn({
+            let client = client.clone();
+            let destination = destination.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let download_id = client
+                            .start_download(&request, &destination, None)
+                            .await
+                            .unwrap();
+                        id_sender.send(download_id).unwrap();
+                        let _ = shutdown_receiver.await;
+                    });
+            }
+        });
+        let download_id = id_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("start must return its admitted ID");
+        drop(physical_guard);
+        reached
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Worker must reach the after-check projection seam");
+        assert!(client.pause_download(&download_id).await.unwrap());
+        release_sender.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                let settled =
+                    client
+                        .downloads
+                        .read()
+                        .await
+                        .get(&download_id)
+                        .is_some_and(|state| {
+                            state.status == DownloadStatus::Paused && !state.task_registered
+                        });
+                if settled && !client.download_tasks.contains(&download_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Worker that lost the projection race must settle Paused");
+        assert_eq!(
+            client
+                .destination_executions
+                .claim_count(&destination_identity(&client, &destination)),
+            1
+        );
+        client.download_tasks.set_worker_projection_observer(None);
+        let _ = shutdown_sender.send(());
+        worker_runtime.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pause_is_rejected_after_final_file_commit_and_during_cleanup() {
+        for block_at in [
+            "terminal-cleanup-committed",
+            "remove ambient download marker",
+        ] {
+            let temp = TempDir::new().unwrap();
+            let client = Arc::new(configured_download_client(temp.path().join("cache")).unwrap());
+            cache_repo_tree(
+                &client,
+                "acme/model",
+                vec![LfsFileInfo {
+                    filename: "weights.gguf".to_string(),
+                    size: 4,
+                    sha256: "a".repeat(64),
+                }],
+                Vec::new(),
+            );
+            let destination = temp.path().join("library").join("model");
+            std::fs::create_dir_all(&destination).unwrap();
+            std::fs::write(destination.join("weights.gguf"), b"done").unwrap();
+            let physical_guard = client
+                .destination_lock(&destination_identity(&client, &destination))
+                .await
+                .lock_owned()
+                .await;
+            let (reached_sender, reached) = std::sync::mpsc::channel();
+            let reached_sender = Arc::new(std::sync::Mutex::new(Some(reached_sender)));
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let release = Arc::new(std::sync::Mutex::new(Some(release)));
+            if block_at == "terminal-cleanup-committed" {
+                client
+                    .download_tasks
+                    .set_worker_projection_observer(Some(Arc::new({
+                        let reached_sender = reached_sender.clone();
+                        let release = release.clone();
+                        move |projection| {
+                            if projection == "terminal-cleanup-committed" {
+                                if let Some(sender) = reached_sender.lock().unwrap().take() {
+                                    sender.send(()).unwrap();
+                                    release.lock().unwrap().take().unwrap().recv().unwrap();
+                                }
+                            }
+                        }
+                    })));
+            } else {
+                client.download_tasks.set_blocking_observer(Some(Arc::new({
+                    let reached_sender = reached_sender.clone();
+                    let release = release.clone();
+                    move |operation| {
+                        if operation == "remove ambient download marker" {
+                            if let Some(sender) = reached_sender.lock().unwrap().take() {
+                                sender.send(()).unwrap();
+                                release.lock().unwrap().take().unwrap().recv().unwrap();
+                            }
+                        }
+                    }
+                })));
+            }
+            let request = recovery_test_request("acme/model", &["weights.gguf".to_string()]);
+            let (id_sender, id_receiver) = std::sync::mpsc::channel();
+            let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+            let worker_runtime = std::thread::spawn({
+                let client = client.clone();
+                let destination = destination.clone();
+                move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async move {
+                            let download_id = client
+                                .start_download(&request, &destination, None)
+                                .await
+                                .unwrap();
+                            id_sender.send(download_id).unwrap();
+                            let _ = shutdown_receiver.await;
+                        });
+                }
+            });
+            let download_id = id_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("start must return its admitted ID");
+            drop(physical_guard);
+            reached
+                .recv_timeout(Duration::from_secs(1))
+                .expect("Worker must reach terminal cleanup");
+            assert!(!client.pause_download(&download_id).await.unwrap());
+            assert_eq!(
+                client.downloads.read().await[&download_id].status,
+                DownloadStatus::Downloading
+            );
+            release_sender.send(()).unwrap();
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    client.observe_finished_download_tasks().await;
+                    if client.downloads.read().await[&download_id].status
+                        == DownloadStatus::Completed
+                        && !client.download_tasks.contains(&download_id)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal cleanup must complete without a stranded Pausing state");
+            assert_eq!(
+                client
+                    .destination_executions
+                    .claim_count(&destination_identity(&client, &destination)),
+                0
+            );
+            let _ = shutdown_sender.send(());
+            worker_runtime.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_resume_and_cancel_overlap_ends_cancelled_without_registered_task() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "resume-cancel";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Paused, false),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let resume = {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                client.resume_download(download_id).await.unwrap()
+            })
+        };
+        let cancel = {
+            let client = client.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                client.cancel_download(download_id).await.unwrap()
+            })
+        };
+        barrier.wait().await;
+        let _ = resume.await.unwrap();
+        assert!(cancel.await.unwrap());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_download_status(download_id).await == Some(DownloadStatus::Cancelled)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller-independent cancellation should reach its terminal state");
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Cancelled);
+        assert!(state.recovery_destination().is_none());
+        assert!(!state.task_registered);
+        drop(downloads);
+        client.observe_finished_download_tasks().await;
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_cancel_future_cannot_detach_recovery_finalizer() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancel-finalizer";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+        let (worker_started, started) = tokio::sync::oneshot::channel();
+        let (release_worker, worker_release) = std::sync::mpsc::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::Worker,
+            move |task_context| async move {
+                let _ = task_context
+                    .run_blocking(move || {
+                        let _ = worker_started.send(());
+                        let _ = worker_release.recv();
+                    })
+                    .await;
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        started.await.unwrap();
+
+        let cancellation = {
+            let client = client.clone();
+            tokio::spawn(async move { client.cancel_download(download_id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if client.get_download_status(download_id).await == Some(DownloadStatus::Cancelling)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancel should enter its owned terminal transition");
+        cancellation.abort();
+        let _ = cancellation.await;
+
+        {
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert!(state.task_registered);
+            assert!(state.recovery_destination().is_some());
+        }
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| !task.finished));
+        assert!(client.cancel_download(download_id).await.unwrap());
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| !task.finished));
+
+        release_worker.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = client.downloads.read().await;
+                let state = downloads.get(download_id).unwrap();
+                if state.status == DownloadStatus::Cancelled
+                    && !state.task_registered
+                    && state.recovery_destination().is_none()
+                {
+                    break;
+                }
+                drop(downloads);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the caller-independent finalizer should settle cancellation");
+    }
+
+    #[tokio::test]
+    async fn recovery_finalizer_drains_each_capability_mutation_before_terminal() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            CreateParent,
+            TruncatePart,
+            WritePart,
+            FlushPart,
+            RemovePart,
+            RenamePart,
+            RemoveMarker,
+        }
+
+        for (index, operation) in [
+            Operation::CreateParent,
+            Operation::TruncatePart,
+            Operation::WritePart,
+            Operation::FlushPart,
+            Operation::RemovePart,
+            Operation::RenamePart,
+            Operation::RemoveMarker,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = TempDir::new().unwrap();
+            let library_root = temp.path().join("library");
+            let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+            let verified = verified_recovery(&library_root, "acme/model", &["nested/weights.gguf"]);
+            let destination = DownloadDestination::Recovery(verified.destination.clone());
+            let filename = "nested/weights.gguf";
+            std::fs::create_dir_all(verified.destination.display_path().join("nested")).unwrap();
+            match operation {
+                Operation::RemovePart | Operation::RenamePart => {
+                    std::fs::write(
+                        verified
+                            .destination
+                            .display_path()
+                            .join("nested/weights.gguf.part"),
+                        b"partial",
+                    )
+                    .unwrap();
+                }
+                Operation::RemoveMarker => {
+                    std::fs::write(
+                        verified.destination.display_path().join(".pumas_download"),
+                        b"{}",
+                    )
+                    .unwrap();
+                }
+                Operation::CreateParent
+                | Operation::TruncatePart
+                | Operation::WritePart
+                | Operation::FlushPart => {}
+            }
+
+            let expected_label = match operation {
+                Operation::CreateParent => "create file parent",
+                Operation::TruncatePart => "open partial download file",
+                Operation::WritePart => "write partial download file",
+                Operation::FlushPart => "flush partial download file",
+                Operation::RemovePart => "remove partial download file",
+                Operation::RenamePart => "promote partial download file",
+                Operation::RemoveMarker => "remove download marker",
+            };
+            let (started_sender, started) = tokio::sync::oneshot::channel();
+            let started_sender = Arc::new(std::sync::Mutex::new(Some(started_sender)));
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let release = Arc::new(std::sync::Mutex::new(release));
+            client.download_tasks.set_blocking_observer(Some(Arc::new({
+                let started_sender = started_sender.clone();
+                let release = release.clone();
+                move |label| {
+                    if label == expected_label {
+                        if let Some(sender) = started_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+
+            let download_id = format!("mutation-{index}");
+            client.downloads.write().await.insert(
+                download_id.clone(),
+                recovery_test_state(&verified, &download_id, DownloadStatus::Downloading, true),
+            );
+            let prepared = client.download_tasks.prepare(
+                download_id.clone(),
+                TaskRole::Worker,
+                move |task_context| async move {
+                    let _ = match operation {
+                        Operation::CreateParent => {
+                            destination.prepare_file(&task_context, filename).await
+                        }
+                        Operation::TruncatePart => destination
+                            .open_part(&task_context, filename, false)
+                            .await
+                            .map(drop),
+                        Operation::WritePart => {
+                            match destination.open_part(&task_context, filename, false).await {
+                                Ok(mut file) => file.write_all(&task_context, b"sentinel").await,
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Operation::FlushPart => {
+                            match destination.open_part(&task_context, filename, false).await {
+                                Ok(mut file) => file.flush(&task_context).await,
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Operation::RemovePart => {
+                            destination.remove_part(&task_context, filename).await
+                        }
+                        Operation::RenamePart => {
+                            destination
+                                .rename_part_to_file(&task_context, filename)
+                                .await
+                        }
+                        Operation::RemoveMarker => destination.remove_marker(&task_context).await,
+                    };
+                },
+            );
+            client
+                .download_tasks
+                .install_gated(prepared)
+                .unwrap()
+                .start();
+            started.await.unwrap();
+
+            assert!(client.cancel_download(&download_id).await.unwrap());
+            tokio::task::yield_now().await;
+            {
+                let downloads = client.downloads.read().await;
+                let state = downloads.get(&download_id).unwrap();
+                assert_eq!(state.status, DownloadStatus::Cancelling);
+                assert!(state.recovery_destination().is_some());
+                assert!(state.task_registered);
+            }
+            release_sender.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let downloads = client.downloads.read().await;
+                    let state = downloads.get(&download_id).unwrap();
+                    if state.status == DownloadStatus::Cancelled {
+                        assert!(state.recovery_destination().is_none());
+                        assert!(!state.task_registered);
+                        break;
+                    }
+                    drop(downloads);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal callback must follow the capability mutation drain");
+            let snapshot = || {
+                [
+                    verified.destination.display_path().join(filename),
+                    verified
+                        .destination
+                        .display_path()
+                        .join(format!("{filename}.part")),
+                    verified.destination.display_path().join(".pumas_download"),
+                ]
+                .map(|path| std::fs::read(path).ok())
+            };
+            let terminal_snapshot = snapshot();
+            tokio::task::yield_now().await;
+            assert_eq!(
+                snapshot(),
+                terminal_snapshot,
+                "no mutation may outlive terminal state"
+            );
+            client.download_tasks.set_blocking_observer(None);
+        }
+    }
+
+    #[tokio::test]
+    async fn ambient_finalizer_drains_inflight_write_before_cleanup_and_terminal() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "ambient-held-write-cancel";
+        let mut state =
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true);
+        state.make_managed_for_test();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let destination = DownloadDestination::Managed(verified.destination.clone());
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let started_sender = Arc::new(std::sync::Mutex::new(Some(started_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let started_sender = started_sender.clone();
+            let release = release.clone();
+            move |operation| {
+                if operation == "write ambient partial download file" {
+                    if let Some(sender) = started_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                }
+            }
+        })));
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::Worker,
+            move |task_context| async move {
+                let mut file = destination
+                    .open_part(&task_context, "weights.gguf", false)
+                    .await
+                    .unwrap();
+                file.write_all(&task_context, b"stale-after-cancel")
+                    .await
+                    .unwrap();
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        {
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert_eq!(state.status, DownloadStatus::Cancelling);
+            assert!(state.task_registered);
+        }
+        release_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.get_download_status(download_id).await != Some(DownloadStatus::Cancelled) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ambient terminal must follow the owner-visible write and cleanup");
+        let part = verified
+            .destination
+            .display_path()
+            .join("weights.gguf.part");
+        assert!(!part.exists());
+        tokio::task::yield_now().await;
+        assert!(
+            !part.exists(),
+            "no ambient mutation may outlive terminal state"
+        );
+        client.download_tasks.set_blocking_observer(None);
+    }
+
+    #[tokio::test]
+    async fn recovery_worker_panic_cannot_publish_cancelled_or_release_capability() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "worker-panic-cancel";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    panic!("worker failure sentinel");
+                });
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.recovery_destination().is_some());
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn recovery_nested_panic_cannot_publish_cancelled_or_release_capability() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "nested-panic-cancel";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+        let (nested_finished_sender, nested_finished) = tokio::sync::oneshot::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::Worker,
+            move |context| async move {
+                let _ = context
+                    .run_blocking(|| panic!("nested failure sentinel"))
+                    .await;
+                let _ = nested_finished_sender.send(());
+                std::future::pending::<()>().await;
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        nested_finished.await.unwrap();
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.recovery_destination().is_some());
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn cancellation_cleanup_failure_is_not_reported_as_cancelled() {
+        let temp = TempDir::new().unwrap();
+        let blocked_root = temp.path().join("not-a-directory");
+        std::fs::write(&blocked_root, b"sentinel").unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client.set_persistence(Arc::new(DownloadPersistence::new(&blocked_root)));
+        let download_id = "cleanup-failure-cancel";
+        let library_root = temp.path().join("library");
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let mut state =
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true);
+        state.make_managed_for_test();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await
+                });
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn panicked_cancel_finalizer_is_reconciled_to_error() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "panicked-finalizer";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Cancelling, true),
+        );
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::CancelFinalizer,
+            |_| async { panic!("finalizer failure sentinel") },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let _ = client.list_downloads().await;
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.recovery_destination().is_some());
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn repeated_public_cancel_repairs_finished_and_panicked_finalizers() {
+        for panicked in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let library_root = temp.path().join("library");
+            let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+            let download_id = if panicked {
+                "repeat-panicked-finalizer"
+            } else {
+                "repeat-finished-finalizer"
+            };
+            client.downloads.write().await.insert(
+                download_id.to_string(),
+                recovery_test_state(&verified, download_id, DownloadStatus::Cancelling, true),
+            );
+            let prepared = client.download_tasks.prepare(
+                download_id.to_string(),
+                TaskRole::CancelFinalizer,
+                move |_| async move {
+                    assert!(!panicked, "finalizer failure sentinel");
+                },
+            );
+            client
+                .download_tasks
+                .install_gated(prepared)
+                .unwrap()
+                .start();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !client
+                    .download_tasks
+                    .snapshot(download_id)
+                    .is_some_and(|task| task.finished)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            assert!(client.cancel_download(download_id).await.unwrap());
+            let expected = DownloadStatus::Error;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while client.get_download_status(download_id).await != Some(expected) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("repeat public cancel must settle the finished predecessor");
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert!(!state.task_registered);
+            assert!(state.lifecycle_failure_unverified);
+            assert!(state.recovery_destination().is_some());
+            drop(downloads);
+            assert!(client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| { task.role == TaskRole::CancelFinalizer && task.finished }));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_cancel_preserves_finished_active_worker_obligation() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancel-finished-active-worker";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+        let (finish_sender, finish) = tokio::sync::oneshot::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::Worker,
+            move |_| async move {
+                let _ = finish.await;
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+
+        let (replacement_reached_sender, replacement_reached) = std::sync::mpsc::channel();
+        let replacement_reached_sender =
+            Arc::new(std::sync::Mutex::new(Some(replacement_reached_sender)));
+        let (release_replacement_sender, release_replacement) = std::sync::mpsc::channel();
+        let release_replacement = Arc::new(std::sync::Mutex::new(release_replacement));
+        client
+            .download_tasks
+            .set_cancel_replacement_observer(Some(Arc::new({
+                let replacement_reached_sender = replacement_reached_sender.clone();
+                let release_replacement = release_replacement.clone();
+                move || {
+                    if let Some(sender) = replacement_reached_sender.lock().unwrap().take() {
+                        sender.send(()).unwrap();
+                        release_replacement.lock().unwrap().recv().unwrap();
+                    }
+                }
+            })));
+        let cancel_client = client.clone();
+        let cancel = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let result = cancel_client.cancel_download(download_id).await;
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let terminal = cancel_client
+                                .downloads
+                                .read()
+                                .await
+                                .get(download_id)
+                                .is_some_and(|state| !state.task_registered);
+                            if terminal {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the cancellation runtime must drive its finalizer to terminal");
+                    result
+                })
+        });
+        replacement_reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancel must reach the exact pre-replacement seam");
+        assert!(!client.download_tasks.outer_finished_for_test(download_id));
+        finish_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.download_tasks.outer_finished_for_test(download_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Worker must finish after state capture but before lifecycle replacement");
+        release_replacement_sender.send(()).unwrap();
+        assert!(cancel.join().unwrap().unwrap());
+        client.download_tasks.set_cancel_replacement_observer(None);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed_closed =
+                    client
+                        .downloads
+                        .read()
+                        .await
+                        .get(download_id)
+                        .is_some_and(|state| {
+                            state.status == DownloadStatus::Error
+                                && !state.task_registered
+                                && state.lifecycle_failure_unverified
+                                && state.recovery_destination().is_some()
+                        });
+                if failed_closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("direct cancel must retain the finished Worker's unresolved obligation");
+    }
+
+    #[tokio::test]
+    async fn cancel_drains_held_nested_work_after_outer_finished_and_preserves_obligation() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancel-outer-finished-nested-held";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+        let (nested_started_sender, nested_started) = tokio::sync::oneshot::channel();
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::Worker,
+            move |context| async move {
+                context
+                    .register_blocking_without_wait_for_test("held after outer", move || {
+                        let _ = nested_started_sender.send(());
+                        let _ = release.recv();
+                    })
+                    .unwrap();
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(1), nested_started)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.download_tasks.outer_finished_for_test(download_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Worker outer must finish before cancellation replacement");
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        {
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert_eq!(state.status, DownloadStatus::Cancelling);
+            assert!(state.task_registered);
+            assert!(state.recovery_destination().is_some());
+        }
+
+        release_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let failed_closed =
+                    client
+                        .downloads
+                        .read()
+                        .await
+                        .get(download_id)
+                        .is_some_and(|state| {
+                            state.status == DownloadStatus::Error
+                                && !state.task_registered
+                                && state.lifecycle_failure_unverified
+                                && state.recovery_destination().is_some()
+                        });
+                if failed_closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("held nested work must drain before fail-closed settlement");
+    }
+
+    #[tokio::test]
+    async fn finished_active_worker_is_projected_to_sticky_error_without_cancel() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "project-finished-active-worker";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, false),
+        );
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {});
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let _ = client.list_downloads().await;
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.lifecycle_failure_unverified);
+        assert!(state.recovery_destination().is_some());
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn cancel_superseding_held_terminal_projection_inherits_state_obligation() {
+        for (role, status, download_id) in [
+            (
+                TaskRole::Worker,
+                DownloadStatus::Downloading,
+                "cancel-held-worker-projection",
+            ),
+            (
+                TaskRole::CancelFinalizer,
+                DownloadStatus::Cancelling,
+                "cancel-held-finalizer-projection",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let library_root = temp.path().join("library");
+            let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+            let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+            client.downloads.write().await.insert(
+                download_id.to_string(),
+                recovery_test_state(&verified, download_id, status, false),
+            );
+            let prepared =
+                client
+                    .download_tasks
+                    .prepare(download_id.to_string(), role, |_| async {});
+            client
+                .download_tasks
+                .install_gated(prepared)
+                .unwrap()
+                .start();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !client
+                    .download_tasks
+                    .snapshot(download_id)
+                    .is_some_and(|task| task.finished)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let (projection_sender, projection_reached) = std::sync::mpsc::channel();
+            let projection_sender = Arc::new(std::sync::Mutex::new(Some(projection_sender)));
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let release = Arc::new(std::sync::Mutex::new(release));
+            client
+                .download_tasks
+                .set_projection_observer(Some(Arc::new({
+                    let projection_sender = projection_sender.clone();
+                    let release = release.clone();
+                    move |projection| {
+                        if projection == "finished-task" {
+                            if let Some(sender) = projection_sender.lock().unwrap().take() {
+                                let _ = sender.send(());
+                                let _ = release.lock().unwrap().recv();
+                            }
+                        }
+                    }
+                })));
+            let listing_client = client.clone();
+            let listing = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(listing_client.list_downloads())
+            });
+            projection_reached
+                .recv_timeout(Duration::from_secs(2))
+                .expect("finished owner must enter its terminal projector");
+            assert!(client.cancel_download(download_id).await.unwrap());
+            release_sender.send(()).unwrap();
+            listing.join().unwrap();
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let failed_closed =
+                        client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| {
+                                state.status == DownloadStatus::Error
+                                    && !state.task_registered
+                                    && state.lifecycle_failure_unverified
+                                    && state.recovery_destination().is_some()
+                            });
+                    if failed_closed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancel must inherit the superseded projection's sticky obligation");
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while client.download_tasks.contains(download_id)
+                    || client.download_tasks.outstanding_retired_for_test() != 0
+                {
+                    let _ = client.list_downloads().await;
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the replacement finalizer must be observed and settled");
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert_eq!(state.status, DownloadStatus::Error);
+            assert!(!state.task_registered);
+            assert!(state.lifecycle_failure_unverified);
+            assert!(state.recovery_destination().is_some());
+            drop(downloads);
+            assert_eq!(client.download_tasks.outstanding_retired_for_test(), 0);
+            client.download_tasks.set_projection_observer(None);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_cancel_acknowledges_transferred_failure_after_error_projection() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancel-acknowledges-transferred-projection";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Paused, false),
+        );
+
+        let (fallback_reached_sender, fallback_reached) = tokio::sync::oneshot::channel();
+        let (_fallback_release_sender, fallback_release) = tokio::sync::oneshot::channel::<()>();
+        let prepared = client.download_tasks.prepare_projection(
+            download_id.to_string(),
+            |_, _| async {
+                panic!("terminal projection panic sentinel");
+            },
+            move |_| async move {
+                let _ = fallback_reached_sender.send(());
+                let _ = fallback_release.await;
+                ProjectionOutcome::RolledBack
+            },
+        );
+        let ticket = client
+            .download_tasks
+            .install_projection_gated(prepared)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(1), fallback_reached)
+            .await
+            .expect("projection panic must enter its owned fallback")
+            .unwrap();
+        assert!(!ticket.failure_projected_for_test());
+
+        let (error_reached_sender, error_reached) = std::sync::mpsc::channel();
+        let error_reached_sender = Arc::new(std::sync::Mutex::new(Some(error_reached_sender)));
+        let (release_error_sender, release_error) = std::sync::mpsc::channel();
+        let release_error = Arc::new(std::sync::Mutex::new(release_error));
+        client
+            .download_tasks
+            .set_projection_observer(Some(Arc::new({
+                let error_reached_sender = error_reached_sender.clone();
+                let release_error = release_error.clone();
+                move |projection| {
+                    if projection == "cancel-finalizer-error" {
+                        if let Some(sender) = error_reached_sender.lock().unwrap().take() {
+                            sender.send(()).unwrap();
+                            release_error.lock().unwrap().recv().unwrap();
+                        }
+                    }
+                }
+            })));
+
+        let cancel_client = client.clone();
+        let finalizer_ticket = ticket.clone();
+        let cancel = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    assert!(cancel_client.cancel_download(download_id).await.unwrap());
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !finalizer_ticket.settled_for_test() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("finalizer must settle transferred projection custody");
+                });
+        });
+        tokio::task::spawn_blocking(move || {
+            error_reached
+                .recv_timeout(Duration::from_secs(2))
+                .expect("finalizer must project Error before acknowledging the old cell");
+        })
+        .await
+        .unwrap();
+        assert_eq!(ticket.wait().await, ProjectionOutcome::Superseded);
+        assert!(!ticket.failure_projected_for_test());
+        assert!(!ticket.settled_for_test());
+        {
+            let states = client.downloads.read().await;
+            let state = states.get(download_id).unwrap();
+            assert_eq!(state.status, DownloadStatus::Error);
+            assert!(state.lifecycle_failure_unverified);
+            assert!(state.recovery_destination().is_some());
+        }
+
+        release_error_sender.send(()).unwrap();
+        cancel.join().unwrap();
+        assert!(ticket.failure_projected_for_test());
+        assert!(ticket.settled_for_test());
+        client.download_tasks.set_projection_observer(None);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.download_tasks.contains(download_id) {
+                let _ = client.list_downloads().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("acknowledging finalizer must be observed without residual owner");
+        let states = client.downloads.read().await;
+        let state = states.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.lifecycle_failure_unverified);
+        assert!(state.recovery_destination().is_some());
+    }
+
+    #[tokio::test]
+    async fn panicked_terminal_projection_projects_once_settles_and_stays_fail_closed() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "panicked-terminal-projector";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.error = Some("handled worker outcome".to_string());
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {});
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let projection_calls = Arc::new(AtomicUsize::new(0));
+        let projection_calls_in_task = projection_calls.clone();
+        client
+            .download_tasks
+            .set_projection_observer(Some(Arc::new(move |projection| {
+                if projection == "finished-task" {
+                    projection_calls_in_task.fetch_add(1, Ordering::SeqCst);
+                    panic!("terminal projection panic sentinel");
+                }
+            })));
+        let (first, second) = tokio::join!(client.list_downloads(), client.list_downloads());
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        client.download_tasks.set_projection_observer(None);
+        assert_eq!(projection_calls.load(Ordering::SeqCst), 1);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.lifecycle_failure_unverified);
+        assert!(state.recovery_destination().is_some());
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client
+                .downloads
+                .read()
+                .await
+                .get(download_id)
+                .is_some_and(|state| state.status == DownloadStatus::Cancelling)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.lifecycle_failure_unverified);
+        assert!(state.recovery_destination().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_finished_observer_keeps_owner_until_atomic_state_projection() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "stale-failed-observation";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Queued, true),
+        );
+        let failed =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    panic!("stale worker failure sentinel")
+                });
+        client.download_tasks.install_gated(failed).unwrap().start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let (projection_sender, projection_reached) = std::sync::mpsc::channel();
+        let projection_sender = Arc::new(std::sync::Mutex::new(Some(projection_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_projection_observer(Some(Arc::new({
+                let projection_sender = projection_sender.clone();
+                let release = release.clone();
+                move |projection| {
+                    if projection == "finished-task" {
+                        if let Some(sender) = projection_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let (abort_sender, abort_receiver) = std::sync::mpsc::channel();
+        let (terminal_sender, terminal_receiver) = std::sync::mpsc::channel();
+        let listing_client = client.clone();
+        let listing = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let request_client = listing_client.clone();
+                let request = tokio::spawn(async move { request_client.list_downloads().await });
+                abort_sender.send(request.abort_handle()).unwrap();
+                let _ = request.await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !listing_client
+                        .download_tasks
+                        .snapshot(download_id)
+                        .is_some_and(|task| {
+                            task.role == TaskRole::TerminalProjection && task.finished
+                        })
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                terminal_sender.send(()).unwrap();
+            });
+        });
+        projection_reached
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        abort_receiver.recv().unwrap().abort();
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| task.role == TaskRole::TerminalProjection && task.started));
+        release_sender.send(()).unwrap();
+        terminal_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        listing.join().unwrap();
+        assert!(client.download_tasks.contains(download_id));
+        client.download_tasks.set_projection_observer(None);
+        let _ = client.list_downloads().await;
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(!state.task_registered);
+        assert!(state.recovery_destination().is_some());
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn concurrent_finished_observers_cannot_apply_predecessor_to_successor() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "concurrent-finished-observers";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Queued, true),
+        );
+        let failed =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    panic!("predecessor failure sentinel")
+                });
+        client.download_tasks.install_gated(failed).unwrap().start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let projection_count = Arc::new(AtomicUsize::new(0));
+        let (first_sender, first_reached) = std::sync::mpsc::channel();
+        let first_sender = Arc::new(std::sync::Mutex::new(Some(first_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_projection_observer(Some(Arc::new({
+                let first_sender = first_sender.clone();
+                let release = release.clone();
+                let projection_count = projection_count.clone();
+                move |projection| {
+                    if projection == "finished-task" {
+                        projection_count.fetch_add(1, Ordering::SeqCst);
+                        let sender = first_sender.lock().unwrap().take();
+                        if let Some(sender) = sender {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let first_client = client.clone();
+        let first = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(first_client.observe_finished_download_tasks());
+        });
+        first_reached.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let second_client = client.clone();
+        let second = tokio::spawn(async move { second_client.list_downloads().await });
+        tokio::task::yield_now().await;
+        assert_eq!(projection_count.load(Ordering::SeqCst), 1);
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| task.role == TaskRole::TerminalProjection));
+        let rejected =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await
+                });
+        assert!(client.download_tasks.install_gated(rejected).is_err());
+        client.download_tasks.rescue_abandoned();
+        release_sender.send(()).unwrap();
+        first.join().unwrap();
+        second.await.unwrap();
+        client.download_tasks.set_projection_observer(None);
+
+        let successor =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await
+                });
+        let installed = {
+            let mut downloads = client.downloads.write().await;
+            let state = downloads.get_mut(download_id).unwrap();
+            state.status = DownloadStatus::Queued;
+            state.error = None;
+            state.task_registered = true;
+            client.download_tasks.install_gated(successor).unwrap()
+        };
+        installed.start();
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.error.is_none());
+        assert!(state.task_registered);
+        drop(downloads);
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| task.role == TaskRole::Worker && !task.finished));
+        assert!(client.cancel_download(download_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn public_cancel_without_predecessor_owner_settles_truthfully() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancel-without-predecessor";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, false),
+        );
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let terminal = client
+                    .downloads
+                    .read()
+                    .await
+                    .get(download_id)
+                    .is_some_and(|state| state.status == DownloadStatus::Cancelled);
+                if terminal {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = client.list_downloads().await;
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Cancelled);
+        assert!(state.recovery_destination().is_none());
+        assert!(!state.task_registered);
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn ownerless_cancel_cleans_all_bound_artifacts_before_terminal_in_both_modes() {
+        for recovery in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let library_root = temp.path().join("library");
+            let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+            client.set_persistence(persistence.clone());
+            let verified = verified_recovery(
+                &library_root,
+                "acme/model",
+                &["one.gguf", "nested/two.gguf"],
+            );
+            let download_id = if recovery {
+                "ownerless-recovery-cleanup"
+            } else {
+                "ownerless-ambient-cleanup"
+            };
+            let mut state =
+                recovery_test_state(&verified, download_id, DownloadStatus::Downloading, false);
+            if !recovery {
+                state.make_managed_for_test();
+            }
+            persistence
+                .save(&persisted_recovery_test_state(&state))
+                .unwrap();
+            if recovery {
+                persistence.revoke(download_id).unwrap();
+            }
+            client
+                .downloads
+                .write()
+                .await
+                .insert(download_id.to_string(), state);
+
+            std::fs::create_dir_all(verified.destination.display_path().join("nested")).unwrap();
+            for filename in ["one.gguf", "nested/two.gguf"] {
+                std::fs::write(
+                    verified
+                        .destination
+                        .display_path()
+                        .join(format!("{filename}.part")),
+                    b"partial",
+                )
+                .unwrap();
+            }
+            std::fs::write(
+                verified.destination.display_path().join(".pumas_download"),
+                b"{}",
+            )
+            .unwrap();
+
+            let expected = if recovery {
+                "remove partial download file"
+            } else {
+                "remove ambient partial download file"
+            };
+            let (started_sender, started) = tokio::sync::oneshot::channel();
+            let started_sender = Arc::new(std::sync::Mutex::new(Some(started_sender)));
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let release = Arc::new(std::sync::Mutex::new(release));
+            client.download_tasks.set_blocking_observer(Some(Arc::new({
+                let started_sender = started_sender.clone();
+                let release = release.clone();
+                move |operation| {
+                    if operation == expected {
+                        if let Some(sender) = started_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+
+            assert!(client.cancel_download(download_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(1), started)
+                .await
+                .expect("the finalizer must own partial cleanup")
+                .unwrap();
+            {
+                let downloads = client.downloads.read().await;
+                let state = downloads.get(download_id).unwrap();
+                assert_eq!(state.status, DownloadStatus::Cancelling);
+                assert!(state.task_registered);
+                assert_eq!(state.recovery_destination().is_some(), recovery);
+            }
+            release_sender.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while client.get_download_status(download_id).await
+                    != Some(DownloadStatus::Cancelled)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal cancellation must wait for all cleanup");
+
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert!(!state.task_registered);
+            assert!(state.recovery_destination().is_none());
+            drop(downloads);
+            for filename in ["one.gguf", "nested/two.gguf"] {
+                assert!(!verified
+                    .destination
+                    .display_path()
+                    .join(format!("{filename}.part"))
+                    .exists());
+            }
+            assert!(!verified
+                .destination
+                .display_path()
+                .join(".pumas_download")
+                .exists());
+            assert!(persistence.load_all().is_empty());
+            assert_eq!(persistence.is_revoked(download_id).unwrap(), recovery);
+            client.download_tasks.set_blocking_observer(None);
+        }
+    }
+
+    #[tokio::test]
+    async fn ownerless_cancel_cleanup_failure_is_fail_closed_in_both_modes() {
+        for recovery in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let library_root = temp.path().join("library");
+            let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+            client.set_persistence(persistence.clone());
+            let verified = verified_recovery(
+                &library_root,
+                "acme/model",
+                &["blocked.gguf", "cleaned.gguf"],
+            );
+            let download_id = if recovery {
+                "ownerless-recovery-failure"
+            } else {
+                "ownerless-ambient-failure"
+            };
+            let mut state =
+                recovery_test_state(&verified, download_id, DownloadStatus::Downloading, false);
+            if !recovery {
+                state.make_managed_for_test();
+            }
+            let original = persisted_recovery_test_state(&state);
+            persistence.save(&original).unwrap();
+            if recovery {
+                persistence.revoke(download_id).unwrap();
+                state.revoked_snapshot = Some(original.clone());
+            }
+            client
+                .downloads
+                .write()
+                .await
+                .insert(download_id.to_string(), state);
+
+            std::fs::write(
+                verified
+                    .destination
+                    .display_path()
+                    .join("blocked.gguf.part"),
+                b"scanner-visible partial",
+            )
+            .unwrap();
+            std::fs::write(
+                verified
+                    .destination
+                    .display_path()
+                    .join("cleaned.gguf.part"),
+                b"partial",
+            )
+            .unwrap();
+            std::fs::write(
+                verified.destination.display_path().join(".pumas_download"),
+                b"{}",
+            )
+            .unwrap();
+
+            let failed_once = Arc::new(AtomicBool::new(false));
+            let failed_once_in_observer = failed_once.clone();
+            let failure_operation = if recovery {
+                "remove partial download file"
+            } else {
+                "remove ambient partial download file"
+            };
+            client
+                .download_tasks
+                .set_blocking_failure_observer(Some(Arc::new(move |operation| {
+                    operation == failure_operation
+                        && !failed_once_in_observer.swap(true, Ordering::SeqCst)
+                })));
+
+            assert!(client.cancel_download(download_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let failed =
+                        client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| {
+                                state.status == DownloadStatus::Error
+                                    && state.lifecycle_failure_unverified
+                                    && !state.task_registered
+                            });
+                    if failed {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cleanup failure must settle as Error");
+            let state = client.downloads.read().await;
+            assert_eq!(
+                state[download_id].recovery_destination().is_some(),
+                recovery
+            );
+            drop(state);
+            assert!(verified
+                .destination
+                .display_path()
+                .join("blocked.gguf.part")
+                .is_file());
+            assert!(!verified
+                .destination
+                .display_path()
+                .join("cleaned.gguf.part")
+                .exists());
+            assert!(!verified
+                .destination
+                .display_path()
+                .join(".pumas_download")
+                .exists());
+            if recovery {
+                assert!(persistence.load_all().is_empty());
+                assert!(persistence.is_revoked(download_id).unwrap());
+            } else {
+                assert!(persistence.load_all().is_empty());
+                assert!(!persistence.is_revoked(download_id).unwrap());
+            }
+            let inventory = persistence.load_lifecycle_inventory_strict().unwrap();
+            let quarantine = &inventory.quarantines[download_id];
+            assert_eq!(
+                quarantine.domain,
+                if recovery {
+                    LifecycleQuarantineDomain::Recovery
+                } else {
+                    LifecycleQuarantineDomain::Ambient
+                }
+            );
+            assert_eq!(quarantine.disposition, LifecycleCleanupDisposition::Pending);
+            assert!(quarantine.sticky_failure);
+            let mut expected = serde_json::to_value(&original).unwrap();
+            expected["status"] = serde_json::to_value(DownloadStatus::Error).unwrap();
+            assert_eq!(
+                serde_json::to_value(&quarantine.snapshot).unwrap(),
+                expected
+            );
+            let mut reopened = HuggingFaceClient::new(temp.path().join("reopened")).unwrap();
+            reopened
+                .configure_download_destination_root(&library_root)
+                .unwrap();
+            reopened.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+            assert!(reopened.restore_persisted_downloads().await.is_err());
+            client.download_tasks.set_blocking_failure_observer(None);
+
+            assert_eq!(
+                client
+                    .destination_executions
+                    .claim_count(&verified.destination.identity()),
+                1,
+                "failed cleanup must park destination authority"
+            );
+            assert!(client.cancel_download(download_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let settled =
+                        client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| {
+                                state.status == DownloadStatus::Error
+                                    && state.lifecycle_failure_unverified
+                                    && !state.task_registered
+                            });
+                    if settled
+                        && client
+                            .destination_executions
+                            .claim_count(&verified.destination.identity())
+                            == 0
+                    {
+                        break;
+                    }
+                    let _ = client.get_download_status(download_id).await;
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("successful retry must settle sticky Error and release authority");
+
+            let state = client.downloads.read().await;
+            assert_eq!(state[download_id].status, DownloadStatus::Error);
+            assert!(state[download_id].lifecycle_failure_unverified);
+            assert_eq!(
+                state[download_id].recovery_destination().is_some(),
+                recovery
+            );
+            drop(state);
+            assert!(!verified
+                .destination
+                .display_path()
+                .join("blocked.gguf.part")
+                .exists());
+            assert!(persistence.load_all().is_empty());
+            assert_eq!(persistence.is_revoked(download_id).unwrap(), recovery);
+            reopened.restore_persisted_downloads().await.unwrap();
+            if recovery {
+                assert!(reopened.list_downloads().await.is_empty());
+            } else {
+                assert_eq!(
+                    reopened.get_download_status(download_id).await,
+                    Some(DownloadStatus::Error)
+                );
+                assert!(!reopened.resume_download(download_id).await.unwrap());
+                assert!(reopened.cancel_download(download_id).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replaced_worker_cannot_publish_cancelled_before_its_finalizer() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancel-ready-worker";
+        let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (check_sender, check_reached) = std::sync::mpsc::channel();
+        let check_sender = Arc::new(std::sync::Mutex::new(Some(check_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_cancellation_check_observer(Some(Arc::new({
+                let check_sender = check_sender.clone();
+                let release = release.clone();
+                move || {
+                    if let Some(sender) = check_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                }
+            })));
+        let (state_sender, state_receiver) = tokio::sync::oneshot::channel();
+        let (settled_sender, settled_receiver) = tokio::sync::oneshot::channel();
+        let cancel_client = client.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            check_reached.recv().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                assert!(cancel_client.cancel_download(download_id).await.unwrap());
+                let state_during_cancel = {
+                    let downloads = cancel_client.downloads.read().await;
+                    let state = downloads.get(download_id).unwrap();
+                    (
+                        state.status,
+                        state.recovery_destination().is_some(),
+                        state.task_registered,
+                    )
+                };
+                let _ = state_sender.send(state_during_cancel);
+                release_sender.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let settled = cancel_client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| state.status != DownloadStatus::Cancelling);
+                        if settled {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let _ = settled_sender.send(());
+            });
+        });
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    vec![FileToDownload {
+                        filename: "weights.gguf".to_string(),
+                        size: Some(4),
+                        sha256: None,
+                    }],
+                    DownloadDestination::Recovery(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        );
+        let state_during_cancel = state_receiver.await.unwrap();
+        cancel_thread.join().unwrap();
+        assert_eq!(
+            state_during_cancel,
+            (DownloadStatus::Cancelling, true, true)
+        );
+        settled_receiver.await.unwrap();
+        client.download_tasks.set_cancellation_check_observer(None);
+        let _ = client.list_downloads().await;
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Cancelled);
+        assert!(state.recovery_destination().is_none());
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn replaced_worker_cannot_publish_paused_after_its_finalizer() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancel-ready-pause-worker";
+        let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        pause_flag.store(true, Ordering::Relaxed);
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (projection_sender, projection_reached) = std::sync::mpsc::channel();
+        let projection_sender = Arc::new(std::sync::Mutex::new(Some(projection_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_worker_projection_observer(Some(Arc::new({
+                let projection_sender = projection_sender.clone();
+                let release = release.clone();
+                move |projection| {
+                    if projection == "pause-before-destination" {
+                        if let Some(sender) = projection_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let (state_sender, state_receiver) = tokio::sync::oneshot::channel();
+        let (settled_sender, settled_receiver) = tokio::sync::oneshot::channel();
+        let cancel_client = client.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            projection_reached.recv().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                assert!(cancel_client.cancel_download(download_id).await.unwrap());
+                let state_during_cancel = {
+                    let downloads = cancel_client.downloads.read().await;
+                    let state = downloads.get(download_id).unwrap();
+                    (
+                        state.status,
+                        state.recovery_destination().is_some(),
+                        state.task_registered,
+                    )
+                };
+                let _ = state_sender.send(state_during_cancel);
+                release_sender.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let settled = cancel_client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| state.status != DownloadStatus::Cancelling);
+                        if settled {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let _ = settled_sender.send(());
+            });
+        });
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    vec![FileToDownload {
+                        filename: "weights.gguf".to_string(),
+                        size: Some(4),
+                        sha256: None,
+                    }],
+                    DownloadDestination::Recovery(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        );
+        assert_eq!(
+            state_receiver.await.unwrap(),
+            (DownloadStatus::Cancelling, true, true)
+        );
+        settled_receiver.await.unwrap();
+        cancel_thread.join().unwrap();
+        client.download_tasks.set_worker_projection_observer(None);
+        let _ = client.list_downloads().await;
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Cancelled);
+        assert!(state.recovery_destination().is_none());
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn semantic_recovery_failure_survives_cancel_before_receiver_consumes_result() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["nested/weights.gguf"]);
+        let download_id = "cancel-semantic-failure";
+        let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("nested"),
+            b"not a dir",
+        )
+        .unwrap();
+
+        let (result_sender, result_ready) = std::sync::mpsc::channel();
+        let result_sender = Arc::new(std::sync::Mutex::new(Some(result_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_blocking_result_observer(Some(Arc::new({
+                let result_sender = result_sender.clone();
+                let release = release.clone();
+                move |operation| {
+                    if operation == "create file parent" {
+                        if let Some(sender) = result_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+
+        let (state_sender, state_receiver) = tokio::sync::oneshot::channel();
+        let (settled_sender, settled_receiver) = tokio::sync::oneshot::channel();
+        let cancel_client = client.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            result_ready.recv().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                assert!(cancel_client.cancel_download(download_id).await.unwrap());
+                let state_during_cancel = {
+                    let downloads = cancel_client.downloads.read().await;
+                    let state = downloads.get(download_id).unwrap();
+                    (
+                        state.status,
+                        state.recovery_destination().is_some(),
+                        state.task_registered,
+                    )
+                };
+                let _ = state_sender.send(state_during_cancel);
+                release_sender.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let settled = cancel_client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| state.status != DownloadStatus::Cancelling);
+                        if settled {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let _ = settled_sender.send(());
+            });
+        });
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    vec![FileToDownload {
+                        filename: "nested/weights.gguf".to_string(),
+                        size: Some(4),
+                        sha256: None,
+                    }],
+                    DownloadDestination::Recovery(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        );
+        assert_eq!(
+            state_receiver.await.unwrap(),
+            (DownloadStatus::Cancelling, true, true)
+        );
+        settled_receiver.await.unwrap();
+        cancel_thread.join().unwrap();
+        client.download_tasks.set_blocking_result_observer(None);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.recovery_destination().is_some());
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn retry_and_pause_projections_require_current_worker_and_expected_status() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "worker-projection-generation";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+        let (context_sender, context_receiver) = tokio::sync::oneshot::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::Worker,
+            move |context| async move {
+                let _ = context_sender.send(context);
+                std::future::pending::<()>().await;
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        let stale_worker = context_receiver.await.unwrap();
+
+        {
+            let mut downloads = client.downloads.write().await;
+            assert!(matches!(
+                current_worker_state(
+                    &mut downloads,
+                    download_id,
+                    &stale_worker,
+                    &[DownloadStatus::Queued],
+                ),
+                Err(PumasError::DownloadCancelled)
+            ));
+        }
+        let transition = client
+            .download_tasks
+            .begin_cancel(download_id, |_, _| async {
+                std::future::pending::<()>().await;
+            });
+        let super::super::lifecycle::CancelTransition::Started(finalizer) = transition else {
+            panic!("the worker should be replaced by a finalizer");
+        };
+        finalizer.start();
+        let mut downloads = client.downloads.write().await;
+        assert!(matches!(
+            current_worker_state(
+                &mut downloads,
+                download_id,
+                &stale_worker,
+                &[DownloadStatus::Downloading],
+            ),
+            Err(PumasError::DownloadCancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_reset_projection_cannot_overwrite_replacement_finalizer() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "retry-reset-replacement";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+        let (context_sender, context_receiver) = tokio::sync::oneshot::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.to_string(),
+            TaskRole::Worker,
+            move |context| async move {
+                let _ = context_sender.send(context.clone());
+                std::future::pending::<()>().await;
+            },
+        );
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        let worker_context = context_receiver.await.unwrap();
+
+        let (projection_sender, projection_reached) = std::sync::mpsc::channel();
+        let projection_sender = Arc::new(std::sync::Mutex::new(Some(projection_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_worker_projection_observer(Some(Arc::new({
+                let projection_sender = projection_sender.clone();
+                let release = release.clone();
+                move |projection| {
+                    if projection == "retry-reset" {
+                        if let Some(sender) = projection_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let (state_sender, state_receiver) = tokio::sync::oneshot::channel();
+        let (settled_sender, settled_receiver) = tokio::sync::oneshot::channel();
+        let cancel_client = client.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            projection_reached.recv().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                assert!(cancel_client.cancel_download(download_id).await.unwrap());
+                let state_during_cancel = {
+                    let downloads = cancel_client.downloads.read().await;
+                    let state = downloads.get(download_id).unwrap();
+                    (
+                        state.status,
+                        state.recovery_destination().is_some(),
+                        state.task_registered,
+                    )
+                };
+                let _ = state_sender.send(state_during_cancel);
+                release_sender.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let settled = cancel_client
+                            .downloads
+                            .read()
+                            .await
+                            .get(download_id)
+                            .is_some_and(|state| state.status != DownloadStatus::Cancelling);
+                        if settled {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let _ = settled_sender.send(());
+            });
+        });
+
+        assert!(matches!(
+            project_worker_retry_reset(
+                &client.downloads,
+                download_id,
+                &worker_context,
+                2,
+                Some(4),
+            )
+            .await,
+            Err(PumasError::DownloadCancelled)
+        ));
+        assert_eq!(
+            state_receiver.await.unwrap(),
+            (DownloadStatus::Cancelling, true, true)
+        );
+        settled_receiver.await.unwrap();
+        cancel_thread.join().unwrap();
+        client.download_tasks.set_worker_projection_observer(None);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Cancelled);
+        assert!(state.recovery_destination().is_none());
+        assert!(!state.task_registered);
+    }
+
+    #[tokio::test]
+    async fn recovery_pause_during_blocking_preflight_retains_owner_and_capability() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "pause-blocking-preflight";
+        let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let started_sender = Arc::new(std::sync::Mutex::new(Some(started_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let started_sender = started_sender.clone();
+            let release = release.clone();
+            move |label| {
+                if label == "preflight" {
+                    if let Some(sender) = started_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                    let _ = release.lock().unwrap().recv();
+                }
+            }
+        })));
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    vec![FileToDownload {
+                        filename: "weights.gguf".to_string(),
+                        size: Some(4),
+                        sha256: None,
+                    }],
+                    DownloadDestination::Recovery(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        );
+        started.await.unwrap();
+
+        assert!(client.pause_download(download_id).await.unwrap());
+        {
+            let downloads = client.downloads.read().await;
+            let state = downloads.get(download_id).unwrap();
+            assert_eq!(state.status, DownloadStatus::Pausing);
+            assert!(state.recovery_destination().is_some());
+            assert!(state.task_registered);
+        }
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| !task.finished));
+
+        release_sender.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = client.downloads.read().await;
+                let state = downloads.get(download_id).unwrap();
+                if state.status == DownloadStatus::Paused && !state.task_registered {
+                    assert!(state.recovery_destination().is_some());
+                    break;
+                }
+                drop(downloads);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause should settle only after the owned preflight operation returns");
+        client.observe_finished_download_tasks().await;
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_recovery_resume_before_commit_preserves_paused_state() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "cancelled-resume";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Paused, false),
+        );
+        let auth_guard = client.auth_token.write().await;
+        let resume = {
+            let client = client.clone();
+            tokio::spawn(async move { client.resume_download(download_id).await })
+        };
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if client.get_download_status(download_id).await == Some(DownloadStatus::Queued) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        resume.abort();
+        let _ = resume.await;
+        drop(auth_guard);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Paused);
+        assert!(state.recovery_destination().is_some());
+        assert!(!state.task_registered);
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_recovery_resume_after_commit_keeps_registered_owner() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "post-commit-resume";
+        client.downloads.write().await.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Paused, false),
+        );
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let destination_guard = destination_lock.lock().await;
+        let resume = {
+            let client = client.clone();
+            tokio::spawn(async move { client.resume_download(download_id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let downloads = client.downloads.read().await;
+                let state = downloads.get(download_id).unwrap();
+                if state.status == DownloadStatus::Queued && state.task_registered {
+                    break;
+                }
+                drop(downloads);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery resume should atomically register its worker");
+        resume.abort();
+        let _ = resume.await;
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Queued);
+        assert!(state.recovery_destination().is_some());
+        assert!(state.task_registered);
+        drop(downloads);
+        assert!(client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| !task.finished));
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        drop(destination_guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.get_download_status(download_id).await == Some(DownloadStatus::Cancelled)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancel finalizer should settle the resumed recovery");
+    }
+
+    #[tokio::test]
+    async fn recovery_relocation_refuses_without_mutating_state_or_persistence() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "recovery-relocate";
+        let state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let old_dest = verified.destination.display_path().to_path_buf();
+
+        assert!(!client
+            .relocate_download_destination(
+                download_id,
+                &temp.path().join("other"),
+                Some("reranker"),
+                Some("other"),
+            )
+            .await
+            .unwrap());
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.dest_dir, old_dest);
+        assert!(state.recovery_destination().is_some());
+        assert_eq!(
+            state
+                .download_request
+                .as_ref()
+                .unwrap()
+                .model_type
+                .as_deref(),
+            Some("llm")
+        );
+        assert_eq!(state.download_request.as_ref().unwrap().family, "acme");
+        drop(downloads);
+        let persisted = persistence.load_all();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].dest_dir, old_dest);
+        assert_eq!(
+            persisted[0].download_request.model_type.as_deref(),
+            Some("llm")
+        );
+        assert_eq!(persisted[0].download_request.family, "acme");
+    }
+
+    #[test]
+    fn persisted_download_restore_never_recreates_recovery_authority() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let state = recovery_test_state(&verified, "persisted", DownloadStatus::Paused, false);
+        let restored = DownloadState::from_persisted(
+            &persisted_recovery_test_state(&state),
+            2,
+            DownloadDestination::Managed(verified.destination.clone()),
+        );
+
+        assert!(restored.recovery_destination().is_none());
+        assert_eq!(restored.status, DownloadStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn client_drop_releases_state_and_unstarted_task_recovery_authority() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let baseline = verified.destination.authority_strong_count();
+        let download_id = "drop-recovery";
+        let lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let lock_guard = lock.lock().await;
+        let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    vec![FileToDownload {
+                        filename: "weights.gguf".to_string(),
+                        size: Some(4),
+                        sha256: None,
+                    }],
+                    DownloadDestination::Recovery(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        );
+        assert!(verified.destination.authority_strong_count() > baseline);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if verified.destination.authority_strong_count() == baseline {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted unstarted task and state should release their authority");
+        drop(lock_guard);
+        assert!(!verified
+            .destination
+            .display_path()
+            .join("weights.gguf.part")
+            .exists());
+    }
 
     #[test]
     fn test_select_auxiliary_files_filters_correctly() {
@@ -2127,9 +13191,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_context_requires_one_exact_repo_destination_and_file_set() {
+        let temp = TempDir::new().unwrap();
+        let client = HuggingFaceClient::new(temp.path()).unwrap();
+        let destination = temp.path().join("llm/acme/model");
+        let root =
+            crate::model_library::download_recovery::DownloadDestinationRoot::open(temp.path())
+                .unwrap();
+        let held = root.resolve(&destination).unwrap();
+        let request = DownloadRequest {
+            repo_id: "acme/model".to_string(),
+            family: "acme".to_string(),
+            official_name: "Model".to_string(),
+            model_type: Some("llm".to_string()),
+            quant: None,
+            filename: None,
+            filenames: Some(vec![
+                "weights-2.gguf".to_string(),
+                "weights-1.gguf".to_string(),
+            ]),
+            pipeline_tag: None,
+            bundle_format: None,
+            pipeline_class: None,
+            release_date: None,
+            download_url: None,
+            model_card_json: None,
+            license_status: None,
+        };
+        client.downloads.write().await.insert(
+            "download-1".to_string(),
+            DownloadState {
+                download_id: "download-1".to_string(),
+                repo_id: "acme/model".to_string(),
+                status: DownloadStatus::Paused,
+                progress: 0.5,
+                downloaded_bytes: 1,
+                total_bytes: Some(2),
+                speed: 0.0,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                pause_flag: Arc::new(AtomicBool::new(false)),
+                error: None,
+                retry_attempt: 0,
+                retry_limit: None,
+                retrying: false,
+                next_retry_delay_seconds: None,
+                task_registered: false,
+                lifecycle_failure_unverified: false,
+                dest_dir: destination.clone(),
+                ambient_authority_blocked: false,
+                admission: None,
+                pending_relocation: None,
+                revoked_snapshot: None,
+                destination: Some(DownloadDestination::Managed(held.clone())),
+                filename: "weights-1.gguf".to_string(),
+                files: vec![FileToDownload {
+                    filename: "weights-1.gguf".to_string(),
+                    size: Some(2),
+                    sha256: None,
+                }],
+                files_completed: 0,
+                download_request: Some(request),
+                known_sha256: None,
+                huggingface_evidence: None,
+            },
+        );
+
+        let downloads = client.downloads.read().await;
+        assert!(matches!(
+            recovery_context(
+                &downloads,
+                &held.identity(),
+                "acme/model",
+                &["weights-1.gguf".to_string(), "weights-2.gguf".to_string()],
+            ),
+            RecoveryContext::Exact { download_id } if download_id == "download-1"
+        ));
+        for (repo_id, files) in [
+            (
+                "acme/other",
+                vec!["weights-1.gguf".to_string(), "weights-2.gguf".to_string()],
+            ),
+            ("acme/model", vec!["weights-1.gguf".to_string()]),
+        ] {
+            assert!(matches!(
+                recovery_context(&downloads, &held.identity(), repo_id, &files),
+                RecoveryContext::Mismatch
+            ));
+        }
+        assert!(matches!(
+            recovery_context(
+                &downloads,
+                &root.resolve(&temp.path().join("other")).unwrap().identity(),
+                "acme/model",
+                &["weights-1.gguf".to_string(), "weights-2.gguf".to_string()],
+            ),
+            RecoveryContext::Missing
+        ));
+        drop(downloads);
+
+        let unrelated_request = DownloadRequest {
+            repo_id: "other/model".to_string(),
+            family: "other".to_string(),
+            official_name: "Model".to_string(),
+            model_type: Some("llm".to_string()),
+            quant: None,
+            filename: None,
+            filenames: Some(vec!["other.gguf".to_string()]),
+            pipeline_tag: None,
+            bundle_format: None,
+            pipeline_class: None,
+            release_date: None,
+            download_url: None,
+            model_card_json: None,
+            license_status: None,
+        };
+        client.downloads.write().await.insert(
+            "unrelated".to_string(),
+            DownloadState {
+                download_id: "unrelated".to_string(),
+                repo_id: "other/model".to_string(),
+                status: DownloadStatus::Downloading,
+                progress: 0.0,
+                downloaded_bytes: 0,
+                total_bytes: Some(1),
+                speed: 0.0,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                pause_flag: Arc::new(AtomicBool::new(false)),
+                error: None,
+                retry_attempt: 0,
+                retry_limit: None,
+                retrying: false,
+                next_retry_delay_seconds: None,
+                task_registered: false,
+                lifecycle_failure_unverified: false,
+                dest_dir: destination.clone(),
+                ambient_authority_blocked: false,
+                admission: None,
+                pending_relocation: None,
+                revoked_snapshot: None,
+                destination: Some(DownloadDestination::Managed(held.clone())),
+                filename: "other.gguf".to_string(),
+                files: vec![FileToDownload {
+                    filename: "other.gguf".to_string(),
+                    size: Some(1),
+                    sha256: None,
+                }],
+                files_completed: 0,
+                download_request: Some(unrelated_request),
+                known_sha256: None,
+                huggingface_evidence: None,
+            },
+        );
+        assert!(matches!(
+            recovery_context(
+                &*client.downloads.read().await,
+                &held.identity(),
+                "acme/model",
+                &["weights-1.gguf".to_string(), "weights-2.gguf".to_string()],
+            ),
+            RecoveryContext::Mismatch
+        ));
+    }
+
+    #[tokio::test]
     async fn test_relocate_download_destination_updates_state_and_persistence() {
         let tmp = TempDir::new().unwrap();
         let mut client = HuggingFaceClient::new(tmp.path()).unwrap();
+        client
+            .configure_download_destination_root(tmp.path())
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(tmp.path()));
         client.set_persistence(persistence.clone());
 
@@ -2191,7 +13421,20 @@ mod tests {
                     retrying: false,
                     next_retry_delay_seconds: None,
                     task_registered: false,
+                    lifecycle_failure_unverified: false,
                     dest_dir: old_dest.clone(),
+                    ambient_authority_blocked: false,
+                    admission: None,
+                    pending_relocation: None,
+                    revoked_snapshot: None,
+                    destination: Some(DownloadDestination::Managed(
+                        client
+                            .destination_root
+                            .as_ref()
+                            .unwrap()
+                            .resolve(&old_dest)
+                            .unwrap(),
+                    )),
                     filename: "model.safetensors".to_string(),
                     files: vec![FileToDownload {
                         filename: "model.safetensors".to_string(),
@@ -2232,6 +13475,286 @@ mod tests {
             Some("reranker")
         );
         assert_eq!(entry.download_request.family, "forturne");
+    }
+
+    async fn legacy_relocation_fixture(root: &Path) -> (Arc<HuggingFaceClient>, PathBuf, PathBuf) {
+        let mut client = HuggingFaceClient::new(root.join("cache")).unwrap();
+        client.configure_download_destination_root(root).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(root));
+        let source = root.join("source");
+        let target = root.join("target");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("weights.gguf.part"), b"abc").unwrap();
+        let request = recovery_test_request("owner/model", &["weights.gguf".into()]);
+        persistence
+            .save(&PersistedDownload {
+                download_id: "legacy-move".into(),
+                repo_id: request.repo_id.clone(),
+                filename: "weights.gguf".into(),
+                filenames: vec!["weights.gguf".into()],
+                dest_dir: source.clone(),
+                total_bytes: Some(8),
+                status: DownloadStatus::Paused,
+                download_request: request,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                known_sha256: None,
+                huggingface_evidence: None,
+            })
+            .unwrap();
+        client.set_persistence(persistence);
+        client.restore_persisted_downloads().await.unwrap();
+        (Arc::new(client), source, target)
+    }
+
+    #[tokio::test]
+    async fn legacy_relocation_definite_abort_allows_retry_and_move_back() {
+        let temp = TempDir::new().unwrap();
+        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
+        let collide_once = Arc::new(AtomicBool::new(true));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let target = target.clone();
+            move |operation| {
+                if operation == "move legacy download directory"
+                    && collide_once.swap(false, Ordering::SeqCst)
+                {
+                    std::fs::create_dir(&target).unwrap();
+                }
+            }
+        })));
+        assert!(client
+            .relocate_download_destination("legacy-move", &target, None, None)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(source.join("weights.gguf.part")).unwrap(),
+            b"abc"
+        );
+        assert!(client
+            .persistence()
+            .unwrap()
+            .load_lifecycle_inventory_strict()
+            .unwrap()
+            .pending_relocations
+            .is_empty());
+        std::fs::remove_dir(&target).unwrap();
+        client.download_tasks.set_blocking_observer(None);
+        assert!(client
+            .relocate_download_destination("legacy-move", &target, None, None)
+            .await
+            .unwrap());
+        assert!(!source.exists());
+        assert!(client
+            .relocate_download_destination("legacy-move", &source, None, None)
+            .await
+            .unwrap());
+        assert_eq!(
+            std::fs::read(source.join("weights.gguf.part")).unwrap(),
+            b"abc"
+        );
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn cancelling_persisted_download_quarantines_before_cleanup_and_restart() {
+        let temp = TempDir::new().unwrap();
+        let (client, source, _) = legacy_relocation_fixture(temp.path()).await;
+        let (entered_sender, entered) = tokio::sync::oneshot::channel();
+        let entered_sender = Arc::new(std::sync::Mutex::new(Some(entered_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_blocking_observer(Some(Arc::new(move |operation| {
+                if operation == "remove ambient partial download file" {
+                    if let Some(sender) = entered_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                }
+            })));
+        assert!(client.cancel_download("legacy-move").await.unwrap());
+        tokio::time::timeout(Duration::from_secs(3), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut reopened = HuggingFaceClient::new(temp.path().join("reopened")).unwrap();
+        reopened
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        reopened.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+        let restore = reopened.restore_persisted_downloads().await;
+        let retained = std::fs::read(source.join("weights.gguf.part")).unwrap();
+        release_sender.send(()).unwrap();
+        client.download_tasks.set_blocking_observer(None);
+        assert!(
+            restore.is_err(),
+            "in-progress cancellation must not restore ordinary resumable authority"
+        );
+        assert_eq!(retained, b"abc");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status("legacy-move").await != Some(DownloadStatus::Cancelled)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        reopened.restore_persisted_downloads().await.unwrap();
+        assert!(reopened.list_downloads().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_relocation_dropped_caller_and_cancel_wait_for_owned_move() {
+        let temp = TempDir::new().unwrap();
+        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
+        let (entered_sender, entered) = tokio::sync::oneshot::channel();
+        let entered_sender = Arc::new(std::sync::Mutex::new(Some(entered_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_blocking_observer(Some(Arc::new(move |operation| {
+                if operation == "move legacy download directory" {
+                    if let Some(sender) = entered_sender.lock().unwrap().take() {
+                        let _ = sender.send(());
+                        let _ = release.lock().unwrap().recv();
+                    }
+                }
+            })));
+        let caller = tokio::spawn({
+            let client = client.clone();
+            let target = target.clone();
+            async move {
+                client
+                    .relocate_download_destination("legacy-move", &target, None, None)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        let mut cancel = tokio::spawn({
+            let client = client.clone();
+            async move { client.cancel_download("legacy-move").await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(source.join("weights.gguf.part")).unwrap(),
+            b"abc"
+        );
+        assert!(!target.exists());
+        release_sender.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(3), cancel)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+        client.download_tasks.set_blocking_observer(None);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status("legacy-move").await != Some(DownloadStatus::Cancelled)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancel must settle against the relocated capability");
+        assert_eq!(
+            client.get_download_status("legacy-move").await,
+            Some(DownloadStatus::Cancelled)
+        );
+        assert!(!source.exists());
+        assert!(!target.join("weights.gguf.part").exists());
+        let mut reopened = HuggingFaceClient::new(temp.path().join("reopened")).unwrap();
+        reopened
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        reopened.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+        reopened.restore_persisted_downloads().await.unwrap();
+        assert!(reopened.list_downloads().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_relocation_refuses_persisted_target_incumbent_before_move() {
+        let temp = TempDir::new().unwrap();
+        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
+        let persistence = client.persistence().unwrap();
+        let mut incumbent = persistence.load_all().pop().unwrap();
+        incumbent.download_id = "target-incumbent".into();
+        incumbent.dest_dir = target.clone();
+        persistence.save(&incumbent).unwrap();
+        assert!(client
+            .relocate_download_destination("legacy-move", &target, None, None)
+            .await
+            .is_err());
+        assert!(!target.exists());
+        assert_eq!(
+            std::fs::read(source.join("weights.gguf.part")).unwrap(),
+            b"abc"
+        );
+        assert!(persistence
+            .load_lifecycle_inventory_strict()
+            .unwrap()
+            .pending_relocations
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_legacy_relocation_restore_hides_row_and_blocks_both_destinations() {
+        let temp = TempDir::new().unwrap();
+        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
+        let persistence = client.persistence().unwrap();
+        let expected = persistence.load_all().pop().unwrap();
+        let root = client.destination_root.as_ref().unwrap();
+        let request = LegacyRelocationRequest {
+            source: root.resolve(&source).unwrap().identity().persisted(),
+            target: root.resolve(&target).unwrap().identity().persisted(),
+            target_dir: target.clone(),
+            model_type: None,
+            family: None,
+        };
+        assert!(matches!(
+            persistence
+                .begin_legacy_relocation(&uuid::Uuid::new_v4().to_string(), &expected, &request)
+                .unwrap()
+                .unwrap(),
+            crate::metadata::AtomicPublication::Durable
+        ));
+        let mut reopened = HuggingFaceClient::new(temp.path().join("reopened")).unwrap();
+        reopened
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        reopened.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+        reopened.restore_persisted_downloads().await.unwrap();
+        assert!(reopened.list_downloads().await.is_empty());
+        cache_repo_tree(
+            &reopened,
+            "other/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 8,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let successor = recovery_test_request("other/model", &["weights.gguf".into()]);
+        for destination in [&source, &target] {
+            assert!(reopened.download_owner_for_move(destination).await.is_err());
+            assert!(reopened
+                .start_download(&successor, destination, None)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            std::fs::read(source.join("weights.gguf.part")).unwrap(),
+            b"abc"
+        );
+        assert!(!target.exists());
     }
 
     #[tokio::test]
@@ -2277,7 +13800,13 @@ mod tests {
                     retrying: true,
                     next_retry_delay_seconds: Some(4.0),
                     task_registered: false,
+                    lifecycle_failure_unverified: false,
                     dest_dir: tmp.path().join("owner-model"),
+                    ambient_authority_blocked: false,
+                    admission: None,
+                    pending_relocation: None,
+                    revoked_snapshot: None,
+                    destination: None,
                     filename: "model.safetensors".to_string(),
                     files: vec![FileToDownload {
                         filename: "model.safetensors".to_string(),
@@ -2351,7 +13880,13 @@ mod tests {
                     retrying: false,
                     next_retry_delay_seconds: None,
                     task_registered: false,
+                    lifecycle_failure_unverified: false,
                     dest_dir: tmp.path().join("owner-multi-file"),
+                    ambient_authority_blocked: false,
+                    admission: None,
+                    pending_relocation: None,
+                    revoked_snapshot: None,
+                    destination: None,
                     filename: "config.json".to_string(),
                     files: vec![
                         FileToDownload {
@@ -2429,7 +13964,13 @@ mod tests {
                     retrying: false,
                     next_retry_delay_seconds: None,
                     task_registered: false,
+                    lifecycle_failure_unverified: false,
                     dest_dir: tmp.path().join("owner-multi-file"),
+                    ambient_authority_blocked: false,
+                    admission: None,
+                    pending_relocation: None,
+                    revoked_snapshot: None,
+                    destination: None,
                     filename: "config.json".to_string(),
                     files: vec![
                         FileToDownload {
@@ -2525,7 +14066,13 @@ mod tests {
                     retrying: true,
                     next_retry_delay_seconds: Some(1.0),
                     task_registered: true,
+                    lifecycle_failure_unverified: false,
                     dest_dir: tmp.path().join("owner-model"),
+                    ambient_authority_blocked: false,
+                    admission: None,
+                    pending_relocation: None,
+                    revoked_snapshot: None,
+                    destination: None,
                     filename: "model.Q4_K_M.gguf".to_string(),
                     files: vec![FileToDownload {
                         filename: "model.Q4_K_M.gguf".to_string(),
@@ -2552,6 +14099,179 @@ mod tests {
         assert_eq!(progress.retrying, Some(false));
         assert_eq!(progress.next_retry_delay_seconds, None);
         assert_eq!(persistence.load_all()[0].status, DownloadStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_without_a_durable_ambient_row_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "reconcile-missing-durable-row";
+        let mut state =
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true);
+        state.make_managed_for_test();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+
+        let _ = client.list_downloads().await;
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(!state.task_registered);
+        assert!(state.lifecycle_failure_unverified);
+        drop(downloads);
+        assert!(!client.download_tasks.contains(download_id));
+
+        assert!(client.cancel_download(download_id).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client
+                .downloads
+                .read()
+                .await
+                .get(download_id)
+                .is_some_and(|state| state.status == DownloadStatus::Cancelling)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Error);
+        assert!(state.lifecycle_failure_unverified);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rechecks_owner_installed_after_its_initial_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let library_root = temp.path().join("library");
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "reconcile-install-race";
+        let mut downloads_guard = client.downloads.write().await;
+        downloads_guard.insert(
+            download_id.to_string(),
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true),
+        );
+
+        let (snapshotted_sender, snapshotted) = tokio::sync::oneshot::channel();
+        let snapshotted_sender = Arc::new(std::sync::Mutex::new(Some(snapshotted_sender)));
+        client.download_tasks.set_ids_observer(Some(Arc::new({
+            let snapshotted_sender = snapshotted_sender.clone();
+            move || {
+                if let Some(sender) = snapshotted_sender.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+            }
+        })));
+        let listing = {
+            let client = client.clone();
+            tokio::spawn(async move { client.list_downloads().await })
+        };
+        snapshotted.await.unwrap();
+
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    panic!("finished successor sentinel")
+                });
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        while !client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| task.finished)
+        {
+            tokio::task::yield_now().await;
+        }
+        drop(downloads_guard);
+        let _ = listing.await.unwrap();
+        client.download_tasks.set_ids_observer(None);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Downloading);
+        assert!(state.task_registered);
+        drop(downloads);
+        assert!(client.cancel_download(download_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_does_not_persist_pause_for_a_newly_installed_owner() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "reconcile-persist-install-race";
+        let mut state =
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true);
+        state.make_managed_for_test();
+        persistence
+            .save(&persisted_recovery_test_state(&state))
+            .unwrap();
+        let mut downloads_guard = client.downloads.write().await;
+        downloads_guard.insert(download_id.to_string(), state);
+
+        let (snapshotted_sender, snapshotted) = tokio::sync::oneshot::channel();
+        let snapshotted_sender = Arc::new(std::sync::Mutex::new(Some(snapshotted_sender)));
+        client.download_tasks.set_ids_observer(Some(Arc::new({
+            let snapshotted_sender = snapshotted_sender.clone();
+            move || {
+                if let Some(sender) = snapshotted_sender.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+            }
+        })));
+        let listing = {
+            let client = client.clone();
+            tokio::spawn(async move { client.list_downloads().await })
+        };
+        snapshotted.await.unwrap();
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.to_string(), TaskRole::Worker, |_| async {
+                    panic!("finished persisted successor sentinel")
+                });
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
+        while !client
+            .download_tasks
+            .snapshot(download_id)
+            .is_some_and(|task| task.finished)
+        {
+            tokio::task::yield_now().await;
+        }
+        drop(downloads_guard);
+        let _ = listing.await.unwrap();
+        client.download_tasks.set_ids_observer(None);
+
+        let downloads = client.downloads.read().await;
+        let state = downloads.get(download_id).unwrap();
+        assert_eq!(state.status, DownloadStatus::Downloading);
+        assert!(state.task_registered);
+        drop(downloads);
+        assert_eq!(
+            persistence.load_all()[0].status,
+            DownloadStatus::Downloading
+        );
+        assert!(client.cancel_download(download_id).await.unwrap());
     }
 
     #[tokio::test]
@@ -2648,7 +14368,10 @@ mod tests {
 
         let mut client = HuggingFaceClient::new(tmp.path()).unwrap();
         client.set_persistence(persistence.clone());
-        let completed = client.restore_persisted_downloads().await;
+        client
+            .configure_download_destination_root(tmp.path())
+            .unwrap();
+        let completed = client.restore_persisted_downloads().await.unwrap();
 
         assert!(client.list_downloads().await.is_empty());
         assert_eq!(completed.len(), 1);
@@ -2661,14 +14384,20 @@ mod tests {
     #[tokio::test]
     async fn test_destination_lock_reuses_same_mutex_for_same_path() {
         let tmp = TempDir::new().unwrap();
-        let client = HuggingFaceClient::new(tmp.path()).unwrap();
+        let client = configured_download_client(tmp.path().to_path_buf()).unwrap();
         let a = tmp.path().join("llm/owner/model");
         let b = tmp.path().join("llm/owner/model");
         let c = tmp.path().join("llm/owner/other-model");
 
-        let lock_a = client.destination_lock(&a).await;
-        let lock_b = client.destination_lock(&b).await;
-        let lock_c = client.destination_lock(&c).await;
+        let lock_a = client
+            .destination_lock(&destination_identity(&client, &a))
+            .await;
+        let lock_b = client
+            .destination_lock(&destination_identity(&client, &b))
+            .await;
+        let lock_c = client
+            .destination_lock(&destination_identity(&client, &c))
+            .await;
 
         assert!(Arc::ptr_eq(&lock_a, &lock_b));
         assert!(!Arc::ptr_eq(&lock_a, &lock_c));
@@ -2678,6 +14407,11 @@ mod tests {
     async fn test_cancel_download_aborts_tracked_task() {
         let tmp = TempDir::new().unwrap();
         let client = HuggingFaceClient::new(tmp.path()).unwrap();
+        let destination =
+            crate::model_library::download_recovery::DownloadDestinationRoot::open(tmp.path())
+                .unwrap()
+                .resolve(&tmp.path().join("owner-model"))
+                .unwrap();
         let download_id = "dl-cancel".to_string();
         let mut updates = client.subscribe_download_updates();
 
@@ -2701,7 +14435,13 @@ mod tests {
                     retrying: false,
                     next_retry_delay_seconds: None,
                     task_registered: true,
+                    lifecycle_failure_unverified: false,
                     dest_dir: tmp.path().join("owner-model"),
+                    ambient_authority_blocked: false,
+                    admission: None,
+                    pending_relocation: None,
+                    revoked_snapshot: None,
+                    destination: Some(DownloadDestination::Managed(destination)),
                     filename: "model.safetensors".to_string(),
                     files: vec![FileToDownload {
                         filename: "model.safetensors".to_string(),
@@ -2716,10 +14456,17 @@ mod tests {
             );
         }
 
-        let task_handle = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        });
-        client.store_download_task(download_id.clone(), task_handle);
+        let prepared =
+            client
+                .download_tasks
+                .prepare(download_id.clone(), TaskRole::Worker, |_| async {
+                    std::future::pending::<()>().await
+                });
+        client
+            .download_tasks
+            .install_gated(prepared)
+            .unwrap()
+            .start();
 
         assert!(client.cancel_download(&download_id).await.unwrap());
         let first_update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
@@ -2749,12 +14496,8 @@ mod tests {
             .cancel_flag
             .load(Ordering::Relaxed);
         assert!(cancel_flag_set);
-        assert!(client
-            .download_tasks
-            .lock()
-            .expect("HF download task lock poisoned")
-            .get(&download_id)
-            .is_none());
+        client.observe_finished_download_tasks().await;
+        assert!(!client.download_tasks.contains(&download_id));
         assert_eq!(
             client.get_download_status(&download_id).await,
             Some(DownloadStatus::Cancelled)
@@ -2771,6 +14514,216 @@ mod tests {
         assert!(client
             .download_notification_since(Some(&cursor), snapshot)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn download_snapshots_cannot_deliver_active_after_newer_terminal_state() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "ordered-publication";
+        let mut state =
+            recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true);
+        state.make_managed_for_test();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        let mut updates = client.subscribe_download_updates();
+
+        let (older_built_sender, older_built_receiver) = tokio::sync::oneshot::channel();
+        let older_built_sender = Arc::new(std::sync::Mutex::new(Some(older_built_sender)));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = Arc::new(std::sync::Mutex::new(Some(release_receiver)));
+        client
+            .download_publications
+            .set_dispatch_observer_for_test(Some(Arc::new({
+                let older_built_sender = older_built_sender.clone();
+                let release_receiver = release_receiver.clone();
+                move |snapshot| {
+                    let is_active = snapshot.downloads.iter().any(|download| {
+                        download.download_id == download_id
+                            && download.status == DownloadStatus::Downloading
+                    });
+                    if is_active {
+                        if let Some(sender) = older_built_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            release_receiver
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .recv()
+                                .unwrap();
+                        }
+                    }
+                }
+            })));
+
+        let older = {
+            let client = client.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(client.publish_download_snapshot())
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), older_built_receiver)
+            .await
+            .expect("older active snapshot should be built")
+            .unwrap();
+        client
+            .downloads
+            .write()
+            .await
+            .get_mut(download_id)
+            .unwrap()
+            .status = DownloadStatus::Completed;
+        let newer = {
+            let client = client.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(client.publish_download_snapshot())
+            })
+        };
+        release_sender.send(()).unwrap();
+        older.join().expect("older publication should settle");
+        newer.join().expect("newer publication should settle");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.snapshot.revision < second.snapshot.revision);
+        assert_eq!(
+            first
+                .snapshot
+                .downloads
+                .iter()
+                .find(|download| download.download_id == download_id)
+                .unwrap()
+                .status,
+            DownloadStatus::Downloading
+        );
+        assert_eq!(
+            second
+                .snapshot
+                .downloads
+                .iter()
+                .find(|download| download.download_id == download_id)
+                .unwrap()
+                .status,
+            DownloadStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_snapshot_dispatch_never_holds_the_destination_lease() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        let download_id = "guard-free-worker-publication";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
+        state.make_managed_for_test();
+        let files = state.files.clone();
+        let cancel_flag = state.cancel_flag.clone();
+        let pause_flag = state.pause_flag.clone();
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.to_string(), state);
+        std::fs::write(
+            verified.destination.display_path().join("weights.gguf"),
+            b"done",
+        )
+        .unwrap();
+
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let dispatch_count = Arc::new(AtomicU64::new(0));
+        let guard_was_released = Arc::new(AtomicBool::new(true));
+        client
+            .download_publications
+            .set_dispatch_observer_for_test(Some(Arc::new({
+                let destination_lock = destination_lock.clone();
+                let dispatch_count = dispatch_count.clone();
+                let guard_was_released = guard_was_released.clone();
+                move |snapshot| {
+                    if snapshot
+                        .downloads
+                        .iter()
+                        .any(|download| download.download_id == download_id)
+                    {
+                        dispatch_count.fetch_add(1, Ordering::SeqCst);
+                        if destination_lock.try_lock().is_err() {
+                            guard_was_released.store(false, Ordering::SeqCst);
+                        }
+                    }
+                }
+            })));
+
+        assert!(
+            client
+                .spawn_download_task(
+                    download_id.to_string(),
+                    verified.repo_id.clone(),
+                    files,
+                    DownloadDestination::Managed(verified.destination.clone()),
+                    cancel_flag,
+                    pause_flag,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.get_download_status(download_id).await != Some(DownloadStatus::Completed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should publish its terminal state");
+
+        assert!(dispatch_count.load(Ordering::SeqCst) >= 2);
+        assert!(guard_was_released.load(Ordering::SeqCst));
+        client
+            .download_publications
+            .set_dispatch_observer_for_test(None);
+    }
+
+    #[tokio::test]
+    async fn publication_dispatch_allows_a_subscriber_to_request_another_publication() {
+        let temp = TempDir::new().unwrap();
+        let client = Arc::new(HuggingFaceClient::new(temp.path()).unwrap());
+        let mut updates = client.subscribe_download_updates();
+        let reentrant = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                updates.recv().await.unwrap();
+                client.publish_download_snapshot().await;
+            })
+        };
+
+        client.publish_download_snapshot().await;
+        tokio::time::timeout(Duration::from_secs(1), reentrant)
+            .await
+            .expect("subscriber publication must not deadlock on publisher custody")
+            .unwrap();
     }
 
     #[tokio::test]

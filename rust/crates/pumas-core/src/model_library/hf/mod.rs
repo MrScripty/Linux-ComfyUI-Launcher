@@ -17,6 +17,7 @@
 mod auth;
 mod bundles;
 mod download;
+mod lifecycle;
 mod metadata;
 mod search;
 mod types;
@@ -28,6 +29,9 @@ pub use types::{
 };
 use types::{DownloadState, REPO_CACHE_TTL_SECS};
 
+use download::DownloadPublicationOwner;
+use lifecycle::{DestinationExecutionOwner, DownloadTaskOwner};
+
 use crate::error::{PumasError, Result};
 use crate::model_library::download_store::DownloadPersistence;
 use crate::model_library::hf_cache::HfSearchCache;
@@ -37,14 +41,15 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 /// Client for HuggingFace Hub API operations.
 pub struct HuggingFaceClient {
+    /// Configured mutation authority; absent for standalone search-only clients.
+    pub(super) destination_root: Option<super::download_recovery::DownloadDestinationRoot>,
     /// HTTP client for API requests (has total timeout)
     pub(super) client: Client,
     /// HTTP client for downloads (connect timeout only, no total timeout)
@@ -57,11 +62,16 @@ pub struct HuggingFaceClient {
     pub(super) download_revision: Arc<AtomicU64>,
     /// Broadcast channel for download-state updates.
     pub(super) download_updates: broadcast::Sender<crate::models::ModelDownloadUpdateNotification>,
-    /// Owned background download tasks keyed by download ID.
-    pub(super) download_tasks: Arc<StdMutex<HashMap<String, JoinHandle<()>>>>,
+    /// Serializes download snapshot capture, revision assignment, and dispatch.
+    pub(super) download_publications: Arc<DownloadPublicationOwner>,
+    /// Owner of background download tasks and their blocking filesystem work.
+    download_tasks: Arc<DownloadTaskOwner>,
+    /// Generation-scoped serialization of shared destination effects.
+    destination_executions: Arc<DestinationExecutionOwner>,
     /// Per-destination mutexes so downloads targeting the same model folder
     /// execute sequentially instead of racing on shared files.
-    pub(super) dest_locks: Arc<RwLock<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    pub(super) dest_locks:
+        Arc<RwLock<HashMap<super::download_recovery::DestinationIdentity, Arc<Mutex<()>>>>>,
     /// SQLite search cache (optional)
     pub(super) search_cache: Option<Arc<HfSearchCache>>,
     /// Download persistence for crash recovery (optional)
@@ -72,6 +82,8 @@ pub struct HuggingFaceClient {
     pub(super) aux_complete_callback: Option<AuxFilesCompleteCallback>,
     /// Authentication token for accessing gated/private models.
     pub(super) auth_token: Arc<RwLock<Option<String>>>,
+    #[cfg(test)]
+    download_base_url: Option<String>,
 }
 
 impl std::fmt::Debug for HuggingFaceClient {
@@ -86,7 +98,32 @@ impl std::fmt::Debug for HuggingFaceClient {
 }
 
 impl HuggingFaceClient {
+    #[cfg(test)]
+    pub(crate) fn set_test_download_base_url(&mut self, base_url: String) {
+        self.download_base_url = Some(base_url);
+    }
+
+    pub(crate) fn configure_download_destination_root(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        let root = super::download_recovery::DownloadDestinationRoot::open(path)?;
+        self.set_download_destination_root(root);
+        Ok(())
+    }
+
+    pub(crate) fn set_download_destination_root(
+        &mut self,
+        root: super::download_recovery::DownloadDestinationRoot,
+    ) {
+        self.destination_root = Some(root);
+    }
+
     /// Create a new HuggingFace client.
+    ///
+    /// Standalone clients support search and inspection. Download mutation
+    /// requires held model-root authority configured by the `PumasApi` builder;
+    /// supplying persistence alone does not grant that authority.
     ///
     /// # Arguments
     ///
@@ -121,20 +158,34 @@ impl HuggingFaceClient {
             token
         });
 
+        let downloads = Arc::new(RwLock::new(HashMap::new()));
+        let download_revision = Arc::new(AtomicU64::new(0));
+        let download_updates = broadcast::channel(64).0;
+        let download_publications = Arc::new(DownloadPublicationOwner::new(
+            downloads.clone(),
+            download_revision.clone(),
+            download_updates.clone(),
+        ));
+
         Ok(Self {
+            destination_root: None,
             client,
             download_client,
             cache_dir,
-            downloads: Arc::new(RwLock::new(HashMap::new())),
-            download_revision: Arc::new(AtomicU64::new(0)),
-            download_updates: broadcast::channel(64).0,
-            download_tasks: Arc::new(StdMutex::new(HashMap::new())),
+            downloads,
+            download_revision,
+            download_updates,
+            download_publications,
+            download_tasks: Arc::new(DownloadTaskOwner::new()),
+            destination_executions: Arc::new(DestinationExecutionOwner::new()),
             dest_locks: Arc::new(RwLock::new(HashMap::new())),
             search_cache: None,
             persistence: None,
             completion_callback: None,
             aux_complete_callback: None,
             auth_token: Arc::new(RwLock::new(initial_token)),
+            #[cfg(test)]
+            download_base_url: None,
         })
     }
 
@@ -301,17 +352,9 @@ impl HuggingFaceClient {
 
 impl Drop for HuggingFaceClient {
     fn drop(&mut self) {
-        let handles: Vec<JoinHandle<()>> = self
-            .download_tasks
-            .lock()
-            .expect("HF download task lock poisoned")
-            .drain()
-            .map(|(_, handle)| handle)
-            .collect();
-
-        for handle in handles {
-            handle.abort();
-        }
+        // Slice B only delegates abort requests to the lifecycle owner. Full
+        // shutdown drain/observation remains Milestone 4 / RUST-A6.
+        self.download_tasks.abort_all();
     }
 }
 

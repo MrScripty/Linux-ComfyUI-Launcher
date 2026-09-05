@@ -94,6 +94,7 @@ rand = "0.9"
 
 # Directory utilities (home dir, etc.)
 dirs = { workspace = true }
+cap-std = { workspace = true }
 
 # File system watching
 notify = { workspace = true }

@@ -392,6 +392,15 @@ impl PumasApiBuilder {
         // Initialize model library for AI model management
         let model_library_dir = self.launcher_root.join("shared-resources").join("models");
 
+        // Establish the required library before capturing download authority,
+        // including when the optional launcher directory setup was disabled.
+        let model_library = model_library::ModelLibrary::new(&model_library_dir)
+            .await
+            .map_err(|e| PumasError::Config {
+                message: format!("Model library initialization failed: {}", e),
+            })?;
+        let model_library = Arc::new(model_library);
+
         // Initialize HuggingFace client (if enabled)
         let mut hf_client = if self.enable_hf_client {
             let cache_dir = self
@@ -430,8 +439,13 @@ impl PumasApiBuilder {
                 std::sync::Arc::new(model_library::DownloadPersistence::new(&data_dir));
 
             let hf_cache_dir_for_task = hf_cache_dir.clone();
+            let model_library_dir_for_task = model_library_dir.clone();
             match tokio::task::spawn_blocking(move || {
-                model_library::HuggingFaceClient::new(&hf_cache_dir_for_task)
+                let mut client = model_library::HuggingFaceClient::new(&hf_cache_dir_for_task)?;
+                if let Err(error) = client.configure_download_destination_root(&model_library_dir_for_task) {
+                    tracing::warn!(%error, "Download destination authority unavailable; HuggingFace search remains enabled");
+                }
+                Ok::<_, PumasError>(client)
             })
             .await
             {
@@ -460,13 +474,6 @@ impl PumasApiBuilder {
             None
         };
 
-        // Initialize model library (required - core functionality)
-        let model_library = model_library::ModelLibrary::new(&model_library_dir)
-            .await
-            .map_err(|e| PumasError::Config {
-                message: format!("Model library initialization failed: {}", e),
-            })?;
-        let model_library = Arc::new(model_library);
         let watcher_write_suppressor =
             Arc::new(WatcherWriteSuppressor::new(WATCHER_WRITE_SUPPRESSION_TTL));
         model_library.set_metadata_write_notifier(Some(Arc::new({
@@ -519,7 +526,7 @@ impl PumasApiBuilder {
 
             // Restore only after completion callbacks are wired so byte-complete
             // crash recoveries can finalize and flow through the normal importer.
-            let auto_finalized = client.restore_persisted_downloads().await;
+            let auto_finalized = client.restore_persisted_downloads().await?;
             for info in auto_finalized {
                 match model_importer.finalize_downloaded_directory(&info).await {
                     Ok(result) if result.success => {

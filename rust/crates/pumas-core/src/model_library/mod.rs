@@ -26,6 +26,7 @@ mod artifact_load_target;
 mod dependencies;
 pub(crate) mod dependency_pins;
 mod directory_import;
+mod download_recovery;
 pub mod download_store;
 mod external_assets;
 mod hashing;
@@ -61,6 +62,14 @@ pub use dependencies::{
     ModelDependencyRequirementsResolution, DEPENDENCY_CONTRACT_VERSION,
 };
 pub use directory_import::classify_import_path;
+pub(crate) use download_recovery::{
+    canonical_managed_model_dir, verify_download_recovery_ticket, DownloadRecoveryDestination,
+    DownloadRecoveryVerification, RecoveryDownloadAdmission, VerifiedDownloadRecovery,
+};
+pub use download_recovery::{
+    issue_download_recovery_ticket, DownloadRecoveryModelId, DownloadRecoveryTicket,
+    DownloadRecoveryToken,
+};
 pub use download_store::DownloadPersistence;
 pub(crate) use external_assets::get_diffusers_bundle_lookup_hints;
 pub use external_assets::{get_diffusers_component_manifest, MODEL_EXECUTION_CONTRACT_VERSION};

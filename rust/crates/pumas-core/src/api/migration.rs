@@ -5,13 +5,9 @@ use crate::error::{PumasError, Result};
 use crate::model_library;
 use crate::models;
 use crate::PumasApi;
-use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::{
-    fs,
-    time::{sleep, Duration},
-};
+use tokio::time::{sleep, Duration};
 
 const MIGRATION_REPORTS_DIR: &str = "migration-reports";
 
@@ -114,7 +110,12 @@ impl PumasApi {
             .model_library
             .execute_migration_with_checkpoint()
             .await?;
-        let mutated = relocate_skipped_partial_downloads(primary.as_ref(), &mut report).await?;
+        let mutated = relocate_skipped_partial_downloads(
+            &primary.model_library,
+            primary.hf_client.as_ref(),
+            &mut report,
+        )
+        .await?;
         if mutated {
             recompute_execution_report_counts(&mut report);
             // Rewrite artifacts so UI/opened report JSON reflects post-move outcomes.
@@ -239,66 +240,6 @@ pub(crate) fn split_model_id(model_id: &str) -> Option<(&str, &str, &str)> {
     Some((model_type, family, cleaned_name))
 }
 
-async fn path_exists(path: &Path) -> Result<bool> {
-    fs::try_exists(path)
-        .await
-        .map_err(|err| PumasError::io_with_path(err, path))
-}
-
-pub(crate) async fn update_download_marker(
-    target_dir: &Path,
-    target_model_type: &str,
-    target_family: &str,
-) -> Result<()> {
-    let marker_path = target_dir.join(".pumas_download");
-    if !path_exists(&marker_path).await? {
-        return Ok(());
-    }
-    let marker_text = fs::read_to_string(&marker_path)
-        .await
-        .map_err(|err| PumasError::io_with_path(err, &marker_path))?;
-    let mut marker_json: Value =
-        serde_json::from_str(&marker_text).map_err(|err| PumasError::Json {
-            message: format!("Failed to parse download marker JSON: {}", err),
-            source: None,
-        })?;
-    let Some(marker_obj) = marker_json.as_object_mut() else {
-        return Err(PumasError::Validation {
-            field: "download_marker".to_string(),
-            message: "Expected .pumas_download to be a JSON object".to_string(),
-        });
-    };
-    marker_obj.insert(
-        "model_type".to_string(),
-        Value::String(target_model_type.to_string()),
-    );
-    marker_obj.insert(
-        "family".to_string(),
-        Value::String(target_family.to_string()),
-    );
-    marker_obj.insert(
-        "architecture_family".to_string(),
-        Value::String(target_family.to_string()),
-    );
-    fs::write(&marker_path, serde_json::to_string_pretty(&marker_json)?)
-        .await
-        .map_err(|err| PumasError::io_with_path(err, &marker_path))?;
-    Ok(())
-}
-
-pub(crate) async fn cleanup_empty_parent_dirs_after_move(source_dir: &Path, library_root: &Path) {
-    let mut current = source_dir.parent();
-    while let Some(dir) = current {
-        if dir == library_root {
-            break;
-        }
-        if fs::remove_dir(dir).await.is_err() {
-            break;
-        }
-        current = dir.parent();
-    }
-}
-
 pub(crate) async fn wait_for_download_pause(
     client: &model_library::HuggingFaceClient,
     download_id: &str,
@@ -329,21 +270,9 @@ pub(crate) async fn wait_for_download_pause(
     )))
 }
 
-async fn load_persisted_downloads_for_move(
-    client: &model_library::HuggingFaceClient,
-) -> Vec<model_library::download_store::PersistedDownload> {
-    let persistence = client.persistence().cloned();
-    tokio::task::spawn_blocking(move || {
-        persistence
-            .map(|persistence| persistence.load_all())
-            .unwrap_or_default()
-    })
-    .await
-    .unwrap_or_default()
-}
-
 pub(crate) async fn relocate_skipped_partial_downloads(
-    primary: &super::state::PrimaryState,
+    library: &model_library::ModelLibrary,
+    hf_client: Option<&model_library::HuggingFaceClient>,
     report: &mut model_library::MigrationExecutionReport,
 ) -> Result<bool> {
     let mut mutated = false;
@@ -351,159 +280,110 @@ pub(crate) async fn relocate_skipped_partial_downloads(
         if row.action != "skipped_partial_download" {
             continue;
         }
-
         let Some((target_model_type, target_family, target_cleaned_name)) =
             split_model_id(&row.target_model_id)
         else {
-            row.action = "partial_move_error".to_string();
+            row.action = "partial_move_error".into();
             row.error = Some(format!("Invalid target model_id: {}", row.target_model_id));
             mutated = true;
             continue;
         };
-
-        let source_dir = primary.model_library.library_root().join(&row.model_id);
-        let target_dir = primary.model_library.build_model_path(
-            target_model_type,
-            target_family,
-            target_cleaned_name,
-        );
-        if !path_exists(&source_dir).await? {
-            row.action = "missing_source".to_string();
-            row.error = Some(format!(
-                "Source directory not found: {}",
-                source_dir.display()
-            ));
+        let Some(client) = hf_client else {
+            row.error =
+                Some("Partial download retained: download lifecycle owner unavailable".into());
             mutated = true;
             continue;
-        }
-        if path_exists(&target_dir).await? {
-            row.action = "blocked_collision".to_string();
-            row.error = Some(format!("Target already exists: {}", target_dir.display()));
-            mutated = true;
-            continue;
-        }
-
-        let mut moved = false;
-        let mut relocated_download_id: Option<String> = None;
-        let mut resume_after_move = false;
-        let mut attempted_pause = false;
-
-        let move_result: Result<()> = async {
-            let (download_id, was_active) = if let Some(ref client) = primary.hf_client {
-                let persisted = load_persisted_downloads_for_move(client).await;
-                if let Some(entry) = persisted.iter().find(|entry| entry.dest_dir == source_dir) {
-                    let download_id = entry.download_id.clone();
-                    let status = client.get_download_status(&download_id).await;
-                    let was_active = matches!(
-                        status,
-                        Some(models::DownloadStatus::Queued)
-                            | Some(models::DownloadStatus::Downloading)
-                            | Some(models::DownloadStatus::Pausing)
-                    );
-                    if was_active {
-                        attempted_pause = true;
-                        let _ = client.pause_download(&download_id).await?;
-                        wait_for_download_pause(client, &download_id).await?;
-                    }
-                    (Some(download_id), was_active)
-                } else {
-                    (None, false)
-                }
-            } else {
-                (None, false)
+        };
+        let source_dir = library.library_root().join(&row.model_id);
+        let target_dir =
+            library.build_model_path(target_model_type, target_family, target_cleaned_name);
+        let mut relocation_completed = false;
+        let move_result: Result<bool> = async {
+            let Some(download_id) = client.download_owner_for_move(&source_dir).await? else {
+                return Ok(false);
             };
-            resume_after_move = was_active;
-            let target_parent = target_dir
-                .parent()
-                .ok_or_else(|| PumasError::Other("Target parent missing".to_string()))?;
-            fs::create_dir_all(target_parent)
-                .await
-                .map_err(|err| PumasError::io_with_path(err, target_parent))?;
-            fs::rename(&source_dir, &target_dir)
-                .await
-                .map_err(|err| PumasError::io_with_path(err, &source_dir))?;
-            moved = true;
-
-            update_download_marker(&target_dir, target_model_type, target_family).await?;
-
-            if let Some(download_id) = download_id {
-                if let Some(ref client) = primary.hf_client {
-                    client
-                        .relocate_download_destination(
-                            &download_id,
-                            &target_dir,
-                            Some(target_model_type),
-                            Some(target_family),
-                        )
-                        .await?;
-                    relocated_download_id = Some(download_id);
+            let metadata = library
+                .index()
+                .get(&row.model_id)?
+                .map(|record| {
+                    serde_json::from_value::<model_library::ModelMetadata>(record.metadata)
+                })
+                .transpose()?;
+            let status = client.get_download_status(&download_id).await;
+            let resume_after_move = matches!(
+                status,
+                Some(
+                    models::DownloadStatus::Queued
+                        | models::DownloadStatus::Downloading
+                        | models::DownloadStatus::Pausing
+                )
+            );
+            if resume_after_move {
+                if status != Some(models::DownloadStatus::Pausing)
+                    && !client.pause_download(&download_id).await?
+                {
+                    return Err(PumasError::Validation {
+                        field: "download_relocation".into(),
+                        message: "Download owner refused migration pause".into(),
+                    });
                 }
+                wait_for_download_pause(client, &download_id).await?;
             }
-
-            if let Some(record) = primary.model_library.index().get(&row.model_id)? {
-                let mut metadata: model_library::ModelMetadata =
-                    serde_json::from_value(record.metadata.clone()).unwrap_or_default();
+            if !client
+                .relocate_download_destination_from(
+                    &download_id,
+                    &source_dir,
+                    &target_dir,
+                    Some(target_model_type),
+                    Some(target_family),
+                )
+                .await?
+            {
+                return Err(PumasError::Validation {
+                    field: "download_relocation".into(),
+                    message: "Download owner refused relocation before movement".into(),
+                });
+            }
+            relocation_completed = true;
+            if let Some(mut metadata) = metadata {
                 metadata.model_id = Some(row.target_model_id.clone());
                 metadata.model_type = Some(target_model_type.to_string());
                 metadata.family = Some(target_family.to_string());
                 metadata.cleaned_name = Some(target_cleaned_name.to_string());
                 metadata.updated_date = Some(chrono::Utc::now().to_rfc3339());
-                primary
-                    .model_library
-                    .upsert_index_from_metadata(&target_dir, &metadata)?;
-                let _ = primary.model_library.index().delete(&row.model_id)?;
+                library.upsert_index_from_metadata(&target_dir, &metadata)?;
+                library.index().delete(&row.model_id)?;
             }
-
-            cleanup_empty_parent_dirs_after_move(&source_dir, primary.model_library.library_root())
-                .await;
-            Ok(())
+            // A later index or resume failure cannot authorize a physical rollback.
+            if resume_after_move && !client.resume_download(&download_id).await? {
+                return Err(PumasError::Validation {
+                    field: "download_relocation".into(),
+                    message: "Download moved, but its owner refused resumption".into(),
+                });
+            }
+            Ok(true)
         }
         .await;
-
         match move_result {
-            Ok(()) => {
-                if resume_after_move {
-                    if let (Some(client), Some(download_id)) =
-                        (primary.hf_client.as_ref(), relocated_download_id.as_ref())
-                    {
-                        let _ = client.resume_download(download_id).await?;
-                    }
-                }
-                row.action = "moved_partial".to_string();
+            Ok(true) => {
+                row.action = "moved_partial".into();
                 row.error = None;
-                mutated = true;
             }
-            Err(err) => {
-                if moved && path_exists(&target_dir).await.unwrap_or(false) {
-                    let _ = fs::rename(&target_dir, &source_dir).await;
+            Ok(false) => {
+                row.error = Some("Partial download retained: no tracked download owner".into());
+            }
+            Err(error) => {
+                if relocation_completed {
+                    row.action = "moved_partial".into();
+                    row.error = Some(format!("Download moved; post-move update failed: {error}"));
+                } else {
+                    row.action = "partial_move_error".into();
+                    row.error = Some(error.to_string());
                 }
-                if let (Some(client), Some(download_id)) =
-                    (primary.hf_client.as_ref(), relocated_download_id.as_ref())
-                {
-                    let rollback_source = split_model_id(&row.model_id);
-                    let _ = client
-                        .relocate_download_destination(
-                            download_id,
-                            &source_dir,
-                            rollback_source.map(|(model_type, _, _)| model_type),
-                            rollback_source.map(|(_, family, _)| family),
-                        )
-                        .await;
-                }
-                if attempted_pause && resume_after_move {
-                    if let (Some(client), Some(download_id)) =
-                        (primary.hf_client.as_ref(), relocated_download_id.as_ref())
-                    {
-                        let _ = client.resume_download(download_id).await;
-                    }
-                }
-                row.action = "partial_move_error".to_string();
-                row.error = Some(err.to_string());
-                mutated = true;
             }
         }
+        mutated = true;
     }
-
     Ok(mutated)
 }
 
@@ -514,6 +394,9 @@ pub(crate) fn recompute_execution_report_counts(
     report.skipped_move_count = 0;
     report.error_count = 0;
     for row in &report.results {
+        if row.action == "moved_partial" && row.error.is_some() {
+            report.error_count += 1;
+        }
         match row.action.as_str() {
             "moved" | "already_migrated" | "moved_partial" => report.completed_move_count += 1,
             "blocked_collision" | "missing_source" | "skipped_partial_download" => {
@@ -529,8 +412,118 @@ pub(crate) fn recompute_execution_report_counts(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_migration_report_path, update_download_marker};
+    use super::normalize_migration_report_path;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn partial_migration_preserves_bytes_when_download_owner_refuses() {
+        let temp = TempDir::new().unwrap();
+        let library = crate::model_library::ModelLibrary::new(temp.path().join("models"))
+            .await
+            .unwrap();
+        let source = library.library_root().join("llm/old/model");
+        let target = library.library_root().join("llm/new/model");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("weights.gguf.part"), b"partial bytes").unwrap();
+        let mut client = crate::model_library::HuggingFaceClient::new(temp.path()).unwrap();
+        client
+            .configure_download_destination_root(library.library_root())
+            .unwrap();
+        let persistence =
+            std::sync::Arc::new(crate::model_library::DownloadPersistence::new(temp.path()));
+        let snapshot: crate::model_library::download_store::PersistedDownload =
+            serde_json::from_value(serde_json::json!({
+                "download_id": "not-restored",
+                "repo_id": "owner/model",
+                "filename": "weights.gguf",
+                "filenames": ["weights.gguf"],
+                "dest_dir": source,
+                "total_bytes": 100,
+                "status": "paused",
+                "download_request": {
+                    "repo_id": "owner/model", "family": "old", "official_name": "Model"
+                },
+                "created_at": "2026-09-04T00:00:00Z"
+            }))
+            .unwrap();
+        persistence.save(&snapshot).unwrap();
+        client.set_persistence(persistence.clone());
+        // The persisted row exists, but no runtime owner has restored it.
+        // A refusal must not be treated as a successful filesystem move.
+        let mut report = crate::model_library::MigrationExecutionReport {
+            results: vec![crate::model_library::MigrationExecutionItem {
+                model_id: "llm/old/model".into(),
+                target_model_id: "llm/new/model".into(),
+                action: "skipped_partial_download".into(),
+                error: None,
+            }],
+            ..Default::default()
+        };
+        super::relocate_skipped_partial_downloads(&library, Some(&client), &mut report)
+            .await
+            .unwrap();
+        assert_eq!(report.results[0].action, "partial_move_error");
+        assert!(report.results[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("refused"));
+        assert_eq!(
+            std::fs::read(source.join("weights.gguf.part")).unwrap(),
+            b"partial bytes"
+        );
+        assert!(!target.exists());
+        assert_eq!(persistence.load_all_strict().unwrap()[0].dest_dir, source);
+
+        let marker = serde_json::json!({
+            "repo_id": "owner/model", "family": "old", "model_type": "llm",
+            "selected_artifact": {"artifact_id": "selected-q4", "selected_quant": "q4_k_m"}
+        });
+        std::fs::write(
+            source.join(".pumas_download"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        library
+            .upsert_index_from_metadata(
+                &source,
+                &crate::model_library::ModelMetadata {
+                    model_id: Some("llm/old/model".into()),
+                    family: Some("old".into()),
+                    model_type: Some("llm".into()),
+                    official_name: Some("Model".into()),
+                    cleaned_name: Some("model".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        client.restore_persisted_downloads().await.unwrap();
+        report.results[0].action = "skipped_partial_download".into();
+        super::relocate_skipped_partial_downloads(&library, Some(&client), &mut report)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.results[0].action, "moved_partial",
+            "{:?}",
+            report.results[0].error
+        );
+        assert!(report.results[0].error.is_none());
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(target.join("weights.gguf.part")).unwrap(),
+            b"partial bytes"
+        );
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(target.join(".pumas_download")).unwrap())
+                .unwrap();
+        assert_eq!(actual["family"], "new");
+        assert_eq!(actual["architecture_family"], "new");
+        assert_eq!(actual["selected_artifact"], marker["selected_artifact"]);
+        let reopened = crate::model_library::DownloadPersistence::new(temp.path());
+        assert_eq!(reopened.load_all_strict().unwrap()[0].dest_dir, target);
+        assert!(library.index().get("llm/old/model").unwrap().is_none());
+        assert!(library.index().get("llm/new/model").unwrap().is_some());
+    }
 
     #[test]
     fn normalize_migration_report_path_accepts_relative_report_path() {
@@ -563,48 +556,5 @@ mod tests {
             crate::error::PumasError::InvalidParams { message }
                 if message.contains("within migration reports directory")
         ));
-    }
-
-    #[tokio::test]
-    async fn update_download_marker_adds_architecture_family_and_preserves_artifact() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let model_dir = temp_dir.path().join("model");
-        std::fs::create_dir_all(&model_dir).expect("model dir");
-        std::fs::write(
-            model_dir.join(".pumas_download"),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "repo_id": "Owner/Qwen-GGUF",
-                "family": "qwen35",
-                "model_type": "llm",
-                "selected_artifact": {
-                    "repo_id": "Owner/Qwen-GGUF",
-                    "revision": "main",
-                    "subfolder": null,
-                    "selection_kind": "quant",
-                    "selected_filenames": ["model-q4.gguf"],
-                    "selected_quant": "q4_k_m",
-                    "artifact_digest": "abc123",
-                    "artifact_id": "owner--qwen-gguf__q4_k_m"
-                }
-            }))
-            .expect("marker json"),
-        )
-        .expect("write marker");
-
-        update_download_marker(&model_dir, "vlm", "qwen3_6")
-            .await
-            .expect("marker update");
-
-        let marker: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(model_dir.join(".pumas_download")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(marker["model_type"], "vlm");
-        assert_eq!(marker["family"], "qwen3_6");
-        assert_eq!(marker["architecture_family"], "qwen3_6");
-        assert_eq!(
-            marker["selected_artifact"]["artifact_id"],
-            "owner--qwen-gguf__q4_k_m"
-        );
     }
 }

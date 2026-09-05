@@ -1684,6 +1684,97 @@
   remain open. The GUI was not validated. The original staged UniFFI blob
   `2af018c1e1c27effc7fb3ddf2c77f0570cb78fb9` remains separately owned.
 
+### 2026-09-04 — Core Recovery Integration
+
+- The user explicitly approved finishing core recovery integration and lint
+  repairs before source commit. Continue the focused plan. The additive
+  `PumasApi::resume_partial_download_with_ticket` consumes an indexed model ID
+  and previously issued ticket; it resolves repository/filesystem authority in
+  the core. The old repo/path method remains byte-identical to HEAD for real
+  RPC and binding consumers. It does not acquire stale-ticket protection or
+  synthesize a fresh ticket. Later transports must explicitly select the new
+  method; this checkpoint changes no wire shape.
+- The isolated candidate excludes held Result-shape, reconciliation, RPC,
+  binding, and GUI changes. Its API tests construct real local primary state
+  without registry overrides, IPC listeners, watchers, or background probes. A
+  bounded loopback server proves exact selected-file Range recovery, followed
+  by public cancellation and unrelated-artifact preservation. Stale artifact
+  selection refuses admission without touching payloads. The legacy missing-
+  directory result is retained. Filesystem ticket inspection uses the existing
+  HF task/blocking owner, not detached API work.
+- Store projections no longer duplicate unused persisted attempts, snapshots,
+  release maps, or live queue positions. Canonical durable records, exact
+  replay/publication, and predecessor validation remain. The write-only release
+  confirmation cache and obsolete private relocation adapter were removed;
+  tests now assert the actual store transition and reopened inventory.
+  Review rejected an initial generic-error conversion; the corrected conversion
+  preserves typed I/O paths/sources and publication/cleanup context.
+- Cancellation now begins durable full-snapshot quarantine before payload
+  cleanup, drains effects before verification/settlement, and preserves sticky
+  failure provenance. The first regression was red because a fresh client
+  restored the row while cancellation was held before cleanup. A later review
+  reproduced a second red: cancellation after durable recovery revocation but
+  before snapshot handoff lost quarantine evidence. The snapshot must be in
+  cancellation-visible custody before revocation; post-drain domain selection
+  still requires the store's durable revocation validation before effects.
+- The first isolated strict all-target/all-feature Clippy run passed, but its
+  full library run had 1,070 passes, one outdated ordinary-row assertion, and
+  three ignored helpers. This precedes the revocation-window correction and is
+  not final-source acceptance. The assertion is replaced by exact quarantine
+  preservation and fresh-restore refusal, not a weaker empty-state check.
+- Standards revision `b8805364` changes standards tooling/audit artifacts since
+  `0b10cb84`, not the applicable normative route. The design and TDD skills kept
+  the new work at the existing public recovery/cancel and store transitions.
+  Final verification and the accepted incremental boundary follow below.
+- Final narrow source review accepts the revocation handoff and restore policy:
+  Pending/hidden state and quarantines with active queue admissions still
+  refuse startup; confirmed Verified Recovery history stays hidden behind its
+  durable tombstone; Verified Ambient history is a read-only Error with no
+  destination capability. No queue release is inferred from visible cleanup.
+  Both-domain tests prove Pending preservation, successful retry, and fresh
+  restoration. The verified-only Ambient fixture also caught and corrected an
+  early return when no ordinary downloads existed.
+- Candidate `/tmp/pumas-core-integration.oBhAM2` is an unregistered archive based
+  on `a17c5b32`, not a branch or worktree. It adds the recovery-only API hunks to
+  the prior 15-file boundary; `api/state.rs` still contains only migration
+  arguments. Final reviewed SHA-256: `hf/download.rs`
+  `5969615e42b5a5bd3968fcc6f77ca6e6d1aefccedb944aaa040d974d2d2cd20d`;
+  `hf/lifecycle.rs`
+  `39947dda9c08bfb67908e809e767977c55af3629764e8bd66b83551199b44288`;
+  `hf/types.rs`
+  `dcc7f480eda800a3bf071f5ad45b2da8bcb9feed1d6102ec0dccfa54040efa00`;
+  `hf/mod.rs`
+  `c4468ec218b61ecf483b58580af83c86d8d506122c17da133786944866f7c307`;
+  `download_store.rs`
+  `230f68caf2b55c6b73f7ebf5e7bd3ddd05a3725521a7ff11edf81b728a0ae3be`;
+  isolated `api/hf.rs`
+  `73fa9bb6d507c5b982d9d4b3f262bde2f3c0952ba713917b609619baf98285ac`.
+  Capability and migration retain the prior checkpoint's reviewed hashes.
+- Final candidate verification on Linux with Rust/Cargo 1.92.0:
+  `cargo test --offline -p pumas-library`, also with `--no-default-features`,
+  passes 1,175 checks per configuration: 1,073 library tests, 96 integration
+  tests, and six doctests. Three existing helper tests and eight existing
+  doctests remain ignored; no new ignore or assertion weakening was added.
+  Loopback socket access was explicitly enabled for real local HTTP/IPC tests.
+- Strict core Clippy passes with `--all-targets --all-features -- -D warnings`
+  and separately with `--all-targets --no-default-features -- -D warnings`.
+  `cargo check --offline --workspace --exclude pumas_rustler --all-targets
+  --all-features` passes against unchanged HEAD consumers. The same supported
+  workspace's strict all-target/all-feature Clippy passes. Rustler remains
+  excluded by the repository's existing BEAM-tooling policy, not a new bypass.
+  Scoped Rustfmt and diff checks pass; the plan-contract checks are rerun on
+  the exact staged records before commit. No warning suppression was used for
+  these lint repairs.
+- Accept this coherent 16-source-file incremental boundary, plus its six plan,
+  issue, and ledger records. Public migration obligations are recorded in
+  Rustdoc and the breaking-change commit: standalone HF clients lack mutation
+  authority, restore is fallible, and relocation owns the physical move.
+  The original staged UniFFI blob remains separately owned. No push, transport
+  migration, GUI verification, cross-platform release, full C3, or C4 acceptance
+  follows. Unknown admissions/Pending state, stalled pause, admitted relocation,
+  guard-free effects, actual importer ownership, and hard-process-crash proof
+  remain with their existing owners; stalled pause is the next slice.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):

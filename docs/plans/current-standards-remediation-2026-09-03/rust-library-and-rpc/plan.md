@@ -2,28 +2,24 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestone 1 is accepted. Milestone 2's C3 queue candidate is
-active following the user's approval to coordinate migration and relocation
-in RUST-I8. The shared
-finalization-policy extraction is independently verified; the queue draft is
-not accepted. Milestone 2 otherwise remains producer
+**Current phase:** Milestone 1 is accepted. Milestone 2's C3 core recovery,
+legacy relocation, and cancellation-quarantine checkpoint is verified for
+incremental integration. Full C3 remains active and unaccepted. Milestone 2 remains producer
 contract work that is valid for loopback desktop RPC and local core IPC.
 `RUST-I1` is resolved: desktop RPC is loopback-only and LAN support is removed.
 
-**Next slice:** Establish the exact production core recovery integration boundary
-needed to make the isolated C3 candidate reachable and lint-clean. Legacy owned
-relocation and its migration caller are implemented and narrowly reviewed, but
-the isolated candidate fails strict Clippy. Inventory the held core caller and
-its contracts before admitting it; do not suppress warnings or pull RPC/UI
-consumers into this slice. The real transferred-byte interrupted
-response → settled Error → fresh-owner restore → cancel path is now verified;
-hard process-crash recovery remains unproved. C1 store repairs and C2 destination
-authority passed independent source review and targeted regressions in both
-feature configurations. C3's ordinary admission, exact status/settlement, and
-strict restore integration passed independent review and targeted regressions
-in both feature configurations; final supporting gates are recorded in the
-ledger. Full lifecycle integration is not yet accepted. Unused integration warnings remain visible.
-Slice B remains the accepted lifecycle regression boundary. C3 lifecycle integration and C4 importer integration proceed in
+**Next slice:** Complete C3 stalled-pause ownership at headers, body, and retry
+waits, using the existing task owner and public pause/status seam. Preserve the
+verified recovery, queue, cancellation, and relocation regressions. The additive
+`resume_partial_download_with_ticket` is available to core callers; existing
+repo/path consumers retain their prior contract until explicitly migrated.
+No fresh ticket is synthesized for legacy calls. Unrelated Result-shape,
+reconciliation, RPC, and UI work remains held. Hard-process-crash recovery,
+comprehensive unresolved-state restore, admitted relocation, guard-free effects,
+and C4 importer ownership remain open. Exact evidence is in the ledger:
+full core package tests pass in both feature configurations; strict core and
+supported-workspace Clippy pass without warning suppression.
+C3 lifecycle integration and C4 importer integration proceed in
 that order; they are reviewable checkpoints, not independently shippable claims.
 The accepted Slice B
 generation, terminal-projection, cancellation, cleanup, tombstone, and sticky
@@ -50,7 +46,7 @@ with only its isolated red HF-unavailable oracle recorded.
 | --- | --- | --- |
 | C1 (internally verified) | Durable admission, restart reconciliation, quarantine, and exact queue settlement behind the store Interface | 38 store tests and atomic/HF regressions pass in both feature configurations; independent source review accepted |
 | C2 (internally verified) | Held configured-root destination authority and marker publisher ready for runtime integration | Independent source review accepted; root reproduced 14 recovery, 22 atomic-publication, 38 store, and 155 HF tests in both feature configurations |
-| C3 (active; queue draft unaccepted) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Earlier admission/interrupted-transfer checkpoints remain verified. RUST-I8 scope is approved; legacy relocation and its migration caller must pass before draft acceptance |
+| C3 (active; incremental core checkpoint verified) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Core ticket recovery, legacy relocation, and cancellation quarantine pass independent review, dual full-package tests, and strict lint. Full C3 remains open; ledger owns exact boundaries |
 | C4 | Importer mutations are awaited before settlement; notifications follow release | Real async importer held during cancellation/completion; successor progress and terminal-state tests |
 
 The complete producer/consumer boundary still requires the existing later
@@ -81,8 +77,8 @@ without garbage collection. Queue-owned generic save/remove/revoke/relocate
 operations now refuse mutation; C3 must use dedicated owned transitions rather
 than bypass those guards. Runtime owners must complete destination effects
 before store settlement and explicitly reconcile before restart admission.
-Some private integration APIs remain unused during C3; compilation is not a claim
-of warning-free or end-to-end acceptance.
+The core integration checkpoint is lint-clean; that does not establish the
+remaining end-to-end lifecycle claims.
 
 **C2 integration limits:** the builder establishes the library directory before
 opening its held download authority, and preserves HF search when that authority
@@ -91,8 +87,9 @@ identity; nested symlinks are rejected. Model, creation-anchor, and nested file
 parent replacement cannot redirect capability effects. Marker publication uses
 the existing atomic outcome algebra through a held parent, including directory
 creation sync. C3 now routes ordinary start and admitted resume/cancellation
-through this capability and rejects unconfigured starts. Legacy mutation paths
-and runtime reservation identity still need migration.
+through this capability and rejects unconfigured starts. Legacy relocation and
+runtime reservation identity are integrated; admitted relocation and the
+remaining lifecycle effects still need completion.
 Only Linux execution is evidenced; this is not cross-platform acceptance or a
 full builder-startup test.
 
@@ -103,9 +100,10 @@ and seeded-final-file regressions retain their narrower meaning. The unaccepted
 queue draft uses held identities and one retained capability per state, but
 legacy relocation now transfers path and retained authority together, with
 Pending source/target custody on uncertainty. The physical
-destination mutex remains; comprehensive restore still
-needs task ownership, legacy migration, and hidden/quarantined/recovery-state
-reconciliation. Stalled pause and admitted relocation remain pending. Unknown admissions
+destination mutex remains; comprehensive restore still needs task ownership
+and hidden/Pending-state reconciliation. Verified cleanup history now restores
+without mutation authority; Pending state and active quarantine queues still
+refuse restoration. Stalled pause and admitted relocation remain pending. Unknown admissions
 fail closed but do not yet have the complete recovery path. Runtime release
 facts are retained until owner drop to prevent stale-inventory resurrection.
 The real asynchronous importer and callback ordering remain C4. This admission
@@ -120,6 +118,7 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   the existing untracked
   `rust/crates/pumas-core/src/model_library/download_recovery.rs`,
   `rust/crates/pumas-core/src/api/builder.rs`,
+  `rust/crates/pumas-core/src/api/hf.rs` (additive ticket recovery and regressions only),
   `rust/crates/pumas-core/src/api/migration.rs`,
   `rust/crates/pumas-core/src/api/state.rs` (migration call-site arguments only),
   `rust/crates/pumas-core/src/model_library/partial_download.rs`,

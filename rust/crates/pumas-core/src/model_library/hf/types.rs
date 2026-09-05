@@ -5,6 +5,7 @@
 
 use crate::model_library::download_store::PersistedDownload;
 use crate::model_library::types::{DownloadRequest, DownloadStatus};
+use crate::model_library::DownloadRecoveryDestination;
 use crate::models::HuggingFaceEvidence;
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,6 +13,45 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+#[derive(Clone)]
+pub(super) enum DownloadDestination {
+    Managed(DownloadRecoveryDestination),
+    Recovery(DownloadRecoveryDestination),
+}
+
+#[derive(Clone)]
+pub(super) struct PendingDownloadRelocation {
+    pub(super) attempt_id: String,
+    pub(super) target: DownloadRecoveryDestination,
+}
+
+impl DownloadDestination {
+    pub(super) fn capability(&self) -> &DownloadRecoveryDestination {
+        match self {
+            Self::Managed(value) | Self::Recovery(value) => value,
+        }
+    }
+
+    pub(super) fn identity(&self) -> crate::model_library::download_recovery::DestinationIdentity {
+        self.capability().identity()
+    }
+
+    pub(super) fn display_path(&self) -> &std::path::Path {
+        self.capability().display_path()
+    }
+
+    pub(super) fn domain(&self) -> super::lifecycle::DestinationDomain {
+        match self {
+            Self::Managed(_) => super::lifecycle::DestinationDomain::Ambient,
+            Self::Recovery(_) => super::lifecycle::DestinationDomain::Recovery,
+        }
+    }
+
+    pub(super) fn is_recovery(&self) -> bool {
+        matches!(self, Self::Recovery(_))
+    }
+}
 
 /// HuggingFace API base URL.
 pub(crate) const HF_API_BASE: &str = "https://huggingface.co/api";
@@ -76,6 +116,7 @@ pub(crate) struct FileToDownload {
 
 /// Internal state for an active download.
 pub(crate) struct DownloadState {
+    pub(super) admission: Option<AdmittedDownload>,
     /// Download ID
     pub download_id: String,
     /// Repository ID
@@ -106,8 +147,23 @@ pub(crate) struct DownloadState {
     pub next_retry_delay_seconds: Option<f64>,
     /// Whether a Tokio task was registered for this in-memory download.
     pub task_registered: bool,
+    /// A lifecycle/cleanup failure whose safety preconditions have not been
+    /// re-established. Cancellation must not erase this provenance or release
+    /// a recovery capability as if cleanup had been verified.
+    pub lifecycle_failure_unverified: bool,
     /// Destination directory (needed for resume after restart)
     pub dest_dir: PathBuf,
+    /// Whether this runtime has reserved or revoked the persisted ambient-path
+    /// authority while converting the state to capability-backed recovery.
+    /// Once set, generic ambient resume/relocation remains fail-closed.
+    pub ambient_authority_blocked: bool,
+    /// Held filesystem authority and explicit provenance. All resumable states
+    /// retain it; verified terminal cleanup releases it. Never serialized.
+    pub(super) destination: Option<DownloadDestination>,
+    pub(super) pending_relocation: Option<PendingDownloadRelocation>,
+    /// Exact former ordinary snapshot retained by owned recovery revocation.
+    /// Needed to quarantine later cleanup without reconstructing lost metadata.
+    pub(super) revoked_snapshot: Option<super::super::download_store::PersistedDownload>,
     /// Current filename being downloaded
     pub filename: String,
     /// All files in this download (for multi-file models)
@@ -122,6 +178,11 @@ pub(crate) struct DownloadState {
     pub huggingface_evidence: Option<HuggingFaceEvidence>,
 }
 
+#[derive(Clone)]
+pub(super) struct AdmittedDownload {
+    pub(super) attempt_id: String,
+}
+
 impl std::fmt::Debug for DownloadState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DownloadState")
@@ -134,11 +195,57 @@ impl std::fmt::Debug for DownloadState {
 }
 
 impl DownloadState {
+    pub(super) fn matches_destination(
+        &self,
+        identity: &crate::model_library::download_recovery::DestinationIdentity,
+    ) -> bool {
+        self.destination
+            .as_ref()
+            .is_some_and(|destination| destination.identity() == *identity)
+    }
+    pub(super) fn recovery_destination(&self) -> Option<&DownloadRecoveryDestination> {
+        match self.destination.as_ref() {
+            Some(DownloadDestination::Recovery(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn make_managed_for_test(&mut self) {
+        if let Some(destination) = self.destination.take() {
+            self.destination = Some(DownloadDestination::Managed(
+                destination.capability().clone(),
+            ));
+        }
+    }
     /// Restore a download state from a persisted entry.
     ///
     /// Reconstructs in-memory state from a persistence record, including
     /// file lists, progress calculation, and status normalization.
-    pub(crate) fn from_persisted(entry: &PersistedDownload, downloaded_bytes: u64) -> Self {
+    pub(super) fn from_persisted(
+        entry: &PersistedDownload,
+        downloaded_bytes: u64,
+        destination: DownloadDestination,
+    ) -> Self {
+        Self::restore_fields(entry, downloaded_bytes, Some(destination))
+    }
+
+    /// Historical failure metadata after durable cleanup and queue settlement.
+    /// This state deliberately cannot grant filesystem or resume authority.
+    pub(super) fn from_verified_cleanup(entry: &PersistedDownload) -> Self {
+        let mut state = Self::restore_fields(entry, 0, None);
+        state.status = DownloadStatus::Error;
+        state.error = Some("Download failed; terminal cleanup was verified".into());
+        state.ambient_authority_blocked = true;
+        state.lifecycle_failure_unverified = true;
+        state
+    }
+
+    fn restore_fields(
+        entry: &PersistedDownload,
+        downloaded_bytes: u64,
+        destination: Option<DownloadDestination>,
+    ) -> Self {
         let progress = entry
             .total_bytes
             .map(|total| downloaded_bytes as f32 / total as f32)
@@ -187,7 +294,16 @@ impl DownloadState {
             retrying: false,
             next_retry_delay_seconds: None,
             task_registered: false,
-            dest_dir: entry.dest_dir.clone(),
+            lifecycle_failure_unverified: false,
+            dest_dir: destination
+                .as_ref()
+                .map(|destination| destination.display_path().to_path_buf())
+                .unwrap_or_else(|| entry.dest_dir.clone()),
+            ambient_authority_blocked: false,
+            admission: None,
+            destination,
+            pending_relocation: None,
+            revoked_snapshot: None,
             filename: entry.filename.clone(),
             files,
             files_completed: 0,

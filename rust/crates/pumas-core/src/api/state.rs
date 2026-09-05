@@ -1036,8 +1036,12 @@ impl ipc::server::IpcDispatch for PrimaryState {
                     .model_library
                     .execute_migration_with_checkpoint()
                     .await?;
-                let mutated =
-                    super::migration::relocate_skipped_partial_downloads(self, &mut report).await?;
+                let mutated = super::migration::relocate_skipped_partial_downloads(
+                    &self.model_library,
+                    self.hf_client.as_ref(),
+                    &mut report,
+                )
+                .await?;
                 if mutated {
                     super::migration::recompute_execution_report_counts(&mut report);
                     super::migration::rewrite_migration_execution_report(

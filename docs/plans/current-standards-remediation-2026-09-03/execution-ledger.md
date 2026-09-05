@@ -3319,6 +3319,24 @@
   consumer, GUI, or release acceptance. Existing unrelated changes and the
   original staged UniFFI blob remain preserved.
 
+### 2026-09-04 — Core Recovery Incremental Boundary Accepted
+
+- Completed the user-approved core recovery integration and lint repairs.
+  The additive ticket method preserves existing repo/path consumers; owned
+  cancellation durably quarantines cleanup and retains the exact snapshot
+  across revocation. Verified cleanup restores without granting mutation
+  authority or guessing queue release. Independent reviews accepted the final
+  source after error-type preservation and cancellation-window corrections.
+- The isolated candidate passes 1,175 package checks in each feature mode,
+  strict core lint in both modes, unchanged-consumer compilation, and strict
+  supported-workspace lint. The focused Rust ledger owns exact commands,
+  hashes, ignored-test limits, and breaking consumer migration obligations.
+- Accept the coherent core source and records for incremental integration;
+  PRG-I24's legacy composition gate is resolved. Full C3/C4, transport/UI,
+  cross-platform release, and hard-process-crash claims remain open. Next is
+  stalled-pause ownership. Other worktree changes and the original staged
+  UniFFI blob remain preserved.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.
