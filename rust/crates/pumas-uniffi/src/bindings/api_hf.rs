@@ -34,9 +34,13 @@ impl FfiPumasApi {
     pub async fn get_hf_download_progress(
         &self,
         download_id: String,
-    ) -> Option<FfiModelDownloadProgress> {
-        let progress = self.primary().get_hf_download_progress(&download_id).await;
-        progress.map(FfiModelDownloadProgress::from)
+    ) -> Result<Option<FfiModelDownloadProgress>, FfiError> {
+        let progress = self
+            .primary()
+            .get_hf_download_progress(&download_id)
+            .await
+            .map_err(FfiError::from)?;
+        Ok(progress.map(FfiModelDownloadProgress::from))
     }
 
     /// Cancel an active HuggingFace download.
@@ -48,12 +52,18 @@ impl FfiPumasApi {
     }
 
     /// List interrupted downloads that lost their persistence state.
-    pub async fn list_interrupted_downloads(&self) -> Vec<FfiInterruptedDownload> {
-        let downloads = self.primary().list_interrupted_downloads().await;
-        downloads
+    pub async fn list_interrupted_downloads(
+        &self,
+    ) -> Result<Vec<FfiInterruptedDownload>, FfiError> {
+        let downloads = self
+            .primary()
+            .list_interrupted_downloads()
+            .await
+            .map_err(FfiError::from)?;
+        Ok(downloads
             .into_iter()
             .map(FfiInterruptedDownload::from)
-            .collect()
+            .collect())
     }
 
     /// Recover an interrupted download by providing the correct repo_id.

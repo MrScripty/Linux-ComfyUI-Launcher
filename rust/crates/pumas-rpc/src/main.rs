@@ -3,6 +3,8 @@
 //! This binary provides a JSON-RPC 2.0 server that wraps the pumas-core library
 //! for communication with the Electron main process.
 
+mod catalog_projection;
+mod contract;
 mod handlers;
 #[cfg(feature = "inference-plugins")]
 mod provider_clients;
@@ -17,7 +19,6 @@ use pumas_app_manager::{SizeCalculator, VersionManager};
 use pumas_library::{AppId, PluginLoader};
 #[cfg(feature = "inference-plugins")]
 use std::collections::HashMap;
-use std::net::IpAddr;
 #[cfg(feature = "inference-plugins")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -36,6 +37,14 @@ const VERSION_MANAGED_APPS: &[AppId] = &[AppId::Ollama, AppId::Torch, AppId::Lla
 #[command(name = "pumas-rpc")]
 #[command(about = "JSON-RPC server for Pumas Library")]
 struct Args {
+    /// Export the current desktop wire contract without starting a server.
+    #[cfg(feature = "export-contract")]
+    #[arg(long)]
+    export_desktop_contract: bool,
+    /// Produce real constructor-generated conformance fixtures in a temporary library.
+    #[cfg(feature = "export-contract")]
+    #[arg(long)]
+    export_desktop_fixtures: bool,
     /// Port to listen on (0 = auto-assign)
     #[arg(short, long, default_value = "0")]
     port: u16,
@@ -43,10 +52,6 @@ struct Args {
     /// Host to bind to
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
-
-    /// Allow binding the RPC listener to a non-loopback interface.
-    #[arg(long)]
-    allow_lan: bool,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -59,7 +64,17 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    validate_rpc_host(&args.host, args.allow_lan)?;
+    #[cfg(feature = "export-contract")]
+    if args.export_desktop_fixtures {
+        serde_json::to_writer_pretty(std::io::stdout(), &contract::desktop_contract_fixtures()?)?;
+        return Ok(());
+    }
+    #[cfg(feature = "export-contract")]
+    if args.export_desktop_contract {
+        serde_json::to_writer_pretty(std::io::stdout(), &contract::desktop_contract_schema()?)?;
+        return Ok(());
+    }
+    let host = server::LoopbackHost::parse(&args.host)?;
 
     // Set up logging
     let log_level = if args.debug {
@@ -81,10 +96,10 @@ fn main() -> Result<()> {
         .thread_name("pumas-rpc")
         .build()?;
 
-    runtime.block_on(run(args))
+    runtime.block_on(run(args, host))
 }
 
-async fn run(args: Args) -> Result<()> {
+async fn run(args: Args, host: server::LoopbackHost) -> Result<()> {
     info!("Starting Pumas RPC Server");
 
     // Determine launcher root
@@ -111,7 +126,7 @@ async fn run(args: Args) -> Result<()> {
         }
     };
 
-    info!("Launcher root: {}", launcher_root.display());
+    info!("Launcher root configured");
 
     // Create the core API instance (model library, system utilities)
     // Use builder with auto_create_dirs so first-run (e.g. portable AppImage)
@@ -141,11 +156,8 @@ async fn run(args: Args) -> Result<()> {
             info!("Plugin loader initialized ({} plugins)", loader.count());
             loader
         }
-        Err(e) => {
-            warn!(
-                "Failed to initialize plugin loader: {}, using empty loader",
-                e
-            );
+        Err(_) => {
+            warn!("Plugin loader initialization failed; using empty loader");
             PluginLoader::new_async(std::env::temp_dir().join("pumas-plugins-fallback"))
                 .await
                 .unwrap()
@@ -161,7 +173,7 @@ async fn run(args: Args) -> Result<()> {
         size_calculator,
         #[cfg(feature = "inference-plugins")]
         plugin_loader,
-        &args.host,
+        host,
         args.port,
     )
     .await?;
@@ -176,7 +188,7 @@ async fn run(args: Args) -> Result<()> {
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     info!("Shutdown signal received, exiting");
-    server.shutdown().await;
+    server.shutdown().await?;
 
     Ok(())
 }
@@ -191,8 +203,8 @@ async fn initialize_version_managers(launcher_root: &Path) -> HashMap<String, Ve
                 info!("{app_id} version manager initialized successfully");
                 version_managers.insert(app_id.as_str().to_string(), manager);
             }
-            Err(error) => {
-                warn!("Failed to initialize {app_id} version manager: {error}");
+            Err(_) => {
+                warn!("Failed to initialize {app_id} version manager");
             }
         }
     }
@@ -200,44 +212,12 @@ async fn initialize_version_managers(launcher_root: &Path) -> HashMap<String, Ve
     version_managers
 }
 
-fn validate_rpc_host(host: &str, allow_lan: bool) -> Result<()> {
-    let ip_addr: IpAddr = host
-        .parse()
-        .map_err(|_| anyhow::anyhow!("RPC host must be an IP address, got '{host}'"))?;
-
-    if ip_addr.is_loopback() || allow_lan {
-        return Ok(());
-    }
-
-    Err(anyhow::anyhow!(
-        "Refusing to bind RPC server to non-loopback host '{host}' without --allow-lan"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::validate_rpc_host;
     #[cfg(feature = "inference-plugins")]
     use super::VERSION_MANAGED_APPS;
     #[cfg(feature = "inference-plugins")]
     use pumas_library::AppId;
-
-    #[test]
-    fn rpc_host_validation_allows_loopback_without_lan_flag() {
-        assert!(validate_rpc_host("127.0.0.1", false).is_ok());
-        assert!(validate_rpc_host("::1", false).is_ok());
-    }
-
-    #[test]
-    fn rpc_host_validation_rejects_non_loopback_without_lan_flag() {
-        let error = validate_rpc_host("0.0.0.0", false).unwrap_err();
-        assert!(error.to_string().contains("without --allow-lan"), "{error}");
-    }
-
-    #[test]
-    fn rpc_host_validation_allows_non_loopback_with_lan_flag() {
-        assert!(validate_rpc_host("0.0.0.0", true).is_ok());
-    }
 
     #[cfg(feature = "inference-plugins")]
     #[test]

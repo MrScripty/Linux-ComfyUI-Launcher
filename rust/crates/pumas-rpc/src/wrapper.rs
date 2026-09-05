@@ -81,29 +81,17 @@ pub fn wrap_response(method: &str, result: Value) -> Value {
         | "get_library_status"
         | "get_link_health"
         | "import_model"
-        | "download_model_from_hf"
-        | "start_model_download_from_hf"
-        | "get_model_download_status"
-        | "cancel_model_download"
-        | "pause_model_download"
-        | "resume_model_download"
-        | "resume_partial_download"
-        | "list_model_downloads"
         | "search_hf_models"
         | "get_hf_download_details"
         | "get_related_models"
-        | "search_models_fts"
         | "import_batch"
         | "classify_model_import_paths"
         | "lookup_hf_metadata_for_file"
         | "lookup_hf_metadata_for_bundle_directory"
         | "detect_sharded_sets"
         | "validate_file_type"
-        | "refresh_model_index"
         | "get_file_link_count"
         | "check_files_writable"
-        | "open_path"
-        | "open_url"
         | "open_active_install"
         | "clean_broken_links"
         | "remove_orphaned_links"
@@ -121,13 +109,6 @@ pub fn wrap_response(method: &str, result: Value) -> Value {
         | "ollama_load_model_for_profile"
         | "ollama_unload_model"
         | "ollama_list_running"
-        | "start_model_conversion"
-        | "get_conversion_progress"
-        | "cancel_model_conversion"
-        | "list_model_conversions"
-        | "check_conversion_environment"
-        | "setup_conversion_environment"
-        | "get_supported_quant_types"
         | "get_inference_settings"
         | "update_inference_settings"
         | "update_model_notes"
@@ -169,13 +150,6 @@ pub fn wrap_response(method: &str, result: Value) -> Value {
             json!({
                 "success": true,
                 "version": if result.is_null() { json!("") } else { result }
-            })
-        }
-
-        "get_models" => {
-            json!({
-                "success": true,
-                "models": if result.is_null() { json!({}) } else { result }
             })
         }
 
@@ -269,16 +243,6 @@ mod tests {
     fn test_passthrough_method() {
         let data = json!({"success": true, "version": "1.0.0"});
         let wrapped = wrap_response("get_status", data.clone());
-        assert_eq!(wrapped, data);
-    }
-
-    #[test]
-    fn test_refresh_model_index_passthrough() {
-        let data = json!({
-            "success": true,
-            "indexed_count": 48
-        });
-        let wrapped = wrap_response("refresh_model_index", data.clone());
         assert_eq!(wrapped, data);
     }
 

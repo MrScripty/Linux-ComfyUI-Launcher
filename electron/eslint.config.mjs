@@ -10,6 +10,15 @@ export default tseslint.config(
     ignores: ['dist/**', 'release/**', 'node_modules/**', '*.config.*'],
   },
   {
+    files: ['scripts/**/*.mjs'],
+    extends: [js.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: { process: 'readonly', Buffer: 'readonly', structuredClone: 'readonly' },
+    },
+  },
+  {
     files: ['src/**/*.ts'],
     extends: [
       js.configs.recommended,

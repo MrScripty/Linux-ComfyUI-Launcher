@@ -289,6 +289,20 @@ impl DestinationExecutionOwner {
         true
     }
 
+    /// Historical terminal proof only; this never authorizes another execution.
+    pub(super) fn was_released(
+        &self,
+        destination: &DestinationIdentity,
+        download_id: &str,
+        domain: DestinationDomain,
+    ) -> bool {
+        self.queues
+            .lock()
+            .expect("HF destination-execution owner lock poisoned")
+            .get(destination)
+            .is_some_and(|queue| queue.released.contains(&(download_id.to_string(), domain)))
+    }
+
     /// Eligibility check only; the installed generation must still acquire its turn.
     pub(super) fn is_first(
         &self,
@@ -1160,6 +1174,25 @@ impl DownloadTaskOwner {
                     .as_ref()
                     .filter(|(key, _)| key == identity)
                     .map(|(_, completion)| (id.clone(), completion.clone()))
+            })
+    }
+
+    pub(super) fn pending_recovery_admission(
+        &self,
+        download_id: &str,
+        identity: &PendingAdmissionIdentity,
+    ) -> Option<(TaskGeneration, tokio::sync::watch::Receiver<bool>)> {
+        self.tasks
+            .lock()
+            .expect("HF task owner lock poisoned")
+            .get(download_id)
+            .filter(|entry| entry.role == TaskRole::RecoveryTransition)
+            .and_then(|entry| {
+                entry
+                    .admission
+                    .as_ref()
+                    .filter(|(key, _)| key == identity)
+                    .map(|(_, completion)| (entry.generation.clone(), completion.clone()))
             })
     }
 

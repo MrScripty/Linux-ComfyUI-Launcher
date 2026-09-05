@@ -19,6 +19,19 @@ test('RPC method registry has stable unique method names', () => {
   assert.ok(ALLOWED_RPC_METHODS.includes('torch_configure'));
 });
 
+test('partial recovery admits model tickets and rejects retired recovery requests', () => {
+  const params = { modelId: 'llm/example', recoveryToken: `v1:${'a'.repeat(64)}` };
+  assert.deepEqual(validateApiCallPayload('resume_partial_download', params), {
+    method: 'resume_partial_download', params,
+  });
+  assert.throws(() => validateApiCallPayload('resume_partial_download', {
+    repo_id: 'org/example', dest_dir: '/models/example',
+  }));
+  for (const method of ['recover_download', 'list_interrupted_downloads']) {
+    assert.throws(() => validateApiCallPayload(method, {}), /Unknown API method/);
+  }
+});
+
 test('validateApiCallPayload rejects unknown methods and non-record params', () => {
   assert.deepEqual(validateApiCallPayload('get_status', undefined), {
     method: 'get_status',

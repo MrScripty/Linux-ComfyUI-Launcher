@@ -17,7 +17,6 @@ export interface LocalModelRowState {
   isRecoveringPartial: boolean;
   isStarred: boolean;
   partialError?: string;
-  partialRepoId?: string;
   relatedModels: RelatedModelsState['models'];
   relatedStatus: RelatedModelsState['status'];
   relatedState?: RelatedModelsState;
@@ -38,7 +37,6 @@ interface PartialDownloadState {
   canRecoverPartial: boolean;
   isRecoveringPartial: boolean;
   partialError?: string;
-  partialRepoId?: string;
 }
 
 function getRingDegrees(model: ModelInfo, isQueued: boolean): number {
@@ -89,32 +87,28 @@ function getPartialDownloadState({
   isDownloading,
   isPartialDownload,
   model,
-  recoveringPartialRepoIds,
+  recoveringPartialModelIds,
 }: {
   canRecoverDownload: boolean;
   downloadErrors?: Record<string, string>;
   isDownloading: boolean;
   isPartialDownload: boolean;
   model: ModelInfo;
-  recoveringPartialRepoIds?: Set<string>;
+  recoveringPartialModelIds?: Set<string>;
 }): PartialDownloadState {
-  const partialRepoId = model.repoId ?? model.downloadRepoId;
-  const missingRecoveryMetadata = isPartialDownload && (!model.repoId || !model.modelDir);
+  const hasRecovery = model.provenance === 'catalog' && Boolean(model.recovery);
+  const missingRecoveryMetadata = isPartialDownload && !hasRecovery;
 
   return {
     canRecoverPartial:
       !isDownloading &&
       isPartialDownload &&
       canRecoverDownload &&
-      Boolean(model.repoId) &&
-      Boolean(model.modelDir),
-    isRecoveringPartial: Boolean(partialRepoId && recoveringPartialRepoIds?.has(partialRepoId)),
+      hasRecovery,
+    isRecoveringPartial: Boolean(recoveringPartialModelIds?.has(model.id)),
     partialError: missingRecoveryMetadata
-      ? 'Cannot resume partial download: repository metadata is missing.'
-      : partialRepoId
-        ? downloadErrors?.[partialRepoId]
-        : undefined,
-    partialRepoId,
+      ? 'Resume is unavailable until current recovery information is available.'
+      : downloadErrors?.[model.id],
   };
 }
 
@@ -123,7 +117,7 @@ export function getLocalModelRowState({
   excludedModels,
   expandedRelated,
   model,
-  recoveringPartialRepoIds,
+  recoveringPartialModelIds,
   relatedModelsById,
   starredModels,
   canConvertModel,
@@ -135,7 +129,7 @@ export function getLocalModelRowState({
   excludedModels: Set<string>;
   expandedRelated: Set<string>;
   model: ModelInfo;
-  recoveringPartialRepoIds?: Set<string>;
+  recoveringPartialModelIds?: Set<string>;
   relatedModelsById: Record<string, RelatedModelsState>;
   starredModels: Set<string>;
   canConvertModel: boolean;
@@ -158,7 +152,7 @@ export function getLocalModelRowState({
     isDownloading,
     isPartialDownload,
     model,
-    recoveringPartialRepoIds,
+    recoveringPartialModelIds,
   });
 
   return {
@@ -171,14 +165,13 @@ export function getLocalModelRowState({
     isConvertible: !isDownloading && !isPartialDownload && Boolean(model.primaryFormat) && canConvertModel,
     isDownloading,
     isExpanded: expandedRelated.has(model.id),
-    isLinked: !excludedModels.has(model.id),
+    isLinked: model.provenance !== 'cached' && !excludedModels.has(model.id),
     isPartialDownload,
     isPaused: download.isPaused,
     isQueued: download.isQueued,
     isRecoveringPartial: partial.isRecoveringPartial,
-    isStarred: starredModels.has(model.id),
+    isStarred: model.provenance !== 'cached' && starredModels.has(model.id),
     partialError: partial.partialError,
-    partialRepoId: partial.partialRepoId,
     relatedModels: relatedState?.models ?? [],
     relatedStatus: relatedState?.status ?? 'idle',
     relatedState,

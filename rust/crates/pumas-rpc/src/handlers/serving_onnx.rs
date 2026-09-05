@@ -118,13 +118,15 @@ pub(super) async fn serve_onnx_model(
             .await;
         }
     };
-    if let Err(error) = confirm_onnx_session_loaded(state, &onnx_model_id).await {
+    if confirm_onnx_session_loaded(state, &onnx_model_id)
+        .await
+        .is_err()
+    {
         warn!(
             provider = "onnx_runtime",
             model_id = %request.model_id,
             provider_model_id = %provider_model_id,
             profile_id = %request.config.profile_id.as_str(),
-            error = %error,
             "ONNX session status confirmation failed"
         );
         compensate_onnx_load_failure(
@@ -171,7 +173,6 @@ pub(super) async fn serve_onnx_model(
                 model_id = %request.model_id,
                 provider_model_id = %provider_model_id,
                 profile_id = %request.config.profile_id.as_str(),
-                error = %error,
                 "ONNX served-state record failed after session load"
             );
             compensate_onnx_load_failure(

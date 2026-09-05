@@ -39,12 +39,10 @@ class ImportAPI {
   async searchModelsFTS(
     query: string,
     limit = 100,
-    offset = 0,
-    modelType?: string | null,
-    tags?: string[] | null
+    offset = 0
   ): Promise<FTSSearchResponse> {
     const api = this.getAPI();
-    return await api.search_models_fts(query, limit, offset, modelType, tags);
+    return await api.search_models_fts(query, limit, offset);
   }
 
   /**

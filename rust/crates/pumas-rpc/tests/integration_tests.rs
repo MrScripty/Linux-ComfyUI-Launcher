@@ -8,9 +8,13 @@ use serde_json::{json, Value};
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead};
+use tokio::sync::Mutex;
+
+const MAX_CAPTURED_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 /// Create a temporary directory with launcher-data structure.
 fn create_test_env() -> TempDir {
@@ -48,6 +52,120 @@ fn create_indexable_test_model(root: &std::path::Path, model_id: &str, official_
         .unwrap(),
     )
     .unwrap();
+}
+
+fn create_partial_test_model(root: &std::path::Path) -> &'static str {
+    const MODEL_ID: &str = "llm/acme/partial-model";
+    let model_dir = root.join("shared-resources/models").join(MODEL_ID);
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(model_dir.join("weights.gguf.part"), b"partial").unwrap();
+    std::fs::write(
+        model_dir.join("metadata.json"),
+        serde_json::to_string_pretty(&json!({
+            "schema_version": 2,
+            "model_id": MODEL_ID,
+            "family": "acme",
+            "model_type": "llm",
+            "official_name": "Partial Model",
+            "cleaned_name": "partial-model",
+            "repo_id": "acme/model",
+            "match_source": "download_partial",
+            "expected_files": ["weights.gguf"],
+            "selected_artifact_id": "acme--model__weights-gguf",
+            "selected_artifact_files": ["weights.gguf"],
+            "selected_artifact_quant": "Q4_K_M",
+            "size_bytes": 100
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cache_dir = root.join("launcher-data/cache/hf");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("hf_acme_model_files.json"),
+        serde_json::to_string_pretty(&json!({
+            "repo_id": "acme/model",
+            "lfs_files": [{
+                "filename": "weights.gguf",
+                "size": 100,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }],
+            "regular_files": [],
+            "cached_at": "2026-09-03T00:00:00Z",
+            "last_modified": null,
+            "cache_version": 2
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    MODEL_ID
+}
+
+fn create_tracked_partial_test_model(root: &std::path::Path, status: &str) -> &'static str {
+    let model_id = create_partial_test_model(root);
+    let snapshot = serde_json::from_value(json!({
+        "download_id": "tracked-partial-1",
+        "repo_id": "acme/model",
+        "filename": "weights.gguf",
+        "filenames": ["weights.gguf"],
+        "dest_dir": root.join("shared-resources/models").join(model_id),
+        "total_bytes": 100,
+        "status": status,
+        "download_request": {
+            "repo_id": "acme/model", "family": "acme", "official_name": "Partial Model",
+            "model_type": "llm", "filenames": ["weights.gguf"]
+        },
+        "created_at": "2026-09-03T00:00:00Z"
+    }))
+    .unwrap();
+    pumas_library::model_library::test_support::admit_paused_download(root, &snapshot).unwrap();
+    model_id
+}
+
+fn create_untracked_partial_test_model(root: &std::path::Path) -> &'static str {
+    let model_id = create_partial_test_model(root);
+    let cache_dir = root.join("launcher-data/cache/hf");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("hf_acme_model_files.json"),
+        serde_json::to_string_pretty(&json!({
+            "repo_id": "acme/model",
+            "lfs_files": [{
+                "filename": "weights.gguf",
+                "size": 100,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }],
+            "regular_files": ["config.json"],
+            "cached_at": "2026-09-03T00:00:00Z",
+            "last_modified": null,
+            "cache_version": 2
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    model_id
+}
+
+fn create_untracked_partial_with_missing_remote_member(root: &std::path::Path) -> &'static str {
+    let model_id = create_untracked_partial_test_model(root);
+    let model_dir = root.join("shared-resources/models").join(model_id);
+    std::fs::remove_file(model_dir.join("weights.gguf.part")).unwrap();
+    std::fs::write(model_dir.join("weights-1.gguf.part"), b"partial").unwrap();
+    let metadata_path = model_dir.join("metadata.json");
+    let mut metadata: Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["expected_files"] = json!(["weights-1.gguf", "weights-2.gguf"]);
+    metadata["selected_artifact_files"] = json!(["weights-1.gguf", "weights-2.gguf"]);
+    std::fs::write(metadata_path, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
+    let cache_path = root.join("launcher-data/cache/hf/hf_acme_model_files.json");
+    let mut tree: Value = serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+    tree["lfs_files"] = json!([{
+        "filename": "weights-1.gguf",
+        "size": 100,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }]);
+    std::fs::write(cache_path, serde_json::to_vec_pretty(&tree).unwrap()).unwrap();
+    model_id
 }
 
 #[cfg(feature = "inference-plugins")]
@@ -97,6 +215,44 @@ async fn rpc_call_raw(port: u16, method: &str, params: Value) -> Result<Value, S
         .map_err(|e| e.to_string())?;
 
     response.json::<Value>().await.map_err(|e| e.to_string())
+}
+
+async fn recovery_token_for_model(port: u16, model_id: &str) -> String {
+    let pointer = format!(
+        "/models/{}/artifact/recovery/recoveryToken",
+        model_id.replace('~', "~0").replace('/', "~1")
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let models = rpc_call(port, "get_models", json!({})).await.unwrap();
+        if let Some(token) = models.pointer(&pointer).and_then(Value::as_str) {
+            return token.to_string();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "partial model never appeared with a recovery ticket: {models}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Send an exact request body to the real producer adapter.
+async fn rpc_body_raw(port: u16, body: &str) -> Result<Value, String> {
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/rpc"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("unexpected HTTP status {}", response.status()));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Check health endpoint.
@@ -164,15 +320,27 @@ struct RpcServerHandle {
     child: tokio::process::Child,
     port: u16,
     stdout_drain: Option<tokio::task::JoinHandle<()>>,
+    stderr_drain: Option<tokio::task::JoinHandle<()>>,
+    stdout: Arc<Mutex<String>>,
+    stderr: Arc<Mutex<String>>,
 }
 
 impl RpcServerHandle {
     async fn stop(mut self) {
-        if let Some(drain) = self.stdout_drain.take() {
-            drain.abort();
-        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+        if let Some(drain) = self.stdout_drain.take() {
+            let _ = drain.await;
+        }
+        if let Some(drain) = self.stderr_drain.take() {
+            let _ = drain.await;
+        }
+    }
+
+    async fn diagnostics(&self) -> String {
+        let stdout = self.stdout.lock().await.clone();
+        let stderr = self.stderr.lock().await.clone();
+        format!("{stdout}\n{stderr}")
     }
 }
 
@@ -181,36 +349,80 @@ impl Drop for RpcServerHandle {
         if let Some(drain) = self.stdout_drain.take() {
             drain.abort();
         }
+        if let Some(drain) = self.stderr_drain.take() {
+            drain.abort();
+        }
         let _ = self.child.start_kill();
     }
 }
 
 /// Start the RPC binary and wait until `/health` is ready.
 async fn start_rpc_server(launcher_root: &std::path::Path) -> Result<RpcServerHandle, String> {
-    let binary = if let Ok(path) = std::env::var("CARGO_BIN_EXE_pumas-rpc") {
-        PathBuf::from(path)
+    start_rpc_server_with_debug(launcher_root, false).await
+}
+
+fn rpc_binary_path() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_pumas-rpc") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve current_exe for fallback: {error}"))?;
+    let target_debug_dir = current_exe
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| "failed to resolve target/debug directory for fallback".to_string())?;
+    let mut fallback = target_debug_dir.join("pumas-rpc");
+    if cfg!(target_os = "windows") {
+        fallback.set_extension("exe");
+    }
+    if fallback.exists() {
+        Ok(fallback)
     } else {
-        let current_exe = std::env::current_exe()
-            .map_err(|e| format!("failed to resolve current_exe for fallback: {e}"))?;
-        let target_debug_dir = current_exe
-            .parent()
-            .and_then(|p| p.parent())
-            .ok_or_else(|| "failed to resolve target/debug directory for fallback".to_string())?;
+        Err(format!(
+            "CARGO_BIN_EXE_pumas-rpc not set and fallback binary not found at {}",
+            fallback.display()
+        ))
+    }
+}
 
-        let mut fallback = target_debug_dir.join("pumas-rpc");
-        if cfg!(target_os = "windows") {
-            fallback.set_extension("exe");
-        }
-        if !fallback.exists() {
-            return Err(format!(
-                "CARGO_BIN_EXE_pumas-rpc not set and fallback binary not found at {}",
-                fallback.display()
-            ));
-        }
-        fallback
-    };
+async fn append_bounded(capture: &Arc<Mutex<String>>, line: &str) {
+    let mut captured = capture.lock().await;
+    if captured.len() >= MAX_CAPTURED_DIAGNOSTIC_BYTES {
+        return;
+    }
+    let remaining = MAX_CAPTURED_DIAGNOSTIC_BYTES - captured.len();
+    let mut take = line.len().min(remaining);
+    while !line.is_char_boundary(take) {
+        take -= 1;
+    }
+    captured.push_str(&line[..take]);
+    if captured.len() < MAX_CAPTURED_DIAGNOSTIC_BYTES {
+        captured.push('\n');
+    }
+}
 
-    let mut child = tokio::process::Command::new(&binary)
+fn spawn_diagnostic_drain<R>(reader: R, capture: Arc<Mutex<String>>) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            append_bounded(&capture, &line).await;
+        }
+    })
+}
+
+/// Start the real RPC binary and retain bounded stdout/stderr diagnostics.
+async fn start_rpc_server_with_debug(
+    launcher_root: &std::path::Path,
+    debug: bool,
+) -> Result<RpcServerHandle, String> {
+    let binary = rpc_binary_path()?;
+
+    let mut command = tokio::process::Command::new(&binary);
+    command
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
@@ -218,7 +430,11 @@ async fn start_rpc_server(launcher_root: &std::path::Path) -> Result<RpcServerHa
         .arg("--launcher-root")
         .arg(launcher_root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped());
+    if debug {
+        command.arg("--debug");
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("failed to spawn pumas-rpc: {e}"))?;
 
@@ -227,12 +443,20 @@ async fn start_rpc_server(launcher_root: &std::path::Path) -> Result<RpcServerHa
         .take()
         .ok_or_else(|| "failed to capture stdout".to_string())?;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture stderr".to_string())?;
+    let stdout_capture = Arc::new(Mutex::new(String::new()));
+    let stderr_capture = Arc::new(Mutex::new(String::new()));
+    let stderr_drain = spawn_diagnostic_drain(stderr, stderr_capture.clone());
 
     let mut discovered_port: Option<u16> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(250), lines.next_line()).await {
             Ok(Ok(Some(line))) => {
+                append_bounded(&stdout_capture, &line).await;
                 if let Some(value) = line.strip_prefix("RPC_PORT=") {
                     let parsed = value
                         .trim()
@@ -254,13 +478,20 @@ async fn start_rpc_server(launcher_root: &std::path::Path) -> Result<RpcServerHa
         return Err(format!("pumas-rpc failed health check on port {port}"));
     }
 
-    let stdout_drain =
-        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    let remaining_stdout_capture = stdout_capture.clone();
+    let stdout_drain = tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            append_bounded(&remaining_stdout_capture, &line).await;
+        }
+    });
 
     Ok(RpcServerHandle {
         child,
         port,
         stdout_drain: Some(stdout_drain),
+        stderr_drain: Some(stderr_drain),
+        stdout: stdout_capture,
+        stderr: stderr_capture,
     })
 }
 
@@ -1009,11 +1240,650 @@ mod tests {
             .get("error")
             .expect("expected JSON-RPC error payload");
         assert_eq!(error.get("code").and_then(|v| v.as_i64()), Some(-32602));
-        assert!(error
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .contains("keep_latest must be >= 0"));
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("Request parameters are invalid.")
+        );
+        assert_eq!(
+            error.pointer("/data/class").and_then(Value::as_str),
+            Some("invalid_request")
+        );
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_rpc_producer_rejects_invalid_envelopes_methods_and_typed_params() {
+        const SENTINEL_TOKEN: &str = "hf_rpc_admission_secret_do_not_disclose";
+
+        if !can_bind_local_tcp_for_tests() {
+            return;
+        }
+        let env = create_test_env();
+        let server = start_rpc_server(env.path()).await.unwrap();
+
+        let cases = [
+            ("{", -32700, None),
+            (
+                r#"{"jsonrpc":"1.0","method":"get_status","params":{},"id":41}"#,
+                -32600,
+                Some(41),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"get_status","params":{},"id":42,"extra":true}"#,
+                -32600,
+                Some(42),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"unknown_operation","params":{},"id":43}"#,
+                -32601,
+                Some(43),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"get_status","params":null,"id":44}"#,
+                -32602,
+                Some(44),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"check_launcher_updates","params":{"force_refresh":-1},"id":45}"#,
+                -32602,
+                Some(45),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"get_links_for_model","params":{},"id":48}"#,
+                -32602,
+                Some(48),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"check_files_writable","params":{"file_paths":[]},"id":49}"#,
+                -32602,
+                Some(49),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"set_model_link_exclusion","params":{"model_id":"model","app_id":"app","excluded":1},"id":50}"#,
+                -32602,
+                Some(50),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"start_model_conversion","params":{"model_id":"model","direction":"unknown"},"id":52}"#,
+                -32602,
+                Some(52),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"get_conversion_progress","params":{"conversion_id":"one","conversionId":"two"},"id":53}"#,
+                -32602,
+                Some(53),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"list_model_conversions","params":{"unexpected":true},"id":54}"#,
+                -32602,
+                Some(54),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"open_url","params":{"url":"file:///tmp/private"},"id":56}"#,
+                -32602,
+                Some(56),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"open_path","params":{"path":"/definitely/missing/rpc-open-path-sentinel"},"id":57}"#,
+                -32602,
+                Some(57),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"start_model_download_from_hf","params":{"repo_id":"acme/model","family":"acme","official_name":"Model","filenames":[]},"id":58}"#,
+                -32602,
+                Some(58),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"get_model_download_status","params":{"download_id":"one","downloadId":"two"},"id":59}"#,
+                -32602,
+                Some(59),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"list_model_downloads","params":{"unexpected":true},"id":60}"#,
+                -32602,
+                Some(60),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"get_models","params":{"unexpected":true},"id":63}"#,
+                -32602,
+                Some(63),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"refresh_model_index","params":null,"id":64}"#,
+                -32602,
+                Some(64),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"list_interrupted_downloads","params":{},"id":67}"#,
+                -32601,
+                Some(67),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"recover_download","params":{"repo_id":"acme/model","dest_dir":"/tmp/model"},"id":68}"#,
+                -32601,
+                Some(68),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"resume_partial_download","params":{"repo_id":"acme/model","dest_dir":"/tmp/model"},"id":69}"#,
+                -32602,
+                Some(69),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"resume_partial_download","params":{"modelId":"llm/acme/model","recoveryToken":"v1:short"},"id":70}"#,
+                -32602,
+                Some(70),
+            ),
+        ];
+
+        for (body, expected_code, expected_id) in cases {
+            let response = rpc_body_raw(server.port, body).await.unwrap();
+            assert_eq!(
+                response.pointer("/error/code").and_then(Value::as_i64),
+                Some(expected_code)
+            );
+            assert_eq!(response.get("id").and_then(Value::as_i64), expected_id);
+        }
+
+        let secret_body = json!({
+            "jsonrpc": "2.0",
+            "method": "set_hf_token",
+            "params": {"token": SENTINEL_TOKEN, "extra": SENTINEL_TOKEN},
+            "id": 46
+        })
+        .to_string();
+        let secret_response = rpc_body_raw(server.port, &secret_body).await.unwrap();
+        assert_eq!(
+            secret_response
+                .pointer("/error/code")
+                .and_then(Value::as_i64),
+            Some(-32602)
+        );
+        assert!(!secret_response.to_string().contains(SENTINEL_TOKEN));
+
+        let health = rpc_body_raw(
+            server.port,
+            r#"{"jsonrpc":"2.0","method":"health_check","id":47}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            health.pointer("/result/status").and_then(Value::as_str),
+            Some("ok")
+        );
+
+        let link_health = rpc_body_raw(
+            server.port,
+            r#"{"jsonrpc":"2.0","method":"get_link_health","id":51}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            link_health
+                .pointer("/result/success")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let conversion_progress = rpc_body_raw(
+            server.port,
+            r#"{"jsonrpc":"2.0","method":"get_conversion_progress","params":{"conversionId":"missing"},"id":55}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            conversion_progress.pointer("/result"),
+            Some(&json!({"success": true, "progress": null}))
+        );
+
+        let download_status = rpc_body_raw(
+            server.port,
+            r#"{"jsonrpc":"2.0","method":"get_model_download_status","params":{"downloadId":"missing"},"id":61}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            download_status.pointer("/result"),
+            Some(&json!({"success": false, "error": "Download not found"}))
+        );
+
+        let downloads = rpc_body_raw(
+            server.port,
+            r#"{"jsonrpc":"2.0","method":"list_model_downloads","id":62}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            downloads.pointer("/result"),
+            Some(&json!({"success": true, "downloads": []}))
+        );
+
+        let missing_recovery = rpc_body_raw(
+            server.port,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "resume_partial_download",
+                "params": {
+                    "modelId": "llm/acme/missing",
+                    "recoveryToken": format!("v1:{}", "a".repeat(64))
+                },
+                "id": 71
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            missing_recovery.pointer("/result"),
+            Some(&json!({
+                "success": false,
+                "action": "none",
+                "download_id": null,
+                "status": null,
+                "reason_code": "model_not_found",
+                "error": "The partial download could not be resumed."
+            }))
+        );
+        assert!(!missing_recovery.to_string().contains("repo_id"));
+        assert!(!missing_recovery.to_string().contains("dest_dir"));
+        assert!(!missing_recovery.to_string().contains("message"));
+
+        let models = rpc_body_raw(
+            server.port,
+            r#"{"jsonrpc":"2.0","method":"get_models","id":65}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            models.pointer("/result/success").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(models
+            .pointer("/result/models")
+            .and_then(Value::as_object)
+            .is_some());
+
+        let refresh = rpc_body_raw(
+            server.port,
+            r#"{"jsonrpc":"2.0","method":"refresh_model_index","params":{},"id":66}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refresh.pointer("/result/success").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(refresh
+            .pointer("/result/indexed_count")
+            .and_then(Value::as_u64)
+            .is_some());
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_rpc_partial_recovery_uses_issued_ticket_for_tracked_download() {
+        if !can_bind_local_tcp_for_tests() {
+            return;
+        }
+        let env = create_test_env();
+        let model_id = create_tracked_partial_test_model(env.path(), "paused");
+        let server = start_rpc_server(env.path()).await.unwrap();
+
+        let recovery_token = recovery_token_for_model(server.port, model_id).await;
+
+        let catalog = rpc_call(server.port, "get_models", json!({}))
+            .await
+            .unwrap();
+        let search = rpc_call(
+            server.port,
+            "search_models_fts",
+            json!({"query":"partial", "limit":10, "offset":0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(search["success"], true);
+        assert_eq!(search["models"].as_array().unwrap().len(), 1);
+        assert_eq!(search["models"][0], catalog["models"][model_id]);
+        assert_eq!(
+            search["models"][0]["artifact"]["recovery"]["recoveryToken"],
+            recovery_token
+        );
+
+        let stale = rpc_call(
+            server.port,
+            "resume_partial_download",
+            json!({
+                "modelId": model_id,
+                "recoveryToken": format!("v1:{}", "b".repeat(64))
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stale,
+            json!({
+                "success": false,
+                "action": "none",
+                "download_id": null,
+                "status": null,
+                "reason_code": "recovery_context_stale",
+                "error": "The partial download could not be resumed."
+            })
+        );
+
+        let resumed = rpc_call(
+            server.port,
+            "resume_partial_download",
+            json!({"modelId": model_id, "recoveryToken": recovery_token}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed["success"], true);
+        assert_eq!(resumed["action"], "resume");
+        assert_eq!(resumed["download_id"], "tracked-partial-1");
+        assert_eq!(resumed["status"], "queued");
+        assert!(resumed.get("repoId").is_none());
+        assert!(resumed.get("modelDir").is_none());
+        assert!(resumed.get("message").is_none());
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_rpc_partial_recovery_attaches_to_active_exact_context() {
+        if !can_bind_local_tcp_for_tests() {
+            return;
+        }
+        let env = create_test_env();
+        let model_id = create_tracked_partial_test_model(env.path(), "paused");
+        let server = start_rpc_server(env.path()).await.unwrap();
+        let recovery_token = recovery_token_for_model(server.port, model_id).await;
+
+        let first = rpc_call(
+            server.port,
+            "resume_partial_download",
+            json!({"modelId": model_id, "recoveryToken": recovery_token}),
+        );
+        let second = rpc_call(
+            server.port,
+            "resume_partial_download",
+            json!({"modelId": model_id, "recoveryToken": recovery_token}),
+        );
+        let (first, second) = tokio::join!(first, second);
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert!(
+            outcomes.iter().all(|outcome| outcome["success"] == true),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome["action"] == "resume")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome["action"] == "attach")
+                .count(),
+            1
+        );
+        assert!(outcomes.iter().all(|outcome| {
+            outcome["download_id"] == "tracked-partial-1"
+                && if outcome["action"] == "resume" {
+                    outcome["status"] == "queued"
+                } else {
+                    matches!(
+                        outcome["status"].as_str(),
+                        Some("queued" | "downloading" | "pausing" | "cancelling")
+                    )
+                }
+        }));
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_rpc_partial_recovery_starts_untracked_download_from_issued_ticket() {
+        if !can_bind_local_tcp_for_tests() {
+            return;
+        }
+        let env = create_test_env();
+        let model_id = create_untracked_partial_test_model(env.path());
+        let server = start_rpc_server(env.path()).await.unwrap();
+        let recovery_token = recovery_token_for_model(server.port, model_id).await;
+
+        let recovered = rpc_call(
+            server.port,
+            "resume_partial_download",
+            json!({"modelId": model_id, "recoveryToken": recovery_token}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered["success"], true);
+        assert_eq!(recovered["action"], "recover");
+        assert_eq!(recovered["status"], "queued");
+        assert!(recovered["download_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        assert!(recovered.get("repoId").is_none());
+        assert!(recovered.get("modelDir").is_none());
+        assert!(recovered.get("message").is_none());
+        // Fresh-owner reconciliation may publish an empty current-format store.
+        // Recovery must not create an unowned ordinary resumable snapshot.
+        let store: Value = serde_json::from_slice(
+            &std::fs::read(env.path().join("launcher-data/downloads.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(store["downloads"], json!([]));
+        let model_dir = env.path().join("shared-resources/models").join(model_id);
+        assert!(!model_dir.join("config.json").exists());
+        assert!(!model_dir.join("config.json.part").exists());
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_rpc_partial_recovery_refuses_missing_bound_remote_file_without_task_or_write()
+    {
+        if !can_bind_local_tcp_for_tests() {
+            return;
+        }
+        let env = create_test_env();
+        let model_id = create_untracked_partial_with_missing_remote_member(env.path());
+        let model_dir = env.path().join("shared-resources/models").join(model_id);
+        let server = start_rpc_server(env.path()).await.unwrap();
+        let recovery_token = recovery_token_for_model(server.port, model_id).await;
+        let store_path = env.path().join("launcher-data/downloads.json");
+        let store_before = std::fs::read(&store_path).unwrap();
+
+        let refused = rpc_call(
+            server.port,
+            "resume_partial_download",
+            json!({"modelId": model_id, "recoveryToken": recovery_token}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refused,
+            json!({
+                "success": false,
+                "action": "none",
+                "download_id": null,
+                "status": null,
+                "reason_code": "recovery_context_stale",
+                "error": "The partial download could not be resumed."
+            })
+        );
+        assert_eq!(
+            std::fs::read(model_dir.join("weights-1.gguf.part")).unwrap(),
+            b"partial"
+        );
+        assert!(!model_dir.join("weights-2.gguf.part").exists());
+        assert!(!model_dir.join(".pumas_download").exists());
+        assert_eq!(std::fs::read(store_path).unwrap(), store_before);
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_rpc_partial_recovery_maps_repo_lookup_failure_to_closed_outcome() {
+        if !can_bind_local_tcp_for_tests() {
+            return;
+        }
+        let env = create_test_env();
+        let model_id = create_untracked_partial_test_model(env.path());
+        let server = start_rpc_server(env.path()).await.unwrap();
+        let recovery_token = recovery_token_for_model(server.port, model_id).await;
+        std::fs::write(
+            env.path()
+                .join("launcher-data/cache/hf/hf_acme_model_files.json"),
+            b"not-json",
+        )
+        .unwrap();
+
+        let refused = rpc_call(
+            server.port,
+            "resume_partial_download",
+            json!({"modelId": model_id, "recoveryToken": recovery_token}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refused,
+            json!({
+                "success": false,
+                "action": "none",
+                "download_id": null,
+                "status": null,
+                "reason_code": "recover_failed",
+                "error": "The partial download could not be resumed."
+            })
+        );
+
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn rpc_cli_rejects_remote_host_and_removed_lan_flag_before_startup() {
+        let env = create_test_env();
+        let binary = rpc_binary_path().unwrap();
+
+        let remote = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(&binary)
+                .args(["--host", "0.0.0.0", "--port", "0", "--launcher-root"])
+                .arg(env.path())
+                .output(),
+        )
+        .await
+        .expect("remote-host process did not terminate")
+        .expect("remote-host process did not start");
+        let remote_stdout = String::from_utf8_lossy(&remote.stdout);
+        let remote_stderr = String::from_utf8_lossy(&remote.stderr);
+        assert!(!remote.status.success());
+        assert!(!remote_stdout.contains("RPC_PORT="));
+        assert!(remote_stderr.contains("loopback"), "{remote_stderr}");
+
+        let removed_flag = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(binary)
+                .args([
+                    "--host",
+                    "127.0.0.1",
+                    "--allow-lan",
+                    "--port",
+                    "0",
+                    "--launcher-root",
+                ])
+                .arg(env.path())
+                .output(),
+        )
+        .await
+        .expect("removed-flag process did not terminate")
+        .expect("removed-flag process did not start");
+        let flag_stdout = String::from_utf8_lossy(&removed_flag.stdout);
+        let flag_stderr = String::from_utf8_lossy(&removed_flag.stderr);
+        assert!(!removed_flag.status.success());
+        assert!(!flag_stdout.contains("RPC_PORT="));
+        assert!(flag_stderr.contains("--allow-lan"), "{flag_stderr}");
+    }
+
+    #[tokio::test]
+    async fn debug_rpc_process_does_not_disclose_credentials_or_private_locators() {
+        const SENTINEL_TOKEN: &str = "hf_test_rpc_secret_do_not_disclose";
+        const SENTINEL_PATH_FRAGMENT: &str = "private-rpc-path-sentinel";
+        const SENTINEL_URL_FRAGMENT: &str = "private-rpc-url-sentinel";
+
+        if !can_bind_local_tcp_for_tests() {
+            return;
+        }
+        let env = create_test_env();
+        let server = start_rpc_server_with_debug(env.path(), true).await.unwrap();
+
+        let token_response = match rpc_call_raw(
+            server.port,
+            "set_hf_token",
+            json!({"token": SENTINEL_TOKEN}),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!("credential request did not return a JSON-RPC response"),
+        };
+        assert!(token_response.get("error").is_none());
+
+        let private_path = env.path().join(SENTINEL_PATH_FRAGMENT);
+        let path_response = match rpc_call_raw(
+            server.port,
+            "open_path",
+            json!({"path": private_path.to_string_lossy()}),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!("private-path request did not return a JSON-RPC response"),
+        };
+        let path_error = path_response
+            .get("error")
+            .expect("private-path failure must be a typed JSON-RPC error");
+        assert_eq!(path_error.get("code").and_then(Value::as_i64), Some(-32602));
+        assert_eq!(
+            path_error.pointer("/data/class").and_then(Value::as_str),
+            Some("invalid_request")
+        );
+
+        let url_response = match rpc_call_raw(
+            server.port,
+            "open_url",
+            json!({"url": format!("file:///{SENTINEL_URL_FRAGMENT}")}),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!("private-URL request did not return a JSON-RPC response"),
+        };
+        let url_error = url_response
+            .get("error")
+            .expect("private-URL failure must be a typed JSON-RPC error");
+        assert_eq!(url_error.get("code").and_then(Value::as_i64), Some(-32602));
+        assert_eq!(
+            url_error.pointer("/data/class").and_then(Value::as_str),
+            Some("invalid_request")
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let diagnostics = server.diagnostics().await;
+        let responses = format!("{token_response}{path_response}{url_response}");
+
+        assert!(!diagnostics.contains(SENTINEL_TOKEN));
+        assert!(!diagnostics.contains(SENTINEL_PATH_FRAGMENT));
+        assert!(!diagnostics.contains(SENTINEL_URL_FRAGMENT));
+        assert!(!responses.contains(SENTINEL_TOKEN));
+        assert!(!responses.contains(SENTINEL_PATH_FRAGMENT));
+        assert!(!responses.contains(SENTINEL_URL_FRAGMENT));
 
         server.stop().await;
     }

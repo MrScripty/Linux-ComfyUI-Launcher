@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { MotionConfig } from 'framer-motion';
 import App from '@app-entry';
+import { LauncherRootRecoveryProvider } from './hooks/useLauncherRootRecovery';
 import './index.css';
 
 const rootElement = document.getElementById('root');
@@ -14,7 +15,9 @@ const root = ReactDOM.createRoot(rootElement);
 root.render(
   <React.StrictMode>
     <MotionConfig reducedMotion="user">
-      <App />
+      <LauncherRootRecoveryProvider>
+        <App />
+      </LauncherRootRecoveryProvider>
     </MotionConfig>
   </React.StrictMode>
 );

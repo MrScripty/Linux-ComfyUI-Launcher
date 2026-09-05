@@ -691,6 +691,7 @@ pub struct DownloadOption {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 pub enum DownloadStatus {
     Queued,
     Downloading,

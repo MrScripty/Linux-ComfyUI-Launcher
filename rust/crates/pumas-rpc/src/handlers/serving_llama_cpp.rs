@@ -70,8 +70,8 @@ pub(super) async fn serve_llama_cpp_model(
         .await
     {
         Ok(endpoint) => endpoint,
-        Err(err) => {
-            warn!("failed to resolve llama.cpp serving endpoint: {}", err);
+        Err(_) => {
+            warn!("failed to resolve llama.cpp serving endpoint");
             return non_critical_failure_response(
                 state,
                 serving_error(
@@ -114,15 +114,15 @@ pub(super) async fn serve_llama_cpp_model(
             let message = response.error.unwrap_or_else(|| {
                 "llama.cpp runtime profile did not start for the selected model".to_string()
             });
-            warn!("llama.cpp model serve launch failed: {}", message);
+            warn!("llama.cpp model serve launch failed");
             return non_critical_failure_response(
                 state,
                 serving_error(ModelServeErrorCode::ProviderLoadFailed, message, &request),
             )
             .await;
         }
-        Err(err) => {
-            warn!("llama.cpp model serve launch failed: {}", err);
+        Err(_) => {
+            warn!("llama.cpp model serve launch failed");
             return non_critical_failure_response(
                 state,
                 serving_error(
@@ -200,8 +200,13 @@ pub(super) async fn unserve_llama_cpp_model(
         })?);
     }
 
-    if let Err(err) = state.api.stop_runtime_profile(profile_id.clone()).await {
-        warn!("llama.cpp serving unload failed: {}", err);
+    if state
+        .api
+        .stop_runtime_profile(profile_id.clone())
+        .await
+        .is_err()
+    {
+        warn!("llama.cpp serving unload failed");
         return Ok(serde_json::to_value(UnserveModelResponse {
             success: true,
             error: Some("llama.cpp runtime profile could not be stopped".to_string()),

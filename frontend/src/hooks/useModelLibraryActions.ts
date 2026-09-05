@@ -1,14 +1,13 @@
-import { useCallback, useState, type Dispatch, type SetStateAction } from 'react';
+import { useCallback, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import { api, isAPIAvailable } from '../api/adapter';
 import { modelsAPI } from '../api/models';
 import { APIError } from '../errors';
 import type { ModelInfo, RelatedModelsState } from '../types/apps';
 import { getLogger } from '../utils/logger';
-import type { DownloadStatus } from './modelDownloadState';
 
 const logger = getLogger('useModelLibraryActions');
 
-function formatPartialResumeError(reasonCode?: string, fallback?: string): string {
+function formatPartialResumeError(reasonCode?: string | null, fallback?: string | null): string {
   switch (reasonCode) {
     case 'dest_dir_missing':
       return 'Partial files directory is missing.';
@@ -36,8 +35,6 @@ function formatPartialResumeError(reasonCode?: string, fallback?: string): strin
 }
 
 interface UseModelLibraryActionsOptions {
-  downloadStatusByRepo: Record<string, DownloadStatus>;
-  cancelDownload: (downloadKey: string) => Promise<void> | void;
   onModelsImported?: () => void;
   setDownloadErrors: Dispatch<SetStateAction<Record<string, string>>>;
   startDownload: (
@@ -54,14 +51,13 @@ interface UseModelLibraryActionsOptions {
 }
 
 export function useModelLibraryActions({
-  downloadStatusByRepo,
-  cancelDownload,
   onModelsImported,
   setDownloadErrors,
   startDownload,
 }: UseModelLibraryActionsOptions) {
   const [expandedRelated, setExpandedRelated] = useState<Set<string>>(new Set());
-  const [recoveringPartialRepoIds, setRecoveringPartialRepoIds] = useState<Set<string>>(new Set());
+  const [recoveringPartialModelIds, setRecoveringPartialModelIds] = useState<Set<string>>(new Set());
+  const pendingRecoveryModelIds = useRef(new Set<string>());
   const [relatedModelsById, setRelatedModelsById] = useState<
     Record<string, RelatedModelsState>
   >({});
@@ -169,42 +165,43 @@ export function useModelLibraryActions({
       return;
     }
 
-    const repoId = model.repoId;
-    const destDir = model.modelDir;
-    if (!repoId || !destDir) {
-      logger.warn('Cannot recover partial download without repoId + modelDir', {
+    const recovery = model.recovery;
+    if (model.provenance !== 'catalog' || !model.isPartialDownload || !recovery) {
+      logger.warn('Cannot resume without a current catalog recovery ticket', {
         modelId: model.id,
-        repoId,
-        destDir,
       });
       return;
     }
+    const modelId = model.id;
+    const repoId = recovery.repoId;
+    if (pendingRecoveryModelIds.current.has(modelId)) return;
+    pendingRecoveryModelIds.current.add(modelId);
 
     setDownloadErrors((prev) => {
-      if (!prev[repoId]) return prev;
+      if (!prev[modelId]) return prev;
       const next = { ...prev };
-      delete next[repoId];
+      delete next[modelId];
       return next;
     });
-    setRecoveringPartialRepoIds((prev) => {
+    setRecoveringPartialModelIds((prev) => {
       const next = new Set(prev);
-      next.add(repoId);
+      next.add(modelId);
       return next;
     });
 
     try {
-      const result = await modelsAPI.resumePartialDownload(repoId, destDir);
-      const action = result.action ?? 'none';
+      const result = await modelsAPI.resumePartialDownload(modelId, recovery.recoveryToken);
+      const action = result.action;
       if (!result.success || action === 'none' || !result.download_id) {
         const errorMsg = formatPartialResumeError(result.reason_code, result.error);
         logger.error('Resume partial download failed', {
           repoId,
-          destDir,
+          modelId,
           action,
           reasonCode: result.reason_code,
           error: errorMsg,
         });
-        setDownloadErrors((prev) => ({ ...prev, [repoId]: errorMsg }));
+        setDownloadErrors((prev) => ({ ...prev, [modelId]: errorMsg }));
         return;
       }
 
@@ -213,11 +210,9 @@ export function useModelLibraryActions({
         action,
         downloadId: result.download_id,
       });
-      const downloadKey = model.selectedArtifactId ?? model.downloadSelectedArtifactId ?? repoId;
-      startDownload(downloadKey, result.download_id, {
+      startDownload(result.download_id, result.download_id, {
         repoId,
-        selectedArtifactId: model.selectedArtifactId ?? model.downloadSelectedArtifactId,
-        artifactId: model.downloadArtifactId,
+        selectedArtifactId: recovery.selectedArtifactId,
         modelName: model.name,
         modelType: model.category,
       });
@@ -228,19 +223,20 @@ export function useModelLibraryActions({
           error: error.message,
           endpoint: error.endpoint,
           repoId,
-          destDir,
+          modelId,
         });
       } else if (error instanceof Error) {
-        logger.error('Failed to recover partial download', { error: error.message, repoId, destDir });
+        logger.error('Failed to recover partial download', { error: error.message, repoId, modelId });
       } else {
-        logger.error('Unknown error recovering partial download', { error, repoId, destDir });
+        logger.error('Unknown error recovering partial download', { error, repoId, modelId });
       }
-      setDownloadErrors((prev) => ({ ...prev, [repoId]: message }));
+      setDownloadErrors((prev) => ({ ...prev, [modelId]: message }));
     } finally {
-      setRecoveringPartialRepoIds((prev) => {
-        if (!prev.has(repoId)) return prev;
+      pendingRecoveryModelIds.current.delete(modelId);
+      setRecoveringPartialModelIds((prev) => {
+        if (!prev.has(modelId)) return prev;
         const next = new Set(prev);
-        next.delete(repoId);
+        next.delete(modelId);
         return next;
       });
     }
@@ -248,17 +244,6 @@ export function useModelLibraryActions({
 
   const handleDeleteModel = useCallback(async (modelId: string) => {
     try {
-      for (const [downloadKey, status] of Object.entries(downloadStatusByRepo)) {
-        if (['queued', 'downloading', 'pausing', 'paused', 'error'].includes(status.status)) {
-          const modelSuffix = modelId.split('/').slice(1).join('/');
-          const repoId = status.repoId ?? downloadKey;
-          if (repoId === modelSuffix || repoId.toLowerCase() === modelSuffix.toLowerCase()) {
-            logger.info('Cancelling active download before delete', { modelId, repoId, downloadKey });
-            await cancelDownload(downloadKey);
-          }
-        }
-      }
-
       const result = await modelsAPI.deleteModel(modelId);
       if (result.success) {
         logger.info('Model deleted', { modelId });
@@ -271,7 +256,7 @@ export function useModelLibraryActions({
         logger.error('Error deleting model', { modelId, error: error.message });
       }
     }
-  }, [onModelsImported, downloadStatusByRepo, cancelDownload]);
+  }, [onModelsImported]);
 
   const handleConvertModel = useCallback((modelId: string) => {
     logger.info('Convert model requested', { modelId });
@@ -285,7 +270,7 @@ export function useModelLibraryActions({
     handleRecoverPartialDownload,
     handleToggleRelated,
     openRemoteUrl,
-    recoveringPartialRepoIds,
+    recoveringPartialModelIds,
     relatedModelsById,
   };
 }

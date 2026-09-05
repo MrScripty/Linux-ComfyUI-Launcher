@@ -6,6 +6,31 @@ use crate::{model_library, models};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+fn hf_client_unavailable() -> PumasError {
+    PumasError::Config {
+        message: "HuggingFace client not initialized".to_string(),
+    }
+}
+
+fn require_hf_client(
+    primary: &PrimaryState,
+) -> std::result::Result<&model_library::HuggingFaceClient, PumasError> {
+    primary
+        .hf_client
+        .as_deref()
+        .ok_or_else(hf_client_unavailable)
+}
+
+async fn finish_interrupted_download_scan<T>(
+    task: tokio::task::JoinHandle<T>,
+) -> std::result::Result<T, PumasError> {
+    task.await.map_err(|error| {
+        PumasError::Other(format!(
+            "Failed to join interrupted-download scan task: {error}"
+        ))
+    })
+}
+
 async fn load_hf_model_snapshot(
     library: Arc<model_library::ModelLibrary>,
     model_dir: std::path::PathBuf,
@@ -50,18 +75,15 @@ pub(super) async fn search_hf_models_with_hydration(
     limit: usize,
     hydrate_limit: usize,
 ) -> std::result::Result<Vec<models::HuggingFaceModel>, PumasError> {
-    if let Some(ref client) = primary.hf_client {
-        let params = model_library::HfSearchParams {
-            query: query.to_string(),
-            kind: kind.map(String::from),
-            limit: Some(limit),
-            hydrate_limit: Some(hydrate_limit.min(limit)),
-            ..Default::default()
-        };
-        client.search(&params).await
-    } else {
-        Ok(vec![])
-    }
+    let client = require_hf_client(primary)?;
+    let params = model_library::HfSearchParams {
+        query: query.to_string(),
+        kind: kind.map(String::from),
+        limit: Some(limit),
+        hydrate_limit: Some(hydrate_limit.min(limit)),
+        ..Default::default()
+    };
+    client.search(&params).await
 }
 
 pub(super) async fn get_hf_download_details(
@@ -231,67 +253,55 @@ pub(super) async fn start_hf_download(
 pub(super) async fn get_hf_download_progress(
     primary: &PrimaryState,
     download_id: &str,
-) -> Option<models::ModelDownloadProgress> {
-    if let Some(ref client) = primary.hf_client {
-        client.get_download_progress(download_id).await
-    } else {
-        None
-    }
+) -> std::result::Result<Option<models::ModelDownloadProgress>, PumasError> {
+    Ok(require_hf_client(primary)?
+        .get_download_progress(download_id)
+        .await)
 }
 
 pub(super) async fn cancel_hf_download(
     primary: &PrimaryState,
     download_id: &str,
 ) -> std::result::Result<bool, PumasError> {
-    if let Some(ref client) = primary.hf_client {
-        client.cancel_download(download_id).await
-    } else {
-        Ok(false)
-    }
+    require_hf_client(primary)?
+        .cancel_download(download_id)
+        .await
 }
 
 pub(super) async fn pause_hf_download(
     primary: &PrimaryState,
     download_id: &str,
 ) -> std::result::Result<bool, PumasError> {
-    if let Some(ref client) = primary.hf_client {
-        client.pause_download(download_id).await
-    } else {
-        Ok(false)
-    }
+    require_hf_client(primary)?
+        .pause_download(download_id)
+        .await
 }
 
 pub(super) async fn resume_hf_download(
     primary: &PrimaryState,
     download_id: &str,
 ) -> std::result::Result<bool, PumasError> {
-    if let Some(ref client) = primary.hf_client {
-        client.resume_download(download_id).await
-    } else {
-        Ok(false)
-    }
+    require_hf_client(primary)?
+        .resume_download(download_id)
+        .await
 }
 
 pub(super) async fn list_hf_downloads(
     primary: &PrimaryState,
-) -> Vec<models::ModelDownloadProgress> {
-    if let Some(ref client) = primary.hf_client {
-        client.list_downloads().await
-    } else {
-        vec![]
-    }
+) -> std::result::Result<Vec<models::ModelDownloadProgress>, PumasError> {
+    Ok(require_hf_client(primary)?.list_downloads().await)
 }
 
 pub(super) async fn list_interrupted_downloads(
     primary: &PrimaryState,
-) -> Vec<model_library::InterruptedDownload> {
+) -> std::result::Result<Vec<model_library::InterruptedDownload>, PumasError> {
     let model_importer = primary.model_importer.clone();
     let persistence = primary
         .hf_client
         .as_ref()
         .and_then(|client| client.persistence().cloned());
 
-    tokio::task::spawn_blocking(move || {
+    let task = tokio::task::spawn_blocking(move || {
         let known_dirs: HashSet<std::path::PathBuf> = persistence
             .map(|persistence| {
                 persistence
@@ -303,9 +313,8 @@ pub(super) async fn list_interrupted_downloads(
             .unwrap_or_default();
 
         model_importer.find_interrupted_downloads(&known_dirs)
-    })
-    .await
-    .unwrap_or_default()
+    });
+    finish_interrupted_download_scan(task).await
 }
 
 pub(super) async fn recover_download(
@@ -802,5 +811,19 @@ pub(super) async fn get_hf_auth_status(
             username: None,
             token_source: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod download_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn interrupted_scan_join_failure_is_not_an_empty_success() {
+        let task = tokio::task::spawn_blocking(|| {
+            panic!("synthetic interrupted-scan panic");
+        });
+
+        assert!(finish_interrupted_download_scan(task).await.is_err());
     }
 }

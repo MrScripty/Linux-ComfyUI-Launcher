@@ -1076,6 +1076,33 @@ impl RecoveryLaunchPlan {
     }
 }
 
+fn recovery_selection_matches(
+    state: &DownloadState,
+    repo_id: &str,
+    expected_files: &BTreeSet<&str>,
+) -> bool {
+    let tracked_selection = state.download_request.as_ref().map(|request| {
+        let selected_filenames = state
+            .huggingface_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.selected_filenames.clone());
+        SelectedArtifactIdentity::from_download_request(request, selected_filenames)
+            .selected_filenames
+    });
+    let tracked_files: BTreeSet<&str> = tracked_selection
+        .as_ref()
+        .filter(|files| !files.is_empty())
+        .map(|files| files.iter().map(String::as_str).collect())
+        .unwrap_or_else(|| {
+            state
+                .files
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect()
+        });
+    state.repo_id == repo_id && tracked_files == *expected_files
+}
+
 fn recovery_context(
     downloads: &HashMap<String, DownloadState>,
     identity: &crate::model_library::download_recovery::DestinationIdentity,
@@ -1090,26 +1117,7 @@ fn recovery_context(
         .values()
         .filter(|state| state.matches_destination(identity))
     {
-        let tracked_selection = state.download_request.as_ref().map(|request| {
-            let selected_filenames = state
-                .huggingface_evidence
-                .as_ref()
-                .and_then(|evidence| evidence.selected_filenames.clone());
-            SelectedArtifactIdentity::from_download_request(request, selected_filenames)
-                .selected_filenames
-        });
-        let tracked_files: BTreeSet<&str> = tracked_selection
-            .as_ref()
-            .filter(|files| !files.is_empty())
-            .map(|files| files.iter().map(String::as_str).collect())
-            .unwrap_or_else(|| {
-                state
-                    .files
-                    .iter()
-                    .map(|file| file.filename.as_str())
-                    .collect()
-            });
-        if state.repo_id == repo_id && tracked_files == expected_files && exact.is_none() {
+        if recovery_selection_matches(state, repo_id, &expected_files) && exact.is_none() {
             exact = Some(state.download_id.clone());
         } else {
             mismatch = true;
@@ -4382,6 +4390,15 @@ impl HuggingFaceClient {
             .await;
 
         if let RecoveryLaunchPlan::Existing { download_id } = &launch_plan {
+            let admission_identity = super::lifecycle::PendingAdmissionIdentity {
+                destination: verified.destination.identity(),
+                repo_id: verified.repo_id.clone(),
+                files: files
+                    .iter()
+                    .map(|file| (file.filename.clone(), file.size, file.sha256.clone()))
+                    .collect(),
+            };
+            let (admission_completed, admission_completion) = tokio::sync::watch::channel(false);
             let transition_download_id = download_id.clone();
             let transition_repo_id = verified.repo_id.clone();
             let transition_bound_files = verified.files.clone();
@@ -4537,11 +4554,15 @@ impl HuggingFaceClient {
                         matches!(&result, Ok(RecoveryDownloadAdmission::Resumed { .. }));
                     let _ = result_sender.send(result);
                     if run_worker {
+                        // Only a durably committed state/domain handoff is joinable.
+                        admission_completed.send_replace(true);
                         let _ = prepared_download.run_owned(task_context).await;
                     }
                 },
             );
 
+            let mut pending_admission = None;
+            let mut existing_admission = None;
             let transition_install = {
                 let mut states = self.downloads.write().await;
                 let exact = matches!(
@@ -4553,7 +4574,21 @@ impl HuggingFaceClient {
                 let inactive = states.get(download_id).is_some_and(|state| {
                     matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
                 });
-                if exact && inactive {
+                if exact {
+                    // Recheck under installation's state lock: another caller
+                    // may have committed or installed since launch planning.
+                    existing_admission = states.get(download_id).and_then(|state| {
+                        admitted_existing_recovery(
+                            state,
+                            self.download_tasks.snapshot(download_id).as_ref(),
+                        )
+                    });
+                    pending_admission = self
+                        .download_tasks
+                        .pending_recovery_admission(download_id, &admission_identity);
+                }
+                if exact && inactive && pending_admission.is_none() && existing_admission.is_none()
+                {
                     if let Ok(installed) = self.download_tasks.install_gated(prepared_transition) {
                         let current_domain = if states
                             .get(download_id)
@@ -4570,6 +4605,12 @@ impl HuggingFaceClient {
                             installed.generation().clone(),
                         );
                         if reserved {
+                            self.download_tasks.bind_pending_admission(
+                                download_id,
+                                installed.generation(),
+                                admission_identity,
+                                admission_completion,
+                            );
                             states
                                 .get_mut(download_id)
                                 .expect("exact recovery state remains present")
@@ -4584,11 +4625,66 @@ impl HuggingFaceClient {
                         None
                     }
                 } else {
+                    drop(prepared_transition);
                     None
                 }
             };
             let Some((transition_generation, installed_transition)) = transition_install else {
                 self.download_tasks.rescue_abandoned();
+                if let Some(admission) = existing_admission {
+                    return Ok(admission);
+                }
+                if let Some((generation, mut completion)) = pending_admission {
+                    completion
+                        .wait_for(|completed| *completed)
+                        .await
+                        .map_err(|_| {
+                            PumasError::Other("Concurrent recovery admission did not commit".into())
+                        })?;
+                    let states = self.downloads.read().await;
+                    // A committed worker can release its capability and finish before
+                    // this waiter is polled again. Its existing release record proves
+                    // only this terminal observation, never a new attachment.
+                    let generation_current = self
+                        .download_tasks
+                        .generation_is_current(download_id, &generation);
+                    let terminal_proof = generation_current
+                        || self.destination_executions.was_released(
+                            &verified.destination.identity(),
+                            download_id,
+                            DestinationDomain::Recovery,
+                        );
+                    if terminal_proof {
+                        if let Some(state) = states.get(download_id).filter(|state| {
+                            state.download_id == *download_id
+                                && recovery_selection_matches(
+                                    state,
+                                    &verified.repo_id,
+                                    &verified.files.iter().map(String::as_str).collect(),
+                                )
+                                && matches!(
+                                    state.status,
+                                    DownloadStatus::Completed | DownloadStatus::Cancelled
+                                )
+                        }) {
+                            if let Some(admission) = admitted_existing_recovery(state, None) {
+                                return Ok(admission);
+                            }
+                        }
+                    }
+                    let exact = matches!(recovery_context(&states, &verified.destination.identity(), &verified.repo_id, &verified.files),
+                        RecoveryContext::Exact { download_id: current_id } if current_id == *download_id);
+                    if exact && generation_current {
+                        if let Some(admission) = states.get(download_id).and_then(|state| {
+                            admitted_existing_recovery(
+                                state,
+                                self.download_tasks.snapshot(download_id).as_ref(),
+                            )
+                        }) {
+                            return Ok(admission);
+                        }
+                    }
+                }
                 return Ok(RecoveryDownloadAdmission::ContextMismatch);
             };
             installed_transition.start();
@@ -7631,6 +7727,154 @@ mod tests {
 
         assert!(client.cancel_download(&download_id).await.unwrap());
         drop(destination_guard);
+    }
+
+    #[tokio::test]
+    async fn same_recovery_ticket_waits_for_durable_revocation_before_attaching() {
+        let (returned_early, first, second) = overlapping_recovery_admission(false, false).await;
+        assert!(
+            !returned_early,
+            "same-context admission returned before durable handoff"
+        );
+        assert!(
+            matches!(first.unwrap(), RecoveryDownloadAdmission::Resumed { download_id } if download_id == "same-ticket-durable-handoff")
+        );
+        assert!(
+            matches!(second.unwrap(), RecoveryDownloadAdmission::Attached { download_id, status: DownloadStatus::Queued } if download_id == "same-ticket-durable-handoff")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_transition_never_attaches_same_ticket_waiter() {
+        let (returned_early, first, second) = overlapping_recovery_admission(true, false).await;
+        assert!(!returned_early);
+        assert!(first.is_err());
+        assert!(second.is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_waiter_observes_completion_after_committed_generation_is_released() {
+        let (returned_early, first, second) = overlapping_recovery_admission(false, true).await;
+        assert!(!returned_early);
+        assert!(matches!(
+            first.unwrap(),
+            RecoveryDownloadAdmission::Resumed { .. }
+        ));
+        assert!(
+            matches!(second.unwrap(), RecoveryDownloadAdmission::AlreadyCompleted { download_id } if download_id == "same-ticket-durable-handoff")
+        );
+    }
+
+    async fn overlapping_recovery_admission(
+        fail_revocation: bool,
+        complete_before_join: bool,
+    ) -> (
+        bool,
+        Result<RecoveryDownloadAdmission>,
+        Result<RecoveryDownloadAdmission>,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        cache_repo_tree(
+            &client,
+            "acme/model",
+            vec![LfsFileInfo {
+                filename: "weights.gguf".into(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let download_id = "same-ticket-durable-handoff";
+        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        state.make_managed_for_test();
+        persist_state_fixture(&persistence, &mut state);
+        client
+            .downloads
+            .write()
+            .await
+            .insert(download_id.into(), state);
+        std::fs::write(
+            verified
+                .destination
+                .display_path()
+                .join("weights.gguf.part"),
+            b"done",
+        )
+        .unwrap();
+        let destination_lock = client
+            .destination_lock(&verified.destination.identity())
+            .await;
+        let mut destination_guard = Some(destination_lock.lock().await);
+
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let started = Arc::new(std::sync::Mutex::new(Some(started)));
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        client
+            .download_tasks
+            .set_blocking_observer(Some(Arc::new(move |operation| {
+                if operation == "revoke persisted recovery authority" {
+                    if let Some(started) = started.lock().unwrap().take() {
+                        let _ = started.send(());
+                        release_rx.lock().unwrap().recv().unwrap();
+                        assert!(
+                            !fail_revocation,
+                            "injected revocation task failure before publication"
+                        );
+                    }
+                }
+            })));
+        let client = Arc::new(client);
+        let first = tokio::spawn({
+            let client = client.clone();
+            let verified = verified.clone();
+            async move {
+                client
+                    .admit_recovery_download(&verified, Some("llm".into()))
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("first recovery must reach durable revocation")
+            .unwrap();
+        // Keep caller polling under test control so completion can precede
+        // observation of the already-committed handoff notification.
+        let mut second = Box::pin(client.admit_recovery_download(&verified, Some("llm".into())));
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut second).await;
+        let returned_before_commit = early.is_ok();
+        release.send(()).unwrap();
+        let first_result = first.await.unwrap();
+        if complete_before_join {
+            drop(destination_guard.take());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let status = client.get_download_status(download_id).await;
+                    if status == Some(DownloadStatus::Completed)
+                        && !client.download_tasks.contains(download_id)
+                    {
+                        break;
+                    }
+                    client.observe_finished_download_tasks().await;
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("committed worker must complete before waiter is polled again");
+        }
+        let second_result = match early {
+            Ok(result) => result,
+            Err(_) => second.await,
+        };
+        client.download_tasks.set_blocking_observer(None);
+        drop(destination_guard);
+        client.cancel_download(download_id).await.unwrap();
+        (returned_before_commit, first_result, second_result)
     }
 
     #[tokio::test]

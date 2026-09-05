@@ -6,6 +6,197 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
+import type {
+  LauncherRootSelectionResult,
+  LauncherRootStartupState,
+} from './launcher-root-recovery';
+import type { LauncherRootCommittedPresentation } from './window-presentation';
+import {
+  decodeCatalogSearchOutcome,
+  decodeDownloadListOutcome,
+  decodeDownloadMutationOutcome,
+  decodeDownloadStartedOutcome,
+  decodeDownloadStatusOutcome,
+  decodeModelIndexRefreshOutcome,
+  decodeModelsOutcome,
+  decodePartialDownloadOutcome,
+  decodeRecoverDownloadParams,
+  type DecodeOutcome,
+} from './generated/desktop-contract';
+
+const launcherRootPresentationTimeoutListeners = new Set<() => void>();
+let launcherRootPresentationTimeoutLatched = false;
+
+ipcRenderer.on('launcher-root:presentation-timeout', () => {
+  launcherRootPresentationTimeoutLatched = true;
+  for (const listener of launcherRootPresentationTimeoutListeners) {
+    listener();
+  }
+});
+
+class LauncherRootRecoveryContractError extends Error {
+  readonly code = 'launcher_root_contract_invalid';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'LauncherRootRecoveryContractError';
+  }
+}
+
+function decodeLauncherRootStartupState(value: unknown): LauncherRootStartupState {
+  try {
+    if (hasExactShape(value, ['status']) && value['status'] === 'initializing') {
+      return { status: 'initializing' };
+    }
+
+    if (
+      hasExactShape(value, ['status', 'selectionAction', 'libraryScopeId']) &&
+      value['status'] === 'ready' &&
+      isLauncherRootSelectionAction(value['selectionAction']) &&
+      (value['libraryScopeId'] === null ||
+        (typeof value['libraryScopeId'] === 'string' && /^display-v1:[a-f0-9]{64}$/.test(value['libraryScopeId'])))
+    ) {
+      return {
+        status: value['status'],
+        selectionAction: value['selectionAction'],
+        libraryScopeId: value['libraryScopeId'],
+      };
+    }
+
+    if (
+      hasExactShape(value, ['status', 'reason', 'authoritySource', 'action']) &&
+      value['status'] === 'recovery-required' &&
+      (value['reason'] === 'invalid' || value['reason'] === 'unavailable') &&
+      isLauncherRootAuthoritySource(value['authoritySource']) &&
+      isCorrelatedLauncherRootStartupAction(
+        value['authoritySource'],
+        value['action']
+      )
+    ) {
+      return {
+        status: value['status'],
+        reason: value['reason'],
+        authoritySource: value['authoritySource'],
+        action: value['action'],
+      };
+    }
+  } catch {
+    // Convert accessor/proxy failures to the same stable contract diagnostic.
+  }
+
+  throw new LauncherRootRecoveryContractError('Invalid launcher-root startup state.');
+}
+
+function decodeLauncherRootSelectionResult(
+  value: unknown
+): LauncherRootSelectionResult {
+  try {
+    if (hasExactShape(value, ['status'])) {
+      if (value['status'] === 'cancelled') {
+        return { status: 'cancelled' };
+      }
+      if (value['status'] === 'restarting') {
+        return { status: 'restarting' };
+      }
+    }
+
+    if (
+      hasExactShape(value, ['status', 'action']) &&
+      value['status'] === 'not-selectable' &&
+      value['action'] === 'correct-launch-input'
+    ) {
+      return {
+        status: value['status'],
+        action: value['action'],
+      };
+    }
+
+    if (
+      hasExactShape(value, ['status', 'reason', 'authorityState']) &&
+      value['status'] === 'recovery-required'
+    ) {
+      if (
+        (value['reason'] === 'invalid-selection' ||
+          value['reason'] === 'chooser-unavailable') &&
+        value['authorityState'] === 'unchanged'
+      ) {
+        return {
+          status: value['status'],
+          reason: value['reason'],
+          authorityState: value['authorityState'],
+        };
+      }
+      if (
+        value['reason'] === 'persistence-unavailable' &&
+        isLauncherRootPersistenceAuthorityState(value['authorityState'])
+      ) {
+        return {
+          status: value['status'],
+          reason: value['reason'],
+          authorityState: value['authorityState'],
+        };
+      }
+      if (
+        value['reason'] === 'restart-unavailable' &&
+        value['authorityState'] === 'published'
+      ) {
+        return {
+          status: value['status'],
+          reason: value['reason'],
+          authorityState: value['authorityState'],
+        };
+      }
+    }
+  } catch {
+    // Convert accessor/proxy failures to the same stable contract diagnostic.
+  }
+
+  throw new LauncherRootRecoveryContractError('Invalid launcher-root selection result.');
+}
+
+function hasExactShape(
+  value: unknown,
+  expectedKeys: readonly string[]
+): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const actualKeys = Object.keys(value);
+  return actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => actualKeys.includes(key));
+}
+
+function isLauncherRootSelectionAction(
+  value: unknown
+): value is 'select-library' | 'correct-launch-input' {
+  return value === 'select-library' || value === 'correct-launch-input';
+}
+
+function isLauncherRootAuthoritySource(
+  value: unknown
+): value is 'persisted' | 'environment' | 'argument' {
+  return value === 'persisted' || value === 'environment' || value === 'argument';
+}
+
+function isCorrelatedLauncherRootStartupAction(
+  authoritySource: 'persisted' | 'environment' | 'argument',
+  action: unknown
+): action is 'select-library' | 'correct-launch-input' {
+  return authoritySource === 'persisted'
+    ? action === 'select-library'
+    : action === 'correct-launch-input';
+}
+
+function isLauncherRootPersistenceAuthorityState(
+  value: unknown
+): value is 'unchanged' |
+  'replacement-visibility-unknown' |
+  'published-durability-unavailable' {
+  return value === 'unchanged' ||
+    value === 'replacement-visibility-unknown' ||
+    value === 'published-durability-unavailable';
+}
 
 /**
  * Generic RPC call wrapper
@@ -13,6 +204,29 @@ import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'ele
  */
 async function apiCall<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
   return await ipcRenderer.invoke('api:call', method, params);
+}
+
+class DesktopContractError extends Error {
+  readonly status: Exclude<DecodeOutcome<never>, { status: 'valid' }>['status'];
+
+  constructor(method: string, outcome: Exclude<DecodeOutcome<never>, { status: 'valid' }>) {
+    super(`Desktop contract ${outcome.status} for ${method}: ${outcome.message}`);
+    this.name = 'DesktopContractError';
+    this.status = outcome.status;
+  }
+}
+
+function requireDecoded<T>(result: DecodeOutcome<T>, method: string): T {
+  if (result.status === 'valid') return result.value;
+  throw new DesktopContractError(method, result);
+}
+
+async function validatedApiCall<T>(
+  method: string,
+  decode: (value: unknown) => DecodeOutcome<T>,
+  params: Record<string, unknown> = {}
+): Promise<T> {
+  return requireDecoded(decode(await apiCall<unknown>(method, params)), method);
 }
 
 type BaseRpcResponse = {
@@ -421,8 +635,8 @@ const electronAPI = {
   // ========================================
   // Model Management
   // ========================================
-  get_models: () => apiCall('get_models'),
-  refresh_model_index: () => apiCall('refresh_model_index'),
+  get_models: () => validatedApiCall('get_models', decodeModelsOutcome),
+  refresh_model_index: () => validatedApiCall('refresh_model_index', decodeModelIndexRefreshOutcome),
   scan_shared_storage: () => apiCall('scan_shared_storage'),
   search_hf_models: (
     query: string,
@@ -446,7 +660,7 @@ const electronAPI = {
     quant?: string | null,
     filenames?: string[] | null
   ) =>
-    apiCall('start_model_download_from_hf', {
+    validatedApiCall('start_model_download_from_hf', decodeDownloadStartedOutcome, {
       repo_id: repoId,
       family,
       official_name: officialName,
@@ -468,7 +682,7 @@ const electronAPI = {
     quant?: string | null,
     filenames?: string[] | null
   ) =>
-    apiCall('download_model_from_hf', {
+    validatedApiCall('download_model_from_hf', decodeDownloadStartedOutcome, {
       repo_id: repoId,
       family,
       official_name: officialName,
@@ -480,21 +694,18 @@ const electronAPI = {
       filenames,
     }),
   get_model_download_status: (downloadId: string) =>
-    apiCall('get_model_download_status', { download_id: downloadId }),
+    validatedApiCall('get_model_download_status', decodeDownloadStatusOutcome, { download_id: downloadId }),
   cancel_model_download: (downloadId: string) =>
-    apiCall('cancel_model_download', { download_id: downloadId }),
+    validatedApiCall('cancel_model_download', decodeDownloadMutationOutcome, { download_id: downloadId }),
   pause_model_download: (downloadId: string) =>
-    apiCall('pause_model_download', { download_id: downloadId }),
+    validatedApiCall('pause_model_download', decodeDownloadMutationOutcome, { download_id: downloadId }),
   resume_model_download: (downloadId: string) =>
-    apiCall('resume_model_download', { download_id: downloadId }),
+    validatedApiCall('resume_model_download', decodeDownloadMutationOutcome, { download_id: downloadId }),
   list_model_downloads: () =>
-    apiCall('list_model_downloads'),
-  list_interrupted_downloads: () =>
-    apiCall('list_interrupted_downloads'),
-  recover_download: (repoId: string, destDir: string) =>
-    apiCall('recover_download', { repo_id: repoId, dest_dir: destDir }),
-  resume_partial_download: (repoId: string, destDir: string) =>
-    apiCall('resume_partial_download', { repo_id: repoId, dest_dir: destDir }),
+    validatedApiCall('list_model_downloads', decodeDownloadListOutcome),
+  resume_partial_download: (modelId: string, recoveryToken: string) =>
+    validatedApiCall('resume_partial_download', decodePartialDownloadOutcome,
+      requireDecoded(decodeRecoverDownloadParams({ modelId, recoveryToken }), 'resume_partial_download request')),
   get_library_model_metadata: (modelId: string) =>
     apiCall('get_library_model_metadata', { model_id: modelId }),
   refetch_model_metadata_from_hf: (modelId: string) =>
@@ -529,16 +740,12 @@ const electronAPI = {
   search_models_fts: (
     query: string,
     limit?: number,
-    offset?: number,
-    modelType?: string | null,
-    tags?: string[] | null
+    offset?: number
   ) =>
-    apiCall('search_models_fts', {
+    validatedApiCall('search_models_fts', decodeCatalogSearchOutcome, {
       query,
       limit,
       offset,
-      model_type: modelType,
-      tags,
     }),
   import_batch: (importSpecs: Array<Record<string, unknown>>) =>
     apiCall('import_batch', { imports: importSpecs }),
@@ -655,8 +862,38 @@ const electronAPI = {
     return await apiCall('open_path', { path });
   },
 
+  get_launcher_root_state: async () => {
+    return decodeLauncherRootStartupState(
+      await ipcRenderer.invoke('launcher:getRootState')
+    );
+  },
+
+  get_launcher_root_bootstrap: () => {
+    return decodeLauncherRootStartupState(
+      ipcRenderer.sendSync('launcher:getRootBootstrap')
+    );
+  },
+
+  notify_launcher_root_presentation_committed: async (
+    presentation: LauncherRootCommittedPresentation
+  ) => {
+    await ipcRenderer.invoke('launcher-root:presentation-committed', presentation);
+  },
+
+  onLauncherRootPresentationTimeout: (callback: () => void): (() => void) => {
+    launcherRootPresentationTimeoutListeners.add(callback);
+    if (launcherRootPresentationTimeoutLatched) {
+      callback();
+    }
+    return () => {
+      launcherRootPresentationTimeoutListeners.delete(callback);
+    };
+  },
+
   select_launcher_root: async () => {
-    return await ipcRenderer.invoke('launcher:chooseLibraryRoot');
+    return decodeLauncherRootSelectionResult(
+      await ipcRenderer.invoke('launcher:chooseLibraryRoot')
+    );
   },
 
   open_active_install: (appId?: string) => apiCall('open_active_install', { app_id: appId }),

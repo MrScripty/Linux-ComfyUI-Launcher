@@ -1,4 +1,5 @@
 import { act, renderHook } from '@testing-library/react';
+import { createElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ModelCategory } from '../types/apps';
 import type { ModelLibraryUpdateNotification, ModelRecord } from '../types/api';
@@ -7,14 +8,14 @@ import { MODEL_LIBRARY_SNAPSHOT_KEY } from '../utils/modelLibrarySnapshot';
 const {
   getModelsMock,
   getElectronAPIMock,
-  groupModelRecordsMock,
+  groupCatalogModelsMock,
   isApiAvailableMock,
   scanSharedStorageMock,
   searchModelsFTSMock,
 } = vi.hoisted(() => ({
   getModelsMock: vi.fn(),
   getElectronAPIMock: vi.fn(),
-  groupModelRecordsMock: vi.fn(),
+  groupCatalogModelsMock: vi.fn(),
   isApiAvailableMock: vi.fn<() => boolean>(),
   scanSharedStorageMock: vi.fn(),
   searchModelsFTSMock: vi.fn(),
@@ -39,10 +40,31 @@ vi.mock('../api/import', () => ({
 }));
 
 vi.mock('../utils/libraryModels', () => ({
-  groupModelRecords: groupModelRecordsMock,
+  groupCatalogModels: groupCatalogModelsMock,
 }));
 
 import { useModels } from './useModels';
+import { LauncherRootRecoveryProvider } from './useLauncherRootRecovery';
+
+const libraryScopeId = `display-v1:${'a'.repeat(64)}`;
+
+function renderModelsHook() {
+  getElectronAPIMock.mockReturnValue({
+    get_launcher_root_bootstrap: () => ({ status: 'ready', selectionAction: 'select-library', libraryScopeId }),
+    notify_launcher_root_presentation_committed: async () => undefined,
+    onLauncherRootPresentationTimeout: () => () => undefined,
+    ...getElectronAPIMock(),
+  });
+  return renderHook(() => useModels(), {
+    wrapper: ({ children }) => createElement(LauncherRootRecoveryProvider, null, children),
+  });
+}
+
+function cachedGroups(ids: string[], category = 'grouped'): ModelCategory[] {
+  return grouped(ids, category).map((group) => ({ ...group,
+    models: group.models.map((model) => ({ ...model, provenance: 'cached' })),
+  }));
+}
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
@@ -108,7 +130,7 @@ describe('useModels', () => {
       models: [makeRecord('search-hit')],
       query_time_ms: 12,
     });
-    groupModelRecordsMock.mockImplementation((records: ModelRecord[]) =>
+    groupCatalogModelsMock.mockImplementation((records: ModelRecord[]) =>
       grouped(records.map((record) => record.id))
     );
   });
@@ -119,14 +141,15 @@ describe('useModels', () => {
   });
 
   it('fetches and groups models on mount when the API is available', async () => {
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     await flushMicrotasks();
 
     expect(getModelsMock).toHaveBeenCalledTimes(1);
-    expect(groupModelRecordsMock).toHaveBeenCalledWith([makeRecord('alpha')]);
+    expect(groupCatalogModelsMock).toHaveBeenCalledWith([makeRecord('alpha')]);
     expect(result.current.modelGroups).toEqual(grouped(['alpha']));
     expect(JSON.parse(localStorage.getItem(MODEL_LIBRARY_SNAPSHOT_KEY) ?? 'null')).toEqual({
+      libraryScopeId,
       modelGroups: grouped(['alpha']),
     });
   });
@@ -134,7 +157,7 @@ describe('useModels', () => {
   it('recovers loading status after a failed fetch without accepting an older failure', async () => {
     const older = createDeferred<{ success: boolean; models: Record<string, ModelRecord> }>();
     getModelsMock.mockReturnValueOnce(older.promise);
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
     expect(result.current.libraryLoadStatus).toBe('loading');
     await act(async () => { await result.current.fetchModels(); });
     expect(result.current.libraryLoadStatus).toBe('ready');
@@ -144,7 +167,7 @@ describe('useModels', () => {
     getModelsMock.mockRejectedValueOnce(new Error('Current request failed'));
     await act(async () => { await result.current.fetchModels(); });
     expect(result.current.libraryLoadStatus).toBe('unavailable');
-    expect(result.current.modelGroups).toEqual(grouped(['alpha']));
+    expect(result.current.modelGroups).toEqual(cachedGroups(['alpha']));
     await act(async () => { await result.current.fetchModels(); });
     expect(result.current.libraryLoadStatus).toBe('ready');
   });
@@ -156,14 +179,14 @@ describe('useModels', () => {
     }>();
     localStorage.setItem(
       MODEL_LIBRARY_SNAPSHOT_KEY,
-      JSON.stringify({ modelGroups: grouped(['cached-model']) })
+      JSON.stringify({ libraryScopeId, modelGroups: grouped(['cached-model']) })
     );
     getModelsMock.mockReturnValueOnce(pendingModels.promise);
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     expect(getModelsMock).toHaveBeenCalledTimes(1);
-    expect(result.current.modelGroups).toEqual(grouped(['cached-model']));
+    expect(result.current.modelGroups).toEqual(cachedGroups(['cached-model']));
   });
 
   it('ignores malformed startup snapshots while revalidation is pending', () => {
@@ -179,7 +202,7 @@ describe('useModels', () => {
     );
     getModelsMock.mockReturnValueOnce(pendingModels.promise);
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     expect(result.current.modelGroups).toEqual([]);
   });
@@ -199,7 +222,7 @@ describe('useModels', () => {
         },
       });
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     await flushMicrotasks();
 
@@ -225,12 +248,12 @@ describe('useModels', () => {
         query_time_ms: 15,
       });
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     await flushMicrotasks();
 
     act(() => {
-      result.current.searchModelsFTS('alpha', 'checkpoint', ['tag-b', 'tag-a']);
+      result.current.searchModelsFTS('alpha');
     });
 
     await act(async () => {
@@ -243,10 +266,10 @@ describe('useModels', () => {
     expect(result.current.hasNewResults).toBe(false);
 
     act(() => {
-      result.current.searchModelsFTS('alpha', 'checkpoint', ['tag-a', 'tag-b']);
+      result.current.searchModelsFTS('alpha');
     });
 
-    expect(result.current.modelGroups).toEqual(grouped(['alpha-result']));
+    expect(result.current.modelGroups).toEqual(cachedGroups(['alpha-result']));
     expect(result.current.isSearching).toBe(false);
     expect(result.current.isRevalidating).toBe(true);
 
@@ -282,7 +305,7 @@ describe('useModels', () => {
       .mockReturnValueOnce(firstSearch.promise)
       .mockReturnValueOnce(secondSearch.promise);
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     await flushMicrotasks();
 
@@ -399,7 +422,7 @@ describe('useModels', () => {
         },
       });
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     await flushMicrotasks();
 
@@ -437,7 +460,7 @@ describe('useModels', () => {
       }),
     });
 
-    renderHook(() => useModels());
+    renderModelsHook();
 
     await flushMicrotasks();
 
@@ -464,7 +487,7 @@ describe('useModels', () => {
       }),
     });
 
-    const { unmount } = renderHook(() => useModels());
+    const { unmount } = renderModelsHook();
 
     await flushMicrotasks();
 
@@ -508,12 +531,12 @@ describe('useModels', () => {
         query_time_ms: 11,
       });
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     await flushMicrotasks();
 
     act(() => {
-      result.current.searchModelsFTS('qwen', 'checkpoint', ['tag-a']);
+      result.current.searchModelsFTS('qwen');
     });
 
     await act(async () => {
@@ -539,7 +562,7 @@ describe('useModels', () => {
     });
 
     expect(searchModelsFTSMock).toHaveBeenCalledTimes(2);
-    expect(searchModelsFTSMock).toHaveBeenLastCalledWith('qwen', 100, 0, 'checkpoint', ['tag-a']);
+    expect(searchModelsFTSMock).toHaveBeenLastCalledWith('qwen', 100, 0);
     expect(getModelsMock).toHaveBeenCalledTimes(1);
     expect(result.current.modelGroups).toEqual(grouped(['refreshed-search']));
   });
@@ -557,7 +580,7 @@ describe('useModels', () => {
       query_time_ms: 10,
     });
 
-    const { result } = renderHook(() => useModels());
+    const { result } = renderModelsHook();
 
     act(() => {
       result.current.searchModelsFTS('active-query');

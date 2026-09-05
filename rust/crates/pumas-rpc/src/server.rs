@@ -1,5 +1,6 @@
 //! HTTP server implementation using Axum.
 
+use crate::catalog_projection::CatalogProjection;
 use crate::handlers::{
     handle_health, handle_model_download_update_events, handle_model_library_update_events,
     handle_rpc, handle_status_telemetry_update_events,
@@ -27,16 +28,19 @@ use pumas_library::{
 };
 #[cfg(feature = "inference-plugins")]
 use std::collections::HashMap;
+use std::future::IntoFuture;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(feature = "inference-plugins")]
 use std::time::Duration;
+use tokio::sync::oneshot;
 #[cfg(feature = "inference-plugins")]
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{error, info, warn};
+use tracing::info;
 
 const MAX_IN_FLIGHT_RPC_REQUESTS: usize = 64;
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -47,8 +51,34 @@ const PROVIDER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "inference-plugins")]
 const ONNX_MAX_CONCURRENT_OPERATIONS: usize = 4;
 
+/// A validated desktop RPC bind host.
+///
+/// The private field makes a non-loopback server configuration
+/// unrepresentable after CLI admission.
+#[derive(Clone, Copy)]
+pub(crate) struct LoopbackHost(IpAddr);
+
+impl LoopbackHost {
+    pub(crate) fn parse(host: &str) -> anyhow::Result<Self> {
+        let address: IpAddr = host
+            .parse()
+            .map_err(|_| anyhow::anyhow!("RPC host must be a loopback IP address"))?;
+        if !address.is_loopback() {
+            return Err(anyhow::anyhow!(
+                "RPC host must be a loopback IP address; remote access is not supported"
+            ));
+        }
+        Ok(Self(address))
+    }
+
+    const fn socket_addr(self, port: u16) -> SocketAddr {
+        SocketAddr::new(self.0, port)
+    }
+}
+
 /// Application state shared across handlers.
 pub struct AppState {
+    pub(crate) catalog_projection: CatalogProjection,
     /// Core API (model library, system utilities)
     pub api: PumasApi,
     /// Version managers for compiled-in inference plugins.
@@ -83,7 +113,8 @@ pub struct AppState {
 /// Owned handle for the running HTTP server task.
 pub struct ServerHandle {
     addr: SocketAddr,
-    task: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
+    shutdown_signal: Option<oneshot::Sender<()>>,
 }
 
 impl ServerHandle {
@@ -93,22 +124,23 @@ impl ServerHandle {
     }
 
     /// Stop the server task and wait until it is no longer running.
-    pub async fn shutdown(mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            match task.await {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => warn!("RPC server task failed during shutdown: {}", error),
-            }
+    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        if let Some(signal) = self.shutdown_signal.take() {
+            let _ = signal.send(());
         }
+        if let Some(task) = self.task.take() {
+            task.await??;
+        }
+        Ok(())
     }
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
+        // Drop requests shutdown but cannot prove its asynchronous completion.
+        // Call shutdown() for an observed drain; the supervisor owns its worker.
+        if let Some(signal) = self.shutdown_signal.take() {
+            let _ = signal.send(());
         }
     }
 }
@@ -122,14 +154,14 @@ pub async fn start_server(
     #[cfg(feature = "inference-plugins")] version_managers: HashMap<String, VersionManager>,
     #[cfg(feature = "inference-plugins")] size_calculator: SizeCalculator,
     #[cfg(feature = "inference-plugins")] plugin_loader: PluginLoader,
-    host: &str,
+    host: LoopbackHost,
     port: u16,
 ) -> anyhow::Result<ServerHandle> {
     #[cfg(feature = "inference-plugins")]
     let gateway_http_client = build_gateway_http_client()?;
     #[cfg(feature = "inference-plugins")]
     let provider_http_client = build_provider_http_client()?;
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    let addr = host.socket_addr(port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
     #[cfg(feature = "inference-plugins")]
@@ -145,7 +177,9 @@ pub async fn start_server(
     .map_err(|err| anyhow::anyhow!("failed to build ONNX session manager: {err}"))?;
     #[cfg(feature = "inference-plugins")]
     let provider_registry = ProviderRegistry::builtin();
+    let (catalog_projection, catalog_worker) = CatalogProjection::start(MAX_IN_FLIGHT_RPC_REQUESTS);
     let state = Arc::new(AppState {
+        catalog_projection,
         api,
         #[cfg(feature = "inference-plugins")]
         version_managers: Arc::new(RwLock::new(version_managers)),
@@ -219,15 +253,21 @@ pub async fn start_server(
     );
 
     // Spawn the server in the background and retain ownership of the task.
+    let (shutdown_signal, shutdown) = oneshot::channel();
     let task = tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, app).await {
-            error!("RPC server error: {}", error);
-        }
+        let serving = axum::serve(listener, app).into_future();
+        let server_result = tokio::select! {
+            result = serving => result.map_err(anyhow::Error::from),
+            _ = shutdown => Ok(()),
+        };
+        let projection_result = catalog_worker.shutdown().await;
+        server_result.and(projection_result)
     });
 
     Ok(ServerHandle {
         addr: actual_addr,
         task: Some(task),
+        shutdown_signal: Some(shutdown_signal),
     })
 }
 
@@ -279,6 +319,17 @@ mod tests {
     use std::io::ErrorKind;
     use tempfile::TempDir;
 
+    #[test]
+    fn loopback_host_rejects_every_remote_or_ambiguous_form() {
+        assert!(LoopbackHost::parse("127.0.0.1").is_ok());
+        assert!(LoopbackHost::parse("::1").is_ok());
+
+        for host in ["0.0.0.0", "::", "192.168.1.10", "8.8.8.8", "localhost"] {
+            let error = LoopbackHost::parse(host).err().expect("host must fail");
+            assert!(error.to_string().contains("loopback"), "{host}: {error}");
+        }
+    }
+
     fn is_socket_bind_permission_error(err: &anyhow::Error) -> bool {
         err.chain().any(|cause| {
             cause
@@ -321,7 +372,7 @@ mod tests {
             size_calculator,
             #[cfg(feature = "inference-plugins")]
             plugin_loader,
-            "127.0.0.1",
+            LoopbackHost::parse("127.0.0.1").unwrap(),
             0,
         )
         .await;
@@ -335,7 +386,7 @@ mod tests {
         };
         let addr = server.addr();
         assert!(addr.port() > 0);
-        server.shutdown().await;
+        server.shutdown().await.unwrap();
     }
 
     #[test]

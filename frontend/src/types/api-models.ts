@@ -1,4 +1,7 @@
 import type { BaseResponse } from './api-common';
+import type {
+  DownloadListOutcome, DownloadStartedOutcome, DownloadStatusOutcome, ModelsOutcome, PartialDownloadOutcome,
+} from '../generated/desktop-contract';
 
 // ============================================================================
 // Model Types
@@ -50,9 +53,7 @@ export interface ModelRecord {
   updatedAt: string;
 }
 
-export interface ModelsResponse extends BaseResponse {
-  models: Record<string, ModelRecord>;
-}
+export type ModelsResponse = ModelsOutcome;
 
 export interface HuggingFaceModel {
   repoId: string;
@@ -148,15 +149,13 @@ export interface GetHFDownloadDetailsResponse extends BaseResponse {
   details?: HFDownloadDetails;
 }
 
-export interface ModelDownloadResponse extends BaseResponse {
-  download_id?: string;
-  selectedArtifactId?: string | null;
-  artifactId?: string | null;
-  total_bytes?: number;
-  model_path?: string;
-}
+export type ModelDownloadResponse = DownloadStartedOutcome;
+export type ModelDownloadStatusResponse = DownloadStatusOutcome;
+export type ListModelDownloadsResponse = DownloadListOutcome;
 
-export interface ModelDownloadStatusResponse extends BaseResponse {
+/** Existing core push-event payload; distinct from the RPC status/list outcomes. */
+export interface ModelDownloadSnapshotEntry {
+  success?: boolean;
   downloadId?: string;
   repoId?: string;
   selectedArtifactId?: string | null;
@@ -176,14 +175,6 @@ export interface ModelDownloadStatusResponse extends BaseResponse {
   error?: string;
 }
 
-export interface ListModelDownloadsResponse extends BaseResponse {
-  downloads: ModelDownloadStatusResponse[];
-}
-
-export type ModelDownloadSnapshotEntry = Omit<ModelDownloadStatusResponse, 'success'> & {
-  success?: boolean;
-};
-
 export interface ModelDownloadSnapshot {
   cursor: string;
   revision: number;
@@ -197,29 +188,7 @@ export interface ModelDownloadUpdateNotification {
   snapshot_required: boolean;
 }
 
-export interface InterruptedDownloadInfo {
-  model_dir: string;
-  model_type?: string;
-  family: string;
-  inferred_name: string;
-  part_files: string[];
-  completed_files: string[];
-}
-
-export interface ListInterruptedDownloadsResponse extends BaseResponse {
-  interrupted: InterruptedDownloadInfo[];
-}
-
-export interface RecoverDownloadResponse extends BaseResponse {
-  download_id?: string;
-}
-
-export interface ResumePartialDownloadResponse extends BaseResponse {
-  action?: 'resume' | 'recover' | 'attach' | 'none';
-  download_id?: string;
-  status?: string;
-  reason_code?: string;
-}
+export type ResumePartialDownloadResponse = PartialDownloadOutcome;
 
 export interface ScanSharedStorageResponse extends BaseResponse {
   result: {

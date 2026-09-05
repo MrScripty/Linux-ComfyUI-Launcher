@@ -13,7 +13,7 @@ interface LocalModelRowProps {
   excludedModels: Set<string>;
   expandedRelated: Set<string>;
   model: ModelInfo;
-  recoveringPartialRepoIds?: Set<string>;
+  recoveringPartialModelIds?: Set<string>;
   relatedModelsById: Record<string, RelatedModelsState>;
   selectedAppId: string | null;
   servedStatus: ServedModelStatus | null;
@@ -37,7 +37,7 @@ export function LocalModelRow({
   excludedModels,
   expandedRelated,
   model,
-  recoveringPartialRepoIds,
+  recoveringPartialModelIds,
   relatedModelsById,
   selectedAppId,
   servedStatus,
@@ -55,6 +55,7 @@ export function LocalModelRow({
   onToggleRelated,
   onToggleStar,
 }: LocalModelRowProps) {
+  const isReadOnly = model.provenance === 'cached';
   const rowState = getLocalModelRowState({
     canConvertModel: Boolean(onConvertModel),
     canPauseDownload: Boolean(onPauseDownload),
@@ -64,7 +65,7 @@ export function LocalModelRow({
     excludedModels,
     expandedRelated,
     model,
-    recoveringPartialRepoIds,
+    recoveringPartialModelIds,
     relatedModelsById,
     starredModels,
   });
@@ -73,15 +74,16 @@ export function LocalModelRow({
     <ListItem highlighted={rowState.isLinked}>
       <ListItemContent>
         <div className="flex items-center gap-2 flex-1 min-w-0">
-          <IconButton
+          {!isReadOnly && <IconButton
             icon={<Star fill={rowState.isStarred ? 'currentColor' : 'none'} />}
             tooltip={rowState.isStarred ? 'Unstar' : 'Star'}
             onClick={() => onToggleStar(model.id)}
             disabled={rowState.isDownloading}
             size="sm"
-          />
+          />}
           <div className="flex-1 min-w-0">
             <LocalModelNameButton
+              readOnly={isReadOnly}
               downloadProgress={model.downloadProgress}
               modelId={model.id}
               modelName={model.name}
@@ -93,15 +95,19 @@ export function LocalModelRow({
               integrityIssueMessage={model.integrityIssueMessage}
               onOpenMetadata={onOpenMetadata}
             />
-            <LocalModelMetadataSummary
+            {model.provenance === 'activity' ? (
+              <div className="mt-1.5 text-[11px] text-[hsl(var(--text-secondary))]">
+                Download activity · {model.downloadStatus}
+              </div>
+            ) : <LocalModelMetadataSummary
               format={model.format}
               quant={model.quant}
               size={model.size}
               hasDependencies={model.hasDependencies}
               dependencyCount={model.dependencyCount}
               partialError={rowState.partialError}
-            />
-            {servedStatus && (
+            />}
+            {!isReadOnly && servedStatus && (
               <div className="mt-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-[hsl(var(--accent-success))]">
                 <span className="rounded bg-[hsl(var(--accent-success)/0.14)] px-1.5 py-0.5">
                   Loaded
@@ -113,7 +119,7 @@ export function LocalModelRow({
             )}
           </div>
         </div>
-        <LocalModelRowActions
+        {!isReadOnly && <LocalModelRowActions
           model={model}
           rowState={rowState}
           selectedAppId={selectedAppId}
@@ -127,9 +133,9 @@ export function LocalModelRow({
           onServeModel={onServeModel}
           onToggleLink={onToggleLink}
           onToggleRelated={onToggleRelated}
-        />
+        />}
       </ListItemContent>
-      {rowState.canShowRelated && rowState.isExpanded && (
+      {!isReadOnly && rowState.canShowRelated && rowState.isExpanded && (
         <RelatedModelsPanel
           error={rowState.relatedState?.error}
           relatedModels={rowState.relatedModels}

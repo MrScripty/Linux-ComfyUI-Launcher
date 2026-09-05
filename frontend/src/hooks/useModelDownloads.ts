@@ -10,6 +10,7 @@ import { api, getElectronAPI, isAPIAvailable } from '../api/adapter';
 import type { ModelDownloadSnapshotEntry } from '../types/api';
 import { getLogger } from '../utils/logger';
 import { APIError } from '../errors';
+import { projectDownloadProgress } from '../utils/downloadProgressProjection';
 import {
   getDownloadArtifactKey,
   selectDownloadsByRepo,
@@ -55,8 +56,8 @@ export function useModelDownloads() {
       if (!isAPIAvailable()) return;
       try {
         const result = await api.list_model_downloads();
-        if (!cancelled && result.success) {
-          applyDownloadSnapshot(result.downloads, { preserveExisting: true });
+        if (!cancelled) {
+          applyDownloadSnapshot(result.downloads.map(projectDownloadProgress), { preserveExisting: true });
         }
       } catch (error) {
         logger.warn('Failed to restore downloads on startup', { error });

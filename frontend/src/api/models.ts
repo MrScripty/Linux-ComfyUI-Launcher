@@ -93,19 +93,9 @@ class ModelsAPI {
     return await api.cancel_model_download(downloadId);
   }
 
-  async listInterruptedDownloads() {
+  async resumePartialDownload(modelId: string, recoveryToken: string) {
     const api = this.getAPI();
-    return await api.list_interrupted_downloads();
-  }
-
-  async recoverDownload(repoId: string, destDir: string) {
-    const api = this.getAPI();
-    return await api.recover_download(repoId, destDir);
-  }
-
-  async resumePartialDownload(repoId: string, destDir: string) {
-    const api = this.getAPI();
-    return await api.resume_partial_download(repoId, destDir);
+    return await api.resume_partial_download(modelId, recoveryToken);
   }
 
   async deleteModel(modelId: string) {

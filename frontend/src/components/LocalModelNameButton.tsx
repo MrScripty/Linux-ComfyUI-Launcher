@@ -1,6 +1,7 @@
 import type { MouseEvent } from 'react';
 
 interface LocalModelNameButtonProps {
+  readOnly?: boolean;
   downloadProgress?: number | undefined;
   hasIntegrityIssue: boolean;
   integrityIssueMessage?: string | undefined;
@@ -14,6 +15,7 @@ interface LocalModelNameButtonProps {
 }
 
 export function LocalModelNameButton({
+  readOnly = false,
   downloadProgress,
   hasIntegrityIssue,
   integrityIssueMessage,
@@ -25,6 +27,7 @@ export function LocalModelNameButton({
   onOpenMetadata,
   wasDequantized,
 }: LocalModelNameButtonProps) {
+  const NameElement = readOnly ? 'span' : 'button';
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
     if (event.ctrlKey || event.metaKey) {
       event.preventDefault();
@@ -44,9 +47,9 @@ export function LocalModelNameButton({
         : `${Math.round(normalizedProgress * 100)}%`;
 
   return (
-    <button
-      type="button"
-      className={`text-sm font-medium flex max-w-full items-center text-left bg-transparent border-0 p-0 cursor-pointer ${
+    <NameElement
+      type={readOnly ? undefined : 'button'}
+      className={`text-sm font-medium flex max-w-full items-center text-left bg-transparent border-0 p-0 ${readOnly ? '' : 'cursor-pointer'} ${
         isDownloading
           ? 'text-[hsl(var(--text-muted))]'
           : isPartialDownload
@@ -55,8 +58,8 @@ export function LocalModelNameButton({
           ? 'text-[hsl(var(--text-primary))]'
           : 'text-[hsl(var(--text-secondary))]'
       }`}
-      onClick={handleClick}
-      title="Ctrl+click to view metadata"
+      onClick={readOnly ? undefined : handleClick}
+      title={readOnly ? 'Saved model information' : 'Ctrl+click to view metadata'}
     >
       <span className="truncate">{modelName}</span>
       {wasDequantized && (
@@ -93,6 +96,6 @@ export function LocalModelNameButton({
           {`PARTIAL${progressPercent ? ` ${progressPercent}` : ''}`}
         </span>
       )}
-    </button>
+    </NameElement>
   );
 }

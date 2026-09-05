@@ -8,7 +8,7 @@ export default tseslint.config(
     ignores: ['dist/**', 'node_modules/**', 'scripts/**', '*.config.*'],
   },
   {
-    files: ['src/**/*.{ts,tsx}'],
+    files: ['src/**/*.{ts,tsx}', 'conformance/**/*.test.tsx'],
     extends: [
       js.configs.recommended,
       ...tseslint.configs.strictTypeChecked,

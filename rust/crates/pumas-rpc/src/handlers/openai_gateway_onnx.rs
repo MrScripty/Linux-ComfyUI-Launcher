@@ -169,19 +169,24 @@ fn openai_embedding_response(response: OnnxEmbeddingResponse, requested_model: &
 }
 
 fn onnx_runtime_error_response(error: OnnxRuntimeError) -> Response {
-    let (status, code) = match error.code {
-        OnnxRuntimeErrorCode::Validation => {
-            (StatusCode::BAD_REQUEST, ModelServeErrorCode::InvalidRequest)
-        }
-        OnnxRuntimeErrorCode::NotLoaded => {
-            (StatusCode::NOT_FOUND, ModelServeErrorCode::ModelNotFound)
-        }
+    let (status, code, message) = match error.code {
+        OnnxRuntimeErrorCode::Validation => (
+            StatusCode::BAD_REQUEST,
+            ModelServeErrorCode::InvalidRequest,
+            "The embedding request is invalid.",
+        ),
+        OnnxRuntimeErrorCode::NotLoaded => (
+            StatusCode::NOT_FOUND,
+            ModelServeErrorCode::ModelNotFound,
+            "The requested embedding model is not loaded.",
+        ),
         OnnxRuntimeErrorCode::Backend => (
             StatusCode::BAD_GATEWAY,
             ModelServeErrorCode::ProviderLoadFailed,
+            "The embedding provider could not complete the request.",
         ),
     };
-    openai_error_response_with_code(status, code, error.to_string())
+    openai_error_response_with_code(status, code, message)
 }
 
 #[cfg(test)]

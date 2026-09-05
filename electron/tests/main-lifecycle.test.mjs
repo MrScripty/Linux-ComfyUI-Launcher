@@ -14,6 +14,8 @@ const requireMain = createRequire(mainUrl);
 
 function createMainHarness({ root, bridgeRuntime } = {}) {
   const app = new EventEmitter();
+  const ipcMain = new EventEmitter();
+  ipcMain.handle = () => {};
   const timers = new Set();
   const windows = [];
   const exits = [];
@@ -38,6 +40,7 @@ function createMainHarness({ root, bridgeRuntime } = {}) {
     constructor() {
       super();
       this.contents.isDestroyed = () => this.destroyed;
+      this.contents.mainFrame = {};
       windows.push(this);
     }
     static getAllWindows() { return windows.filter((window) => !window.destroyed); }
@@ -70,7 +73,7 @@ function createMainHarness({ root, bridgeRuntime } = {}) {
     clearTimeout(callback) { timers.delete(callback); },
     require(specifier) {
       if (specifier === 'electron') return {
-        app, BrowserWindow, ipcMain: { handle() {} },
+        app, BrowserWindow, ipcMain,
       };
       if (specifier === 'electron-log') return logger;
       if (specifier === './python-bridge' && bridgeRuntime) return bridgeRuntime.module;
@@ -84,7 +87,7 @@ function createMainHarness({ root, bridgeRuntime } = {}) {
       return requireMain(specifier);
     },
   });
-  return { app, timers, windows, ready, exits, errors };
+  return { app, ipcMain, timers, windows, ready, exits, errors };
 }
 
 test('closing the native window settles presentation without accessing its destroyed getter', async () => {
@@ -165,6 +168,20 @@ test('failed backend startup stops its pending restart before application cleanu
     await setImmediate();
     assert.equal(runtime.children.length, 1);
     assert.equal(runtime.requests.length, 1);
+    // Exercise the actual compiled main handler, not a copy of its sender guard.
+    const contents = harness.windows[0].webContents;
+    const bootstrap = { sender: contents, senderFrame: contents.mainFrame };
+    harness.ipcMain.emit('launcher:getRootBootstrap', bootstrap);
+    assert.equal(bootstrap.returnValue.status, 'ready');
+    assert.equal(bootstrap.returnValue.libraryScopeId, null);
+    for (const denied of [
+      { sender: contents, senderFrame: {} },
+      { sender: {}, senderFrame: contents.mainFrame },
+    ]) {
+      harness.ipcMain.emit('launcher:getRootBootstrap', denied);
+      assert.equal(denied.returnValue, null);
+    }
+    assert.equal(runtime.requests.length, 1, 'bootstrap must not start another backend request');
     runtime.children[0].emit('exit', 1, null);
     assert.equal(runtime.timers.size, 1, 'crash has a pending restart before startup fails');
     runtime.expireStartup();

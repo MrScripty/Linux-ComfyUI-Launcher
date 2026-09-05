@@ -28,8 +28,8 @@ pub(super) async fn serve_ollama_model(
         .await
     {
         Ok(endpoint) => endpoint,
-        Err(err) => {
-            warn!("failed to resolve Ollama serving endpoint: {}", err);
+        Err(_) => {
+            warn!("failed to resolve Ollama serving endpoint");
             return non_critical_failure_response(
                 state,
                 serving_error(
@@ -59,8 +59,8 @@ pub(super) async fn serve_ollama_model(
     let client = state.ollama_client_factory.client(Some(endpoint.as_str()));
     let registered = match client.list_models().await {
         Ok(models) => models.iter().any(|model| model.name == model_alias),
-        Err(err) => {
-            warn!("Ollama model inventory failed before serving: {}", err);
+        Err(_) => {
+            warn!("Ollama model inventory failed before serving");
             return non_critical_failure_response(
                 state,
                 serving_error(
@@ -73,29 +73,30 @@ pub(super) async fn serve_ollama_model(
         }
     };
 
-    if !registered {
-        if let Err(err) = client
+    if !registered
+        && client
             .create_model(&model_alias, &gguf_path, known_sha256.as_deref())
             .await
-        {
-            warn!("Ollama model registration failed before serving: {}", err);
-            return non_critical_failure_response(
-                state,
-                serving_error(
-                    ModelServeErrorCode::ProviderLoadFailed,
-                    "Ollama could not register the selected model",
-                    &request,
-                ),
-            )
-            .await;
-        }
+            .is_err()
+    {
+        warn!("Ollama model registration failed before serving");
+        return non_critical_failure_response(
+            state,
+            serving_error(
+                ModelServeErrorCode::ProviderLoadFailed,
+                "Ollama could not register the selected model",
+                &request,
+            ),
+        )
+        .await;
     }
 
-    if let Err(err) = client
+    if client
         .load_model_with_keep_alive(&model_alias, request.config.keep_loaded)
         .await
+        .is_err()
     {
-        warn!("Ollama model load failed: {}", err);
+        warn!("Ollama model load failed");
         return non_critical_failure_response(
             state,
             serving_error(
@@ -112,11 +113,8 @@ pub(super) async fn serve_ollama_model(
             .iter()
             .find(|model| model.name == model_alias)
             .map(|model| model.size),
-        Err(err) => {
-            warn!(
-                "Ollama running inventory failed after serving load: {}",
-                err
-            );
+        Err(_) => {
+            warn!("Ollama running inventory failed after serving load");
             None
         }
     };
@@ -168,8 +166,8 @@ pub(super) async fn unserve_ollama_model(
         .await
     {
         Ok(endpoint) => endpoint,
-        Err(err) => {
-            warn!("failed to resolve serving unload endpoint: {}", err);
+        Err(_) => {
+            warn!("failed to resolve serving unload endpoint");
             return Ok(serde_json::to_value(UnserveModelResponse {
                 success: true,
                 error: Some("selected runtime profile is not available".to_string()),
@@ -180,8 +178,8 @@ pub(super) async fn unserve_ollama_model(
     };
 
     let client = state.ollama_client_factory.client(Some(endpoint.as_str()));
-    if let Err(err) = client.unload_model(&model_alias).await {
-        warn!("Ollama serving unload failed: {}", err);
+    if client.unload_model(&model_alias).await.is_err() {
+        warn!("Ollama serving unload failed");
         return Ok(serde_json::to_value(UnserveModelResponse {
             success: true,
             error: Some("Ollama could not unload the selected model".to_string()),

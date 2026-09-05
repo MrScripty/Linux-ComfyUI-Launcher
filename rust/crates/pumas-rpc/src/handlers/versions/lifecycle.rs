@@ -75,10 +75,10 @@ pub async fn install_version(state: &AppState, params: &Value) -> pumas_library:
                 }))
             }
             Err(e) => {
-                warn!("Failed to start installation of {}: {}", tag, e);
+                warn!("Failed to start requested version installation");
                 Ok(json!({
                     "success": false,
-                    "error": e.to_string()
+                    "error": crate::contract::PublicError::from(&e).message
                 }))
             }
         }

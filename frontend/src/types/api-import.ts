@@ -1,5 +1,5 @@
 import type { BaseResponse } from './api-common';
-import type { ModelRecord } from './api-models';
+import type { CatalogSearchOutcome } from '../generated/desktop-contract';
 
 // ============================================================================
 // Model Library Types (Phase 1A - Part 6)
@@ -205,12 +205,7 @@ export interface NetworkStatusResponse extends BaseResponse {
 /**
  * FTS5 search response for local model library
  */
-export interface FTSSearchResponse extends BaseResponse {
-  models: ModelRecord[];
-  total_count: number;
-  query_time_ms: number;
-  query: string;
-}
+export type FTSSearchResponse = CatalogSearchOutcome;
 
 /**
  * File writability check response

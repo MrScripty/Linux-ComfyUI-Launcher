@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, getElectronAPI, isAPIAvailable } from '../api/adapter';
 import type { ModelDownloadSnapshotEntry } from '../types/api';
 import { getLogger } from '../utils/logger';
+import { projectDownloadProgress } from '../utils/downloadProgressProjection';
 
 const logger = getLogger('useActiveModelDownload');
 
@@ -87,15 +88,11 @@ export function useActiveModelDownload() {
 
       try {
         const result = await api.list_model_downloads();
-        if (!result.success || cancelled) {
-          if (!cancelled) {
-            setActiveDownload(null);
-            setActiveDownloadCount(0);
-          }
+        if (cancelled) {
           return;
         }
 
-        applyDownloads(result.downloads);
+        applyDownloads(result.downloads.map(projectDownloadProgress));
       } catch (error) {
         logger.debug('Failed to load active model download snapshot', { error });
       }

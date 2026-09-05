@@ -164,7 +164,7 @@ export async function startRemoteModelDownload({
       request.quant,
       request.filenames
     );
-    if (!result.success || !result.download_id) {
+    if (!result.success) {
       const errorMsg = result.error || 'Download failed.';
       loggerInstance.error('Remote download failed', { error: errorMsg, repoId: request.repoId });
       recordRepoDownloadError(request.repoId, errorMsg, setDownloadErrors);

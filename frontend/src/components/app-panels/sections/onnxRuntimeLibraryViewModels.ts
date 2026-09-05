@@ -59,6 +59,7 @@ export function buildOnnxRuntimeModelRows({
 
   return filterProviderCompatibleModelGroups(modelGroups, ONNX_RUNTIME_PROVIDER)
     .flatMap((group) => group.models)
+    .filter((model) => model.provenance !== 'cached')
     .map((model) => {
       const route = routeByModelId.get(model.id);
       const selectedProfile = route?.profile_id ? profileById.get(route.profile_id) ?? null : null;

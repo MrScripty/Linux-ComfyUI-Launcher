@@ -73,6 +73,7 @@ async fn gateway_test_state_with_clients(
         .unwrap();
     let onnx_session_manager = OnnxSessionManager::new(onnx_backend, 2).unwrap();
     let state = Arc::new(AppState {
+        catalog_projection: crate::catalog_projection::CatalogProjection::unavailable(),
         api,
         version_managers: Arc::new(RwLock::new(HashMap::new())),
         size_calculator: Arc::new(Mutex::new(
@@ -494,10 +495,10 @@ async fn openai_proxy_rejects_malformed_json_before_provider_dispatch() {
 }
 
 #[tokio::test]
-async fn openai_proxy_preserves_provider_error_status_and_body() {
+async fn openai_proxy_redacts_provider_error_body_and_preserves_status() {
     let endpoint = spawn_gateway_response_server(
         StatusCode::SERVICE_UNAVAILABLE,
-        r#"{"error":{"message":"provider unavailable","type":"provider_error"}}"#,
+        r#"{"error":{"message":"credential hf_test_provider_secret failed for https://example.invalid/private-provider-url","type":"provider_error"}}"#,
     )
     .await;
     let (_temp_dir, state) = gateway_test_state().await;
@@ -516,12 +517,19 @@ async fn openai_proxy_preserves_provider_error_status_and_body() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         body.pointer("/error/message").and_then(Value::as_str),
-        Some("provider unavailable")
+        Some("A required operation is currently unavailable.")
     );
     assert_eq!(
         body.pointer("/error/type").and_then(Value::as_str),
-        Some("provider_error")
+        Some("pumas_error")
     );
+    assert_eq!(
+        body.pointer("/error/class").and_then(Value::as_str),
+        Some("unavailable")
+    );
+    let encoded = body.to_string();
+    assert!(!encoded.contains("hf_test_provider_secret"));
+    assert!(!encoded.contains("private-provider-url"));
 }
 
 #[tokio::test(start_paused = true)]

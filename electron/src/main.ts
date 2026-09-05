@@ -5,13 +5,27 @@
  * Manages window lifecycle, Python sidecar, and IPC communication.
  */
 
-import { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  shell,
+  nativeTheme,
+  type Event as ElectronEvent,
+} from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
+import { readLibraryDisplayScope } from './library-display-scope';
 import {
   persistLauncherRootOverride,
   resolveLauncherRoot,
 } from './launcher-root';
+import {
+  createLauncherRootSelectionHandler,
+  projectLauncherRootStartupState,
+  type LauncherRootStartupState,
+} from './launcher-root-recovery';
 import {
   sanitizeOpenDialogOptions,
   validateApiCallPayload,
@@ -21,9 +35,16 @@ import { resolveBackendBinaryPath } from './backend-path';
 import { PythonBridge } from './python-bridge';
 import {
   LauncherRootRecoveryRequiredError,
+  classifyBackendInitializationOutcome,
   observeBackendInitialization,
   projectBackendInitializationFailure,
 } from './startup-task';
+import {
+  createWindowPresentationOwner,
+  frameContainsWindowPresentationMarker,
+  WINDOW_PRESENTATION_MARKER_CSS,
+  type WindowPresentationOwner,
+} from './window-presentation';
 import log from 'electron-log';
 
 // Configure logging
@@ -49,15 +70,59 @@ const SERVING_STATUS_UNSUBSCRIBE_CHANNEL = 'serving-status:unsubscribe';
 const STATUS_TELEMETRY_UPDATE_CHANNEL = 'status-telemetry:update';
 const STATUS_TELEMETRY_SUBSCRIBE_CHANNEL = 'status-telemetry:subscribe';
 const STATUS_TELEMETRY_UNSUBSCRIBE_CHANNEL = 'status-telemetry:unsubscribe';
+const LAUNCHER_ROOT_PRESENTATION_COMMITTED_CHANNEL =
+  'launcher-root:presentation-committed';
+const LAUNCHER_ROOT_PRESENTATION_TIMEOUT_CHANNEL =
+  'launcher-root:presentation-timeout';
+const WINDOW_PRESENTATION_DEADLINE_MS = 30_000;
+const WINDOW_PRESENTATION_FALLBACK_GRACE_MS = 2_000;
 
 // Python sidecar bridge
 let pythonBridge: PythonBridge | null = null;
 let mainWindow: BrowserWindow | null = null;
+let windowPresentationOwner: WindowPresentationOwner | null = null;
 let backendInitializationPromise: Promise<void> | null = null;
+let launcherRootStartupState: LauncherRootStartupState = { status: 'initializing' };
+const selectLauncherRoot = createLauncherRootSelectionHandler({
+  chooseLibraryRoot: async () => {
+    const targetWindow = mainWindow;
+    if (!targetWindow || targetWindow.isDestroyed()) {
+      return { status: 'unavailable' };
+    }
+
+    const result = await dialog.showOpenDialog(targetWindow, {
+      title: 'Select Existing Pumas Library',
+      buttonLabel: 'Use This Library',
+      properties: ['openDirectory'],
+      message: 'Choose a launcher root, shared-resources directory, or shared-resources/models directory.',
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return { status: 'cancelled' };
+    }
+    return { status: 'selected', selectedPath: result.filePaths[0]! };
+  },
+  persistLauncherRoot: (selectedPath) => {
+    persistLauncherRootOverride(app.getPath('userData'), selectedPath);
+  },
+  requestRestart: () => {
+    app.relaunch();
+    setTimeout(() => {
+      app.quit();
+    }, 100);
+  },
+});
 let modelDownloadRendererSubscriptions = 0;
 let runtimeProfileRendererSubscriptions = 0;
 let servingStatusRendererSubscriptions = 0;
 let statusTelemetryRendererSubscriptions = 0;
+let applicationExitCode = 0;
+let applicationCleanupStarted = false;
+
+function requestApplicationExit(exitCode: number): void {
+  applicationExitCode = Math.max(applicationExitCode, exitCode);
+  process.exitCode = applicationExitCode;
+  app.quit();
+}
 
 function logBackendInitializationFailure(message: string, error: unknown): void {
   const diagnostic = projectBackendInitializationFailure(message, error);
@@ -74,12 +139,7 @@ function focusExistingWindow(): void {
     return;
   }
 
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
-  }
-
-  mainWindow.show();
-  mainWindow.focus();
+  windowPresentationOwner?.focusRequested();
 }
 
 function isReleaseSmokeMode(): boolean {
@@ -162,12 +222,11 @@ function getRuntimeIconPath(): string | undefined {
 /**
  * Create the main application window
  */
-async function createWindow(): Promise<void> {
+async function createWindow(): Promise<'shown' | 'fatal' | 'closed'> {
   log.info('Creating main window...');
   const windowIconPath = getRuntimeIconPath();
-  const releaseSmokeMode = isReleaseSmokeMode();
 
-  mainWindow = new BrowserWindow({
+  const createdWindow = new BrowserWindow({
     width: WINDOW_WIDTH,
     height: WINDOW_HEIGHT,
     minWidth: MIN_WINDOW_WIDTH,
@@ -185,15 +244,148 @@ async function createWindow(): Promise<void> {
       webSecurity: true,
     },
   });
+  mainWindow = createdWindow;
 
-  // Show window when ready - must be set up BEFORE loading content
-  const readyToShowPromise = new Promise<void>((resolve) => {
-    mainWindow?.once('ready-to-show', () => {
-      mainWindow?.show();
-      log.info('Window shown');
-      resolve();
-    });
+  let presentationTerminalSettled = false;
+  let settlePresentationTerminal: (
+    status: 'shown' | 'fatal' | 'closed'
+  ) => void = () => {};
+  const presentationTerminal = new Promise<'shown' | 'fatal' | 'closed'>((resolve) => {
+    settlePresentationTerminal = (status) => {
+      if (presentationTerminalSettled) {
+        return;
+      }
+      presentationTerminalSettled = true;
+      resolve(status);
+    };
   });
+  const presentationOwner = createWindowPresentationOwner({
+    getAuthoritativeStatus: () => launcherRootStartupState.status,
+    schedule: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearScheduled: (handle) => {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    },
+    subscribeToPresentationFrames: (callback) => {
+      if (createdWindow.webContents.isDestroyed()) {
+        throw new Error('Application window is unavailable.');
+      }
+      createdWindow.webContents.beginFrameSubscription(false, callback);
+    },
+    unsubscribeFromPresentationFrames: () => {
+      if (!createdWindow.webContents.isDestroyed()) {
+        createdWindow.webContents.endFrameSubscription();
+      }
+    },
+    insertPresentationMarker: (onInserted, onUnavailable) => {
+      if (createdWindow.webContents.isDestroyed()) {
+        onUnavailable();
+        return;
+      }
+      void createdWindow.webContents.insertCSS(WINDOW_PRESENTATION_MARKER_CSS).then(
+        (markerHandle) => {
+          if (typeof markerHandle !== 'string' || markerHandle.length === 0) {
+            onUnavailable();
+            return;
+          }
+          onInserted(markerHandle);
+        },
+        onUnavailable
+      );
+    },
+    removePresentationMarker: (markerHandle, onRemoved, onUnavailable) => {
+      if (
+        typeof markerHandle !== 'string' ||
+        createdWindow.webContents.isDestroyed()
+      ) {
+        onUnavailable();
+        return;
+      }
+      void createdWindow.webContents.removeInsertedCSS(markerHandle).then(
+        onRemoved,
+        onUnavailable
+      );
+    },
+    invalidatePresentationFrame: () => {
+      if (createdWindow.webContents.isDestroyed()) {
+        throw new Error('Application window is unavailable.');
+      }
+      createdWindow.webContents.invalidate();
+    },
+    frameContainsPresentationMarker: frameContainsWindowPresentationMarker,
+    showWindow: () => {
+      if (createdWindow.isDestroyed()) {
+        throw new Error('Application window is unavailable.');
+      }
+      createdWindow.show();
+      settlePresentationTerminal('shown');
+      log.info('Window shown after committed launcher-root presentation');
+    },
+    focusWindow: () => {
+      if (createdWindow.isDestroyed()) {
+        throw new Error('Application window is unavailable.');
+      }
+      if (createdWindow.isMinimized()) {
+        createdWindow.restore();
+      }
+      createdWindow.focus();
+    },
+    reportFocusUnavailable: () => {
+      log.warn('Application window focus request was unavailable.');
+    },
+    sendVisibilityTimeout: () => {
+      if (createdWindow.isDestroyed()) {
+        throw new Error('Application window is unavailable.');
+      }
+      createdWindow.webContents.send(LAUNCHER_ROOT_PRESENTATION_TIMEOUT_CHANNEL);
+    },
+    showNativeFatal: () => {
+      settlePresentationTerminal('fatal');
+      dialog.showErrorBox(
+        'Pumas Library could not start',
+        'The application window could not be prepared safely.'
+      );
+    },
+    destroyWindow: () => {
+      if (!createdWindow.isDestroyed()) {
+        createdWindow.destroy();
+      }
+    },
+    quitApplication: () => {
+      requestApplicationExit(1);
+    },
+  }, {
+    presentationDeadlineMs: WINDOW_PRESENTATION_DEADLINE_MS,
+    fallbackGraceMs: WINDOW_PRESENTATION_FALLBACK_GRACE_MS,
+  });
+  windowPresentationOwner = presentationOwner;
+
+  // Browser readiness alone cannot reveal an unverified launcher-root presentation.
+  const handleBrowserReady = () => {
+    presentationOwner.browserReady();
+  };
+  const handleDocumentChanged = (
+    _event: ElectronEvent,
+    _url: string,
+    isInPlace: boolean,
+    isMainFrame: boolean
+  ) => {
+    if (isMainFrame && !isInPlace) {
+      presentationOwner.documentChanged();
+    }
+  };
+  const handleDocumentReady = (_event: ElectronEvent, isMainFrame: boolean) => {
+    if (isMainFrame) {
+      presentationOwner.documentReady();
+    }
+  };
+  const handlePreloadFailure = () => {
+    log.error('Application preload was unavailable.');
+    presentationOwner.preloadFailed();
+  };
+  createdWindow.on('ready-to-show', handleBrowserReady);
+  createdWindow.webContents.on('did-start-navigation', handleDocumentChanged);
+  createdWindow.webContents.on('did-frame-finish-load', handleDocumentReady);
+  createdWindow.webContents.on('preload-error', handlePreloadFailure);
 
   // Load frontend content
   const frontendPath = getFrontendPath();
@@ -203,7 +395,7 @@ async function createWindow(): Promise<void> {
   if (isDev) {
     log.info(`Loading development server: ${frontendPath}`);
     try {
-      await mainWindow.loadURL(frontendPath);
+      await createdWindow.loadURL(frontendPath);
     } catch {
       // Dev server not running, fall back to production build
       log.warn('Dev server not available, falling back to production build');
@@ -211,20 +403,50 @@ async function createWindow(): Promise<void> {
         ? path.join(process.resourcesPath, 'frontend', 'index.html')
         : path.join(__dirname, '..', '..', 'frontend', 'dist', 'index.html');
       log.info(`Loading production build: ${prodPath}`);
-      await mainWindow.loadFile(prodPath);
+      try {
+        await createdWindow.loadFile(prodPath);
+      } catch {
+        presentationOwner.loadFailed();
+        return await presentationTerminal;
+      }
     }
   } else {
     log.info(`Loading production build: ${frontendPath}`);
-    await mainWindow.loadFile(frontendPath);
+    try {
+      await createdWindow.loadFile(frontendPath);
+    } catch {
+      presentationOwner.loadFailed();
+      return await presentationTerminal;
+    }
   }
 
   // Open DevTools in development mode
   if (wantsDevTools) {
-    mainWindow.webContents.openDevTools({ mode: 'detach' });
+    createdWindow.webContents.openDevTools({ mode: 'detach' });
   }
 
   // Handle window closed
-  mainWindow.on('closed', () => {
+  createdWindow.on('closed', () => {
+    presentationOwner.dispose();
+    settlePresentationTerminal('closed');
+    createdWindow.removeListener('ready-to-show', handleBrowserReady);
+    if (!createdWindow.isDestroyed() && !createdWindow.webContents.isDestroyed()) {
+      createdWindow.webContents.removeListener(
+        'did-start-navigation',
+        handleDocumentChanged
+      );
+      createdWindow.webContents.removeListener(
+        'did-frame-finish-load',
+        handleDocumentReady
+      );
+      createdWindow.webContents.removeListener('preload-error', handlePreloadFailure);
+    }
+    if (windowPresentationOwner === presentationOwner) {
+      windowPresentationOwner = null;
+    }
+    if (mainWindow !== createdWindow) {
+      return;
+    }
     servingStatusRendererSubscriptions = 0;
     runtimeProfileRendererSubscriptions = 0;
     statusTelemetryRendererSubscriptions = 0;
@@ -234,11 +456,11 @@ async function createWindow(): Promise<void> {
     mainWindow = null;
   });
 
-  if (releaseSmokeMode) {
-    await readyToShowPromise;
+  const presentationStatus = await presentationTerminal;
+  if (presentationStatus === 'shown') {
+    log.info('Main window created');
   }
-
-  log.info('Main window created');
+  return presentationStatus;
 }
 
 /**
@@ -284,45 +506,47 @@ function registerIPCHandlers(): void {
     return await dialog.showOpenDialog(mainWindow, sanitizeOpenDialogOptions(options));
   });
 
+  ipcMain.handle('launcher:getRootState', () => launcherRootStartupState);
+  // A snapshot only: never wait for the backend or perform IO in synchronous IPC.
+  ipcMain.on('launcher:getRootBootstrap', (event) => {
+    const window = mainWindow;
+    event.returnValue = window && !window.isDestroyed() &&
+      event.sender === window.webContents &&
+      event.senderFrame === window.webContents.mainFrame
+      ? launcherRootStartupState
+      : null;
+  });
+
+  ipcMain.handle(
+    LAUNCHER_ROOT_PRESENTATION_COMMITTED_CHANNEL,
+    (event, presentation: unknown) => {
+      const targetWindow = mainWindow;
+      const targetOwner = windowPresentationOwner;
+      if (!targetWindow || targetWindow.isDestroyed() || !targetOwner) {
+        return;
+      }
+      const outcome = targetOwner.rendererCommitted({
+        currentTopDocument:
+          event.sender === targetWindow.webContents &&
+          event.senderFrame === targetWindow.webContents.mainFrame,
+        presentation,
+      });
+      if (outcome.status === 'invalid') {
+        throw new Error('Invalid launcher-root presentation state.');
+      }
+    }
+  );
+
   ipcMain.handle('launcher:chooseLibraryRoot', async () => {
-    if (!mainWindow) {
-      return { success: false, error: 'Main window is not available.' };
-    }
-
-    const result = await dialog.showOpenDialog(mainWindow, {
-      title: 'Select Existing Pumas Library',
-      buttonLabel: 'Use This Library',
-      properties: ['openDirectory'],
-      message: 'Choose a launcher root, shared-resources directory, or shared-resources/models directory.',
-    });
-
-    if (result.canceled || result.filePaths.length === 0) {
-      return { success: false, cancelled: true };
-    }
-
-    try {
-      const selectedPath = result.filePaths[0]!;
-      const config = persistLauncherRootOverride(app.getPath('userData'), selectedPath);
-
+    const result = await selectLauncherRoot(launcherRootStartupState);
+    if (result.status === 'restarting') {
       log.info('Persisted launcher root override');
-
-      setTimeout(() => {
-        app.relaunch();
-        app.quit();
-      }, 100);
-
-      return {
-        success: true,
-        cancelled: false,
-        restarting: true,
-        selectedPath: config.selectedPath ?? selectedPath,
-        launcherRoot: config.launcherRoot,
-      };
-    } catch {
-      const message = 'Failed to persist launcher root selection.';
-      log.error(message);
-      return { success: false, cancelled: false, error: message };
+    } else if (result.status === 'recovery-required') {
+      log.error(
+        `Launcher root selection requires recovery: ${result.reason} (${result.authorityState}).`
+      );
     }
+    return result;
   });
 
   // Shell handlers
@@ -512,6 +736,12 @@ async function initializeBackend(): Promise<void> {
       isPackaged: app.isPackaged,
       userDataPath: app.getPath('userData'),
     });
+    launcherRootStartupState = projectLauncherRootStartupState(
+      launcherRootResolution,
+      launcherRootResolution.status === 'resolved'
+        ? readLibraryDisplayScope(launcherRootResolution.launcherRoot)
+        : null
+    );
     if (launcherRootResolution.status === 'recovery-required') {
       throw new LauncherRootRecoveryRequiredError(launcherRootResolution);
     }
@@ -599,13 +829,40 @@ if (!hasSingleInstanceLock) {
       // Attach rejection handling before window creation can delay consumption.
       const backendInitialization = observeBackendInitialization(initializeBackend());
 
-      // Show the window immediately; backend warmup continues in parallel.
-      await createWindow();
+      if (!releaseSmokeMode) {
+        void backendInitialization.then((outcome) => {
+          const disposition = classifyBackendInitializationOutcome(outcome, 'desktop');
+          if (disposition.status === 'ready') {
+            return;
+          }
+
+          if (disposition.status === 'recovery-required') {
+            log.error('Launcher root recovery is required before backend startup.');
+            return;
+          }
+
+          logBackendInitializationFailure(
+            'Failed to initialize backend bridge',
+            disposition.error
+          );
+          requestApplicationExit(1);
+        });
+      }
+
+      // Backend warmup and the hidden window presentation proceed in parallel.
+      const presentationStatus = await createWindow();
+      if (presentationStatus !== 'shown') {
+        return;
+      }
 
       if (releaseSmokeMode) {
         const outcome = await backendInitialization;
-        if (outcome.status === 'rejected') {
-          throw outcome.error;
+        const disposition = classifyBackendInitializationOutcome(
+          outcome,
+          'release-smoke'
+        );
+        if (disposition.status === 'fatal') {
+          throw disposition.error;
         }
 
         const exitDelayMs = getReleaseSmokeExitDelayMs();
@@ -616,15 +873,9 @@ if (!hasSingleInstanceLock) {
         return;
       }
 
-      void backendInitialization.then((outcome) => {
-        if (outcome.status === 'rejected') {
-          logBackendInitializationFailure('Failed to initialize backend bridge', outcome.error);
-          app.quit();
-        }
-      });
     } catch (error) {
       logBackendInitializationFailure('Failed to initialize app', error);
-      app.quit();
+      requestApplicationExit(1);
     }
   });
 }
@@ -644,10 +895,23 @@ app.on('activate', async () => {
   }
 });
 
-app.on('before-quit', async (event) => {
+app.on('before-quit', (event) => {
   event.preventDefault();
-  await cleanup();
-  app.exit(0);
+  if (applicationCleanupStarted) {
+    return;
+  }
+  applicationCleanupStarted = true;
+  void cleanup().then(
+    () => {
+      app.exit(applicationExitCode);
+    },
+    () => {
+      log.error('Cleanup failed.');
+      applicationExitCode = Math.max(applicationExitCode, 1);
+      process.exitCode = applicationExitCode;
+      app.exit(applicationExitCode);
+    }
+  );
 });
 
 // Handle uncaught exceptions

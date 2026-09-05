@@ -56,7 +56,8 @@
   },
   "include": [
     "src/**/*.ts",
-    "src/**/*.tsx"
+    "src/**/*.tsx",
+    "conformance/**/*.test.tsx"
   ],
   "exclude": [
     "node_modules",

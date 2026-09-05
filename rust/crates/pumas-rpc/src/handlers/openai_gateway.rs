@@ -1,6 +1,7 @@
 //! OpenAI-compatible gateway handlers backed by Pumas serving state.
 
 use super::openai_gateway_onnx::handle_onnx_embedding;
+use crate::contract::PublicError;
 use crate::server::AppState;
 use axum::{
     body::Bytes,
@@ -43,16 +44,10 @@ pub async fn handle_openai_models(State(state): State<Arc<AppState>>) -> impl In
             }))
             .into_response()
         }
-        Err(error) => (
+        Err(error) => openai_public_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": {
-                    "message": error.to_string(),
-                    "type": "pumas_error"
-                }
-            })),
-        )
-            .into_response(),
+            PublicError::from(&error),
+        ),
     }
 }
 
@@ -113,7 +108,10 @@ pub async fn handle_openai_proxy(
             return openai_error_response_with_code(StatusCode::CONFLICT, code, message);
         }
         Err(error) => {
-            return openai_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+            return openai_public_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                PublicError::from(&error),
+            );
         }
     };
 
@@ -167,7 +165,7 @@ pub async fn handle_openai_proxy(
         .await
     {
         Ok(response) => proxy_response(response).await,
-        Err(error) => openai_error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+        Err(_) => openai_public_error_response(StatusCode::BAD_GATEWAY, PublicError::unavailable()),
     }
 }
 
@@ -308,6 +306,9 @@ fn resolve_openai_served_model(
 
 async fn proxy_response(response: reqwest::Response) -> Response {
     let status = response.status();
+    if !status.is_success() {
+        return openai_public_error_response(status, PublicError::unavailable());
+    }
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -315,7 +316,7 @@ async fn proxy_response(response: reqwest::Response) -> Response {
         .and_then(|value| HeaderValue::from_str(value).ok());
     match response.bytes().await {
         Ok(bytes) => response_with_bytes(status, content_type, bytes),
-        Err(error) => openai_error_response(StatusCode::BAD_GATEWAY, error.to_string()),
+        Err(_) => openai_public_error_response(StatusCode::BAD_GATEWAY, PublicError::unavailable()),
     }
 }
 
@@ -341,6 +342,21 @@ pub(crate) fn openai_error_response_with_code(
     message: impl Into<String>,
 ) -> Response {
     openai_error_response_body(status, message, Some(code))
+}
+
+fn openai_public_error_response(status: StatusCode, error: PublicError) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": error.message,
+                "type": "pumas_error",
+                "code": error.code,
+                "class": error.class,
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn openai_error_response_body(

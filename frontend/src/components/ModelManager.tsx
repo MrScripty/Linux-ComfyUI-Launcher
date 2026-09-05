@@ -147,11 +147,9 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
     handleRecoverPartialDownload,
     handleToggleRelated,
     openRemoteUrl,
-    recoveringPartialRepoIds,
+    recoveringPartialModelIds,
     relatedModelsById,
   } = useModelLibraryActions({
-    cancelDownload,
-    downloadStatusByRepo,
     onModelsImported,
     setDownloadErrors,
     startDownload,
@@ -165,7 +163,10 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
 
   // Computed Values
   const totalModels = useMemo(() => {
-    return localModelGroups.reduce((sum: number, group: ModelCategory) => sum + group.models.length, 0);
+    return localModelGroups.reduce(
+      (sum: number, group: ModelCategory) => sum + group.models.filter((model) => model.provenance !== 'activity').length,
+      0
+    );
   }, [localModelGroups]);
 
   const integrityIssueCount = useMemo(() => {
@@ -303,7 +304,7 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
                   onResumeDownload={resumeDownload}
                   onCancelDownload={cancelDownload}
                   onRecoverPartialDownload={handleRecoverPartialDownload}
-                  recoveringPartialRepoIds={recoveringPartialRepoIds}
+                  recoveringPartialModelIds={recoveringPartialModelIds}
                   downloadErrors={downloadErrors}
                   onDeleteModel={handleDeleteModel}
                   onConvertModel={handleConvertModel}

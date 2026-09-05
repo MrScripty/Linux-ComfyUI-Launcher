@@ -10,6 +10,35 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::{info, warn};
 
+async fn start_recovered_download(
+    client: &model_library::HuggingFaceClient,
+    repo_id: &str,
+    dest: &std::path::Path,
+    model_type: Option<String>,
+    filenames: Option<Vec<String>>,
+) -> Result<String> {
+    let (family, official_name) = repo_id.split_once('/').ok_or_else(|| PumasError::Config {
+        message: "Invalid repo_id format (expected 'owner/name')".to_string(),
+    })?;
+    let request = model_library::DownloadRequest {
+        repo_id: repo_id.to_string(),
+        family: family.to_string(),
+        official_name: official_name.to_string(),
+        model_type,
+        quant: None,
+        filename: None,
+        filenames,
+        pipeline_tag: None,
+        bundle_format: None,
+        pipeline_class: None,
+        release_date: None,
+        download_url: None,
+        model_card_json: None,
+        license_status: None,
+    };
+    client.start_download(&request, dest, None).await
+}
+
 async fn load_hf_model_snapshot(
     library: Arc<model_library::ModelLibrary>,
     model_dir: std::path::PathBuf,
@@ -122,19 +151,14 @@ impl PumasApi {
         limit: usize,
         hydrate_limit: usize,
     ) -> Result<Vec<models::HuggingFaceModel>> {
-        if let Some(ref client) = self.primary().hf_client {
-            let params = model_library::HfSearchParams {
-                query: query.to_string(),
-                kind: kind.map(String::from),
-                limit: Some(limit),
-                hydrate_limit: Some(hydrate_limit.min(limit)),
-                ..Default::default()
-            };
-            // search() handles caching transparently
-            client.search(&params).await
-        } else {
-            Ok(vec![])
-        }
+        super::state_hf::search_hf_models_with_hydration(
+            self.primary(),
+            query,
+            kind,
+            limit,
+            hydrate_limit,
+        )
+        .await
     }
 
     /// Get exact download details for a single HuggingFace repository.
@@ -314,48 +338,28 @@ impl PumasApi {
     pub async fn get_hf_download_progress(
         &self,
         download_id: &str,
-    ) -> Option<models::ModelDownloadProgress> {
-        if let Some(ref client) = self.primary().hf_client {
-            client.get_download_progress(download_id).await
-        } else {
-            None
-        }
+    ) -> Result<Option<models::ModelDownloadProgress>> {
+        super::state_hf::get_hf_download_progress(self.primary(), download_id).await
     }
 
     /// Cancel a HuggingFace download.
     pub async fn cancel_hf_download(&self, download_id: &str) -> Result<bool> {
-        if let Some(ref client) = self.primary().hf_client {
-            client.cancel_download(download_id).await
-        } else {
-            Ok(false)
-        }
+        super::state_hf::cancel_hf_download(self.primary(), download_id).await
     }
 
     /// Pause a HuggingFace download, preserving the `.part` file for later resume.
     pub async fn pause_hf_download(&self, download_id: &str) -> Result<bool> {
-        if let Some(ref client) = self.primary().hf_client {
-            client.pause_download(download_id).await
-        } else {
-            Ok(false)
-        }
+        super::state_hf::pause_hf_download(self.primary(), download_id).await
     }
 
     /// Resume a paused or errored HuggingFace download.
     pub async fn resume_hf_download(&self, download_id: &str) -> Result<bool> {
-        if let Some(ref client) = self.primary().hf_client {
-            client.resume_download(download_id).await
-        } else {
-            Ok(false)
-        }
+        super::state_hf::resume_hf_download(self.primary(), download_id).await
     }
 
     /// List all HuggingFace downloads (active, paused, completed, etc.).
-    pub async fn list_hf_downloads(&self) -> Vec<models::ModelDownloadProgress> {
-        if let Some(ref client) = self.primary().hf_client {
-            client.list_downloads().await
-        } else {
-            vec![]
-        }
+    pub async fn list_hf_downloads(&self) -> Result<Vec<models::ModelDownloadProgress>> {
+        super::state_hf::list_hf_downloads(self.primary()).await
     }
 
     /// Snapshot all HuggingFace downloads with a monotonic cursor.
@@ -411,29 +415,10 @@ impl PumasApi {
     ///
     /// These are downloads that lost their tracking state (e.g. due to crash).
     /// Use `recover_download()` with the correct repo_id to resume them.
-    pub async fn list_interrupted_downloads(&self) -> Vec<model_library::InterruptedDownload> {
-        let primary = self.primary();
-        let model_importer = primary.model_importer.clone();
-        let persistence = primary
-            .hf_client
-            .as_ref()
-            .and_then(|client| client.persistence().cloned());
-
-        tokio::task::spawn_blocking(move || {
-            let known_dirs: std::collections::HashSet<std::path::PathBuf> = persistence
-                .map(|persistence| {
-                    persistence
-                        .load_all()
-                        .into_iter()
-                        .map(|e| e.dest_dir)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            model_importer.find_interrupted_downloads(&known_dirs)
-        })
-        .await
-        .unwrap_or_default()
+    pub async fn list_interrupted_downloads(
+        &self,
+    ) -> Result<Vec<model_library::InterruptedDownload>> {
+        super::state_hf::list_interrupted_downloads(self.primary()).await
     }
 
     /// Recover an interrupted download that lost its persistence state.
@@ -452,19 +437,6 @@ impl PumasApi {
             .ok_or_else(|| PumasError::Config {
                 message: "HuggingFace client not initialized".to_string(),
             })?;
-
-        // Parse repo_id into family/name
-        let parts: Vec<&str> = repo_id.splitn(2, '/').collect();
-        if parts.len() != 2 {
-            return Err(PumasError::Config {
-                message: format!(
-                    "Invalid repo_id format (expected 'owner/name'): {}",
-                    repo_id
-                ),
-            });
-        }
-        let family = parts[0];
-        let official_name = parts[1];
 
         // Determine model_type from directory path relative to library root
         let library_root = primary.model_library.library_root();
@@ -495,24 +467,7 @@ impl PumasApi {
             );
         }
 
-        let request = model_library::DownloadRequest {
-            repo_id: repo_id.to_string(),
-            family: family.to_string(),
-            official_name: official_name.to_string(),
-            model_type,
-            quant: None,
-            filename: None,
-            filenames: recovery_filenames,
-            pipeline_tag: None,
-            bundle_format: None,
-            pipeline_class: None,
-            release_date: None,
-            download_url: None,
-            model_card_json: None,
-            license_status: None,
-        };
-
-        client.start_download(&request, &dest, None).await
+        start_recovered_download(client, repo_id, &dest, model_type, recovery_filenames).await
     }
 
     /// Resume a partial download from a previously issued model-state ticket.
@@ -1433,6 +1388,7 @@ fn partial_download_error(error: &PumasError) -> models::PartialDownloadAction {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
     pub(in crate::api) async fn recovery_api_fixture(
         root: &std::path::Path,
         download_base_url: Option<String>,

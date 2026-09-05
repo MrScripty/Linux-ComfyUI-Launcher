@@ -2,22 +2,13 @@
 
 #[cfg(feature = "inference-plugins")]
 use super::{get_version_manager, path_exists, require_str_param};
-use super::{parse_params, validate_existing_local_path, validate_external_url};
+use super::{validate_existing_local_path, validate_external_url};
+use crate::contract::OperationStatusOutcome;
 use crate::server::AppState;
-use serde::Deserialize;
+#[cfg(feature = "inference-plugins")]
 use serde_json::{json, Value};
 #[cfg(feature = "inference-plugins")]
 use tracing::{info, warn};
-
-#[derive(Debug, Deserialize)]
-struct OpenPathParams {
-    path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenUrlParams {
-    url: String,
-}
 
 #[cfg(feature = "inference-plugins")]
 pub async fn launch_ollama(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
@@ -25,15 +16,18 @@ pub async fn launch_ollama(state: &AppState, _params: &Value) -> pumas_library::
     info!("launch_ollama: checking for ollama version manager");
     if let Some(vm) = get_version_manager(state, "ollama").await {
         let installed = vm.get_installed_versions().await?;
-        info!("launch_ollama: installed versions: {:?}", installed);
+        info!(
+            installed_version_count = installed.len(),
+            "launch_ollama: installed versions resolved"
+        );
         let active = vm.get_active_version().await?;
-        info!("launch_ollama: active version: {:?}", active);
+        info!(
+            active_version_present = active.is_some(),
+            "launch_ollama: active version resolved"
+        );
         if let Some(tag) = active {
             let version_dir = vm.version_path(&tag);
-            info!(
-                "launch_ollama: launching tag={} from {:?}",
-                tag, version_dir
-            );
+            info!("launch_ollama: launching active version");
             let response = state.api.launch_ollama(&tag, &version_dir).await?;
             info!("launch_ollama: result success={}", response.success);
             Ok(serde_json::to_value(response)?)
@@ -70,10 +64,13 @@ pub async fn launch_torch(state: &AppState, _params: &Value) -> pumas_library::R
     info!("launch_torch: checking for torch version manager");
     if let Some(vm) = get_version_manager(state, "torch").await {
         let active = vm.get_active_version().await?;
-        info!("launch_torch: active version: {:?}", active);
+        info!(
+            active_version_present = active.is_some(),
+            "launch_torch: active version resolved"
+        );
         if let Some(tag) = active {
             let version_dir = vm.version_path(&tag);
-            info!("launch_torch: launching tag={} from {:?}", tag, version_dir);
+            info!("launch_torch: launching active version");
             let response = state.api.launch_torch(&tag, &version_dir).await?;
             info!("launch_torch: result success={}", response.success);
             Ok(serde_json::to_value(response)?)
@@ -105,22 +102,26 @@ pub async fn is_torch_running(state: &AppState, _params: &Value) -> pumas_librar
     Ok(serde_json::to_value(running)?)
 }
 
-pub async fn open_path(state: &AppState, params: &Value) -> pumas_library::Result<Value> {
-    let command: OpenPathParams = parse_params("open_path", params)?;
-    let path = validate_existing_local_path(command.path, "path").await?;
+pub async fn open_path(
+    state: &AppState,
+    path: String,
+) -> pumas_library::Result<OperationStatusOutcome> {
+    let path = validate_existing_local_path(path, "path").await?;
     let path = path.to_string_lossy().to_string();
     match state.api.open_path(&path).await {
-        Ok(()) => Ok(json!({"success": true})),
-        Err(e) => Ok(json!({"success": false, "error": e.to_string()})),
+        Ok(()) => Ok(OperationStatusOutcome::success()),
+        Err(_) => Ok(OperationStatusOutcome::failed()),
     }
 }
 
-pub async fn open_url(state: &AppState, params: &Value) -> pumas_library::Result<Value> {
-    let command: OpenUrlParams = parse_params("open_url", params)?;
-    let url = validate_external_url(command.url)?;
+pub async fn open_url(
+    state: &AppState,
+    url: String,
+) -> pumas_library::Result<OperationStatusOutcome> {
+    let url = validate_external_url(url)?;
     match state.api.open_url(&url).await {
-        Ok(()) => Ok(json!({"success": true})),
-        Err(e) => Ok(json!({"success": false, "error": e.to_string()})),
+        Ok(()) => Ok(OperationStatusOutcome::success()),
+        Err(_) => Ok(OperationStatusOutcome::failed()),
     }
 }
 
@@ -134,7 +135,10 @@ pub async fn open_active_install(state: &AppState, params: &Value) -> pumas_libr
             if path_exists(&version_dir).await? {
                 match state.api.open_directory(&version_dir).await {
                     Ok(()) => Ok(json!({"success": true})),
-                    Err(e) => Ok(json!({"success": false, "error": e.to_string()})),
+                    Err(e) => Ok(json!({
+                        "success": false,
+                        "error": crate::contract::PublicError::from(&e).message
+                    })),
                 }
             } else {
                 Ok(json!({"success": false, "error": "Version directory not found"}))

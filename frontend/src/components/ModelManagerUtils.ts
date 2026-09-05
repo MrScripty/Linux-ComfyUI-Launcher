@@ -18,6 +18,7 @@ export function buildDownloadingModels(
       const repoId = status.repoId || downloadKey;
       const name = status.modelName || repoId.split('/').pop() || repoId;
       return {
+        provenance: 'activity',
         id: `download:${downloadKey}`,
         name,
         category: status.modelType || 'llm',
@@ -35,90 +36,6 @@ export function buildDownloadingModels(
     });
 }
 
-function normalizeIdentity(value?: string | null): string | undefined {
-  const normalized = value?.trim().toLowerCase();
-  return normalized || undefined;
-}
-
-function normalizeArtifactToken(value?: string | null): string | undefined {
-  const normalized = normalizeIdentity(value)?.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-  return normalized || undefined;
-}
-
-function getDownloadArtifactIdentity(download: ModelInfo): string | undefined {
-  return normalizeIdentity(download.downloadSelectedArtifactId ?? download.downloadArtifactId);
-}
-
-function getModelArtifactIdentity(model: ModelInfo): string | undefined {
-  return normalizeIdentity(model.selectedArtifactId);
-}
-
-function isFileGroupOrRepoArtifactIdentity(artifactIdentity: string): boolean {
-  const normalized = normalizeIdentity(artifactIdentity);
-  const artifactToken = normalizeArtifactToken(artifactIdentity);
-  return Boolean(
-    normalized &&
-      artifactToken &&
-      (normalized.endsWith('__full_repo') ||
-        normalized.includes('__files_') ||
-        artifactToken.endsWith('_full_repo') ||
-        artifactToken.includes('_files_'))
-  );
-}
-
-function artifactIdentityContainsQuant(artifactIdentity: string, quant?: string | null): boolean {
-  const quantToken = normalizeArtifactToken(quant);
-  if (!quantToken) {
-    return false;
-  }
-
-  const artifactToken = normalizeArtifactToken(artifactIdentity);
-  return Boolean(
-    artifactToken &&
-      (artifactToken === quantToken ||
-        artifactToken.endsWith(`_${quantToken}`) ||
-        artifactToken.includes(`__${quantToken}`))
-  );
-}
-
-function downloadMatchesLocalModel(model: ModelInfo, download: ModelInfo): boolean {
-  const modelRepoId = normalizeIdentity(model.repoId);
-  const downloadRepoId = normalizeIdentity(download.downloadRepoId);
-  if (!modelRepoId || !downloadRepoId || modelRepoId !== downloadRepoId) {
-    return false;
-  }
-
-  const downloadArtifactIdentity = getDownloadArtifactIdentity(download);
-  if (!downloadArtifactIdentity) {
-    return true;
-  }
-
-  const modelArtifactIdentity = getModelArtifactIdentity(model);
-  if (modelArtifactIdentity) {
-    return modelArtifactIdentity === downloadArtifactIdentity;
-  }
-
-  return (
-    artifactIdentityContainsQuant(downloadArtifactIdentity, model.selectedArtifactQuant) ||
-    artifactIdentityContainsQuant(downloadArtifactIdentity, model.quant) ||
-    (Boolean(model.isPartialDownload) && isFileGroupOrRepoArtifactIdentity(downloadArtifactIdentity))
-  );
-}
-
-function mergeDownloadState(model: ModelInfo, download: ModelInfo): ModelInfo {
-  return {
-    ...model,
-    isDownloading: true,
-    downloadProgress: download.downloadProgress,
-    downloadStatus: download.downloadStatus,
-    downloadKey: download.downloadKey,
-    downloadRepoId: download.downloadRepoId,
-    downloadSelectedArtifactId: download.downloadSelectedArtifactId,
-    downloadArtifactId: download.downloadArtifactId,
-    downloadTotalBytes: download.downloadTotalBytes,
-  };
-}
-
 export function mergeLocalModelGroups(
   modelGroups: ModelCategory[],
   downloadingModels: ModelInfo[]
@@ -127,41 +44,12 @@ export function mergeLocalModelGroups(
     return modelGroups;
   }
 
-  const mergedDownloadKeys = new Set<string>();
-  const groupMap = new Map<string, ModelInfo[]>();
-  const repoIdsWithPartialRows = new Set(
-    modelGroups.flatMap((group) =>
-      group.models
-        .filter((model) => model.isPartialDownload)
-        .map((model) => normalizeIdentity(model.repoId))
-        .filter((repoId): repoId is string => Boolean(repoId))
-    )
+  // The download contract has no library model ID. Repository and artifact
+  // labels do not authorize attaching activity to a catalog row.
+  const groupMap = new Map<string, ModelInfo[]>(
+    modelGroups.map((group) => [group.category, [...group.models]])
   );
-
-  modelGroups.forEach((group) => {
-    const models = group.models.map((model) => {
-      const download = downloadingModels.find((candidate) =>
-        !mergedDownloadKeys.has(candidate.downloadKey ?? candidate.id) &&
-        !(
-          !model.isPartialDownload &&
-          !getDownloadArtifactIdentity(candidate) &&
-          repoIdsWithPartialRows.has(normalizeIdentity(model.repoId) ?? '')
-        ) &&
-        downloadMatchesLocalModel(model, candidate)
-      );
-      if (download) {
-        mergedDownloadKeys.add(download.downloadKey ?? download.id);
-        return mergeDownloadState(model, download);
-      }
-      return model;
-    });
-    groupMap.set(group.category, models);
-  });
-
-  const orphanDownloads = downloadingModels.filter(
-    (download) => !mergedDownloadKeys.has(download.downloadKey ?? download.id)
-  );
-  orphanDownloads.forEach((model) => {
+  downloadingModels.forEach((model) => {
     const existing = groupMap.get(model.category);
     if (existing) {
       groupMap.set(model.category, [model, ...existing]);
@@ -173,7 +61,7 @@ export function mergeLocalModelGroups(
   const orderedCategories = Array.from(
     new Set([
       ...modelGroups.map((group) => group.category),
-      ...orphanDownloads.map((model) => model.category),
+      ...downloadingModels.map((model) => model.category),
     ])
   );
 

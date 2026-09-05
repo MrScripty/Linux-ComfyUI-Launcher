@@ -22,12 +22,10 @@ import type {
   HfAuthStatusResponse,
   InferenceParamSchema,
   InferenceSettingsResponse,
-  ListInterruptedDownloadsResponse,
   ListModelDownloadsResponse,
   ModelDownloadResponse,
   ModelDownloadStatusResponse,
   ModelsResponse,
-  RecoverDownloadResponse,
   RelatedModelsResponse,
   ResumePartialDownloadResponse,
   ScanSharedStorageResponse,
@@ -87,9 +85,7 @@ export interface DesktopBridgeModelAPI {
   pause_model_download(downloadId: string): Promise<BaseResponse>;
   resume_model_download(downloadId: string): Promise<BaseResponse>;
   list_model_downloads(): Promise<ListModelDownloadsResponse>;
-  list_interrupted_downloads(): Promise<ListInterruptedDownloadsResponse>;
-  recover_download(repoId: string, destDir: string): Promise<RecoverDownloadResponse>;
-  resume_partial_download(repoId: string, destDir: string): Promise<ResumePartialDownloadResponse>;
+  resume_partial_download(modelId: string, recoveryToken: string): Promise<ResumePartialDownloadResponse>;
 
   // HuggingFace Authentication
   set_hf_token(token: string): Promise<BaseResponse>;
@@ -180,9 +176,7 @@ export interface DesktopBridgeModelAPI {
   search_models_fts(
     query: string,
     limit?: number,
-    offset?: number,
-    modelType?: string | null,
-    tags?: string[] | null
+    offset?: number
   ): Promise<FTSSearchResponse>;
 
   /**

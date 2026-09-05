@@ -28,7 +28,7 @@ pub async fn torch_load_model(state: &AppState, params: &Value) -> pumas_library
         Err(err) => {
             return Ok(json!({
                 "success": false,
-                "error": err.to_string()
+                "error": crate::contract::PublicError::from(&err).message
             }));
         }
     };

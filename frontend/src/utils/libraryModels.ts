@@ -1,91 +1,45 @@
 import type { ModelCategory, ModelInfo } from '../types/apps';
-import type { ModelRecord, ModelRecordMetadata } from '../types/api';
-
-function asString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
-}
-
-function asNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-}
-
-function asBoolean(value: unknown): boolean | undefined {
-  return typeof value === 'boolean' ? value : undefined;
-}
-
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function asStringArray(value: unknown): string[] | undefined {
-  const strings = asArray(value).filter((item): item is string => typeof item === 'string');
-  return strings.length > 0 ? strings : undefined;
-}
-
-function getIntegrityIssueMessage(metadata: ModelRecordMetadata): string | undefined {
-  if (!metadata.integrity_issue_duplicate_repo_id) {
-    return undefined;
-  }
-
-  const count = metadata.integrity_issue_duplicate_repo_id_count ?? 2;
-  return `Duplicate artifact entries detected (${count} paths). Run library reconciliation.`;
-}
+import type { CatalogModel } from '../generated/desktop-contract';
 
 function getConvertibleFormat(format?: string): ModelInfo['primaryFormat'] {
-  if (format === 'gguf' || format === 'safetensors') {
-    return format;
-  }
-  return undefined;
+  return format === 'gguf' || format === 'safetensors' ? format : undefined;
 }
 
-export function mapModelRecordToInfo(model: ModelRecord): ModelInfo {
-  const metadata = model.metadata;
-  const fileName = model.id.split('/').pop() || model.id;
-  const displayName = model.officialName ?? model.cleanedName ?? fileName;
-  const dependencyBindings = asArray(metadata.dependency_bindings);
-  const format = asString(metadata.primary_format);
-
+/** One projection owns both full catalog and catalog-search row semantics. */
+export function projectCatalogModel(model: CatalogModel): ModelInfo {
+  const partial = model.artifact.state === 'partial' ? model.artifact : undefined;
   return {
+    provenance: 'catalog',
     id: model.id,
-    name: displayName,
-    category: model.modelType || 'uncategorized',
+    name: model.displayName,
+    category: model.modelType,
     path: model.id,
-    modelDir: model.path,
-    format,
-    quant: asString(metadata.quantization),
-    size: asNumber(metadata.size_bytes),
-    date: asString(metadata.added_date),
-    relatedAvailable: asBoolean(metadata.related_available) ?? false,
-    isPartialDownload: asBoolean(metadata.download_incomplete) ?? false,
-    downloadProgress: asNumber(metadata.download_progress),
-    repoId: asString(metadata.repo_id),
-    selectedArtifactId: asString(metadata.selected_artifact_id),
-    selectedArtifactFiles: asStringArray(metadata.selected_artifact_files),
-    selectedArtifactQuant: asString(metadata.selected_artifact_quant),
-    hasDependencies: dependencyBindings.length > 0,
-    dependencyCount: dependencyBindings.length || undefined,
-    hasIntegrityIssue: asBoolean(metadata.integrity_issue_duplicate_repo_id) ?? false,
-    integrityIssueMessage: getIntegrityIssueMessage(metadata),
-    primaryFormat: getConvertibleFormat(format),
+    modelDir: model.modelDir,
+    format: model.format,
+    quant: model.quantization,
+    size: model.sizeBytes,
+    date: model.displayDate,
+    relatedAvailable: model.relatedAvailable,
+    isPartialDownload: Boolean(partial),
+    downloadProgress: partial?.downloadProgressFraction,
+    recovery: partial?.recovery,
+    hasDependencies: model.dependencyCount > 0,
+    dependencyCount: model.dependencyCount,
+    hasIntegrityIssue: model.integrity.state === 'duplicate',
+    integrityIssueMessage: model.integrity.state === 'duplicate'
+      ? `Duplicate artifact entries detected (${model.integrity.count} paths). Run library reconciliation.`
+      : undefined,
+    primaryFormat: getConvertibleFormat(model.format),
   };
 }
 
-export function groupModelRecords(models: ModelRecord[]): ModelCategory[] {
+export function groupCatalogModels(models: readonly CatalogModel[]): ModelCategory[] {
   const categoryMap = new Map<string, ModelInfo[]>();
-
   for (const model of models) {
-    const modelInfo = mapModelRecordToInfo(model);
-    const groupedModels = categoryMap.get(modelInfo.category);
-    if (groupedModels) {
-      groupedModels.push(modelInfo);
-      continue;
-    }
-
-    categoryMap.set(modelInfo.category, [modelInfo]);
+    const row = projectCatalogModel(model);
+    const group = categoryMap.get(row.category);
+    if (group) group.push(row);
+    else categoryMap.set(row.category, [row]);
   }
-
-  return Array.from(categoryMap.entries()).map(([category, groupedModels]) => ({
-    category,
-    models: groupedModels,
-  }));
+  return Array.from(categoryMap, ([category, models]) => ({ category, models }));
 }

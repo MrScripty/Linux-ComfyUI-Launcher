@@ -16,7 +16,7 @@ use pumas_library::models::{
     RuntimePort, RuntimeProfileConfig, RuntimeProfileId, RuntimeProviderId, RuntimeProviderMode,
     ServedModelLoadState, ServedModelStatus,
 };
-use pumas_library::{AppId, PumasApi};
+use pumas_library::{AppId, PumasApi, PumasError};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
@@ -93,6 +93,48 @@ fn create_indexable_test_model(root: &Path, model_id: &str, official_name: &str)
         .unwrap(),
     )
     .unwrap();
+}
+
+#[tokio::test]
+async fn disabled_hf_operations_report_unavailable() {
+    let temp_dir = create_test_env();
+    let _registry = RegistryTestGuard::new(temp_dir.path());
+    let api = PumasApi::builder(temp_dir.path())
+        .with_hf_client(false)
+        .with_process_manager(false)
+        .build()
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        api.get_hf_download_progress("missing").await,
+        Err(PumasError::Config { .. })
+    ));
+    assert!(matches!(
+        api.cancel_hf_download("missing").await,
+        Err(PumasError::Config { .. })
+    ));
+    assert!(matches!(
+        api.pause_hf_download("missing").await,
+        Err(PumasError::Config { .. })
+    ));
+    assert!(matches!(
+        api.resume_hf_download("missing").await,
+        Err(PumasError::Config { .. })
+    ));
+    assert!(matches!(
+        api.list_hf_downloads().await,
+        Err(PumasError::Config { .. })
+    ));
+    assert!(matches!(
+        api.search_hf_models("model", None, 25).await,
+        Err(PumasError::Config { .. })
+    ));
+    assert!(matches!(
+        api.search_hf_models_with_hydration("model", None, 25, 6)
+            .await,
+        Err(PumasError::Config { .. })
+    ));
 }
 
 async fn raw_local_ipc_call(port: u16, request: serde_json::Value) -> serde_json::Value {

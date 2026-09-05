@@ -34,6 +34,51 @@ messages. A contract change must update the receiver decoder, producer,
 consumer, and negative tests together. Treat sidecar logs as sensitive: they
 can contain backend diagnostics and must not expose credentials.
 
+### Generated catalog and download contract
+
+The selected catalog, FTS, download, and recovery declarations remain in Rust
+`pumas-rpc/src/contract.rs`. The optional `export-contract` feature derives
+Draft 7 schemas with Schemars 1.2.0: serialization contracts for results and
+deserialization contracts for requests. Its export module selects existing
+wire invariants, including UTF-8 byte limits and recovery-result correlations.
+It does not confer filesystem or recovery authority.
+
+Request projections describe the canonical desktop outbound spelling accepted
+by Electron's registry and Rust. They do not promise every standalone Rust
+deserialization alias; unselected `Legacy` methods remain outside this slice.
+
+`pnpm --dir electron run generate:desktop-contract` rebuilds that exporter and
+generates identical `src/generated/desktop-contract*` artifacts in Electron
+and frontend. `check:desktop-contract` regenerates from current Rust source
+and rejects any stale artifact; CI runs that command. Normal UI builds do not
+invoke Cargo or fetch generator dependencies.
+
+Export/check uses `cargo --offline --locked` and cannot update dependency
+resolution. Provision missing locked Rust dependencies explicitly first with
+`cargo fetch --locked --manifest-path rust/Cargo.toml` (as CI does).
+
+`test:desktop-contract-conformance` uses a private temporary producer fixture
+through `scripts/with-desktop-contract-fixtures.mjs`. The frontend's dedicated
+`test:desktop-contract` command crosses the real bundled preload and renderer.
+Both gates run in CI; selecting a conformance test without its required fixture
+fails. Fixtures retain real temporary filesystem identity and are retired after
+the command, rather than checking in or normalizing recovery tickets.
+
+AJV 8.20.0 owns Draft 7 validation and compiles standalone validators. The thin
+type generator rejects unsupported reachable constructs and format vocabulary.
+Named Pumas refinements preserve product-specific wire consistency, not JSON
+Schema semantics. Generated wrappers return typed diagnostics or copied,
+frozen values. Preload is bundled with esbuild while retaining Electron's
+sandbox; validators require neither runtime code generation nor Node imports.
+
+The older cached Schemars 0.8 candidate was rejected because its default
+deserialization view loses emitted-null versus omitted-field distinctions.
+AJV 6 would require the archived `ajv-pack` for standalone output; AJV 8's
+[maintained standalone generator](https://ajv.js.org/standalone.html) avoids
+that dependency and runtime evaluation. Both tools are generation-only owned
+dependencies; checked outputs are coordinated replacements, not a promise of
+support for older backend cohorts.
+
 ## Sidecar and Events
 
 Electron owns process lifecycle and forwards backend event streams to the

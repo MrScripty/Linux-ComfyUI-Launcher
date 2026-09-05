@@ -196,7 +196,7 @@ pub async fn lookup_hf_metadata_for_file(
         Err(e) => Ok(json!({
             "success": false,
             "found": false,
-            "error": e.to_string()
+            "error": crate::contract::PublicError::from(&e).message
         })),
     }
 }
@@ -229,7 +229,7 @@ pub async fn lookup_hf_metadata_for_bundle_directory(
         Err(e) => Ok(json!({
             "success": false,
             "found": false,
-            "error": e.to_string()
+            "error": crate::contract::PublicError::from(&e).message
         })),
     }
 }
@@ -320,7 +320,7 @@ pub async fn get_embedded_metadata(
             Err(e) => Ok(json!({
                 "success": false,
                 "file_type": "gguf",
-                "error": e.to_string(),
+                "error": crate::contract::PublicError::from(&e).message,
                 "metadata": null
             })),
         },

@@ -4,14 +4,22 @@ import { useAppWindowActions } from './useAppWindowActions';
 
 const {
   closeWindowMock,
+  chooseLibraryRootMock,
   isApiAvailableMock,
   minimizeMock,
   openPathMock,
 } = vi.hoisted(() => ({
   closeWindowMock: vi.fn<() => Promise<void>>(),
+  chooseLibraryRootMock: vi.fn<() => Promise<void>>(),
   isApiAvailableMock: vi.fn<() => boolean>(),
   minimizeMock: vi.fn<() => Promise<void>>(),
   openPathMock: vi.fn<(_path: string) => Promise<{ success: boolean; error?: string }>>(),
+}));
+
+vi.mock('./useLauncherRootRecovery', () => ({
+  useLauncherRootRecovery: () => ({
+    chooseLibraryRoot: chooseLibraryRootMock,
+  }),
 }));
 
 vi.mock('../api/adapter', () => ({
@@ -31,6 +39,7 @@ describe('useAppWindowActions', () => {
     openPathMock.mockResolvedValue({ success: true });
     closeWindowMock.mockResolvedValue(undefined);
     minimizeMock.mockResolvedValue(undefined);
+    chooseLibraryRootMock.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -57,6 +66,16 @@ describe('useAppWindowActions', () => {
 
     expect(minimizeMock).toHaveBeenCalledTimes(1);
     expect(closeWindowMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('delegates library selection to the launcher-root recovery owner', async () => {
+    const { result } = renderHook(() => useAppWindowActions());
+
+    await act(async () => {
+      await result.current.chooseLibraryRoot();
+    });
+
+    expect(chooseLibraryRootMock).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to window.close when the backend API is unavailable', async () => {

@@ -28,16 +28,21 @@ mod serving_ollama;
 mod serving_onnx;
 mod shared;
 mod status;
-#[cfg(all(test, feature = "inference-plugins"))]
+#[cfg(test)]
 mod test_support;
 #[cfg(feature = "inference-plugins")]
 mod torch;
 #[cfg(feature = "inference-plugins")]
 mod versions;
 
+use crate::contract::{
+    AdmittedRpcRequest, HealthOutcome, HfAuthOutcome, PublicError, RpcCommand, RpcOutcome,
+    ShutdownOutcome, SuccessOutcome,
+};
 use crate::server::AppState;
 use crate::wrapper::wrap_response;
 use axum::{
+    body::Bytes,
     extract::{Query, State},
     http::StatusCode,
     response::{
@@ -82,17 +87,6 @@ pub(crate) use shared::{get_version_manager, read_utf8_file, require_version_man
 // JSON-RPC types
 // ============================================================================
 
-/// JSON-RPC 2.0 request structure.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct JsonRpcRequest {
-    pub jsonrpc: String,
-    pub method: String,
-    #[serde(default)]
-    pub params: Option<Value>,
-    pub id: Option<Value>,
-}
-
 /// JSON-RPC 2.0 response structure.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
@@ -123,14 +117,14 @@ impl JsonRpcResponse {
         }
     }
 
-    pub fn error(id: Option<Value>, code: i32, message: String) -> Self {
+    pub fn error(id: Option<Value>, error: PublicError) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             result: None,
             error: Some(JsonRpcError {
-                code,
-                message,
-                data: None,
+                code: error.code,
+                message: error.message.to_string(),
+                data: Some(json!({ "class": error.class })),
             }),
             id,
         }
@@ -157,11 +151,16 @@ pub async fn handle_model_library_update_events(
                 stream::unfold(stream_state, next_model_library_update_event).boxed()
             }
             Err(error) => {
-                warn!("model-library update stream startup failed: {}", error);
+                let public_error = PublicError::from(&error);
+                warn!(
+                    error_code = public_error.code,
+                    error_class = public_error.class.as_str(),
+                    "model-library update stream startup failed"
+                );
                 stream::once(async move {
                     Ok(Event::default()
                         .event("model-library-error")
-                        .data(json!({ "error": error.to_string() }).to_string()))
+                        .data(public_error_event(public_error)))
                 })
                 .boxed()
             }
@@ -249,11 +248,16 @@ pub async fn handle_model_download_update_events(
                 stream::unfold(stream_state, next_model_download_update_event).boxed()
             }
             Err(error) => {
-                warn!("model download update stream startup failed: {}", error);
+                let public_error = PublicError::from(&error);
+                warn!(
+                    error_code = public_error.code,
+                    error_class = public_error.class.as_str(),
+                    "model download update stream startup failed"
+                );
                 stream::once(async move {
                     Ok(Event::default()
                         .event("model-download-error")
-                        .data(json!({ "error": error.to_string() }).to_string()))
+                        .data(public_error_event(public_error)))
                 })
                 .boxed()
             }
@@ -317,9 +321,11 @@ async fn build_runtime_profile_update_stream_state(
         }
         Ok(_) => None,
         Err(error) => {
+            let public_error = PublicError::from(&error);
             warn!(
-                "runtime-profile update stream startup recovery failed: {}",
-                error
+                error_code = public_error.code,
+                error_class = public_error.class.as_str(),
+                "runtime-profile update stream startup recovery failed"
             );
             Some(RuntimeProfileUpdateFeed::snapshot_required(
                 "runtime-profiles:0".to_string(),
@@ -365,9 +371,11 @@ async fn build_serving_status_update_stream_state(
         }
         Ok(_) => None,
         Err(error) => {
+            let public_error = PublicError::from(&error);
             warn!(
-                "serving-status update stream startup recovery failed: {}",
-                error
+                error_code = public_error.code,
+                error_class = public_error.class.as_str(),
+                "serving-status update stream startup recovery failed"
             );
             Some(ServingStatusUpdateFeed::snapshot_required(
                 "serving:0".to_string(),
@@ -392,11 +400,16 @@ pub async fn handle_status_telemetry_update_events(
                 stream::unfold(stream_state, next_status_telemetry_update_event).boxed()
             }
             Err(error) => {
-                warn!("status telemetry update stream startup failed: {}", error);
+                let public_error = PublicError::from(&error);
+                warn!(
+                    error_code = public_error.code,
+                    error_class = public_error.class.as_str(),
+                    "status telemetry update stream startup failed"
+                );
                 stream::once(async move {
                     Ok(Event::default()
                         .event("status-telemetry-error")
-                        .data(json!({ "error": error.to_string() }).to_string()))
+                        .data(public_error_event(public_error)))
                 })
                 .boxed()
             }
@@ -406,88 +419,353 @@ pub async fn handle_status_telemetry_update_events(
 }
 
 /// Main JSON-RPC handler.
-pub async fn handle_rpc(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<JsonRpcRequest>,
-) -> impl IntoResponse {
-    let method = &request.method;
-    let params = request.params.unwrap_or(Value::Object(Default::default()));
-    let id = request.id.clone();
+pub async fn handle_rpc(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    let request = match AdmittedRpcRequest::decode(&body) {
+        Ok(request) => request,
+        Err(admission) => {
+            warn!(
+                error_code = admission.error.code,
+                error_class = admission.error.class.as_str(),
+                "RPC request admission failed"
+            );
+            return (
+                StatusCode::OK,
+                Json(JsonRpcResponse::error(admission.id, admission.error)),
+            );
+        }
+    };
+    let id = request.id;
+    let method = request.command.method().to_string();
 
-    debug!("RPC call: {}({:?})", method, params);
+    debug!(
+        rpc_method = diagnostic_method(&method),
+        request_id = ?diagnostic_request_id(id.as_ref()),
+        "RPC call received"
+    );
 
-    // Handle built-in methods
-    if method == "health_check" {
-        return (
-            StatusCode::OK,
-            Json(JsonRpcResponse::success(id, json!({"status": "ok"}))),
-        );
-    }
-
-    if method == "shutdown" {
-        #[cfg(not(feature = "inference-plugins"))]
-        return (
-            StatusCode::OK,
-            Json(JsonRpcResponse::success(
-                id,
-                json!({ "status": "shutting_down" }),
-            )),
-        );
-
-        #[cfg(feature = "inference-plugins")]
-        let shutdown_summary = match state.api.stop_all_managed_runtime_profiles().await {
-            Ok(summary) => summary,
-            Err(error) => {
-                warn!(
-                    "managed runtime shutdown failed before backend exit: {}",
-                    error
-                );
-                return (
-                    StatusCode::OK,
-                    Json(JsonRpcResponse::success(
-                        id,
-                        json!({
-                            "status": "shutting_down",
-                            "managed_profiles_processed": 0,
-                            "managed_processes_stopped": 0,
-                            "errors": [error.to_string()],
-                        }),
-                    )),
-                );
-            }
-        };
-        #[cfg(feature = "inference-plugins")]
-        return (
-            StatusCode::OK,
-            Json(JsonRpcResponse::success(
-                id,
-                json!({
-                    "status": "shutting_down",
-                    "managed_profiles_processed": shutdown_summary.profiles_processed,
-                    "managed_processes_stopped": shutdown_summary.processes_stopped,
-                    "errors": shutdown_summary.errors,
-                }),
-            )),
-        );
-    }
-
-    // Dispatch to API methods
-    let result = dispatch_method(&state, method, &params).await;
+    let result = dispatch_admitted_command(&state, request.command).await;
 
     match result {
-        Ok(value) => {
-            let wrapped = wrap_response(method, value);
-            (StatusCode::OK, Json(JsonRpcResponse::success(id, wrapped)))
+        Ok(outcome) => {
+            let uses_response_wrapper = outcome.uses_response_wrapper();
+            let value = match outcome.into_value() {
+                Ok(value) => value,
+                Err(public_error) => {
+                    error!(
+                        rpc_method = diagnostic_method(&method),
+                        request_id = ?diagnostic_request_id(id.as_ref()),
+                        error_code = public_error.code,
+                        error_class = public_error.class.as_str(),
+                        "RPC outcome serialization failed"
+                    );
+                    return (
+                        StatusCode::OK,
+                        Json(JsonRpcResponse::error(id, public_error)),
+                    );
+                }
+            };
+            let value = if uses_response_wrapper {
+                wrap_response(&method, value)
+            } else {
+                value
+            };
+            (StatusCode::OK, Json(JsonRpcResponse::success(id, value)))
         }
-        Err(e) => {
-            error!("RPC error for {}: {}", method, e);
-            let code = e.to_rpc_error_code();
+        Err(error) => {
+            let public_error = match error {
+                RpcDispatchError::Domain(error) => PublicError::from(&error),
+                RpcDispatchError::MethodNotFound => PublicError::method_not_found(),
+            };
+            error!(
+                rpc_method = diagnostic_method(&method),
+                request_id = ?diagnostic_request_id(id.as_ref()),
+                error_code = public_error.code,
+                error_class = public_error.class.as_str(),
+                "RPC call failed"
+            );
             (
                 StatusCode::OK,
-                Json(JsonRpcResponse::error(id, code, e.to_string())),
+                Json(JsonRpcResponse::error(id, public_error)),
             )
         }
     }
+}
+
+enum RpcDispatchError {
+    Domain(pumas_library::PumasError),
+    MethodNotFound,
+}
+
+impl From<pumas_library::PumasError> for RpcDispatchError {
+    fn from(error: pumas_library::PumasError) -> Self {
+        Self::Domain(error)
+    }
+}
+
+async fn dispatch_admitted_command(
+    state: &AppState,
+    command: RpcCommand,
+) -> Result<RpcOutcome, RpcDispatchError> {
+    let result: pumas_library::Result<RpcOutcome> = match command {
+        RpcCommand::HealthCheck => Ok(RpcOutcome::Health(HealthOutcome::ok())),
+        RpcCommand::Shutdown => shutdown_result(state).await,
+        RpcCommand::GetStatus => status::get_status(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::Status),
+        RpcCommand::GetDiskSpace => status::get_disk_space(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::DiskSpace),
+        RpcCommand::GetSystemResources => status::get_system_resources(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::SystemResources),
+        RpcCommand::GetStatusTelemetrySnapshot => status::get_status_telemetry_snapshot(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::StatusTelemetry),
+        RpcCommand::GetLauncherVersion => status::get_launcher_version(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::LauncherVersion),
+        RpcCommand::CheckLauncherUpdates { force_refresh } => {
+            status::check_launcher_updates(state, force_refresh)
+                .await
+                .map(Box::new)
+                .map(RpcOutcome::LauncherUpdateCheck)
+        }
+        RpcCommand::ApplyLauncherUpdate => status::apply_launcher_update(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::LauncherUpdateApply),
+        RpcCommand::RestartLauncher => Ok(RpcOutcome::OperationStatus(
+            status::restart_launcher(state).await,
+        )),
+        RpcCommand::GetSandboxInfo => Ok(RpcOutcome::Sandbox(status::get_sandbox_info().await)),
+        RpcCommand::CheckGit => Ok(RpcOutcome::Git(Box::new(status::check_git(state).await))),
+        RpcCommand::GetNetworkStatus => Ok(RpcOutcome::Network(Box::new(
+            status::get_network_status(state).await,
+        ))),
+        RpcCommand::GetLibraryStatus => status::get_library_status(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::Library),
+        #[cfg(feature = "inference-plugins")]
+        RpcCommand::GetAppStatus { app_id } => Ok(RpcOutcome::AppStatus(
+            status::get_app_status(state, &app_id).await,
+        )),
+        RpcCommand::SetHfToken { token } => {
+            state.api.set_hf_token(token.expose()).await?;
+            Ok(RpcOutcome::HfTokenMutation(SuccessOutcome::new()))
+        }
+        RpcCommand::ClearHfToken => {
+            state.api.clear_hf_token().await?;
+            Ok(RpcOutcome::HfTokenMutation(SuccessOutcome::new()))
+        }
+        RpcCommand::GetHfAuthStatus => {
+            let status = state.api.get_hf_auth_status().await?;
+            Ok(RpcOutcome::HfAuth(Box::new(HfAuthOutcome::from(status))))
+        }
+        RpcCommand::GetLinkHealth { version_tag } => {
+            links::get_link_health(state, version_tag.as_deref())
+                .await
+                .map(Box::new)
+                .map(RpcOutcome::LinkHealth)
+        }
+        RpcCommand::CleanBrokenLinks => links::clean_broken_links(state)
+            .await
+            .map(RpcOutcome::CleanBrokenLinks),
+        RpcCommand::RemoveOrphanedLinks { version_tag } => {
+            links::remove_orphaned_links(state, &version_tag)
+                .await
+                .map(RpcOutcome::RemoveOrphanedLinks)
+        }
+        RpcCommand::GetLinksForModel { model_id } => links::get_links_for_model(state, &model_id)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::LinksForModel),
+        RpcCommand::DeleteModelWithCascade { model_id } => {
+            links::delete_model_with_cascade(state, &model_id)
+                .await
+                .map(RpcOutcome::DeleteModel)
+        }
+        RpcCommand::GetFileLinkCount { file_path } => links::get_file_link_count(file_path)
+            .await
+            .map(RpcOutcome::FileLinkCount),
+        RpcCommand::CheckFilesWritable { file_paths } => links::check_files_writable(file_paths)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::FilesWritable),
+        RpcCommand::SetModelLinkExclusion {
+            model_id,
+            app_id,
+            excluded,
+        } => links::set_model_link_exclusion(state, &model_id, &app_id, excluded)
+            .await
+            .map(RpcOutcome::LinkExclusionMutation),
+        RpcCommand::GetLinkExclusions { app_id } => links::get_link_exclusions(state, &app_id)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::LinkExclusions),
+        RpcCommand::StartModelConversion { request } => {
+            conversion::start_model_conversion(state, request)
+                .await
+                .map(RpcOutcome::ConversionStarted)
+        }
+        RpcCommand::GetConversionProgress { conversion_id } => Ok(RpcOutcome::ConversionProgress(
+            Box::new(conversion::get_conversion_progress(state, &conversion_id)),
+        )),
+        RpcCommand::CancelModelConversion { conversion_id } => {
+            conversion::cancel_model_conversion(state, &conversion_id)
+                .await
+                .map(RpcOutcome::ConversionCancelled)
+        }
+        RpcCommand::ListModelConversions => Ok(RpcOutcome::ConversionList(Box::new(
+            conversion::list_model_conversions(state),
+        ))),
+        RpcCommand::CheckConversionEnvironment => conversion::check_conversion_environment(state)
+            .await
+            .map(RpcOutcome::ConversionEnvironment),
+        RpcCommand::SetupConversionEnvironment => {
+            conversion::setup_conversion_environment(state).await?;
+            Ok(RpcOutcome::ConversionMutation(SuccessOutcome::new()))
+        }
+        RpcCommand::GetSupportedQuantTypes => conversion::get_supported_quant_types(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::SupportedQuantTypes),
+        RpcCommand::GetBackendStatus => conversion::get_backend_status(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::BackendStatus),
+        RpcCommand::SetupQuantizationBackend { backend } => {
+            conversion::setup_quantization_backend(state, backend).await?;
+            Ok(RpcOutcome::ConversionMutation(SuccessOutcome::new()))
+        }
+        RpcCommand::OpenPath { path } => process::open_path(state, path)
+            .await
+            .map(RpcOutcome::OperationStatus),
+        RpcCommand::OpenUrl { url } => process::open_url(state, url)
+            .await
+            .map(RpcOutcome::OperationStatus),
+        RpcCommand::DownloadModelFromHf { request } => {
+            models::download_model_from_hf(state, request)
+                .await
+                .map(RpcOutcome::DownloadStarted)
+        }
+        RpcCommand::StartModelDownloadFromHf { request } => {
+            models::start_model_download_from_hf(state, request)
+                .await
+                .map(RpcOutcome::DownloadStarted)
+        }
+        RpcCommand::GetModelDownloadStatus { download_id } => {
+            models::get_model_download_status(state, &download_id)
+                .await
+                .map(Box::new)
+                .map(RpcOutcome::DownloadStatus)
+        }
+        RpcCommand::CancelModelDownload { download_id } => {
+            models::cancel_model_download(state, &download_id)
+                .await
+                .map(RpcOutcome::DownloadMutation)
+        }
+        RpcCommand::PauseModelDownload { download_id } => {
+            models::pause_model_download(state, &download_id)
+                .await
+                .map(RpcOutcome::DownloadMutation)
+        }
+        RpcCommand::ResumeModelDownload { download_id } => {
+            models::resume_model_download(state, &download_id)
+                .await
+                .map(RpcOutcome::DownloadMutation)
+        }
+        RpcCommand::ListModelDownloads => models::list_model_downloads(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::DownloadList),
+        RpcCommand::ResumePartialDownload {
+            model_id,
+            recovery_token,
+        } => models::resume_partial_download(state, &model_id, &recovery_token)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::PartialDownload),
+        RpcCommand::GetModels => models::get_models(state)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::Models),
+        RpcCommand::SearchCatalog {
+            query,
+            limit,
+            offset,
+        } => models::search_models_fts(state, &query, limit, offset)
+            .await
+            .map(Box::new)
+            .map(RpcOutcome::CatalogSearch),
+        RpcCommand::RefreshModelIndex => models::refresh_model_index(state)
+            .await
+            .map(RpcOutcome::ModelIndexRefresh),
+        RpcCommand::Legacy { method, params } => {
+            return dispatch_method(state, &method, &params)
+                .await
+                .map(RpcOutcome::Legacy);
+        }
+    };
+    result.map_err(RpcDispatchError::Domain)
+}
+
+async fn shutdown_result(state: &AppState) -> pumas_library::Result<RpcOutcome> {
+    #[cfg(not(feature = "inference-plugins"))]
+    {
+        let _ = state;
+        Ok(RpcOutcome::Shutdown(ShutdownOutcome::core_only()))
+    }
+
+    #[cfg(feature = "inference-plugins")]
+    {
+        let shutdown_summary = match state.api.stop_all_managed_runtime_profiles().await {
+            Ok(summary) => summary,
+            Err(error) => {
+                let public_error = PublicError::from(&error);
+                warn!(
+                    error_code = public_error.code,
+                    error_class = public_error.class.as_str(),
+                    "managed runtime shutdown failed before backend exit"
+                );
+                return Ok(RpcOutcome::Shutdown(ShutdownOutcome::managed(0, 0, 1)));
+            }
+        };
+        Ok(RpcOutcome::Shutdown(ShutdownOutcome::managed(
+            shutdown_summary.profiles_processed,
+            shutdown_summary.processes_stopped,
+            shutdown_summary.errors.len(),
+        )))
+    }
+}
+
+fn diagnostic_method(method: &str) -> &'static str {
+    match method {
+        "health_check" => "health_check",
+        "shutdown" => "shutdown",
+        "set_hf_token" => "set_hf_token",
+        "open_path" => "open_path",
+        "open_url" => "open_url",
+        _ => "other_or_unsupported",
+    }
+}
+
+fn diagnostic_request_id(id: Option<&Value>) -> Option<u64> {
+    id.and_then(Value::as_u64)
+}
+
+fn public_error_event(error: PublicError) -> String {
+    json!({
+        "error": error.message,
+        "error_code": error.code,
+        "error_class": error.class,
+    })
+    .to_string()
 }
 
 struct ModelLibraryUpdateStreamState {
@@ -523,10 +801,12 @@ async fn next_model_library_update_event(
             Some((Ok(event), state))
         }
         Err(error) => {
+            let public_error = PublicError::from(&error);
             warn!(
                 cursor = %state.cursor,
-                "model-library update stream ended: {}",
-                error
+                error_code = public_error.code,
+                error_class = public_error.class.as_str(),
+                "model-library update stream ended"
             );
             None
         }
@@ -536,9 +816,9 @@ async fn next_model_library_update_event(
 fn model_library_update_sse_event(notification: &ModelLibraryUpdateNotification) -> Event {
     match serde_json::to_string(notification) {
         Ok(payload) => Event::default().event("model-library-update").data(payload),
-        Err(error) => Event::default()
+        Err(_) => Event::default()
             .event("model-library-error")
-            .data(json!({ "error": error.to_string() }).to_string()),
+            .data(public_error_event(PublicError::internal())),
     }
 }
 
@@ -569,9 +849,9 @@ fn model_download_update_sse_event(notification: &ModelDownloadUpdateNotificatio
         Ok(payload) => Event::default()
             .event("model-download-update")
             .data(payload),
-        Err(error) => Event::default()
+        Err(_) => Event::default()
             .event("model-download-error")
-            .data(json!({ "error": error.to_string() }).to_string()),
+            .data(public_error_event(PublicError::internal())),
     }
 }
 
@@ -636,7 +916,12 @@ async fn next_status_telemetry_update_event(
                     Some((Ok(event), state))
                 }
                 Err(error) => {
-                    warn!("status telemetry refresh after lag failed: {}", error);
+                    let public_error = PublicError::from(&error);
+                    warn!(
+                        error_code = public_error.code,
+                        error_class = public_error.class.as_str(),
+                        "status telemetry refresh after lag failed"
+                    );
                     None
                 }
             }
@@ -650,9 +935,9 @@ fn status_telemetry_update_sse_event(notification: &StatusTelemetryUpdateNotific
         Ok(payload) => Event::default()
             .event("status-telemetry-update")
             .data(payload),
-        Err(error) => Event::default()
+        Err(_) => Event::default()
             .event("status-telemetry-error")
-            .data(json!({ "error": error.to_string() }).to_string()),
+            .data(public_error_event(PublicError::internal())),
     }
 }
 
@@ -686,9 +971,9 @@ fn runtime_profile_update_sse_event(feed: &RuntimeProfileUpdateFeed) -> Event {
         Ok(payload) => Event::default()
             .event("runtime-profile-update")
             .data(payload),
-        Err(error) => Event::default()
+        Err(_) => Event::default()
             .event("runtime-profile-error")
-            .data(json!({ "error": error.to_string() }).to_string()),
+            .data(public_error_event(PublicError::internal())),
     }
 }
 
@@ -721,9 +1006,9 @@ fn serving_status_update_sse_event(feed: &ServingStatusUpdateFeed) -> Event {
         Ok(payload) => Event::default()
             .event("serving-status-update")
             .data(payload),
-        Err(error) => Event::default()
+        Err(_) => Event::default()
             .event("serving-status-error")
-            .data(json!({ "error": error.to_string() }).to_string()),
+            .data(public_error_event(PublicError::internal())),
     }
 }
 
@@ -736,26 +1021,8 @@ async fn dispatch_method(
     state: &AppState,
     method: &str,
     params: &Value,
-) -> pumas_library::Result<Value> {
-    match method {
-        // Status & System
-        "get_status" => status::get_status(state, params).await,
-        "get_disk_space" => status::get_disk_space(state, params).await,
-        "get_system_resources" => status::get_system_resources(state, params).await,
-        "get_status_telemetry_snapshot" => {
-            status::get_status_telemetry_snapshot(state, params).await
-        }
-        "get_launcher_version" => status::get_launcher_version(state, params).await,
-        "check_launcher_updates" => status::check_launcher_updates(state, params).await,
-        "apply_launcher_update" => status::apply_launcher_update(state, params).await,
-        "restart_launcher" => status::restart_launcher(state, params).await,
-        "get_sandbox_info" => status::get_sandbox_info(state, params).await,
-        "check_git" => status::check_git(state, params).await,
-        "get_network_status" => status::get_network_status(state, params).await,
-        "get_library_status" => status::get_library_status(state, params).await,
-        #[cfg(feature = "inference-plugins")]
-        "get_app_status" => status::get_app_status(state, params).await,
-
+) -> Result<Value, RpcDispatchError> {
+    let result: pumas_library::Result<Value> = match method {
         // Local Runtime Profiles
         #[cfg(feature = "inference-plugins")]
         "get_runtime_profiles_snapshot" => {
@@ -849,23 +1116,10 @@ async fn dispatch_method(
         "get_release_dependencies" => versions::get_release_dependencies(state, params).await,
 
         // Model Library
-        "get_models" => models::get_models(state, params).await,
-        "refresh_model_index" => models::refresh_model_index(state, params).await,
         "import_model" => models::import_model(state, params).await,
-        "download_model_from_hf" => models::download_model_from_hf(state, params).await,
-        "start_model_download_from_hf" => models::start_model_download_from_hf(state, params).await,
-        "get_model_download_status" => models::get_model_download_status(state, params).await,
-        "cancel_model_download" => models::cancel_model_download(state, params).await,
-        "pause_model_download" => models::pause_model_download(state, params).await,
-        "resume_model_download" => models::resume_model_download(state, params).await,
-        "list_model_downloads" => models::list_model_downloads(state, params).await,
-        "list_interrupted_downloads" => models::list_interrupted_downloads(state, params).await,
-        "recover_download" => models::recover_download(state, params).await,
-        "resume_partial_download" => models::resume_partial_download(state, params).await,
         "search_hf_models" => models::search_hf_models(state, params).await,
         "get_hf_download_details" => models::get_hf_download_details(state, params).await,
         "get_related_models" => models::get_related_models(state, params).await,
-        "search_models_fts" => models::search_models_fts(state, params).await,
         "import_batch" => models::import_batch(state, params).await,
         "import_external_diffusers_directory" => {
             models::import_external_diffusers_directory(state, params).await
@@ -927,11 +1181,6 @@ async fn dispatch_method(
             models::prune_model_migration_reports(state, params).await
         }
 
-        // HuggingFace Authentication
-        "set_hf_token" => models::set_hf_token(state, params).await,
-        "clear_hf_token" => models::clear_hf_token(state, params).await,
-        "get_hf_auth_status" => models::get_hf_auth_status(state, params).await,
-
         // Process Management
         #[cfg(feature = "inference-plugins")]
         "launch_ollama" => process::launch_ollama(state, params).await,
@@ -945,8 +1194,6 @@ async fn dispatch_method(
         "stop_torch" => process::stop_torch(state, params).await,
         #[cfg(feature = "inference-plugins")]
         "is_torch_running" => process::is_torch_running(state, params).await,
-        "open_path" => process::open_path(state, params).await,
-        "open_url" => process::open_url(state, params).await,
         #[cfg(feature = "inference-plugins")]
         "open_active_install" => process::open_active_install(state, params).await,
 
@@ -998,32 +1245,6 @@ async fn dispatch_method(
         #[cfg(feature = "inference-plugins")]
         "torch_configure" => torch::torch_configure(state, params).await,
 
-        // Link Management
-        "get_link_health" => links::get_link_health(state, params).await,
-        "clean_broken_links" => links::clean_broken_links(state, params).await,
-        "remove_orphaned_links" => links::remove_orphaned_links(state, params).await,
-        "get_links_for_model" => links::get_links_for_model(state, params).await,
-        "delete_model_with_cascade" => links::delete_model_with_cascade(state, params).await,
-        "get_file_link_count" => links::get_file_link_count(state, params).await,
-        "check_files_writable" => links::check_files_writable(state, params).await,
-        "set_model_link_exclusion" => links::set_model_link_exclusion(state, params).await,
-        "get_link_exclusions" => links::get_link_exclusions(state, params).await,
-
-        // Conversion
-        "start_model_conversion" => conversion::start_model_conversion(state, params).await,
-        "get_conversion_progress" => conversion::get_conversion_progress(state, params).await,
-        "cancel_model_conversion" => conversion::cancel_model_conversion(state, params).await,
-        "list_model_conversions" => conversion::list_model_conversions(state, params).await,
-        "check_conversion_environment" => {
-            conversion::check_conversion_environment(state, params).await
-        }
-        "setup_conversion_environment" => {
-            conversion::setup_conversion_environment(state, params).await
-        }
-        "get_supported_quant_types" => conversion::get_supported_quant_types(state, params).await,
-        "get_backend_status" => conversion::get_backend_status(state, params).await,
-        "setup_quantization_backend" => conversion::setup_quantization_backend(state, params).await,
-
         // Plugins
         #[cfg(feature = "inference-plugins")]
         "get_plugins" => plugins::get_plugins(state, params).await,
@@ -1036,13 +1257,11 @@ async fn dispatch_method(
 
         // Unknown method
         _ => {
-            warn!("Method not found: {}", method);
-            Err(pumas_library::PumasError::Other(format!(
-                "Method not found: {}",
-                method
-            )))
+            warn!("Unsupported RPC method requested");
+            return Err(RpcDispatchError::MethodNotFound);
         }
-    }
+    };
+    result.map_err(RpcDispatchError::Domain)
 }
 
 // ============================================================================
@@ -1052,6 +1271,7 @@ async fn dispatch_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_json_rpc_response_success() {
@@ -1062,10 +1282,10 @@ mod tests {
 
     #[test]
     fn test_json_rpc_response_error() {
-        let response = JsonRpcResponse::error(Some(json!(1)), -32600, "Test error".into());
+        let response = JsonRpcResponse::error(Some(json!(1)), PublicError::internal());
         assert!(response.error.is_some());
         assert!(response.result.is_none());
-        assert_eq!(response.error.unwrap().code, -32600);
+        assert_eq!(response.error.unwrap().code, -32603);
     }
 
     #[tokio::test]
@@ -1074,5 +1294,68 @@ mod tests {
         // In normal development, we're not sandboxed
         // This test verifies the function runs without error
         assert!(!is_sandboxed || ["flatpak", "snap", "docker", "appimage"].contains(&sandbox_type));
+    }
+
+    #[tokio::test]
+    async fn disabled_hf_download_commands_return_unavailable() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = test_support::build_test_app_state(temp_dir.path()).await;
+
+        for command in [
+            RpcCommand::GetModelDownloadStatus {
+                download_id: "missing".to_string(),
+            },
+            RpcCommand::CancelModelDownload {
+                download_id: "missing".to_string(),
+            },
+            RpcCommand::PauseModelDownload {
+                download_id: "missing".to_string(),
+            },
+            RpcCommand::ResumeModelDownload {
+                download_id: "missing".to_string(),
+            },
+            RpcCommand::ListModelDownloads,
+        ] {
+            let error = match dispatch_admitted_command(&state, command).await {
+                Err(RpcDispatchError::Domain(error)) => PublicError::from(&error),
+                _ => panic!("disabled HF command did not return a domain error"),
+            };
+            assert_eq!(error.code, -32000);
+            assert_eq!(error.class, crate::contract::PublicErrorClass::Unavailable);
+            assert_eq!(
+                error.message,
+                "A required operation is currently unavailable."
+            );
+        }
+
+        let partial = match dispatch_admitted_command(
+            &state,
+            RpcCommand::ResumePartialDownload {
+                model_id: pumas_library::model_library::DownloadRecoveryModelId::parse(
+                    "llm/acme/model",
+                )
+                .unwrap(),
+                recovery_token: pumas_library::model_library::DownloadRecoveryToken::parse(
+                    &format!("v1:{}", "a".repeat(64)),
+                )
+                .unwrap(),
+            },
+        )
+        .await
+        {
+            Ok(outcome) => outcome.into_value().unwrap(),
+            Err(_) => panic!("disabled partial recovery did not return its typed outcome"),
+        };
+        assert_eq!(
+            partial,
+            serde_json::json!({
+                "success": false,
+                "action": "none",
+                "download_id": null,
+                "status": null,
+                "reason_code": "hf_client_unavailable",
+                "error": "The partial download could not be resumed."
+            })
+        );
     }
 }

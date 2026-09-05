@@ -50,11 +50,8 @@ pub(super) async fn serve_llama_cpp_router_model(
         .await
     {
         Ok(endpoint) => endpoint,
-        Err(err) => {
-            warn!(
-                "failed to resolve llama.cpp router serving endpoint: {}",
-                err
-            );
+        Err(_) => {
+            warn!("failed to resolve llama.cpp router serving endpoint");
             return non_critical_failure_response(
                 state,
                 serving_error(
@@ -98,26 +95,23 @@ pub(super) async fn serve_llama_cpp_router_model(
     let should_restart_for_profile_settings = !profile_not_running
         && !endpoint_unreachable
         && llama_cpp_router_should_restart_for_launch_settings(state, &request, &profile).await?;
-    if should_restart_for_profile_settings {
-        if let Err(err) = state
+    if should_restart_for_profile_settings
+        && state
             .api
             .stop_runtime_profile(request.config.profile_id.clone())
             .await
-        {
-            warn!(
-                "failed to restart llama.cpp router profile before applying device settings: {}",
-                err
-            );
-            return non_critical_failure_response(
-                state,
-                serving_error(
-                    ModelServeErrorCode::ProviderLoadFailed,
-                    "llama.cpp router profile could not be restarted to apply device settings",
-                    &request,
-                ),
-            )
-            .await;
-        }
+            .is_err()
+    {
+        warn!("failed to restart llama.cpp router profile before applying device settings");
+        return non_critical_failure_response(
+            state,
+            serving_error(
+                ModelServeErrorCode::ProviderLoadFailed,
+                "llama.cpp router profile could not be restarted to apply device settings",
+                &request,
+            ),
+        )
+        .await;
     }
     if profile_not_running || endpoint_unreachable || should_restart_for_profile_settings {
         if let Some(error) = launch_llama_cpp_router_profile(state, &request, &profile).await? {
@@ -142,15 +136,20 @@ pub(super) async fn serve_llama_cpp_router_model(
 
     let gateway_alias = effective_gateway_alias_from_config(&request);
     let router_model_id = provider_request_model_id(&request, &state.provider_registry);
-    if let Err(message) = state
+    if state
         .llama_cpp_router_client
         .load_model(endpoint.as_str(), &router_model_id)
         .await
+        .is_err()
     {
-        warn!("llama.cpp router model load failed: {}", message);
+        warn!("llama.cpp router model load failed");
         return non_critical_failure_response(
             state,
-            serving_error(ModelServeErrorCode::ProviderLoadFailed, message, &request),
+            serving_error(
+                ModelServeErrorCode::ProviderLoadFailed,
+                "llama.cpp router could not load the selected model",
+                &request,
+            ),
         )
         .await;
     }
@@ -201,11 +200,8 @@ pub(super) async fn unserve_llama_cpp_router_model(
         .await
     {
         Ok(endpoint) => endpoint,
-        Err(err) => {
-            warn!(
-                "failed to resolve llama.cpp router unload endpoint: {}",
-                err
-            );
+        Err(_) => {
+            warn!("failed to resolve llama.cpp router unload endpoint");
             return Ok(Some(serde_json::to_value(
                 pumas_library::models::UnserveModelResponse {
                     success: true,
@@ -217,16 +213,17 @@ pub(super) async fn unserve_llama_cpp_router_model(
         }
     };
     let router_model_id = request_model_id.trim();
-    if let Err(message) = state
+    if state
         .llama_cpp_router_client
         .unload_model(endpoint.as_str(), router_model_id)
         .await
+        .is_err()
     {
-        warn!("llama.cpp router model unload failed: {}", message);
+        warn!("llama.cpp router model unload failed");
         return Ok(Some(serde_json::to_value(
             pumas_library::models::UnserveModelResponse {
                 success: true,
-                error: Some(message),
+                error: Some("llama.cpp router could not unload the selected model".to_string()),
                 unloaded: false,
                 snapshot: Some(current_serving_snapshot(state).await?),
             },
@@ -314,15 +311,15 @@ async fn launch_llama_cpp_router_profile(
             let message = response.error.unwrap_or_else(|| {
                 "llama.cpp router profile did not start for the selected model".to_string()
             });
-            warn!("llama.cpp router serve launch failed: {}", message);
+            warn!("llama.cpp router serve launch failed");
             Ok(Some(serving_error(
                 ModelServeErrorCode::ProviderLoadFailed,
                 message,
                 request,
             )))
         }
-        Err(err) => {
-            warn!("llama.cpp router serve launch failed: {}", err);
+        Err(_) => {
+            warn!("llama.cpp router serve launch failed");
             Ok(Some(serving_error(
                 ModelServeErrorCode::MissingRuntime,
                 "llama.cpp router runtime could not be launched",

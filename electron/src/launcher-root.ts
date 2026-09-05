@@ -64,6 +64,17 @@ export class LauncherRootPersistenceError extends Error {
   }
 }
 
+export class LauncherRootSelectionError extends Error {
+  readonly code = 'launcher_root_invalid';
+
+  constructor() {
+    super(
+      'Selected path must be a launcher root, shared-resources directory, or shared-resources/models directory.'
+    );
+    this.name = 'LauncherRootSelectionError';
+  }
+}
+
 export type PersistedLauncherRootState =
   | 'not-consulted'
   | 'absent'
@@ -319,9 +330,7 @@ export function persistLauncherRootOverride(
     NODE_LAUNCHER_ROOT_FILE_SYSTEM
   );
   if (validation.state !== 'valid') {
-    throw new Error(
-      'Selected path must be a launcher root, shared-resources directory, or shared-resources/models directory.'
-    );
+    throw new LauncherRootSelectionError();
   }
   const launcherRoot = validation.launcherRoot;
 

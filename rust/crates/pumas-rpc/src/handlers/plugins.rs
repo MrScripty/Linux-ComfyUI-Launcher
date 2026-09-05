@@ -99,7 +99,7 @@ pub async fn call_plugin_endpoint(
         })),
         Err(error) => Ok(json!({
             "success": false,
-            "error": error.to_string()
+            "error": crate::contract::PublicError::from(&error).message
         })),
     }
 }

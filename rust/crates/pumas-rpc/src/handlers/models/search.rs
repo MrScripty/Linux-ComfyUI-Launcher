@@ -24,7 +24,7 @@ pub async fn search_hf_models(state: &AppState, params: &Value) -> pumas_library
         Err(e) => Ok(json!({
             "success": false,
             "models": [],
-            "error": e.to_string()
+            "error": crate::contract::PublicError::from(&e).message
         })),
     }
 }
@@ -65,31 +65,18 @@ pub async fn get_hf_download_details(
         })),
         Err(e) => Ok(json!({
             "success": false,
-            "error": e.to_string()
+            "error": crate::contract::PublicError::from(&e).message
         })),
     }
 }
 
-pub async fn search_models_fts(state: &AppState, params: &Value) -> pumas_library::Result<Value> {
-    let query = require_str_param(params, "query", "query")?;
-    let limit = get_i64_param(params, "limit", "limit").unwrap_or(100) as usize;
-    let offset = get_i64_param(params, "offset", "offset").unwrap_or(0) as usize;
-
-    match state.api.search_models(&query, limit, offset).await {
-        Ok(result) => Ok(json!({
-            "success": true,
-            "models": result.models,
-            "total_count": result.total_count,
-            "query_time_ms": result.query_time_ms,
-            "query": result.query
-        })),
-        Err(e) => Ok(json!({
-            "success": false,
-            "models": [],
-            "total_count": 0,
-            "query_time_ms": 0,
-            "query": query,
-            "error": e.to_string()
-        })),
-    }
+pub async fn search_models_fts(
+    state: &AppState,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> pumas_library::Result<crate::contract::CatalogSearchOutcome> {
+    let search = state.api.search_models(query, limit, offset).await?;
+    let root = state.api.launcher_root().join("shared-resources/models");
+    state.catalog_projection.search(search, root).await
 }

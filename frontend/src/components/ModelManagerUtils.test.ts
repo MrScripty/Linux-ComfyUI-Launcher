@@ -91,7 +91,7 @@ describe('ModelManagerUtils', () => {
     });
   });
 
-  it('merges active downloads onto local models by repo id case-insensitively and prepends orphan downloads', () => {
+  it('keeps unassociated activity separate even when repository names match', () => {
     const localGroups: ModelCategory[] = [
       {
         category: 'llm',
@@ -124,19 +124,20 @@ describe('ModelManagerUtils', () => {
 
     expect(merged.map((group) => group.category)).toEqual(['llm', 'vision']);
     expect(merged[0]?.models[0]).toMatchObject({
-      id: 'model-1',
+      id: 'download:org/alpha',
       isDownloading: true,
       downloadRepoId: 'org/alpha',
       downloadProgress: 0.7,
       downloadTotalBytes: 9999,
     });
+    expect(merged[0]?.models[1]).toEqual(localGroups[0]?.models[0]);
     expect(merged[1]?.models[0]).toMatchObject({
       id: 'download:vision/model',
       name: 'Vision Download',
     });
   });
 
-  it('does not merge an artifact-specific download onto a different quant from the same repo', () => {
+  it('does not infer a catalog association from matching artifact or quant labels', () => {
     const localGroups: ModelCategory[] = [
       {
         category: 'vlm',
@@ -175,20 +176,20 @@ describe('ModelManagerUtils', () => {
     const merged = mergeLocalModelGroups(localGroups, downloadingModels);
 
     expect(merged[0]?.models[0]).toMatchObject({
-      id: 'vlm/davidau/qwen3_6-27b-heretic/q4',
+      id: 'download:davidau--qwen3_6-heretic-gguf__q4_k_m',
       isDownloading: true,
       downloadKey: 'davidau--qwen3_6-heretic-gguf__q4_k_m',
       downloadProgress: 0.33,
     });
-    expect(merged[0]?.models[1]).toMatchObject({
+    expect(merged[0]?.models[2]).toMatchObject({
       id: 'vlm/davidau/qwen3_6-27b-heretic/q5',
       quant: 'Q5_K_M',
     });
     expect(merged[0]?.models[1]?.isDownloading).toBeUndefined();
-    expect(merged[0]?.models).toHaveLength(2);
+    expect(merged[0]?.models.slice(1)).toEqual(localGroups[0]?.models);
   });
 
-  it('falls back to repo matching when a download has no artifact identity', () => {
+  it('does not fall back to repo matching when a download has no artifact identity', () => {
     const localGroups: ModelCategory[] = [
       {
         category: 'llm',
@@ -214,14 +215,15 @@ describe('ModelManagerUtils', () => {
     const merged = mergeLocalModelGroups(localGroups, downloadingModels);
 
     expect(merged[0]?.models[0]).toMatchObject({
-      id: 'model-1',
+      id: 'download:org/alpha',
       isDownloading: true,
       downloadKey: 'org/alpha',
       downloadProgress: 0.25,
     });
+    expect(merged[0]?.models[1]).toEqual(localGroups[0]?.models[0]);
   });
 
-  it('prefers an incomplete local row over a complete same-repo row for repo-scoped downloads', () => {
+  it('preserves both complete and partial rows for unassociated repo-scoped downloads', () => {
     const localGroups: ModelCategory[] = [
       {
         category: 'llm',
@@ -254,17 +256,16 @@ describe('ModelManagerUtils', () => {
 
     const merged = mergeLocalModelGroups(localGroups, downloadingModels);
 
-    expect(merged[0]?.models[0]?.isDownloading).toBeUndefined();
-    expect(merged[0]?.models[1]).toMatchObject({
-      id: 'llm/aeon-7/text-partial',
+    expect(merged[0]?.models[0]).toMatchObject({
+      id: 'download:aeon-7/qwen3.6-text',
       isDownloading: true,
       downloadKey: 'aeon-7/qwen3.6-text',
       downloadProgress: 0.4,
     });
-    expect(merged[0]?.models).toHaveLength(2);
+    expect(merged[0]?.models.slice(1)).toEqual(localGroups[0]?.models);
   });
 
-  it('matches file-group artifact downloads to incomplete same-repo rows without selected metadata', () => {
+  it('keeps file-group downloads separate from incomplete same-repo rows', () => {
     const localGroups: ModelCategory[] = [
       {
         category: 'llm',
@@ -299,14 +300,13 @@ describe('ModelManagerUtils', () => {
 
     const merged = mergeLocalModelGroups(localGroups, downloadingModels);
 
-    expect(merged[0]?.models[0]?.isDownloading).toBeUndefined();
-    expect(merged[0]?.models[1]).toMatchObject({
-      id: 'llm/aeon-7/text-partial',
+    expect(merged[0]?.models[0]).toMatchObject({
+      id: 'download:aeon-7--qwen3_6-text__files_abc123',
       isDownloading: true,
       downloadKey: 'aeon-7--qwen3_6-text__files_abc123',
       downloadSelectedArtifactId: 'aeon-7--qwen3_6-text__files_abc123',
     });
-    expect(merged[0]?.models).toHaveLength(2);
+    expect(merged[0]?.models.slice(1)).toEqual(localGroups[0]?.models);
   });
 
   it('filters local groups by selected category and matches search against model path', () => {

@@ -34,7 +34,7 @@ interface LocalModelsListProps {
   onResumeDownload?: (downloadKey: string) => void;
   onCancelDownload?: (downloadKey: string) => void;
   onRecoverPartialDownload?: (model: ModelInfo) => void;
-  recoveringPartialRepoIds?: Set<string>;
+  recoveringPartialModelIds?: Set<string>;
   downloadErrors?: Record<string, string>;
   onDeleteModel?: (modelId: string) => void;
   onConvertModel?: (modelId: string) => void;
@@ -62,7 +62,7 @@ export function LocalModelsList({
   onResumeDownload,
   onCancelDownload,
   onRecoverPartialDownload,
-  recoveringPartialRepoIds,
+  recoveringPartialModelIds,
   downloadErrors,
   onDeleteModel,
   onConvertModel,
@@ -110,7 +110,7 @@ export function LocalModelsList({
                 excludedModels={excludedModels}
                 expandedRelated={expandedRelated}
                 model={model}
-                recoveringPartialRepoIds={recoveringPartialRepoIds}
+                recoveringPartialModelIds={recoveringPartialModelIds}
                 relatedModelsById={relatedModelsById}
                 selectedAppId={selectedAppId}
                 servedStatus={servedModelById.get(model.id) ?? null}

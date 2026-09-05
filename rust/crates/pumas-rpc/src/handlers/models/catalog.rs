@@ -1,28 +1,27 @@
 //! Model catalog and mapping handlers.
 
+use crate::contract::{ModelIndexRefreshOutcome, ModelsOutcome};
 use crate::handlers::require_str_param;
 use crate::server::AppState;
 use serde_json::{json, Value};
 
-pub async fn get_models(state: &AppState, _params: &Value) -> pumas_library::Result<Value> {
-    let models = state.api.list_models().await?;
-    // Convert to a format with model_id as keys for frontend compatibility
-    let mut result = serde_json::Map::new();
-    for model in models {
-        result.insert(model.id.clone(), serde_json::to_value(&model)?);
-    }
-    Ok(json!(result))
+pub async fn get_models(state: &AppState) -> pumas_library::Result<ModelsOutcome> {
+    let library_root = state
+        .api
+        .launcher_root()
+        .join("shared-resources")
+        .join("models");
+    state
+        .catalog_projection
+        .models(state.api.list_models().await?, library_root)
+        .await
 }
 
 pub async fn refresh_model_index(
     state: &AppState,
-    _params: &Value,
-) -> pumas_library::Result<Value> {
+) -> pumas_library::Result<ModelIndexRefreshOutcome> {
     let count = state.api.rebuild_model_index().await?;
-    Ok(json!({
-        "success": true,
-        "indexed_count": count
-    }))
+    count.try_into()
 }
 
 pub async fn scan_shared_storage(

@@ -10,15 +10,17 @@ import { isAPIAvailable } from '../api/adapter';
 import { modelsAPI } from '../api/models';
 import { importAPI } from '../api/import';
 import type { ModelCategory } from '../types/apps';
-import type { ModelRecord } from '../types/api';
+import type { CatalogModel } from '../generated/desktop-contract';
 import { getLogger } from '../utils/logger';
 import { APIError } from '../errors';
-import { groupModelRecords } from '../utils/libraryModels';
+import { groupCatalogModels } from '../utils/libraryModels';
 import {
   readModelLibrarySnapshot,
+  toDisplayOnlyModelGroups,
   writeModelLibrarySnapshot,
 } from '../utils/modelLibrarySnapshot';
 import { useModelLibraryUpdateSubscription } from './useModelLibraryUpdateSubscription';
+import { useLibraryScopeId } from './useLauncherRootRecovery';
 
 const logger = getLogger('useModels');
 
@@ -33,15 +35,14 @@ export type ModelLibraryLoadStatus = 'loading' | 'ready' | 'unavailable';
 /** Cache entry for SWR pattern */
 interface CacheEntry {
   query: string;
-  modelType?: string | null;
-  tags?: string[] | null;
   results: ModelCategory[];
   queryTime: number | null;
   timestamp: number;
 }
 
 export function useModels() {
-  const [modelGroups, setModelGroups] = useState<ModelCategory[]>(readModelLibrarySnapshot);
+  const libraryScopeId = useLibraryScopeId();
+  const [modelGroups, setModelGroups] = useState<ModelCategory[]>(() => readModelLibrarySnapshot(libraryScopeId));
   const [libraryLoadStatus, setLibraryLoadStatus] = useState<ModelLibraryLoadStatus>('loading');
   const [isSearching, setIsSearching] = useState(false);
   const [isRevalidating, setIsRevalidating] = useState(false);
@@ -53,12 +54,11 @@ export function useModels() {
   const searchCacheRef = useRef<Map<string, CacheEntry>>(new Map());
   const activeSearchRef = useRef<{
     query: string;
-    modelType?: string | null;
-    tags?: string[] | null;
   } | null>(null);
 
   const fetchModels = useCallback(async () => {
     const currentSequence = ++fetchSequenceRef.current;
+    setModelGroups(toDisplayOnlyModelGroups);
     // Check API availability before fetching
     if (!isAPIAvailable()) {
       logger.debug('API not available yet, skipping fetch');
@@ -71,7 +71,7 @@ export function useModels() {
     try {
       const result = await modelsAPI.getModels();
       if (currentSequence === fetchSequenceRef.current) {
-        setLibraryLoadStatus(result.success ? 'ready' : 'unavailable');
+        setLibraryLoadStatus('ready');
       }
       if (currentSequence !== fetchSequenceRef.current || activeSearchRef.current) {
         logger.debug('Discarding stale model list response', {
@@ -82,12 +82,10 @@ export function useModels() {
         return;
       }
 
-      if (result.success) {
-        const freshModelGroups = groupModelRecords(Object.values(result.models));
-        setModelGroups(freshModelGroups);
-        if (!writeModelLibrarySnapshot(freshModelGroups)) {
-          logger.debug('Model library startup snapshot could not be persisted');
-        }
+      const freshModelGroups = groupCatalogModels(Object.values(result.models));
+      setModelGroups(freshModelGroups);
+      if (!writeModelLibrarySnapshot(freshModelGroups, libraryScopeId)) {
+        logger.debug('Model library startup snapshot could not be persisted');
       }
     } catch (error) {
       if (currentSequence === fetchSequenceRef.current) {
@@ -101,7 +99,7 @@ export function useModels() {
         logger.error('Unknown error fetching models', { error });
       }
     }
-  }, []);
+  }, [libraryScopeId]);
 
   const scanModels = useCallback(async () => {
     try {
@@ -129,21 +127,11 @@ export function useModels() {
   }, [fetchModels]);
 
   /**
-   * Generate a cache key for a search query
-   */
-  const getCacheKey = useCallback(
-    (query: string, modelType?: string | null, tags?: string[] | null): string => {
-      return JSON.stringify({ query, modelType, tags: tags?.sort() });
-    },
-    []
-  );
-
-  /**
    * Transform FTS results to ModelCategory format
    */
   const transformFTSResults = useCallback(
-    (models: ModelRecord[]): ModelCategory[] => {
-      return groupModelRecords(models);
+    (models: readonly CatalogModel[]): ModelCategory[] => {
+      return groupCatalogModels(models);
     },
     []
   );
@@ -165,7 +153,7 @@ export function useModels() {
    * Uses sequence guards to discard stale responses.
    */
   const searchModelsFTS = useCallback(
-    (query: string, modelType?: string | null, tags?: string[] | null) => {
+    (query: string) => {
       // Clear any pending search
       if (searchTimeoutRef.current) {
         clearTimeout(searchTimeoutRef.current);
@@ -188,16 +176,16 @@ export function useModels() {
         return;
       }
 
-      activeSearchRef.current = { query, modelType, tags };
+      activeSearchRef.current = { query };
 
       // Check cache for immediate response (SWR pattern)
-      const cacheKey = getCacheKey(query, modelType, tags);
+      const cacheKey = query;
       const cached = searchCacheRef.current.get(cacheKey);
       const now = Date.now();
 
       if (cached && now - cached.timestamp < CACHE_TTL_MS) {
         // Show cached results immediately
-        setModelGroups(cached.results);
+        setModelGroups(toDisplayOnlyModelGroups(cached.results));
         setSearchQueryTime(cached.queryTime);
         setIsSearching(false);
         setIsRevalidating(true);
@@ -210,7 +198,7 @@ export function useModels() {
       // Debounce the search (revalidation happens in background)
       searchTimeoutRef.current = setTimeout(async () => {
         try {
-          const result = await importAPI.searchModelsFTS(query, 100, 0, modelType, tags);
+          const result = await importAPI.searchModelsFTS(query, 100, 0);
 
           // Sequence guard: discard stale responses
           if (currentSequence !== searchSequenceRef.current) {
@@ -221,32 +209,25 @@ export function useModels() {
             return;
           }
 
-          if (result.success) {
-            const categorizedModels = transformFTSResults(result.models);
+          const categorizedModels = transformFTSResults(result.models);
+          const displayResults = toDisplayOnlyModelGroups(categorizedModels);
 
-            // Check if results differ from cached (for notification)
-            const resultsChanged =
-              cached && JSON.stringify(categorizedModels) !== JSON.stringify(cached.results);
+          const resultsChanged =
+            cached && JSON.stringify(displayResults) !== JSON.stringify(cached.results);
 
-            // Update cache
-            searchCacheRef.current.set(cacheKey, {
-              query,
-              modelType,
-              tags,
-              results: categorizedModels,
-              queryTime: result.query_time_ms,
-              timestamp: Date.now(),
-            });
+          searchCacheRef.current.set(cacheKey, {
+            query,
+            results: displayResults,
+            queryTime: result.query_time_ms,
+            timestamp: Date.now(),
+          });
 
-            // Update UI
-            setModelGroups(categorizedModels);
-            setSearchQueryTime(result.query_time_ms);
+          setModelGroups(categorizedModels);
+          setSearchQueryTime(result.query_time_ms);
 
-            // Notify if results changed during revalidation
-            if (resultsChanged) {
-              setHasNewResults(true);
-              logger.debug('New results available after revalidation', { query });
-            }
+          if (resultsChanged) {
+            setHasNewResults(true);
+            logger.debug('New results available after revalidation', { query });
           }
         } catch (error) {
           if (error instanceof APIError) {
@@ -267,7 +248,7 @@ export function useModels() {
         }
       }, SEARCH_DEBOUNCE_MS);
     },
-    [fetchModels, getCacheKey, transformFTSResults]
+    [fetchModels, transformFTSResults]
   );
 
   useModelLibraryUpdateSubscription(
@@ -276,7 +257,7 @@ export function useModels() {
 
       const activeSearch = activeSearchRef.current;
       if (activeSearch?.query.trim()) {
-        searchModelsFTS(activeSearch.query, activeSearch.modelType, activeSearch.tags);
+        searchModelsFTS(activeSearch.query);
         return;
       }
 

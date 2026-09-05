@@ -1,4 +1,5 @@
 import type { LucideIcon } from 'lucide-react';
+import type { CatalogRecoveryIdentity } from '../generated/desktop-contract';
 
 export type AppStatus = 'idle' | 'running' | 'installing' | 'error';
 export type AppIconState = 'running' | 'offline' | 'uninstalled' | 'error' | 'starting' | 'stopping';
@@ -21,6 +22,9 @@ export interface AppConfig {
 }
 
 export interface ModelInfo {
+  /** Cached rows are display-only and cannot authorize model actions. */
+  provenance?: 'catalog' | 'cached' | 'activity';
+  recovery?: CatalogRecoveryIdentity;
   id: string;
   name: string;
   category: string;

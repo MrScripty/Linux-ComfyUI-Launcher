@@ -53,7 +53,7 @@ describe('getLocalModelRowState', () => {
     expect(rowState.ringDegrees).toBe(0);
   });
 
-  it('surfaces missing repository metadata for non-resumable partial downloads', () => {
+  it('does not infer recovery authority from a partial model without a current ticket', () => {
     const rowState = getLocalModelRowState({
       excludedModels: new Set(),
       expandedRelated: new Set(),
@@ -72,7 +72,7 @@ describe('getLocalModelRowState', () => {
 
     expect(rowState.canRecoverPartial).toBe(false);
     expect(rowState.partialError).toBe(
-      'Cannot resume partial download: repository metadata is missing.'
+      'Resume is unavailable until current recovery information is available.'
     );
   });
 

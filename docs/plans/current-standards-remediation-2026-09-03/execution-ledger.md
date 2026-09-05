@@ -3404,11 +3404,62 @@
   now passes; complete source and GUI acceptance remain pending.
 - Display bootstrap scopes read-only cache entries using an opaque digest of
   canonical model root, physical root identity, and the current logical marker.
-  Missing identity means no cache. Root replacement/remount invalidates cache;
+  Missing identity means no cache. Changed observed root identity invalidates cache;
   the digest never grants filesystem access or recovery authority. The main
   synchronous IPC handler returns an already-computed state, with no IO/wait.
 - Commit verified coherent drafts before investigating RUST-I12. No live model
   data, paused downloads, or private migration backups are part of these edits.
+
+### 2026-09-05 — Coordinated Desktop Contract Verification
+
+- The selected catalog, FTS, download, and ticket-recovery contract is produced
+  from current Rust declarations. Schemars serialization/request projections,
+  AJV standalone validation, bounded type generation, and bundled sandboxed
+  preload replace independently maintained selected wire representations.
+  Current-source freshness and actual-producer decoder/renderer conformance
+  are mandatory CI gates; unselected Legacy routes remain outside acceptance.
+- Catalog filesystem projection has bounded server-owned admission and an
+  observed worker drain. Same-ticket recovery waits for durable handoff;
+  generation and released-destination evidence permit only truthful attachment
+  or terminal observation. Independent reviews accepted these narrow owners,
+  not general application or HTTP/provider shutdown.
+- Desktop consumption removes guessed repo/name/quant activity associations
+  and obsolete recovery routes. Root-scoped cached rows carry display fields
+  only and expose no action authority; related-model controls remain available
+  on fresh catalog rows. The synchronous bootstrap returns precomputed state.
+- Root's combined gate reproduced disabled HF search incorrectly returning an
+  empty success. Both public search and primary-state IPC now share the
+  required-client helper; the existing unavailable-error regression passes.
+- Automated verification: both full core feature configurations pass
+  1,184 tests each (11 existing ignores); frontend passes 520 tests, types,
+  lint, and both production builds; Electron passes 129 tests with one explicit
+  real-runtime skip plus the separately enabled real sandbox preload oracle.
+  Generator tests pass 5/5; actual-producer decoder and renderer conformance
+  pass 5/5 and 2/2 respectively. RPC passes 110 tests with plugins and 70
+  without, each with 10 existing ignores. The related-availability fixture
+  now supplies the required catalog fields and checks the specific malformed
+  flag error; it cannot pass by failing unrelated field validation.
+- Strict supported-workspace all-target/all-feature lint (excluding the
+  BEAM-loaded Rustler crate), no-default core all-target lint, full Rust
+  formatting, diff checks, and all five plan contracts pass. The final default
+  backend builds. Broader C3/C4, M2J, and release claims remain open.
+- Cold and warm GUI runs reproduced one remaining presentation defect: two
+  unassociated paused activities inflated the catalog count from 83 to 85.
+  A real ModelManager regression now proves activity rows remain visible and
+  retain exact-ID controls while being excluded from the model count. Their
+  metadata line explicitly identifies download activity and current status.
+  Category row totals and association logic are unchanged.
+- Final built-app verification passes on Linux/X11 with real sandboxed
+  Electron: 83 catalog models, two explicitly labelled paused activities,
+  nine partial badges with retained percentages, no Ready-to-finish state,
+  zero renderer errors, scrolling, and normal window-control shutdown.
+  A native window-only capture confirms cached rows are painted during warm
+  refresh without stale action controls. All 60 tracked payload paths and both
+  paused records remain unchanged; the store hash remains `a0885e5f`.
+  Private deciding logs and captures are in `/tmp/pumas-draft-integration.tEfbTc`.
+- Accept this coherent source checkpoint, including the previously staged HF
+  UniFFI adapter. The still-reproduced Qwen destination collision is RUST-I12;
+  its separate diagnosis and no-loss correction follow the source commit.
 
 ## Reports
 

@@ -1,6 +1,5 @@
 //! Model library handlers.
 
-mod auth;
 mod catalog;
 mod dependencies;
 mod downloads;
@@ -9,7 +8,6 @@ mod inference;
 mod migration;
 mod search;
 
-pub use auth::*;
 pub use catalog::*;
 pub use dependencies::*;
 pub use downloads::*;

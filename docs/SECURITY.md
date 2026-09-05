@@ -29,14 +29,15 @@ maintainer explicitly announces otherwise.
 ## Sensitive Data
 
 Hugging Face tokens and other secrets must never appear in logs, errors, URLs,
-or diagnostics. The 2026-09-03 audit found that backend debug logging can record
-complete `set_hf_token` parameters and Electron can persist that output. Until
-the handler is fixed, do not set credentials while running the backend with
-`--debug` or the desktop app in development/debug mode. Rotate any token that
-may have been exposed and inspect/remove affected local logs.
+or diagnostics. `pumas-rpc` does not log request parameter values, including in
+debug mode. Request diagnostics use an allowlisted method label, a numeric
+request ID when present, and a stable outcome class/code.
 
-Public error responses must use stable redacted error types rather than raw
-internal path, URL, or dependency messages.
+JSON-RPC and RPC-owned event errors pass through the Rust producer's stable
+public error projection. Its messages are bounded and deny disclosure of raw
+internal path, URL, credential, dependency, and upstream error text. Internal
+errors must not be serialized through `Display` or `Debug`; new transports must
+reuse the same projection.
 
 ## Dependency and Release Evidence
 

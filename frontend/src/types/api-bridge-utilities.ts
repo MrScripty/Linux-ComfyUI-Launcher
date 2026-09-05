@@ -15,11 +15,16 @@ import type {
 } from './api-processes';
 import type {
   CloseWindowResponse,
+  LauncherRootSelectionResult,
+  LauncherRootStartupState,
   OpenActiveInstallResponse,
   OpenPathResponse,
   OpenUrlResponse,
-  SelectLauncherRootResponse,
 } from './api-window';
+
+export type LauncherRootCommittedPresentation =
+  | Exclude<LauncherRootStartupState['status'], 'initializing'>
+  | 'bridge-unavailable';
 
 export interface DesktopBridgeUtilityAPI {
   // ========================================
@@ -53,7 +58,13 @@ export interface DesktopBridgeUtilityAPI {
   // ========================================
   open_url(url: string): Promise<OpenUrlResponse>;
   open_path(path: string): Promise<OpenPathResponse>;
-  select_launcher_root(): Promise<SelectLauncherRootResponse>;
+  get_launcher_root_state: () => Promise<LauncherRootStartupState>;
+  get_launcher_root_bootstrap: () => LauncherRootStartupState;
+  select_launcher_root: () => Promise<LauncherRootSelectionResult>;
+  notify_launcher_root_presentation_committed: (
+    presentation: LauncherRootCommittedPresentation
+  ) => Promise<void>;
+  onLauncherRootPresentationTimeout: (callback: () => void) => () => void;
   open_active_install(appId?: string): Promise<OpenActiveInstallResponse>;
   close_window(): Promise<CloseWindowResponse>;
 

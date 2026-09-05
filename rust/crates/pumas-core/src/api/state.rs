@@ -1134,7 +1134,7 @@ impl ipc::server::IpcDispatch for PrimaryState {
                         .ok_or_else(|| PumasError::InvalidParams {
                             message: "download_id is required".to_string(),
                         })?;
-                let progress = get_hf_download_progress(self, download_id).await;
+                let progress = get_hf_download_progress(self, download_id).await?;
                 Ok(serde_json::to_value(progress)?)
             }
             "cancel_hf_download" => {
@@ -1168,11 +1168,11 @@ impl ipc::server::IpcDispatch for PrimaryState {
                 Ok(serde_json::to_value(resumed)?)
             }
             "list_hf_downloads" => {
-                let downloads = list_hf_downloads(self).await;
+                let downloads = list_hf_downloads(self).await?;
                 Ok(serde_json::to_value(downloads)?)
             }
             "list_interrupted_downloads" => {
-                let downloads = list_interrupted_downloads(self).await;
+                let downloads = list_interrupted_downloads(self).await?;
                 Ok(serde_json::to_value(downloads)?)
             }
             "recover_download" => {

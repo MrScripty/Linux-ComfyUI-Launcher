@@ -1,105 +1,49 @@
 import { describe, expect, it } from 'vitest';
-import { groupModelRecords, mapModelRecordToInfo } from './libraryModels';
-import type { ModelRecord } from '../types/api';
+import { groupCatalogModels, projectCatalogModel } from './libraryModels';
+import type { CatalogModel } from '../generated/desktop-contract';
 
-function makeModelRecord(overrides: Partial<ModelRecord> = {}): ModelRecord {
+function catalog(overrides: Partial<CatalogModel> = {}): CatalogModel {
   return {
-    id: 'llm/llama/test-model',
-    path: '/tmp/models/llm/llama/test-model',
-    modelType: 'llm',
-    officialName: 'Test Model',
-    cleanedName: 'test-model',
-    tags: [],
-    hashes: {},
-    metadata: {
-      size_bytes: 1234,
-      download_progress: 0.42,
-      added_date: '2026-03-06T00:00:00Z',
-      repo_id: 'example/test-model',
-      primary_format: 'gguf',
-      quantization: 'Q4_K_M',
-      dependency_bindings: [{ profile_id: 'llama-cpp-runtime' }],
-      conversion_source: {
-        source_model_id: 'llm/llama/source-model',
-        source_format: 'safetensors',
-        target_format: 'gguf',
-        conversion_date: '2026-03-06T00:00:00Z',
-        was_dequantized: false,
-      },
-    },
-    updatedAt: '2026-03-06T00:00:00Z',
-    ...overrides,
+    id: 'llm/example', modelDir: '/models/example', modelType: 'llm',
+    displayName: 'Example', format: 'gguf', quantization: 'Q4_K_M', sizeBytes: 1234,
+    displayDate: '2026-03-06T00:00:00Z', dependencyCount: 1, relatedAvailable: true,
+    artifact: { state: 'complete' }, integrity: { state: 'clean' }, ...overrides,
   };
 }
 
-describe('mapModelRecordToInfo', () => {
-  it('maps canonical indexed metadata into row display fields', () => {
-    const info = mapModelRecordToInfo(makeModelRecord());
-
-    expect(info.id).toBe('llm/llama/test-model');
-    expect(info.modelDir).toBe('/tmp/models/llm/llama/test-model');
-    expect(info.format).toBe('gguf');
-    expect(info.quant).toBe('Q4_K_M');
-    expect(info.size).toBe(1234);
-    expect(info.downloadProgress).toBe(0.42);
-    expect(info.date).toBe('2026-03-06T00:00:00Z');
-    expect(info.repoId).toBe('example/test-model');
-    expect(info.hasDependencies).toBe(true);
-    expect(info.dependencyCount).toBe(1);
-    expect(info.primaryFormat).toBe('gguf');
+describe('catalog projection', () => {
+  it('uses explicit catalog fields without reading raw model metadata', () => {
+    expect(projectCatalogModel(catalog())).toMatchObject({
+      id: 'llm/example', name: 'Example', category: 'llm', modelDir: '/models/example',
+      format: 'gguf', quant: 'Q4_K_M', size: 1234, date: '2026-03-06T00:00:00Z',
+      dependencyCount: 1, hasDependencies: true, isPartialDownload: false,
+      hasIntegrityIssue: false, provenance: 'catalog', relatedAvailable: true,
+    });
   });
 
-  it('keeps non-convertible formats out of the convert action field', () => {
-    const info = mapModelRecordToInfo(
-      makeModelRecord({
-        id: 'vision/onnx/test-model',
-        modelType: 'vision',
-        metadata: {
-          primary_format: 'onnx',
-          quantization: null,
-          dependency_bindings: [],
-        },
-      })
-    );
-
-    expect(info.format).toBe('onnx');
-    expect(info.primaryFormat).toBeUndefined();
-    expect(info.hasDependencies).toBe(false);
+  it('preserves partial progress and exact ticket separately from integrity', () => {
+    const recovery = { recoveryToken: `v1:${'a'.repeat(64)}`, repoId: 'org/example', selectedArtifactFiles: ['weights.gguf'] };
+    const model = projectCatalogModel(catalog({
+      artifact: { state: 'partial', downloadProgressFraction: 0.42, reasons: ['part_file_present'], recovery },
+      integrity: { state: 'duplicate', count: 2, otherModelIds: ['llm/other'] },
+    }));
+    expect(model).toMatchObject({
+      isPartialDownload: true, downloadProgress: 0.42, recovery, hasIntegrityIssue: true,
+      integrityIssueMessage: 'Duplicate artifact entries detected (2 paths). Run library reconciliation.',
+    });
   });
 
-  it('uses dedicated row fields instead of cleaned metadata duplicates', () => {
-    const info = mapModelRecordToInfo(
-      makeModelRecord({
-        modelType: '',
-        metadata: {
-          model_type: 'legacy-metadata-type',
-          conversion_source: {
-            source_format: 'safetensors',
-            was_dequantized: true,
-          },
-        },
-      })
-    );
-
-    expect(info.category).toBe('uncategorized');
-    expect(info.wasDequantized).toBeUndefined();
-    expect(info.convertedFrom).toBeUndefined();
+  it('does not invent progress, recovery permission, or conversion support', () => {
+    const model = projectCatalogModel(catalog({
+      format: 'onnx', artifact: { state: 'partial', reasons: ['expected_files_missing'] },
+    }));
+    expect(model.downloadProgress).toBeUndefined();
+    expect(model.recovery).toBeUndefined();
+    expect(model.primaryFormat).toBeUndefined();
   });
-});
 
-describe('groupModelRecords', () => {
-  it('groups mapped records by model type', () => {
-    const groups = groupModelRecords([
-      makeModelRecord(),
-      makeModelRecord({
-        id: 'audio/kittentts/test-model',
-        modelType: 'audio',
-        officialName: 'Audio Model',
-      }),
-    ]);
-
-    expect(groups).toHaveLength(2);
-    expect(groups[0]?.models[0]?.name).toBeDefined();
-    expect(groups.map((group) => group.category).sort()).toEqual(['audio', 'llm']);
+  it('groups catalog rows by their declared model type', () => {
+    expect(groupCatalogModels([catalog(), catalog({ id: 'audio/example', modelType: 'audio' })])
+      .map((group) => group.category)).toEqual(['llm', 'audio']);
   });
 });

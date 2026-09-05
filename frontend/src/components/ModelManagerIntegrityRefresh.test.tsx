@@ -1,18 +1,27 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ModelLibraryUpdateNotification, ModelRecord } from '../types/api';
+import type { ModelLibraryUpdateNotification } from '../types/api';
+import type { CatalogModel } from '../generated/desktop-contract';
+import type { DownloadStatus } from '../hooks/modelDownloadState';
 import { useModels } from '../hooks/useModels';
 import { ModelManager } from './ModelManager';
 import { writeModelLibrarySnapshot } from '../utils/modelLibrarySnapshot';
+import { LauncherRootRecoveryProvider } from '../hooks/useLauncherRootRecovery';
+
+const libraryScopeId = `display-v1:${'a'.repeat(64)}`;
 
 const {
   getElectronAPIMock,
   getModelsMock,
   isApiAvailableMock,
+  downloadActivities,
+  resumeDownloadMock,
 } = vi.hoisted(() => ({
   getElectronAPIMock: vi.fn(),
   getModelsMock: vi.fn(),
   isApiAvailableMock: vi.fn<() => boolean>(),
+  downloadActivities: {} as Record<string, DownloadStatus>,
+  resumeDownloadMock: vi.fn(),
 }));
 
 vi.mock('../api/adapter', () => ({
@@ -56,10 +65,10 @@ vi.mock('../hooks/useModelDownloads', () => ({
   useModelDownloads: () => ({
     cancelDownload: vi.fn(),
     downloadErrors: {},
-    downloadStatusByRepo: {},
+    downloadStatusByRepo: downloadActivities,
     hasActiveDownloads: false,
     pauseDownload: vi.fn(),
-    resumeDownload: vi.fn(),
+    resumeDownload: resumeDownloadMock,
     setDownloadErrors: vi.fn(),
     startDownload: vi.fn(),
   }),
@@ -83,7 +92,7 @@ vi.mock('../hooks/useModelLibraryActions', () => ({
     handleRecoverPartialDownload: vi.fn(),
     handleToggleRelated: vi.fn(),
     openRemoteUrl: vi.fn(),
-    recoveringPartialRepoIds: new Set<string>(),
+    recoveringPartialModelIds: new Set<string>(),
     relatedModelsById: {},
   }),
 }));
@@ -152,28 +161,30 @@ vi.mock('./RemoteModelsList', () => ({
   RemoteModelsList: () => null,
 }));
 
-function makeRecord(id: string, hasIntegrityIssue: boolean): ModelRecord {
+function makeRecord(id: string, hasIntegrityIssue: boolean): CatalogModel {
   return {
     id,
-    path: `/models/${id}`,
+    modelDir: `/models/${id}`,
     modelType: 'llm',
-    officialName: 'Qwen Test',
-    tags: [],
-    hashes: {},
-    metadata: hasIntegrityIssue
-      ? {
-          integrity_issue_duplicate_repo_id: true,
-          integrity_issue_duplicate_repo_id_count: 2,
-          repo_id: 'qwen/test',
-        }
-      : {
-          repo_id: 'qwen/test',
-        },
-    updatedAt: '2026-05-04T00:00:00Z',
+    displayName: 'Qwen Test',
+    dependencyCount: 0,
+    relatedAvailable: false,
+    artifact: { state: 'complete' },
+    integrity: hasIntegrityIssue ? { state: 'duplicate', count: 2, otherModelIds: ['other'] } : { state: 'clean' },
   };
 }
 
 function Harness() {
+  getElectronAPIMock.mockReturnValue({
+    get_launcher_root_bootstrap: () => ({ status: 'ready', selectionAction: 'select-library', libraryScopeId }),
+    notify_launcher_root_presentation_committed: async () => undefined,
+    onLauncherRootPresentationTimeout: () => () => undefined,
+    ...getElectronAPIMock(),
+  });
+  return <LauncherRootRecoveryProvider><HarnessContent /></LauncherRootRecoveryProvider>;
+}
+
+function HarnessContent() {
   const { modelGroups, libraryLoadStatus } = useModels();
 
   return (
@@ -199,6 +210,7 @@ async function flushMicrotasks() {
 describe('ModelManager integrity refresh acceptance', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    for (const key of Object.keys(downloadActivities)) delete downloadActivities[key];
     vi.useFakeTimers();
     isApiAvailableMock.mockReturnValue(true);
     localStorage.clear();
@@ -208,6 +220,23 @@ describe('ModelManager integrity refresh acceptance', () => {
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+  });
+
+  it('counts catalog models separately from visibly identified download activity with exact controls', async () => {
+    getModelsMock.mockResolvedValue({ success: true, models: { qwen: makeRecord('qwen', false) } });
+    downloadActivities['download-exact-id'] = {
+      downloadId: 'download-exact-id',
+      status: 'paused', repoId: 'publisher/Qwen', modelName: 'Qwen Test',
+      progress: 0.25,
+    };
+    render(<Harness />);
+    await flushMicrotasks();
+
+    expect(screen.getByPlaceholderText('Search 1 models')).toBeInTheDocument();
+    expect(screen.getAllByText('Qwen Test')).toHaveLength(2);
+    expect(screen.getByText('Download activity · paused')).toBeVisible();
+    fireEvent.click(screen.getByTitle('Resume download'));
+    expect(resumeDownloadMock).toHaveBeenCalledExactlyOnceWith('download-exact-id');
   });
 
   it('shows loading rather than an empty library or a zero count before the first response', () => {
@@ -224,7 +253,7 @@ describe('ModelManager integrity refresh acceptance', () => {
     'does not claim an empty library when the backend is %s',
     async (failure) => {
       if (failure === 'rejected') getModelsMock.mockRejectedValue(new Error('Backend startup failed'));
-      if (failure === 'unsuccessful') getModelsMock.mockResolvedValue({ success: false, models: {} });
+      if (failure === 'unsuccessful') getModelsMock.mockRejectedValue(new Error('Invalid desktop catalog response'));
       if (failure === 'unavailable') isApiAvailableMock.mockReturnValue(false);
       render(<Harness />);
       await flushMicrotasks();
@@ -249,7 +278,7 @@ describe('ModelManager integrity refresh acceptance', () => {
     writeModelLibrarySnapshot([{
       category: 'llm',
       models: [{ id: 'saved-partial', name: 'Saved partial model', category: 'llm', isPartialDownload: true }],
-    }]);
+    }], libraryScopeId);
     getModelsMock.mockRejectedValue(new Error('Backend startup failed'));
     render(<Harness />);
     expect(screen.getByText('Saved partial model')).toBeInTheDocument();

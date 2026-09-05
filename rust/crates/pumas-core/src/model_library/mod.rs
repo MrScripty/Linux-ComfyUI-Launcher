@@ -46,6 +46,8 @@ mod partial_download;
 mod read_only;
 pub mod sharding;
 mod task_signature;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod types;
 mod watcher;
 

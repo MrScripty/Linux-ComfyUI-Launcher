@@ -57,6 +57,12 @@ function servedStatus(overrides: Partial<ServedModelStatus> = {}): ServedModelSt
 }
 
 describe('ONNX Runtime library view models', () => {
+  it('does not offer cached display models as executable runtime rows', () => {
+    expect(buildOnnxRuntimeModelRows({
+      modelGroups: [{ category: 'llm', models: [model({ provenance: 'cached' })] }],
+      profiles: [profile()], routes: [route()], servedStatuses: [servedStatus()],
+    })).toEqual([]);
+  });
   it('keeps ONNX-compatible models and removes incompatible groups', () => {
     const groups: ModelCategory[] = [
       {

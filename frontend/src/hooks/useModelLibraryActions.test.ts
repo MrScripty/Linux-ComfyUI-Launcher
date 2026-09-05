@@ -47,6 +47,9 @@ const relatedModel = (overrides: Partial<RemoteModelInfo> = {}): RemoteModelInfo
 });
 
 const partialModel = (overrides: Partial<ModelInfo> = {}): ModelInfo => ({
+  provenance: 'catalog',
+  isPartialDownload: true,
+  recovery: { recoveryToken: `v1:${'a'.repeat(64)}`, repoId: 'org/model', selectedArtifactFiles: [] },
   id: 'llm/org-model',
   name: 'Org Model',
   category: 'llm',
@@ -88,8 +91,6 @@ function renderLibraryActions(options?: {
     return {
       downloadErrors,
       ...useModelLibraryActions({
-        downloadStatusByRepo: options?.downloadStatusByRepo ?? {},
-        cancelDownload,
         onModelsImported,
         setDownloadErrors,
         startDownload,
@@ -106,6 +107,22 @@ function renderLibraryActions(options?: {
 }
 
 describe('useModelLibraryActions', () => {
+  it('uses the current model ticket once per model and refuses cached recovery authority', async () => {
+    const request = createDeferred<{ success: boolean; action: string; download_id: string }>();
+    resumePartialDownloadMock.mockReturnValueOnce(request.promise);
+    const { result } = renderLibraryActions();
+    let pending: Promise<void> | undefined;
+    act(() => {
+      pending = result.current.handleRecoverPartialDownload(partialModel());
+      void result.current.handleRecoverPartialDownload(partialModel());
+      void result.current.handleRecoverPartialDownload(partialModel({ provenance: 'cached' }));
+    });
+    expect(resumePartialDownloadMock).toHaveBeenCalledExactlyOnceWith('llm/org-model', `v1:${'a'.repeat(64)}`);
+    await act(async () => {
+      request.resolve({ success: true, action: 'resume', download_id: 'dl-123' });
+      await pending;
+    });
+  });
   const windowOpenSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
 
   beforeEach(() => {
@@ -134,8 +151,6 @@ describe('useModelLibraryActions', () => {
       (apiAvailable: boolean) => {
         isApiAvailableMock.mockReturnValue(apiAvailable);
         return useModelLibraryActions({
-          downloadStatusByRepo: {},
-          cancelDownload: vi.fn(),
           setDownloadErrors: vi.fn(),
           startDownload: vi.fn(),
         });
@@ -231,7 +246,7 @@ describe('useModelLibraryActions', () => {
     expect(getRelatedModelsMock).not.toHaveBeenCalled();
   });
 
-  it('clears stale errors, tracks recovering repo IDs, and starts resumed partial downloads', async () => {
+  it('clears stale errors, tracks recovering model IDs, and starts resumed partial downloads', async () => {
     const recoveryDeferred = createDeferred<{
       success: boolean;
       action: string;
@@ -242,7 +257,7 @@ describe('useModelLibraryActions', () => {
     const startDownload = vi.fn();
     const { result } = renderLibraryActions({
       downloadErrors: {
-        'org/model': 'Old failure',
+        'llm/org-model': 'Old failure',
       },
       startDownload,
     });
@@ -254,8 +269,8 @@ describe('useModelLibraryActions', () => {
     });
 
     expect(result.current.downloadErrors).toEqual({});
-    expect(result.current.recoveringPartialRepoIds.has('org/model')).toBe(true);
-    expect(resumePartialDownloadMock).toHaveBeenCalledWith('org/model', '/models/org-model');
+    expect(result.current.recoveringPartialModelIds.has('llm/org-model')).toBe(true);
+    expect(resumePartialDownloadMock).toHaveBeenCalledWith('llm/org-model', `v1:${'a'.repeat(64)}`);
 
     await act(async () => {
       recoveryDeferred.resolve({
@@ -266,15 +281,15 @@ describe('useModelLibraryActions', () => {
       await recoveryPromise;
     });
 
-    expect(startDownload).toHaveBeenCalledWith('org/model', 'dl-123', {
+    expect(startDownload).toHaveBeenCalledWith('dl-123', 'dl-123', {
       repoId: 'org/model',
       modelName: 'Org Model',
       modelType: 'llm',
     });
-    expect(result.current.recoveringPartialRepoIds.size).toBe(0);
+    expect(result.current.recoveringPartialModelIds.size).toBe(0);
   });
 
-  it('maps partial recovery failures into user-facing repo errors', async () => {
+  it('maps partial recovery failures into user-facing model errors', async () => {
     resumePartialDownloadMock.mockResolvedValueOnce({
       success: false,
       action: 'none',
@@ -293,12 +308,12 @@ describe('useModelLibraryActions', () => {
 
     expect(startDownload).not.toHaveBeenCalled();
     expect(result.current.downloadErrors).toEqual({
-      'org/model': 'HuggingFace rate-limited the request. Try again shortly.',
+      'llm/org-model': 'HuggingFace rate-limited the request. Try again shortly.',
     });
-    expect(result.current.recoveringPartialRepoIds.size).toBe(0);
+    expect(result.current.recoveringPartialModelIds.size).toBe(0);
   });
 
-  it('cancels matching downloads before delete and refreshes models after successful deletion', async () => {
+  it('deletes the exact model without cancelling a download based on repository or quant labels', async () => {
     const cancelDownload = vi.fn().mockResolvedValue(undefined);
     const onModelsImported = vi.fn();
     const { result } = renderLibraryActions({
@@ -323,7 +338,7 @@ describe('useModelLibraryActions', () => {
       await result.current.handleDeleteModel('llm/org/model');
     });
 
-    expect(cancelDownload).toHaveBeenCalledWith('org/model::Q4');
+    expect(cancelDownload).not.toHaveBeenCalled();
     expect(deleteModelMock).toHaveBeenCalledWith('llm/org/model');
     expect(onModelsImported).toHaveBeenCalledTimes(1);
   });

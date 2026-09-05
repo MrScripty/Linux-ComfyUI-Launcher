@@ -69,8 +69,6 @@ export const RPC_METHOD_REGISTRY = {
     'pause_model_download',
     'resume_model_download',
     'list_model_downloads',
-    'list_interrupted_downloads',
-    'recover_download',
     'resume_partial_download',
     'search_hf_models',
     'get_hf_download_details',
@@ -194,7 +192,6 @@ export const RPC_METHOD_PARAM_VALIDATION = {
   refresh_model_index: 'empty-record',
   scan_shared_storage: 'empty-record',
   list_model_downloads: 'empty-record',
-  list_interrupted_downloads: 'empty-record',
   get_hf_auth_status: 'empty-record',
   launch_ollama: 'empty-record',
   stop_ollama: 'empty-record',
@@ -398,16 +395,10 @@ export const RPC_METHOD_REQUEST_SCHEMAS = {
   cancel_model_download: REQUIRED_DOWNLOAD_ID_SCHEMA,
   pause_model_download: REQUIRED_DOWNLOAD_ID_SCHEMA,
   resume_model_download: REQUIRED_DOWNLOAD_ID_SCHEMA,
-  recover_download: {
-    required: {
-      repo_id: 'string',
-      dest_dir: 'string',
-    },
-  },
   resume_partial_download: {
     required: {
-      repo_id: 'string',
-      dest_dir: 'string',
+      modelId: 'string',
+      recoveryToken: 'string',
     },
   },
   open_path: {

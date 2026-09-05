@@ -1,10 +1,12 @@
 import { api, isAPIAvailable, windowAPI } from '../api/adapter';
 import { APIError } from '../errors';
 import { getLogger } from '../utils/logger';
+import { useLauncherRootRecovery } from './useLauncherRootRecovery';
 
 const logger = getLogger('useAppWindowActions');
 
 export function useAppWindowActions() {
+  const { chooseLibraryRoot } = useLauncherRootRecovery();
   const openModelsRoot = async () => {
     if (!isAPIAvailable()) return;
     try {
@@ -35,32 +37,6 @@ export function useAppWindowActions() {
 
   const minimizeWindow = () => {
     void windowAPI.minimize();
-  };
-
-  const chooseLibraryRoot = async (): Promise<void> => {
-    if (!isAPIAvailable()) {
-      return;
-    }
-
-    try {
-      const result = await api.select_launcher_root();
-      if (!result.success && !result.cancelled) {
-        throw new APIError(result.error || 'Failed to select library path', 'select_launcher_root');
-      }
-    } catch (error) {
-      if (error instanceof APIError) {
-        logger.error('API error choosing library path', {
-          error: error.message,
-          endpoint: error.endpoint,
-        });
-      } else if (error instanceof Error) {
-        logger.error('Unexpected error choosing library path', {
-          error: error.message,
-        });
-      } else {
-        logger.error('Unknown error choosing library path', { error });
-      }
-    }
   };
 
   const closeWindow = () => {
