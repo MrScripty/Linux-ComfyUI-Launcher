@@ -23,8 +23,9 @@
 - Milestone 3 has one accepted request-contract slice but remains
   `Active`/pending; runtime scheduling and deployment are blocked on a real
   tuple and fixture.
-- Current slice: Milestone 2 same-directory atomic launcher-root persistence.
-  Renderer recovery and streams remain held.
+- Current slice: Milestone 2 sandbox-compatible renderer-recovery Electron
+  producer tranche at focused real-Electron review boundary. Frontend consumer
+  and streams remain held.
 
 ## Entries
 
@@ -572,6 +573,219 @@
   and Milestone 2 remain open. The existing main-process consumer fails closed
   without success/relaunch/retry, but renderer projection of replacement-unknown
   and published-durability-unavailable states remains future recovery work.
+
+### 2026-09-03 — Admit M2 renderer-recovery producer tranche
+
+- Operation: `continue`; the atomic publication boundary was accepted and
+  integrated as `767e71f0`.
+- Investigation result: typed startup authority failure is logged and quits the
+  app, so the native chooser is unreachable. Selection persistence outcomes are
+  collapsed into an optional-field `{success,error}` bag, forwarded by preload
+  without runtime decoding, and discarded into renderer logs.
+- Producer ownership: `launcher-root.ts` retains detailed resolution,
+  validation, persistence stage/cause, and authority state. A new pure
+  `launcher-root-recovery.ts` Module owns only the closed JSON-safe renderer DTO,
+  projection, and runtime decoder. Main owns lifecycle state and native IPC;
+  preload owns invocation and trust-boundary decoding.
+- Closed startup contract: `initializing`, `ready`, or `recovery-required` with
+  reason `invalid|unavailable`, source `persisted|environment|argument`, and
+  action `select-library|correct-launch-input`. Persisted failure may invoke the
+  chooser; an environment/argument failure may not, because persisted state
+  cannot outrank the same explicit input on relaunch.
+- Closed selection contract: `cancelled`, `restarting`, or `recovery-required`
+  with reason `invalid-selection|persistence-unavailable` and authority state
+  `unchanged|replacement-visibility-unknown|published-durability-unavailable`.
+  Paths, selected values, persistence stages, cleanup state, raw causes, and
+  source chains never cross preload.
+- Lifecycle decision: normal startup keeps the window open only for the typed
+  launcher-root recovery state; other backend failures and release smoke remain
+  fatal. A selection failure never reports success, retries, rolls back, or
+  relaunches. Only a fully persisted selection retains the existing automatic
+  relaunch.
+- Exact producer write set:
+  - `electron/src/launcher-root.ts`
+  - `electron/src/launcher-root-recovery.ts` (new)
+  - `electron/src/startup-task.ts`
+  - `electron/src/main.ts`
+  - `electron/src/preload.ts`
+  - `electron/tests/launcher-root-recovery.test.mjs` (new)
+  - `electron/tests/preload-rpc-contract.test.mjs`
+  - this plan, ledger, issues, and `reports/desktop-lifecycle-evidence.md`
+- Held frontend tranche: `frontend/src/types/{api-window.ts,
+  api-bridge-utilities.ts}`, `frontend/src/hooks/{useLauncherRootRecovery.tsx,
+  useLauncherRootRecovery.test.tsx,useAppWindowActions.ts,
+  useAppWindowActions.test.ts}`, `frontend/src/components/{
+  LauncherRootRecoveryView.tsx,LauncherRootRecoveryView.test.tsx}`, and
+  `frontend/src/index.tsx` require separate root/frontend-owner serialization.
+  They do not overlap the active catalog DTO files.
+- Atomic integration constraint: the Electron tranche must not integrate while
+  its recovery UI is unreachable. Producer and frontend consumer require
+  coordinated acceptance. No catalog, App root, ModelManager/list, adapter,
+  package, Rust/RPC/generated, CI, or shared-doc file enters this tranche.
+
+### 2026-09-03 — Reach initial M2 renderer-recovery producer boundary
+
+- TDD red: the new public recovery test could not import the absent recovery
+  Module; the preload source oracle showed launcher-root IPC values were still
+  forwarded undecoded. A later lifecycle red could not import the absent
+  backend-outcome classifier needed to distinguish normal desktop recovery from
+  release-smoke failure.
+- Module result: `launcher-root-recovery.ts` owns one closed JSON-safe startup
+  state, one closed selection result, exact-shape decoders, source/action
+  correlation, and path-free projections. Detailed resolution paths,
+  persistence stages, cleanup state, and raw causes remain private to the
+  launcher-root producer.
+- Main/preload result: main publishes the projected startup state, permits the
+  native chooser only when current authority can be superseded, returns exact
+  terminal selection outcomes, and relaunches only after complete persistence.
+  Preload decodes both IPC results before exposing them to a renderer.
+- Lifecycle result: one pure classifier maps a fulfilled initialization to
+  ready, typed launcher-root failure to normal-desktop recovery, and every
+  release-smoke rejection or unrelated backend failure to fatal while
+  preserving the original error. Main keeps the window open only for the
+  selected recovery disposition.
+- Focused green: 11 recovery/preload checks pass, including exact-shape and
+  correlated-value negatives, removal of paths from projections, non-explicit
+  chooser availability, selection authority outcomes, normal-versus-smoke
+  lifecycle classification, and preload decoder wiring. The complete Electron
+  build and all seven test files pass.
+- Claim boundary: this is producer, local unit, source-contract, and build
+  evidence. The frontend provider/view is still absent, so this tranche must
+  remain unintegrated until the separately serialized consumer is accepted.
+  Required-real packaged target evidence, stream ownership, and DRBT-A3 final
+  acceptance remain open.
+- Review result: `not accepted`. Resolved environment/argument authority was
+  collapsed into chooser-capable ready state; the main handler had no
+  single-flight/current-attempt owner; native dialog rejection escaped the
+  closed DTO; and chooser admission remained open after ambiguous, published,
+  or restarting outcomes.
+
+### 2026-09-03 — Correct M2 renderer-recovery ownership boundary
+
+- Operation: `re-plan`; the exact 11-file write set is unchanged. No frontend,
+  catalog, package, Rust/RPC, shared-doc, or additional source/test file entered
+  scope.
+- TDD red: handler-level cases could not import the absent selection owner, and
+  existing projection expectations showed that resolved environment/argument
+  roots had no path-free selection policy. The red contract also selected
+  truthful chooser-unavailable, explicit-authority, concurrent-attempt,
+  retryable-unchanged, locked-publication, and restart-request outcomes.
+- Contract correction: ready startup now contains only
+  `selectionAction: select-library|correct-launch-input`. Resolved environment
+  and argument authority selects correction; persisted/discovered/default
+  authority selects the chooser. The main owner enforces the same policy even
+  if a renderer invokes IPC directly.
+- Closed result correction: `not-selectable/correct-launch-input` and
+  `chooser-unavailable/unchanged` no longer masquerade as persistence failure.
+  A failure to synchronously request relaunch after durable publication is
+  `restart-unavailable/published`. Preload exact-shape decoding owns all new
+  correlated variants.
+- Lifecycle owner: one `createLauncherRootSelectionHandler` instance owns the
+  current attempt. Concurrent callers share exactly one Promise and outcome.
+  Cancel, chooser unavailable, invalid selection, and persistence failure with
+  proven-unchanged authority return to idle for explicit retry. Restarting,
+  replacement visibility unknown, published durability unavailable, and
+  restart unavailable are locked terminals replayed without opening another
+  dialog, persisting, or requesting another restart.
+- Restart ordering: after persistence success, the injected restart Adapter
+  calls `app.relaunch()` synchronously and schedules only the response-flush
+  delay before quit. A thrown relaunch request or timer-scheduling failure is
+  observed before `restarting` can be returned and reaches the locked published
+  recovery outcome.
+- Focused green: 18 recovery/preload checks pass, including resolved explicit
+  policy, exact DTO correlation, no-window/dialog rejection, overlap sharing,
+  unchanged re-entry, unexpected/ambiguous/published locking, successful
+  terminal replay, synchronous restart-request failure, and main composition
+  ordering. The complete Electron build and all seven test files pass.
+- Claim boundary: frontend recovery remains absent and atomic integration is
+  still blocked. This is incremental local producer evidence only; required-
+  real packaged targets, streams, and DRBT-A3 acceptance remain open.
+
+### 2026-09-03 — Repair sandboxed preload composition
+
+- Operation: `re-plan`; a Critical composed-runtime oracle reopened the
+  uncommitted producer. Production uses `sandbox:true`,
+  `contextIsolation:true`, and `nodeIntegration:false`, while the TypeScript
+  build emitted `require('./launcher-root-recovery')` from `dist/preload.js`.
+  Electron 39.8.6 could not resolve that local module in a sandboxed preload,
+  so `window.electronAPI` was absent.
+- Exact write authority remains the same 11 files. The repair changes only the
+  existing recovery/preload source and tests plus these four plan-local docs;
+  it does not change package/build tooling, sandbox policy, frontend, catalog,
+  Rust/RPC, or shared docs.
+- TDD red: after a canonical Electron build, the compiled-preload dependency
+  oracle found `./launcher-root-recovery` as an unsupported local runtime
+  require. The preserved real frontend oracle independently emitted an unable-
+  to-load-preload/module-not-found diagnostic and no bridge.
+- Ownership correction: `launcher-root-recovery.ts` remains the sole producer
+  owner for DTO types, resolution projection, selection policy, and attempt
+  lifecycle. `preload.ts` is the sole runtime inbound decoder at the sandboxed
+  IPC trust boundary and imports producer types only. The emitted JavaScript
+  therefore requires only Electron; no parallel runtime decoder remains.
+- Supporting green evidence: the compiled-output check accepts exactly the
+  `electron` runtime require and rejects every other module. A compiled-preload
+  VM harness exercises every closed startup and selection state plus
+  malformed/extra negatives through the exposed API.
+- Deciding green evidence: pinned Electron 39.8.6 ran a hidden BrowserWindow as
+  uid 1000 on Linux with `DISPLAY=:0`, no `--no-sandbox`, and the exact
+  production preferences. The actual built preload exposed `electronAPI`; all
+  nine startup and nine selection values round-tripped; three malformed startup
+  and six malformed/extra selection values rejected with stable messages; and
+  no preload, load, renderer-gone, or unresponsive failure occurred. The owned
+  child exited zero in 551 ms and the test removed its unique temporary state.
+  The hardened harness gives Electron its own process group; success and forced
+  timeout paths observe that the group is gone before removing that state.
+- Full green: the Electron build and all 77 tests, including the enabled real
+  sandbox oracle with no skip, pass; lint, `tsc --noEmit`, plan structure, and
+  scoped tracked/untracked whitespace checks pass.
+- Claim boundary: this is representative real Linux Electron evidence for the
+  sandboxed preload loader/decoder contract. It is not packaged-artifact or
+  required-real Windows/macOS evidence. The renderer consumer remains held, so
+  producer integration is still blocked pending the composed UI oracle.
+
+### 2026-09-03 — Hold first-visible-frame repair at proportionality gate
+
+- Operation: `re-plan`; the Electron producer and serialized frontend consumer
+  remain uncommitted. Product source is frozen pending a product decision; no
+  stream, RPC, package, Rust, or shared-document file entered the slice.
+- Composed red: a real hidden Electron 39 BrowserWindow retained a Checking
+  compositor frame when the renderer sent its semantic acknowledgement after
+  two animation frames. DOM/layout timing therefore could not authorize native
+  show.
+- Causal marker result: the bounded owner subscribes only for one current
+  document challenge, inserts a fixed path-free checker, requires a matching
+  NativeImage, removes the exact CSS, requires a strictly later marker-free
+  NativeImage, re-correlates authority/document state, and only then permits
+  show. Forty-three focused owner cases pass, including queued and pre-insert
+  frames, navigation/fallback cancellation, late insertion cleanup, duplicate
+  callbacks, every Adapter failure stage, and terminal continuation guards.
+  The permanent real preload case also proves marker-present then marker-free
+  while hidden with production sandbox preferences.
+- Real proportionality result: the corrected default-app matrix showed
+  commit-to-show durations of 1283.0 ms immediate and 1049.4–1247.9 ms with a
+  250 ms authority reply; library-only measured 663.9 ms immediate and
+  363.5–438.2 ms delayed. Every completed case showed content, never Checking,
+  and exited cleanly, but the default cost conflicts with the immediate-list
+  objective and is not accepted merely because correctness is green.
+- Rejected direct-bootstrap prototype: a throwaway copy passed one versioned,
+  bounded, path-free terminal state through `additionalArguments`, decoded it
+  in the sandboxed preload, seeded the provider synchronously, and wrapped the
+  initial React render in `flushSync`. The semantic acknowledgement preceded
+  `ready-to-show` (576.5 ms versus 626.2 ms), but the only pre-show NativeImage
+  was a uniform opaque fuchsia surface (1280×874; repeated interior BGRA
+  `[138,0,255]`), not terminal application content. Ready-to-show plus layout
+  acknowledgement is therefore rejected as frame proof.
+- Rejected hidden-capture prototype: after the same terminal boot and
+  `flushSync`, acknowledgement preceded ready-to-show (640.3 ms versus
+  691.3 ms). Fixed marker insertion resolved at 719.8 ms, but
+  `capturePage(undefined,{stayHidden:true})` returned only at 2019.4 ms and the
+  image did not contain the marker. The mechanism was neither causal nor faster
+  than the frame subscription and was stopped before further cases; no retry,
+  delay, invalidation workaround, or product edit was added.
+- Stopping condition: both faster mechanisms are rejected. Full recovery,
+  no-preload, fatal, reload, and 9+9 producer-to-renderer conformance remain
+  held rather than inferred from the completed ready matrix. DRBT-A3 and
+  Milestone 2 remain active.
 
 ## Reports
 

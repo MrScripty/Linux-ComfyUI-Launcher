@@ -2,12 +2,21 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestones 0 through 3 are accepted. M4 renderer source is
-blocked pending the producer/platform contract handoff.
+**Current phase:** Milestones 0 through 3 are accepted. The bounded XR-S1
+launcher-root recovery consumer and renderer half of the construction-safe
+visibility handshake are implemented; the representative NativeImage oracle
+disproved renderer-frame timing as a reveal authority, so cross-owner
+verification awaits a re-planned first-visible-frame owner. The main-owned
+marker challenge was correct but added material hidden-window latency, while a
+temporary terminal-boot/flushSync plus hidden-capture alternative failed to
+capture its inserted marker. XR-S1 product startup source is frozen. M4 renderer source remains blocked pending the
+catalog/search producer and platform-decoder handoff.
 
-**Next slice:** After the M4 provider dependency is accepted, perform its
-mandatory FE-I10/FE-I11/FE-I14 pre-start classification before any renderer
-contract source edit.
+**Next slice:** Re-plan XR-S1 only after a construction-safe first-visible-frame
+owner satisfies both terminal-frame truth and immediate model-list intent;
+then run the full producer/preload/renderer conformance matrix. After the M4 provider dependency is accepted, perform its mandatory
+FE-I10/FE-I11/FE-I14 pre-start classification before any renderer contract
+source edit.
 
 **Acceptance status:** `partial`
 
@@ -55,6 +64,7 @@ changes only owners whose current behavior cannot support the audited claims.
 | FE-A5 | Installation progress and terminal outcomes are programmatically announced without duplicate noise, and the operating-system reduced-motion preference suppresses nonessential CSS and Framer Motion movement. | `user-workflow` | `representative` (built renderer with accessibility-tree and media-preference control) | `automated` | `satisfied` | [M3-S3b real-entry evidence](execution-ledger.md#2026-09-03--m3-s3b-popover-motion-and-terminal-semantics-accepted) |
 | FE-A6 | Both frontend build modes start through their real entry point; the default renderer exposes supported inference-plugin UI, while the library-only renderer omits that UI and still completes the core model-library workflow. | `user-workflow` | `representative` (built default and library-only renderers in the supported desktop browser runtime) | `automated` | `pending` | Pending Milestone 5; packaged-artifact claims remain in the platform plan |
 | FE-A7 | Frontend behavior documentation describes only the accepted cache provenance, keyboard/focus, reduced-motion, and variant behavior, and routes verification policy to the governance owner. | `focused` | `not-applicable` | `manual` | `pending` | Pending Milestones 3 through 5 |
+| FE-A8 | In Electron, one launcher-root owner prevents backend-consuming renderer content from mounting before a decoded ready state, presents every startup/selection recovery outcome without path disclosure or unsafe retry, and gives both normal-ready entries a first visible model-list frame without a painted checking frame; browser mode remains explicitly not applicable. | `integration` | `representative` (production builds and preload in sandboxed Electron) | `automated` | `pending` | [XR-S1 evidence](reports/launcher-root-recovery-consumer-evidence.md); main-owned in-frame compositor proof and composed conformance remain active |
 
 ## Scope
 
@@ -133,6 +143,7 @@ changes only owners whose current behavior cannot support the audited claims.
 | Add one `Popover` Module whose Interface owns trigger relationship/state, outside/Escape dismissal, focus entry/return, and cleanup. Feature content selects semantics appropriate to its actual actions. | Seam between non-modal popup lifecycle and selector/search/download content. | No external production Adapter is needed; tests drive trigger/content behavior through the Interface. | Does not introduce a generic menu/listbox abstraction or hide feature semantics. |
 | Implement progress/status semantics in the existing progress view and motion preference at the frontend composition root/CSS boundary. | Existing presentation owners; no shared Module until a second consumer needs the full lifecycle. | Representative harness controls progress and media preference. | Avoids a hypothetical announcement framework for a single current lifecycle. |
 | Use the installed Electron runtime and Chromium DevTools Protocol behind one package command; a frontend runner owns temporary builds/process cleanup, an Electron main Adapter owns browser input/accessibility/media observation, and deterministic fixtures own only external operations. | Seam between built renderer behavior and acceptance evidence. | Real built renderer and production preload are the production subject; IPC fixtures replace only external operation providers. | [Admission evidence](reports/renderer-harness-admission.md) reached the intended modal failure without a new dependency; jsdom and release smoke cannot decide the same outcomes. |
+| Deepen one `LauncherRootRecoveryProvider` at the renderer composition root as the sole owner of startup admission and library-root selection presentation. | Seam between the platform-decoded launcher-root Interface and backend-consuming renderer trees. | Production Adapter is the accepted sandboxed preload API; tests supply controlled startup/selection promises, and the representative oracle supplies exact IPC fixtures. | Browser mode renders children as not applicable. Electron withholds visibility acknowledgement through initializing, then acknowledges exactly once after ready, recovery, or unavailable presentation commits; the main process owns actual window visibility and its bounded native fallback. |
 
 ## Dependencies And Ownership
 
@@ -159,6 +170,7 @@ Milestone 1, but their shared UI primitive/export files must be serialized.
 | FE-A4 | Built-renderer keyboard workflow and accessibility-tree/focus observations | Browser/Electron focus and accessibility behavior | Screen-reader product certification | Missing name/state, escaped modal focus, broken Escape, or failed restoration fails |
 | FE-A5 | Accessibility-tree outcome observations and reduced-motion media emulation against the built renderer | Browser accessibility tree and operating-system media preference | Every decorative transition in third-party content | Silent terminal state, duplicate announcement, or nonessential motion under reduce fails |
 | FE-A6 | Separate production builds launched through their real entry points and driven through a core model workflow | Build mode/entry configuration and runtime-visible controls | Installer contents or absence of strings in minified bundles | Plugin UI appears in library-only mode or the core library workflow fails in either mode |
+| FE-A8 | Provider tests drive the closed startup/selection state matrix; real sandboxed Electron runs the default and library-only production entries with compositor presentation-frame capture at the native reveal boundary | Accepted platform decoder contract plus browser frame and renderer-console observations | Packaged installer execution and general startup performance | Backend content mounts before ready, a typed state gains the wrong action, startup reads overlap, the native reveal can expose checking, model-list content never reaches a presented frame, or a renderer/preload error is emitted |
 
 For new permanent renderer verification machinery, Milestone 1 must record its
 claim, reachable negative failure, independent oracle, marginal value versus
@@ -471,6 +483,72 @@ both real entries.
 **Acceptance gate:** FE-A5 and the applicable portion of FE-A7.
 
 **Status:** `Accepted`
+
+### Cross-Plan Slice XR-S1: Gate Renderer On Launcher-Root Recovery
+
+**Goal:** Integrate the accepted desktop launcher-root startup and selection
+contract without mounting backend consumers against an unresolved root or
+making the normal ready path feel slower.
+
+**Dependency gate:** The platform owner accepted and froze the closed,
+path-free startup/selection unions, main-process single-flight policy, and
+sandbox-compatible preload decoder before this consumer was integrated.
+
+**Allowed write set:**
+
+- `frontend/src/types/api-window.ts`
+- `frontend/src/types/api-bridge-utilities.ts`
+- `frontend/src/hooks/useLauncherRootRecovery.tsx`
+- `frontend/src/hooks/useLauncherRootRecovery.test.tsx`
+- `frontend/src/hooks/useAppWindowActions.ts`
+- `frontend/src/hooks/useAppWindowActions.test.ts`
+- `frontend/src/components/LauncherRootRecoveryView.tsx`
+- `frontend/src/components/LauncherRootRecoveryView.test.tsx`
+- `frontend/src/index.tsx`
+- `reports/launcher-root-recovery-consumer-evidence.md`
+- this plan, ledger, and issues files
+
+The held product source at this boundary is exactly the two type files, the
+provider and its test, the recovery view and its test, the window-actions hook
+and its test, and `index.tsx` listed above. No other uncommitted frontend source
+belongs to an independently acceptable tranche.
+
+**Tasks:**
+
+- [x] Replace the legacy optional-field selection response with the exact
+  startup and selection unions exposed by the decoded preload Interface.
+- [x] Add one composition-root provider that treats browser mode as not
+  applicable, gates Electron children until ready, serializes startup/selection
+  attempts, keeps initializing polling sequential, and cleans up timers and
+  late outcomes; the main process owns the only visibility deadline.
+- [x] Present checking, explicit-authority guidance, retryable unchanged,
+  ambiguous/published terminal, restarting, and bridge-unavailable states with
+  accessible status/actions and frameless window controls.
+- [x] Delegate the existing Change Library action to the provider and remove
+  the legacy direct bridge/logging path.
+- [x] Prove StrictMode ownership, every state transition, action availability,
+  cancellation restoration, focus, path non-disclosure, both renderer aliases,
+  and absence of legacy response fields through public seams.
+- [x] Run both production entries with the actual sandboxed preload and prove
+  that a fast ready response can reach a model-list content frame; this sample
+  exposed that renderer-only timing cannot prove the first visible frame.
+- [x] Add the renderer half of the construction-safe visibility handshake:
+  never acknowledge initializing, terminal-latch the platform watchdog, and
+  acknowledge ready, recovery, or unavailable exactly once from the terminal
+  layout commit. This is semantic notification only; it makes no compositor-
+  presentation claim.
+- [ ] Prove all closed producer startup and selection values through the actual
+  compiled preload and frontend semantics, reject malformed/extra payloads,
+  and run first-visible ready/recovery/unavailable/no-preload workflows through
+  a re-planned compositor owner. The marker challenge satisfied frame truth but
+  not immediate startup, and the hidden-capture alternative failed its marker
+  proof.
+
+**Acceptance gate:** FE-A8, the accepted platform producer/decoder evidence,
+focused and full frontend gates, both production builds, and the representative
+two-entry frame oracle.
+
+**Status:** `Verifying`
 
 ### Milestone 4: Adopt Decoded Contracts And Honest Model Projection
 

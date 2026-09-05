@@ -1,14 +1,27 @@
 # Plan: Rust Library and RPC Standards Remediation
 
-**Plan status:** `Planned`
+**Plan status:** `Active`
 
-**Current phase:** Planning and ownership reconciliation are complete; no
-implementation slice has started, and the plan awaits an explicit `start`
-operation.
+**Current phase:** Milestone 1 is accepted. Milestone 2 is active for producer
+contract work that is valid for loopback desktop RPC and local core IPC.
+`RUST-I1` is resolved: desktop RPC is loopback-only and LAN support is removed.
 
-**Next slice:** Milestone 1 — establish the Rust public-error/redaction
-contract, remove request-value logging, and prove a sentinel Hugging Face token
-cannot reach backend diagnostics or a JSON-RPC response.
+**Next slice:** Continue PRG-I19 C3 with runtime destination-queue identity and
+the remaining restore/lifecycle integration. The real transferred-byte interrupted
+response → settled Error → fresh-owner restore → cancel path is now verified;
+hard process-crash recovery remains unproved. C1 store repairs and C2 destination
+authority passed independent source review and targeted regressions in both
+feature configurations. C3's ordinary admission, exact status/settlement, and
+strict restore integration passed independent review and targeted regressions
+in both feature configurations; final supporting gates are recorded in the
+ledger. Full lifecycle integration is not yet accepted. Unused integration warnings remain visible.
+Slice B remains the accepted lifecycle regression boundary. C3 lifecycle integration and C4 importer integration proceed in
+that order; they are reviewable checkpoints, not independently shippable claims.
+The accepted Slice B
+generation, terminal-projection, cancellation, cleanup, tombstone, and sticky
+failure semantics remain invariants. General client-drop draining remains
+Milestone 4/RUST-A6, Slices D-E remain held, and Milestone 2J remains queued
+with only its isolated red HF-unavailable oracle recorded.
 
 **Acceptance status:** `pending`
 
@@ -20,6 +33,151 @@ cannot reach backend diagnostics or a JSON-RPC response.
 [execution ledger](execution-ledger.md#reports).
 
 **Audit source:** [Rust library and RPC](../../../audits/current-standards-2026-09-03/rust-library-and-rpc.md)
+
+## Active PRG-I19 Slice C Boundary
+
+### Checkpoints after the implementation audit
+
+| Checkpoint | Owned result | Acceptance evidence |
+| --- | --- | --- |
+| C1 (internally verified) | Durable admission, restart reconciliation, quarantine, and exact queue settlement behind the store Interface | 38 store tests and atomic/HF regressions pass in both feature configurations; independent source review accepted |
+| C2 (internally verified) | Held configured-root destination authority and marker publisher ready for runtime integration | Independent source review accepted; root reproduced 14 recovery, 22 atomic-publication, 38 store, and 155 HF tests in both feature configurations |
+| C3 (active; admission and interrupted-transfer checkpoints verified) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Setup-failure and real interrupted-response → fresh-owner restore → cancel paths pass; complete queue/restore, hard-crash, stalled-pause, and relocation claims remain pending |
+| C4 | Importer mutations are awaited before settlement; notifications follow release | Real async importer held during cancellation/completion; successor progress and terminal-state tests |
+
+The complete producer/consumer boundary still requires the existing later
+acceptance gates. Do not broaden C1 while its regression suite is failing.
+Each checkpoint reports current evidence separately from historical passing
+counts. The user authorized these checkpoints after reviewing the implementation
+audit; they replace the single expanding implementation step, not its required
+product outcomes.
+
+**Persistence mechanism decision:** retain JSON for C1. SQLite is already an
+available dependency and could simplify atomic updates and referential integrity,
+but it would not remove download-to-filesystem recovery, destination authority,
+or task ownership. The existing index database's path-based opening and
+WAL/`synchronous=NORMAL` configuration do not prove this store's authority or
+durability contract. A separate replacement requires a bounded real-file proof
+of database/journal authority, interruption/reopening, and idempotent JSON
+handover, and must demonstrate a net reduction in maintained machinery. C1
+does not add a second authoritative store or a speculative database adapter.
+
+**Restart reconciliation:** persisted bytes cannot reveal whether a previous
+process observed a successful final sync. A fresh owner must explicitly confirm
+the recorded transition through the store before using it to authorize work.
+Tests must distinguish raw inventory from reconciled inventory; an in-memory
+confirmation cache alone is not restart proof.
+
+**C1 integration limits:** terminal settlement retains exact release records
+without garbage collection. Queue-owned generic save/remove/revoke/relocate
+operations now refuse mutation; C3 must use dedicated owned transitions rather
+than bypass those guards. Runtime owners must complete destination effects
+before store settlement and explicitly reconcile before restart admission.
+Some private integration APIs remain unused during C3; compilation is not a claim
+of warning-free or end-to-end acceptance.
+
+**C2 integration limits:** the builder establishes the library directory before
+opening its held download authority, and preserves HF search when that authority
+is unavailable. Root-relative targets and absolute configured-root aliases share
+identity; nested symlinks are rejected. Model, creation-anchor, and nested file
+parent replacement cannot redirect capability effects. Marker publication uses
+the existing atomic outcome algebra through a held parent, including directory
+creation sync. C3 now routes ordinary start and admitted resume/cancellation
+through this capability and rejects unconfigured starts. Legacy mutation paths
+and runtime reservation identity still need migration.
+Only Linux execution is evidenced; this is not cross-platform acceptance or a
+full builder-startup test.
+
+**Current C3 limits:** the new transfer path uses a real loopback HTTP response
+and real partial-file writes, then an orderly Error before reopening; it is not
+a process-crash or live Hugging Face service claim. The earlier marker-failure
+and seeded-final-file regressions retain their narrower meaning. Runtime queue keys and the
+physical destination mutex remain to be replaced; comprehensive restore still
+needs task ownership, legacy migration, and hidden/quarantined/recovery-state
+reconciliation. Stalled pause and relocation remain pending. Unknown admissions
+fail closed but do not yet have the complete recovery path. Runtime release
+facts are retained until owner drop to prevent stale-inventory resurrection.
+The real asynchronous importer and callback ordering remain C4. This admission
+checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
+
+- **Exact source write set:**
+  `rust/crates/pumas-core/src/model_library/hf/download.rs`,
+  `rust/crates/pumas-core/src/model_library/hf/lifecycle.rs`,
+  `rust/crates/pumas-core/src/model_library/hf/types.rs`,
+  `rust/crates/pumas-core/src/model_library/hf/mod.rs`,
+  `rust/crates/pumas-core/src/model_library/download_store.rs`,
+  the existing untracked
+  `rust/crates/pumas-core/src/model_library/download_recovery.rs`,
+  `rust/crates/pumas-core/src/api/builder.rs`,
+  `rust/crates/pumas-core/src/metadata/atomic.rs`, and
+  `rust/crates/pumas-core/src/metadata/mod.rs`.
+- **Exact record set:** this plan, `execution-ledger.md`, `issues.md`, and
+  `reports/rpc-contract-and-threat-model.md`.
+- **Accepted base:** Slice B source hashes `abfe0382` (`lifecycle.rs`),
+  `c69953b1` (`mod.rs`), `2e75638f` (`download.rs`), and `fdd00a3c`
+  (`types.rs`). Additional admitted baselines are `020975b5`
+  (`download_store.rs`), `c7244b5a` (`download_recovery.rs`), `95abe5fe`
+  (`api/builder.rs`), `c838e184` (`metadata/atomic.rs`), and `15adcd4f`
+  (`metadata/mod.rs`).
+- **Admission invariant:** the builder opens the selected model-library root
+  once and injects a crate-private held authority; an unconfigured client may
+  search but destination mutation is typed unavailable. One caller-independent
+  admission transition durably persists the complete request, non-authorizing
+  destination identity, domain, FIFO ordinal, and predecessor/release proof
+  before returning an ID, publishing active state, or performing an effect.
+  Only a confirmed durable attempt promotes to the gated Worker in one no-await
+  downloads-to-task commit; ambiguous publication parks hidden custody.
+- **Destination invariant:** reservation identity and every effect derive from
+  the same held configured-root capability plus validated relative target, not
+  a raw/canonical path string or nearest-existing ancestor. Missing targets and
+  aliases retain one identity; root/path replacement fails closed. The private
+  state-lifetime queue retains Paused, recoverable Error, or Pending quarantine
+  authority, orders restore by durable ordinal, and wakes only after exact
+  generation plus durable/published terminal release. No physical async mutex
+  is held across effect work, signals, or callbacks.
+- **Persistence invariant:** version 3 strictly migrates legacy/v1/v2 rows as
+  recoverable state, owns ordinary row/admission/FIFO truth, and exclusively
+  owns full-snapshot lifecycle quarantine. Pending cleanup is independent of
+  sticky provenance. Clean Pending removal and sticky Pending-to-Verified use
+  exact attempt/release proofs; Recovery quarantine preserves the durable
+  revocation tombstone. Unknown publication never authorizes verification,
+  cancellation, queue release, or empty restore. Stale save/status/relocation
+  rejects every quarantined ID.
+- **Execution/publication invariant:** capability-relative marker staging,
+  file sync, atomic rename, and parent sync use the accepted Slice A outcome
+  algebra. Directory, marker, persistence, pause, restore, relocation, and
+  callback work remains task-owned and drained. A private publisher linearizes
+  immutable snapshot capture/revision/dispatch and signals outside all guards.
+  Pause uses owner-visible wakeups for stalled headers/body/retry and only the
+  exact started generation can durably project Paused. The real asynchronous
+  importer mutation is owned and awaited while the logical destination claim
+  is held; importer failure preserves resumable finalization state. Completion releases
+  logical destination custody after durable/published terminal state and drain,
+  before an owned callback-only phase whose panic cannot roll back Completed.
+- **Current red evidence:** a cached public ordinary start against a path
+  occupied by a regular file returned setup `Err` after leaving a published
+  ownerless `Queued` entry. A public ambient resume cancelled while awaiting
+  authentication similarly left its prior `Paused` state as ownerless Queued.
+  Store reds now also cover missing v1/v2 migration, exclusive quarantine,
+  sticky-versus-clean Pending, typed removal proof, and ambiguous publication.
+  Destination identity, durable FIFO admission/restore, capability marker,
+  stalled pause, relocation, terminal rescue, and callback ordering remain
+  red-first work before freeze.
+- **Held boundaries:** no tenth source file, public constructor/wire outcome,
+  manifest, RPC/IPC/UniFFI, frontend/Electron, package/generated/CI, or shared-
+  document mutation. The metadata files expose only the existing atomic writer
+  to a held capability-relative marker target. Builder changes inject the
+  selected root in C2, propagate strict restore failure in C3, and wire owned
+  asynchronous importer hooks in C4. The Rust restore method returns
+  `Result<Vec<DownloadCompletionInfo>>`; its builder and test callers migrate
+  together. Corrupt or uncertain authoritative download inventory prevents
+  successful API initialization rather than being reported as empty restore.
+  Slices D-E, M2J, full aggregate verification,
+  general client Drop, consumer implementation, and standalone-shippable
+  claims remain excluded. The [root incremental-commit decision](../plan.md#binding-decisions)
+  permits coherent verified candidates with compatible reachable contracts;
+  it does not permit incompatible producer-only integration or full C3
+  acceptance from the narrower admission checkpoint.
 
 ## Objective
 
@@ -60,9 +218,9 @@ owners.
 
 | ID | Observable criterion | Kind | Environment | Mode | Status | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
-| RUST-A1 | An actual debug-enabled `pumas-rpc` process receives a sentinel HF token and representative failures containing sentinel paths/URLs; captured diagnostics and public responses contain none of those values, while stable typed error codes remain observable. | `system` | `representative` — isolated launcher root and loopback process | `automated` | `pending` | Pending Milestone 1 |
+| RUST-A1 | An actual debug-enabled `pumas-rpc` process receives a sentinel HF token and representative failures containing sentinel paths/URLs; captured diagnostics and public responses contain none of those values, while stable typed error codes remain observable. | `system` | `representative` — isolated launcher root and loopback process | `automated` | `satisfied` | [RPC disclosure evidence](reports/rpc-disclosure-evidence.md) |
 | RUST-A2 | Every reachable desktop JSON-RPC method and local core IPC operation is admitted through its owning closed DTO contract; wrong protocol versions, unknown operations, missing/extra fields, negative or oversized values, and wrong result types remain distinct typed failures instead of successful defaults. | `contract` | `not-applicable` — deterministic Rust DTO/dispatch fixtures | `automated` | `pending` | Pending Milestone 2 |
-| RUST-A3 | The accepted desktop-RPC exposure policy is enforced: either non-loopback binding is unavailable, or an unauthenticated hostile client cannot invoke/read any protected operation or event while an authorized caller can. | `system` | `representative` — isolated real TCP listeners and hostile-client fixtures | `automated` | `pending` | Pending Milestone 2 and product decision `RUST-I1` |
+| RUST-A3 | The accepted desktop-RPC exposure policy is enforced: either non-loopback binding is unavailable, or an unauthenticated hostile client cannot invoke/read any protected operation or event while an authorized caller can. | `system` | `representative` — isolated real TCP listeners and hostile-client fixtures | `automated` | `satisfied` | [RPC contract and threat model](reports/rpc-contract-and-threat-model.md#accepted-exposure-decision): typed loopback host, real negative CLI process, and real positive listener evidence |
 | RUST-A4 | For every event-producing model-index mutation, injected failure cannot commit authoritative state without its durable event; after reopen, event replay and authoritative rows converge before an ephemeral notification is published. | `integration` | `representative` — real temporary SQLite files with controlled fault injection | `automated` | `pending` | Pending Milestone 3 |
 | RUST-A5 | Every declared supported prior index schema migrates in deterministic identity/order with integrity checks; interrupted/repeated execution is safe, and unknown or corrupt state returns a typed recovery outcome. | `integration` | `representative` — real SQLite fixtures for every supported prior state | `automated` | `pending` | Pending Milestone 3 |
 | RUST-A6 | Rust task and server owners return typed terminal outcomes; shutdown closes admission, signals cancellation, drains under the accepted bound, distinguishes complete/incomplete/failed work, and plugin startup reports the configured root as ready, explicitly disabled/degraded, or failed without path substitution or panic. | `system` | `representative` — real Tokio runtime, loopback servers, active requests, and invalid plugin root | `automated` | `pending` | Pending Milestone 4 and product decision `RUST-I2` |
@@ -135,8 +293,8 @@ cross-process claims.
 
 ### Assumptions To Validate
 
-- Loopback-only desktop RPC remains an acceptable default; whether LAN mode is
-  retained is unresolved and does not block Milestone 1.
+- Loopback-only desktop RPC is the accepted product boundary; LAN mode is
+  removed and cannot be restored without a new authenticated remote contract.
 - The existing `ModelIndex` public surface can remain the storage module
   interface while transaction/event and migration knowledge moves behind it.
 - A bounded inventory will identify the accepted `pumas-library` consumer
@@ -175,9 +333,9 @@ cross-process claims.
 | The existing `ModelIndex` interface is the test/caller seam; real local SQLite is the production and test adapter, with test-only fault control kept internal to the module. | This plan, Milestone 3 | R-03/R-04; transaction/recovery behavior must not be faked | `accepted` |
 | No universal task supervisor is presumed. Each task-owning module gets the smallest lifecycle interface its actual spawned work requires; consolidation needs a proven shared contract. | This plan, Milestone 4 | R-05 and Rust Async/Concurrency owners | `accepted` |
 | UniFFI and Rustler types/conversions/errors belong to their adapter crates; the core stays framework-free. | This plan, Milestone 6 | R-08 and Rust Language Bindings standards | `accepted` |
-| LAN support is removed or authenticated only after its product/trust decision; CORS is never accepted as caller authentication. | Product/program owner, consumed by Milestone 2 | R-02 | `pending` (`RUST-I1`) |
-| Plugin-loader failure becomes startup failure or an explicit disabled/degraded state; the selected behavior requires a product criticality decision. | Product/program owner, consumed by Milestone 4 | R-09 | `pending` (`RUST-I2`) |
-| Rustler removal versus a real core adapter follows the supported-host disposition from the platform plan; this plan will not infer support from a declared dependency. | Desktop/platform plan, consumed by Milestone 6 | R-08 | `pending` (`RUST-I3`) |
+| Desktop RPC is loopback-only; remove `--allow-lan` and reject every non-loopback `--host`. CORS is not caller authentication. | Product/program owner, consumed by Milestone 2 | R-02 | `accepted` (`RUST-I1`, 2026-09-03) |
+| Compiled-out plugin support reports disabled/unavailable; compiled-in configured subsystem root/loader initialization failure fails startup without root substitution or degraded success. | Product/program owner, consumed by Milestone 4 | R-09 | `accepted` (`RUST-I2`, 2026-09-03) |
+| Remove Pumas-owned UniFFI, Rustler/Elixir, and false Go surfaces while preserving the public Rust library used by Pantograph's exact-Git dependency. | Desktop/platform plan, consumed by Milestone 6 | R-08 and accepted support matrix | `accepted` (`RUST-I3`, 2026-09-03) |
 
 ## Evidence And Oracle Plan
 
@@ -277,27 +435,27 @@ known credential disclosure through the real RPC process.
 
 **Tasks:**
 
-- [ ] Inventory request fields and every outward `PumasError`/handler error path
+- [x] Inventory request fields and every outward `PumasError`/handler error path
   reachable through the RPC process; classify secret, private locator, safe
   identifier, and bounded public context.
-- [ ] Define the closed Rust public error class/code and deny-by-default safe
+- [x] Define the closed Rust public error class/code and deny-by-default safe
   message projection; keep internal causes/locators in private diagnostics only
   when they are not secrets.
-- [ ] Remove complete parameter logging. Emit method, request ID, outcome class,
+- [x] Remove complete parameter logging. Emit method, request ID, outcome class,
   and correlation data only from an explicit allowlist.
-- [ ] Route generic JSON-RPC and protocol-specific public errors through the
+- [x] Route generic JSON-RPC and protocol-specific public errors through the
   redaction interface wherever the inventory proves the same disclosure
   invariant; record non-RPC owners rather than widening silently.
-- [ ] Modify the real-process test harness to capture bounded stderr, exercise
+- [x] Modify the real-process test harness to capture bounded stderr, exercise
   `set_hf_token` with a synthetic sentinel and controlled locator failures, and
   assert absence from diagnostics and responses plus presence of stable codes.
-- [ ] Run focused mapping tests, the real binary scenario, and affected
+- [x] Run focused mapping tests, the real binary scenario, and affected
   `pumas-rpc` format/check/Clippy/default/no-default tests.
 
 **Acceptance gate:** RUST-A1 is satisfied by the process scenario and focused
 mapping tests; text search is supporting evidence only.
 
-**Status:** `Planned`
+**Status:** `Accepted`
 
 ### Milestone 2: Deepen RPC And IPC Contracts At The Trust Seam
 
@@ -314,23 +472,60 @@ contracts and enforce the accepted network exposure policy.
 - `rust/crates/pumas-rpc/src/wrapper.rs`
 - `rust/crates/pumas-rpc/tests/integration_tests.rs`
 - `rust/crates/pumas-core/src/ipc/**`
+- `rust/crates/pumas-core/src/api/hf.rs`
+- `rust/crates/pumas-core/src/api/mod.rs` for the exact Milestone 2I
+  crate-private required-refresh seam export
+- `rust/crates/pumas-core/src/api/models.rs` for the exact Milestone 2I
+  refresh/reconciliation caller correction
+- `rust/crates/pumas-core/src/api/reconciliation.rs` for the exact Milestone
+  2I single-flight admission and success/failure terminal-state correction
 - `rust/crates/pumas-core/src/api/state.rs`
+- `rust/crates/pumas-core/src/api/state_hf.rs`
+- `rust/crates/pumas-core/src/error.rs` for the exact Milestone 2I typed
+  operation-in-progress outcome
+- `rust/crates/pumas-core/src/index/model_index.rs` for the exact Milestone 2I
+  uncapped catalog query
+- `rust/crates/pumas-core/src/model_library/download_recovery.rs` for the exact
+  PRG-I19 recovery snapshot, stale fingerprint, and managed-target authority
+- `rust/crates/pumas-core/src/model_library/download_store.rs` for the exact
+  PRG-I19 serialized persistence mutation/revocation owner
+- `rust/crates/pumas-core/src/metadata/atomic.rs` and `src/metadata/mod.rs` for
+  the exact PRG-I19 Slice A durable-publication Interface and crate-private
+  re-export
+- `rust/crates/pumas-core/src/model_library/mod.rs` for that bounded public
+  recovery-ticket export
+- `rust/crates/pumas-core/src/model_library/hf/download.rs` for exact tracked
+  destination/repository/file-context matching in the PRG-I19 correction
+- `rust/crates/pumas-core/src/model_library/hf/lifecycle.rs` for the exact
+  PRG-I19 Slice B download-generation, outer-task, blocking-task, and
+  cancellation-finalizer owner
+- `rust/crates/pumas-core/src/model_library/hf/types.rs` for the exact private
+  state-local recovery capability aggregate and its non-persisted lifecycle
+- `rust/crates/pumas-core/src/model_library/library.rs` for the exact Milestone
+  2I all-model listing owner and its greater-than-10,000-record oracle
 - `rust/crates/pumas-core/tests/api_tests.rs`
-- `rust/Cargo.toml` and `rust/Cargo.lock` only if an accepted exposure design
-  requires a reviewed dependency
+- `rust/crates/pumas-uniffi/src/bindings.rs` only as a compile-truthful direct
+  exhaustive error projection pending its accepted removal in Milestone 6; no
+  new binding behavior is admitted
+- `rust/crates/pumas-uniffi/src/bindings/api_hf.rs` only as a compile-truthful
+  direct caller pending its accepted removal in Milestone 6; no new binding
+  behavior is admitted
+- `rust/Cargo.toml`, `rust/crates/pumas-core/Cargo.toml`, and `rust/Cargo.lock`
+  for the accepted exact `cap-std = { version = "4.0.3", default-features =
+  false }` held-directory dependency and resolved closure only
 - `rust/README.md`, `rust/crates/pumas-core/README.md`, `docs/ARCHITECTURE.md`,
   and `docs/SECURITY.md`
 - this plan, ledger, issues, and `reports/rpc-contract-and-threat-model.md`
 
 **Tasks:**
 
-- [ ] Resolve `RUST-I1` before the first exposure edit: remove LAN support or
+- [x] Resolve `RUST-I1` before the first exposure edit: remove LAN support or
   record authenticated capability, operation authorization, credential
   lifecycle, admission/rate, event-stream, and failure contracts.
-- [ ] Inventory every desktop RPC method and separate HTTP/SSE/OpenAI route,
+- [x] Inventory every desktop RPC method and separate HTTP/SSE/OpenAI route,
   plus every local IPC operation and consumer. Record one canonical owner and
   migrate/remove/retain disposition per entry.
-- [ ] Compare at least two representative contract-module shapes using a
+- [x] Compare at least two representative contract-module shapes using a
   credential method, a signed pagination/size method, a typed collection
   result, and an event error; select the smaller interface that prevents
   transport/handler knowledge leakage.
@@ -352,7 +547,7 @@ contracts and enforce the accepted network exposure policy.
 **Acceptance gate:** RUST-A2 and RUST-A3 are satisfied, and the platform plan
 has an explicit handoff revision for downstream projections.
 
-**Status:** `Planned`
+**Status:** `Active`
 
 ### Milestone 3: Make Index Mutation, Events, And Evolution Recoverable
 
@@ -602,10 +797,11 @@ no required-real environment is represented by a lower-fidelity substitute.
 ## Blockers
 
 - None for the admitted Milestone 1 slice.
-- `RUST-I1` blocks Milestone 2 exposure changes, but not diagnostic redaction.
-- `RUST-I2` blocks the plugin-policy part of Milestone 4.
-- Platform target/host matrix and `RUST-I3` block final acceptance of
-  Milestones 5-6.
+- `RUST-I1` is resolved; Milestone 2 enforces the accepted loopback-only
+  boundary.
+- `RUST-I2` is resolved; Milestone 4 must prove the accepted startup behavior.
+- `RUST-I3` is resolved; Milestone 6 owns Rust source/manifests removal while
+  the platform plan owns binding scripts, docs, and release projection.
 
 ## Re-Plan Triggers
 
@@ -634,4 +830,4 @@ no required-real environment is represented by a lower-fidelity substitute.
   tests, real binding-host cohorts, generators, packaged artifacts, and release
   evidence remain with the desktop/platform plan; frontend presentation remains
   with the frontend/UI plan.
-- Final status: `Planned`
+- Final status: `Active`

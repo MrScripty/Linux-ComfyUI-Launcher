@@ -6,13 +6,17 @@
 - Planning code baseline: `d84e2b3520ce3da3f39cc3df953301fa9d6d3d50`.
 - Planning standards baseline: `7bf74bb5a8cb0ffccaff3ec86550051f900fb4bb`.
 - Milestones 0 through 3 are accepted; FE-A3, FE-A4, and FE-A5 are satisfied.
-  M4 renderer source remains provider/platform-gated.
+  XR-S1 launcher-root recovery is `Verifying`: its renderer semantic handshake
+  is implemented, while the main-owned in-frame compositor challenge and
+  composed platform/runtime evidence remain pending. M4
+  renderer source remains catalog/search-provider-gated.
 
 ## Reports
 
 - `reports/frontend-async-owner-inventory.md` — completed for M0-S1.
 - `reports/renderer-harness-admission.md` — accepted for M1-S1.
 - `reports/frontend-overlay-consumer-inventory.md` — accepted for M2-S1.
+- `reports/launcher-root-recovery-consumer-evidence.md` — verifying XR-S1.
 - `reports/renderer-contract-consumer-inventory.md` — pending Milestone 4.
 
 ## Slice Ledger
@@ -30,6 +34,7 @@
 | M3-S2 | `accepted` | [focused verification record](#2026-09-03--m3-s2-central-reduced-motion-policy-accepted) | One composition-root and CSS reduced-motion policy covers both variants. |
 | M3-S3a | `accepted` | [repair evidence](#2026-09-03--m3-s3a-status-reachability-terminal-retention-and-admission-order-accepted) | Red→green manager/state/dialog public seams plus requested-install admission order accepted. |
 | M3-S3b | `accepted` | [repair and runtime evidence](#2026-09-03--m3-s3b-popover-motion-and-terminal-semantics-accepted) | Exact Popover entry/exit repair, stale M2 caller correction, both real entries, full suite, and behavior docs accepted. |
+| XR-S1 | `verifying` | [launcher-root recovery evidence](reports/launcher-root-recovery-consumer-evidence.md) | Renderer semantic handshake is focused-green; full composed conformance and first-visible-frame evidence await the main-owned compositor gate. |
 
 ## 2026-09-03 — M0-S1 Installation Progress Owner Accepted
 
@@ -433,3 +438,80 @@
 - Acceptance: root accepted FE-A5, M3-S3b, Milestone 3, FE-I15, and FE-I16 on
   the non-vacuous bidirectional four-scenario evidence. No M4 source or
   permanent runner/package change started.
+
+## 2026-09-03 — XR-S1 Launcher-Root Recovery Consumer Verifying
+
+- Operation: consumed only the accepted launcher-root startup/selection
+  Interface in the exact frontend write set and stopped before M4 catalog or
+  permanent renderer-runner work.
+- TDD progression: public provider tests first failed on the missing owner,
+  premature Electron child mount, absent persisted/explicit outcomes,
+  StrictMode duplicate reads, missing sequential polling cleanup, incorrect retry/back
+  actions, unobserved invocation rejection, overlapping selection, focus, and
+  legacy direct selection. Each vertical slice was made green before the next.
+- Module result: one composition-root provider owns the immediate startup read,
+  sequential initializing polls, selection single-flight, cancellation
+  restoration, typed terminal projection, and late completion cleanup. Browser
+  mode is not applicable and renders children; Electron children do not mount
+  until the decoded state is ready.
+- Presentation result: one lightweight view supplies an accessible named
+  region, polite atomic status, deterministic heading focus, exact action
+  availability, and existing frameless minimize/close controls. Expected typed
+  selection outcomes do not enter the console-error path.
+- Platform counterevidence: the first composed run found the production
+  sandboxed preload could not load a new relative CommonJS decoder import. The
+  platform owner corrected that producer boundary, removed the duplicate
+  decoder authority, and independently passed its real OS-sandbox oracle and
+  full 77-test Electron gate before refreezing.
+- First-frame counterevidence: after the preload correction, the hardened
+  default run recorded one checking frame before content (22.8 milliseconds),
+  while library-only recorded zero. Program review admitted only a provider-
+  local atomic terminal commit; no timing threshold, App, index, platform, or
+  manifest expansion was accepted.
+- No-bridge counterevidence and repair: a real Electron renderer with a missing
+  preload first mounted valid-looking backend content. A public red test then
+  drove the provider to distinguish Electron identity from intentional browser
+  mode. The repaired real renderer showed only focused `Desktop bridge
+  unavailable`, made no root-state request, hid unsupported Minimize, retained
+  working Close, and mounted no model-list content.
+- Rejected timing claim: a provider-local `flushSync` experiment then produced
+  zero checking frames in one default and one library-only sample, but review
+  correctly rejected this as construction proof because an async IPC reply can
+  lose the first paint.
+- Handshake red/green: five of 23 provider tests failed before the renderer had
+  commit notification, timeout subscription, and terminal-latch behavior. The
+  initial provider repair passed 24/24, derives the closed signal type from the existing
+  startup projection, never acknowledges initializing, acknowledges ready,
+  recovery, or unavailable once from a layout effect, removes renderer-owned
+  deadline/attempt policy, and ignores a late reply after the main watchdog.
+  Focused lint and full TypeScript checking passed at that boundary.
+- Compositor counterevidence: a real delayed-default Electron 39.8.6 run used
+  the compiled sandboxed preload and `beginFrameSubscription` NativeImage
+  presentation callbacks. It captured hidden Checking, but the latest frame
+  synchronously available when the production owner called `showWindow` was
+  still Checking after the renderer's proposed two-rAF delay. The harness
+  rejected that run, and a deliberately early acknowledgement was also
+  rejected. Waiting for an invalidated next hidden frame produced no callback
+  under the production preferences. Renderer timing therefore cannot own the
+  actual-presentation decision.
+- Corrected renderer boundary: 3 of 27 provider tests failed after replacing
+  the disproved rAF contract with direct terminal layout-commit expectations.
+  Removing the delay made all 27 pass while preserving one-shot StrictMode
+  notification, timeout replacement of resolved or in-flight ready state, and
+  suppression of late results after unmount. Main now owns the separate in-
+  frame compositor challenge before native reveal.
+- Frozen frontend gates: 34 tests across the provider, recovery view, and
+  window-action seams pass; the full frontend suite passes 111 files and 504
+  tests; lint and TypeScript checking pass; fresh default and library-only
+  production builds pass in 3.40 and 2.48 seconds. Composed runtime evidence
+  remains pending the corrected platform owner.
+- Composed verification gate: after the platform handshake freezes, the real
+  oracle must cover delayed ready in both modes, watchdog unavailable,
+  recovery, missing preload, and acknowledgement failure without a hidden
+  hang. It must also pass all nine startup and nine selection values through
+  the canonical producer, compiled preload decoder, and frontend semantics,
+  while malformed/extra payloads fail before presentation.
+- Claim boundary: neither prior timing samples nor the rejected two-rAF repair
+  decide FE-A8. M5 still owns the
+  admitted reusable renderer runner, packaged-target execution remains with
+  the platform plan, and XR-S1 remains `Verifying` pending the composed gate.

@@ -2,14 +2,17 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestone 2 same-directory atomic launcher-root persistence
-at focused review boundary.
+**Current phase:** Milestone 2 first-visible-frame performance decision gate
+after real Electron correctness and proportionality counterevidence.
 
-**Next slice:** Cross-review the green six-file atomic-persistence boundary. No
-further source slice is admitted; renderer recovery and stream ownership remain
-separate later slices. Milestone 1 remains blocked on the complete Rust producer
-projection, Milestone 3 runtime/deployment remains unavailable, and Milestone 4
-remains pending required-real Windows/macOS evidence.
+**Next slice:** Select whether to accept the frozen causal marker barrier's
+measured default-startup cost or re-plan another construction that proves the
+first visible frame without it. Direct ready-to-show bootstrapping and hidden
+`capturePage` were rejected by bounded real Electron prototypes. No further
+source slice is admitted; stream ownership remains separate. Milestone 1
+remains blocked on the complete Rust producer projection, Milestone 3
+runtime/deployment remains unavailable, and Milestone 4 remains pending
+required-real Windows/macOS evidence.
 
 **Acceptance status:** `pending`
 
@@ -389,12 +392,16 @@ plan consumes but does not redefine recovery and stream outcomes.
 **Allowed write set:**
 
 - `electron/src/launcher-root.ts`
+- `electron/src/launcher-root-recovery.ts`
 - `electron/src/main.ts`
 - `electron/src/startup-task.ts`
 - `electron/src/preload.ts`
+- `electron/src/window-presentation.ts`
 - `electron/src/python-bridge.ts`
 - `electron/tests/launcher-root.test.mjs`
+- `electron/tests/launcher-root-recovery.test.mjs`
 - `electron/tests/preload-rpc-contract.test.mjs`
+- `electron/tests/window-presentation.test.mjs`
 - `electron/tests/python-bridge.test.mjs`
 - `electron/tests/desktop-lifecycle.integration.test.mjs`
 - `electron/package.json`

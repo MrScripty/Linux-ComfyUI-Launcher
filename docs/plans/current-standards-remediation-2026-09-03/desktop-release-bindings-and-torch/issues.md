@@ -22,13 +22,14 @@
   backend startup and become new authority.
 - Owner/boundary: Milestone 2 launcher-root Module; the resolver is its public
   Interface and filesystem inspection is hidden implementation.
-- Disposition: focused state/provenance slice is green and pending review.
+- Disposition: the focused state/provenance slice was accepted and integrated
+  as `1964760d`.
   Invalid, unavailable, and present-but-empty explicit authority no longer
   reaches discovery or backend startup. Authoritative selection accepts only
   an exact root or its two declared chooser forms; ancestor walking is
   discovery-only. Backend initialization is observed before window creation can
   delay failure consumption, and typed recovery diagnostics stay path-free.
-  Atomic replacement remains open.
+  Atomic replacement was implemented by the next focused slice.
 - Verification: real temporary-filesystem public resolver tests with a valid
   discovery decoy plus invalid/unavailable persisted and invalid explicit
   authorities; marker-file rejection; and deterministic injected I/O failure
@@ -36,17 +37,35 @@
   invalid classification, arbitrary-descendant rejection, and an immediate
   recovery rejection while window creation is delayed. Required-real target
   filesystem evidence remains pending.
-- Atomic-persistence status: focused boundary green and pending review. Direct
+- Atomic-persistence status: accepted and integrated as `767e71f0`. Direct
   truncation is replaced by an exclusive adjacent temp, synchronized close,
   namespace replacement, and parent synchronization with explicit pre/post-
   publication failure states. Local Linux old-or-new evidence cannot stand in
   for power-loss or required-real Windows/macOS filesystem evidence.
-- Recovery projection remains open: the existing main consumer maps persistence
-  failure to one stable generic IPC failure and does not report success,
-  relaunch, retry, or fallback. It does not yet expose replacement-visibility-
-  unknown or published-durability-unavailable to the renderer.
-- Revisit trigger: accepted atomic persistence slice, then renderer recovery or
-  stream ownership under separately admitted write sets.
+- Recovery projection status: the initial producer boundary was rejected for
+  collapsed explicit-authority policy and absent selection-attempt ownership.
+  The corrected producer below replaces the generic IPC collapse; the renderer
+  consumer and composed presentation remain open and block integration.
+- Renderer-recovery producer status: corrected focused boundary green pending
+  renewed review. Ready state preserves a path-free selection action, so
+  resolved environment/argument authority cannot open a persisted chooser that
+  will lose on relaunch. One main-owned single-flight handler observes dialog,
+  persistence, and synchronous relaunch-request outcomes; retries only while
+  authority is proven unchanged; and locks ambiguous, published, or restarting
+  terminals. Preload runtime-decodes every correlated IPC value. Integration
+  remains blocked until the separately owned renderer gate is accepted
+  atomically.
+- Sandboxed-preload status: Critical composed-runtime blocker corrected pending
+  renewed review. The initial compiled preload required a local helper module
+  that Electron's sandboxed preload could not load. Runtime decoding now lives
+  only in the standalone preload Adapter with a type-only producer import; the
+  built file requires only Electron. A real pinned-Electron hidden BrowserWindow
+  with exact production security preferences exposes the bridge, accepts all
+  closed values, rejects malformed values, emits no preload/load/render failure,
+  and exits within its bound. This is representative Linux loader evidence, not
+  packaged or cross-target acceptance.
+- Revisit trigger: coordinated renderer recovery acceptance, then required-real
+  target evidence or stream ownership under a separately admitted write set.
 
 ### DRBT-I11 — Desktop stream transitions lack one terminal owner
 
