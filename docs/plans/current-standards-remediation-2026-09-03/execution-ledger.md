@@ -20,6 +20,19 @@
 
 ## Slice Log
 
+### 2026-09-05 — Terminal intent restart confirmation
+
+- Continue from `b491ec97`: confirm only cleanup already recorded as finished,
+  through the store's existing durable reconciliation barrier. Production restore
+  remains unchanged; Pending filesystem replay remains excluded.
+- The [Rust admission](rust-library-and-rpc/execution-ledger.md#2026-09-05--terminal-intent-restart-confirmation-admitted)
+  owns source, publication outcomes, real-store/consumer regressions, and gates.
+- The [verification record](rust-library-and-rpc/execution-ledger.md#2026-09-05--terminal-intent-restart-verification)
+  accepts exact terminal confirmation after actual RED/GREEN, independent review,
+  both 1,209-test core configurations, strict lint, formatting, and plan checks.
+  Pending cleanup remains refused; cross-client/process ownership through drain
+  is the next bounded prerequisite, not an inferred restart permission.
+
 ### 2026-09-05 — Phase-aware cancellation preparation
 
 - Continue with the existing cancellation consumer before expanding restore:

@@ -13771,6 +13771,162 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn restore_confirms_terminal_cleanup_intent_before_restoring_follower() {
+        for domain in [
+            LifecycleQuarantineDomain::Ambient,
+            LifecycleQuarantineDomain::Recovery,
+        ] {
+            let temp = TempDir::new().unwrap();
+            let (head, follower) = admitted_cleanup_queue(temp.path());
+            let completing_store = DownloadPersistence::new(temp.path());
+            completing_store
+                .reconcile_lifecycle_inventory_strict()
+                .unwrap();
+            let attempt = completing_store
+                .load_lifecycle_inventory_strict()
+                .unwrap()
+                .queue_admissions[&head.download_id]
+                .attempt_id
+                .clone();
+            if domain == LifecycleQuarantineDomain::Recovery {
+                completing_store
+                    .revoke_admitted_for_recovery(&head.download_id, &attempt, &head)
+                    .unwrap()
+                    .into_result()
+                    .unwrap();
+            }
+            completing_store
+                .begin_lifecycle_quarantine(&head, domain, true, Some(&attempt))
+                .unwrap();
+            let part = head.dest_dir.join("head.gguf.part");
+            let marker = head.dest_dir.join(".pumas_download");
+            std::fs::remove_file(&part).unwrap();
+            std::fs::File::open(&head.dest_dir)
+                .unwrap()
+                .sync_all()
+                .unwrap();
+            assert!(
+                matches!(completing_store.verify_cleanup_with_interrupted_confirmation_for_test(&head.download_id),
+                Err(PumasError::Other(message)) if message == "injected pre-publication failure")
+            );
+            let before: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(temp.path().join("downloads.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                before["lifecycle_quarantines"][&head.download_id]["disposition"],
+                "verified_intent"
+            );
+            // Successor sentinels are installed after the completed cleanup.
+            // Restore may finish publication, but must not replay that cleanup.
+            std::fs::write(&part, b"successor partial bytes").unwrap();
+            std::fs::write(&marker, b"successor marker").unwrap();
+            let store = Arc::new(DownloadPersistence::new(temp.path()));
+            let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            client
+                .configure_download_destination_root(temp.path())
+                .unwrap();
+            client.set_persistence(store.clone());
+            let deletions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            client.download_tasks.set_blocking_observer(Some(Arc::new({
+                let deletions = deletions.clone();
+                move |operation| {
+                    if operation.starts_with("remove ") {
+                        deletions.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })));
+            assert!(client
+                .restore_persisted_downloads()
+                .await
+                .unwrap()
+                .is_empty());
+            client.download_tasks.set_blocking_observer(None);
+            assert_eq!(deletions.load(Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read(&part).unwrap(), b"successor partial bytes");
+            assert_eq!(std::fs::read(&marker).unwrap(), b"successor marker");
+            let expected_head_status =
+                (domain == LifecycleQuarantineDomain::Ambient).then_some(DownloadStatus::Error);
+            assert_eq!(
+                client.get_download_status(&head.download_id).await,
+                expected_head_status
+            );
+            assert!(!client.resume_download(&head.download_id).await.unwrap());
+            assert_eq!(
+                client.get_download_status(&follower.download_id).await,
+                Some(DownloadStatus::Paused)
+            );
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(temp.path().join("downloads.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                after["released_queue_admissions"][&head.download_id],
+                before["queue_admissions"][&head.download_id]
+            );
+            assert!(after["queue_admissions"].get(&head.download_id).is_none());
+            assert_eq!(
+                after["queue_admissions"][&follower.download_id],
+                before["queue_admissions"][&follower.download_id]
+            );
+            assert_eq!(
+                after["recovery_revocations"],
+                before["recovery_revocations"]
+            );
+            let mut expected_quarantine =
+                before["lifecycle_quarantines"][&head.download_id].clone();
+            expected_quarantine["disposition"] = "verified".into();
+            assert_eq!(
+                after["lifecycle_quarantines"][&head.download_id],
+                expected_quarantine
+            );
+            // Existing final fixture bytes exercise the released predecessor's
+            // successor without making a network-transfer claim.
+            std::fs::write(follower.dest_dir.join(&follower.filename), b"complete").unwrap();
+            assert!(client.resume_download(&follower.download_id).await.unwrap());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    client.observe_finished_download_tasks().await;
+                    if client.get_download_status(&follower.download_id).await
+                        == Some(DownloadStatus::Completed)
+                        && !client.download_tasks.contains(&follower.download_id)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("confirmed terminal intent must release its exact follower");
+            assert_eq!(std::fs::read(&part).unwrap(), b"successor partial bytes");
+            let settled: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(temp.path().join("downloads.json")).unwrap())
+                    .unwrap();
+            let mut fresh = HuggingFaceClient::new(temp.path().join("fresh-cache")).unwrap();
+            fresh
+                .configure_download_destination_root(temp.path())
+                .unwrap();
+            fresh.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+            assert!(fresh
+                .restore_persisted_downloads()
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                fresh.get_download_status(&head.download_id).await,
+                expected_head_status
+            );
+            assert_eq!(
+                fresh.list_downloads().await.len(),
+                usize::from(domain == LifecycleQuarantineDomain::Ambient)
+            );
+            assert!(!fresh.resume_download(&head.download_id).await.unwrap());
+            let repeated: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(temp.path().join("downloads.json")).unwrap())
+                    .unwrap();
+            assert_eq!(repeated, settled);
+        }
+    }
+
     fn ambient_cleanup_cutpoint(
         root: &Path,
         verified: bool,

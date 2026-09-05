@@ -528,9 +528,16 @@ impl DownloadPersistence {
     /// a successful directory sync. Fresh owners therefore keep admissions
     /// hidden until this publication succeeds. Intent-only attempts remain
     /// hidden and require an exact `admit_download` retry.
+    /// Cleanup verification intent already records completed, drained effects;
+    /// finish only its confirmation, never Pending cleanup or filesystem replay.
     pub(crate) fn reconcile_lifecycle_inventory_strict(&self) -> Result<()> {
         let transaction = self.transaction(StoreOperation::Admit)?;
         let mut data = self.load_data_strict(&transaction)?;
+        for quarantine in data.lifecycle_quarantines.values_mut() {
+            if quarantine.disposition == PersistedLifecycleCleanupDisposition::VerifiedIntent {
+                quarantine.disposition = PersistedLifecycleCleanupDisposition::Verified;
+            }
+        }
         self.write_data(&transaction, &mut data)?;
         for admission in data.queue_admissions.values() {
             self.confirm_admission(&admission.attempt_id)?;
@@ -2464,6 +2471,22 @@ mod tests {
         }
     }
 
+    impl DownloadPersistence {
+        /// Exercise the real verification transition with only its terminal
+        /// intent durably published; shared restart fixtures use this cutpoint.
+        pub(crate) fn verify_cleanup_with_interrupted_confirmation_for_test(
+            &self,
+            download_id: &str,
+        ) -> Result<bool> {
+            self.clone()
+                .with_test_publisher(Arc::new(ScriptedPublisher::new([
+                    ScriptedPublication::Durable,
+                    ScriptedPublication::NotPublished,
+                ])))
+                .verify_lifecycle_quarantine(download_id)
+        }
+    }
+
     #[test]
     fn absent_row_requires_unknown_then_durable_publications() {
         let tmp = TempDir::new().unwrap();
@@ -3527,6 +3550,220 @@ mod tests {
         );
         assert!(fresh.settle_queue_admission("first", &first).unwrap());
         assert!(!fresh.settle_queue_admission("absent", &first).unwrap());
+    }
+
+    #[test]
+    fn restart_reconciliation_confirms_terminal_intent_without_settling_custody() {
+        for domain in [
+            LifecycleQuarantineDomain::Ambient,
+            LifecycleQuarantineDomain::Recovery,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let store = DownloadPersistence::new(tmp.path());
+            let snapshot = persisted("terminal-restart");
+            let attempt = store.admit_test_download(&snapshot).unwrap();
+            if domain == LifecycleQuarantineDomain::Recovery {
+                store
+                    .revoke_admitted_for_recovery("terminal-restart", &attempt, &snapshot)
+                    .unwrap()
+                    .into_result()
+                    .unwrap();
+            }
+            store
+                .begin_lifecycle_quarantine(&snapshot, domain, true, Some(&attempt))
+                .unwrap();
+            assert!(matches!(
+                store.verify_cleanup_with_interrupted_confirmation_for_test("terminal-restart"),
+                Err(crate::PumasError::Other(message)) if message == "injected pre-publication failure"
+            ));
+            let fresh = DownloadPersistence::new(tmp.path());
+            let mut expected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fresh.path).unwrap()).unwrap();
+            assert_eq!(
+                expected["lifecycle_quarantines"]["terminal-restart"]["disposition"],
+                "verified_intent"
+            );
+            expected["lifecycle_quarantines"]["terminal-restart"]["disposition"] =
+                "verified".into();
+            fresh.reconcile_lifecycle_inventory_strict().unwrap();
+            let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
+            assert_eq!(
+                inventory.quarantines["terminal-restart"].disposition,
+                LifecycleCleanupDisposition::Verified
+            );
+            assert_eq!(
+                inventory.queue_admissions["terminal-restart"].attempt_id,
+                attempt
+            );
+            assert_eq!(inventory.quarantines["terminal-restart"].domain, domain);
+            assert!(inventory.quarantines["terminal-restart"].sticky_failure);
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fresh.path).unwrap()).unwrap();
+            assert_eq!(
+                after, expected,
+                "only terminal phase may change: {domain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_reconciliation_preserves_incomplete_cleanup_phases() {
+        for interrupted in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let snapshot = persisted("pending-restart");
+            let store = DownloadPersistence::new(tmp.path());
+            let attempt = store.admit_test_download(&snapshot).unwrap();
+            let initial =
+                store.with_test_publisher(Arc::new(ScriptedPublisher::new(if interrupted {
+                    vec![
+                        ScriptedPublication::Durable,
+                        ScriptedPublication::NotPublished,
+                    ]
+                } else {
+                    vec![ScriptedPublication::Durable, ScriptedPublication::Durable]
+                })));
+            let preparation = initial.begin_lifecycle_quarantine(
+                &snapshot,
+                LifecycleQuarantineDomain::Ambient,
+                true,
+                Some(&attempt),
+            );
+            if interrupted {
+                assert!(
+                    matches!(preparation, Err(crate::PumasError::Other(message)) if message == "injected pre-publication failure")
+                );
+            } else {
+                assert_eq!(
+                    preparation.unwrap().disposition,
+                    LifecycleCleanupDisposition::Pending
+                );
+            }
+            let fresh = DownloadPersistence::new(tmp.path());
+            let before: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fresh.path).unwrap()).unwrap();
+            assert_eq!(
+                before["lifecycle_quarantines"]["pending-restart"]["disposition"],
+                if interrupted {
+                    "pending_intent"
+                } else {
+                    "pending"
+                }
+            );
+            fresh.reconcile_lifecycle_inventory_strict().unwrap();
+            let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
+            assert_eq!(
+                inventory.quarantines["pending-restart"].disposition,
+                LifecycleCleanupDisposition::Pending
+            );
+            assert_eq!(
+                inventory.queue_admissions["pending-restart"].attempt_id,
+                attempt
+            );
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fresh.path).unwrap()).unwrap();
+            assert_eq!(after, before);
+            assert!(
+                matches!(fresh.settle_queue_admission("pending-restart", &attempt), Err(crate::PumasError::Validation { field, message }) if field == "downloads.lifecycle_quarantines" && message == "Queue release requires verified failure cleanup")
+            );
+        }
+    }
+
+    #[test]
+    fn restart_reconciliation_requires_confirmed_publication_before_exposing_terminal_cleanup() {
+        for (failure, expected_error, published) in [
+            (
+                ScriptedPublication::NotPublished,
+                "injected pre-publication failure",
+                false,
+            ),
+            (
+                ScriptedPublication::PublishedDurabilityUnknown,
+                "injected parent-sync uncertainty",
+                true,
+            ),
+            (
+                ScriptedPublication::VisibilityUnknownBeforeEffect,
+                "injected rename visibility uncertainty",
+                false,
+            ),
+            (
+                ScriptedPublication::VisibilityUnknownAfterEffect,
+                "injected post-effect rename visibility uncertainty",
+                true,
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let snapshot = persisted("uncertain-restart");
+            let store = DownloadPersistence::new(tmp.path());
+            let attempt = store.admit_test_download(&snapshot).unwrap();
+            store
+                .begin_lifecycle_quarantine(
+                    &snapshot,
+                    LifecycleQuarantineDomain::Ambient,
+                    true,
+                    Some(&attempt),
+                )
+                .unwrap();
+            assert!(
+                matches!(store.verify_cleanup_with_interrupted_confirmation_for_test("uncertain-restart"), Err(crate::PumasError::Other(message)) if message == "injected pre-publication failure")
+            );
+            let mut expected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&store.path).unwrap()).unwrap();
+            assert_eq!(
+                expected["lifecycle_quarantines"]["uncertain-restart"]["disposition"],
+                "verified_intent"
+            );
+            if published {
+                expected["lifecycle_quarantines"]["uncertain-restart"]["disposition"] =
+                    "verified".into();
+            }
+            let publisher = Arc::new(ScriptedPublisher::new([
+                failure,
+                ScriptedPublication::NotPublished,
+            ]));
+            let retry = DownloadPersistence::new(tmp.path()).with_test_publisher(publisher.clone());
+            for expected_error in [expected_error, "injected pre-publication failure"] {
+                assert!(
+                    matches!(retry.reconcile_lifecycle_inventory_strict(), Err(crate::PumasError::Other(message)) if message == expected_error)
+                );
+                let inventory = retry.load_lifecycle_inventory_strict().unwrap();
+                assert_eq!(
+                    inventory.quarantines["uncertain-restart"].disposition,
+                    LifecycleCleanupDisposition::Pending
+                );
+                assert!(inventory.queue_admissions.is_empty());
+                assert!(inventory
+                    .hidden_admissions
+                    .contains_key("uncertain-restart"));
+                let after: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&retry.path).unwrap()).unwrap();
+                assert_eq!(after, expected);
+                assert_eq!(
+                    after["queue_admissions"]["uncertain-restart"]["attempt_id"],
+                    attempt
+                );
+                assert!(after["released_queue_admissions"]
+                    .get("uncertain-restart")
+                    .is_none());
+            }
+            assert_eq!(publisher.calls(), 2);
+            let fresh = DownloadPersistence::new(tmp.path());
+            fresh.reconcile_lifecycle_inventory_strict().unwrap();
+            let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
+            assert_eq!(
+                inventory.quarantines["uncertain-restart"].disposition,
+                LifecycleCleanupDisposition::Verified
+            );
+            assert_eq!(
+                inventory.queue_admissions["uncertain-restart"].attempt_id,
+                attempt
+            );
+            expected["lifecycle_quarantines"]["uncertain-restart"]["disposition"] =
+                "verified".into();
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fresh.path).unwrap()).unwrap();
+            assert_eq!(after, expected);
+        }
     }
 
     #[test]

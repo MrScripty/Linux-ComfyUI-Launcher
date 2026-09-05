@@ -21,6 +21,64 @@
 
 ## Slice Log
 
+### 2026-09-05 — Terminal intent restart verification
+
+- Actual REDs reproduced Pending after reconciliation and public restore's
+  unresolved-quarantine refusal. Logs:
+  `/tmp/pumas-terminal-restart-store-red.log` and
+  `/tmp/pumas-terminal-restart-consumer-red.log`. The fix promotes only validated
+  VerifiedIntent, before the existing durable barrier; production HF is unchanged.
+- Final focused checks pass: 48 store tests with two existing ignores, and the
+  public restore regression for Ambient/Recovery. Store fixtures preserve the
+  whole document except terminal phase, retain exact custody, leave Pending
+  phases unchanged, and refuse four publication-failure/unknown cases plus failed
+  retry until a fresh successful barrier. No store-owned queue settlement added.
+- The consumer regression proves zero deletion calls, unchanged sentinel partial
+  file/marker, exact queue settlement and follower progress/drain, preserved
+  tombstone/sticky history, and unchanged full store on repeat fresh restore.
+  Source/cross-review passes. Final focused logs:
+  `/tmp/pumas-terminal-restart-store-focused.log` and
+  `/tmp/pumas-terminal-restart-consumer-final.log`.
+- Source SHA-256: `download_store.rs`
+  `3b7aaefe75ecbd2d0e5da59ac7b857b767f0282f6d82f31816d71ae2f4a6179d`;
+  `hf/download.rs`
+  `7a9dc326591136e369556e3e7f910b7ef526f363fa86988ef37f96af266bfe79`.
+  Final gate logs are under `/tmp/pumas-terminal-restart.NYqSjJ/`.
+- Both full core package configurations pass 1,209 tests (1,106 unit plus 103
+  integration/doc), with 11 existing ignores. Strict all-target/all-feature and
+  no-default all-target Clippy, workspace formatting, diff checks, and all five
+  plan contracts pass. Both suites retain held-worker Pending refusal and the
+  prior stale-cancellation regressions. No suppression or hook bypass.
+- Accept this bounded terminal confirmation at standards `aff5b867`. Live store
+  SHA-256 remains
+  `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+  This is persisted-cutpoint evidence, not process-kill, power-loss, GUI, or
+  Windows/macOS runtime proof. Full C3/C4 remains open. Next bound cross-client/
+  process ownership through effect drain; Pending filesystem replay stays refused.
+
+### 2026-09-05 — Terminal intent restart confirmation admitted
+
+- Continue from `b491ec97` at unchanged standards `aff5b867`. Exact source:
+  `download_store.rs` reconciliation and inline tests; `hf/download.rs` inline
+  consumer tests only. Root owns both plans/ledgers and serialized final gates.
+- Strictly load the current store, promote only VerifiedIntent to Verified,
+  then require the existing durable write before confirming inventory. These
+  intents are emitted after cleanup effects drain; the previous checkpoint
+  prevents old-owner cancellation retries from repeating deletion. No new
+  production Interface, schema, dependency, filesystem replay, or restore logic.
+- Failed or ambiguous publication must return its error without confirmation
+  or queue settlement. PendingIntent/Pending and hidden admission intents retain
+  their existing refusal. Preserve exact attempts, snapshots, tombstones, and
+  sticky history; the existing restore consumer owns exact terminal settlement.
+- Reproduce actual interrupted-verification restore refusal first. Use the
+  existing real-store scripted publisher through one fixed-cutpoint cfg(test)
+  method, keeping its types/module private and reusing existing HF fixtures.
+  Verify Ambient/Recovery restoration, unchanged sentinel files, successor
+  progress, repeat restore, publication failures, and held-worker refusal.
+  Require independent cross-review, dual full core suites, strict lint,
+  formatting, and plan validation. No live data, GUI, hard-crash, platform,
+  Pending replay, or full C3/C4 acceptance is implied.
+
 ### 2026-09-05 — Phase-aware cancellation verification
 
 - Store Interface decisions now include exact active/released attempt and domain

@@ -219,12 +219,14 @@ Phase-aware cancellation preparation is accepted after independent review,
 dual core suites, strict lint, and formatting. Terminal retries no longer infer
 deletion authority from a stale Pending projection or missing admitted snapshot.
 
-**Next slice:** Bound terminal VerifiedIntent confirmation during restart
-without filesystem replay. The Rust owner records the exact store/restore write
-set and interrupted-publication regression before implementation. Actual Pending
-replay still requires cross-client/process exclusion through effect drain.
-No live mutation, schema change, old-format support, or C4 expansion. Cargo and
-commits remain serialized.
+Terminal intent restart confirmation is accepted after review and dual core
+gates: existing restore can settle completed cleanup without repeating deletion.
+
+**Next slice:** Bound cross-client/process ownership through cleanup drain
+before admitting Pending replay. The Rust owner selects its lifetime, exclusion
+mechanism, exact source, and held-worker/interruption evidence before implementation.
+Fresh-client creation is not abandonment proof. No live mutation, schema change,
+old-format support, or C4 expansion. Cargo and commits remain serialized.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

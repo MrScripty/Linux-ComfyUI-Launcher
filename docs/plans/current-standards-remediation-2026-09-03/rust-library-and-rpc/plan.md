@@ -40,19 +40,24 @@ Phase-aware cancellation preparation is accepted after independent review,
 dual core suites, strict lint, and formatting. The existing store Interface
 validates exact retained ownership and returns its confirmed cleanup phase;
 terminal retries skip deletion, and missing admitted snapshots refuse effects.
-Restore remains unchanged.
 
-**Next slice:** Bound terminal VerifiedIntent confirmation during restart,
-without filesystem replay. Record the exact store/restore write set and deciding
-interrupted-publication regression before implementation; preserve Pending
-live-worker refusal and exact queue settlement. Cross-client/process exclusion
-through cleanup drain remains separate prerequisite work for Pending replay.
+Terminal intent restart confirmation is accepted after independent review,
+dual core suites, strict lint, and formatting. Store reconciliation promotes
+only VerifiedIntent through its durable barrier; existing restore settles the
+exact queue entry without file deletion. Pending and publication-failure refusal
+remain verified. Production HF and supported store format are unchanged.
+
+**Next slice:** Bound cross-client/process ownership through cleanup drain
+before admitting Pending replay. Select the ownership lifetime, exclusion
+mechanism, exact write set, and deciding held-worker/interruption evidence before
+implementation. A fresh client or persisted snapshot is not abandonment proof;
+keep Pending restore refusal until the complete execution contract is verified.
 
 Pending replay remains excluded. Investigation found three prerequisites:
 cross-client/process exclusion through cleanup drain; distinguishing persisted
 intent phases currently projected together as Pending; and parent-sync deletion
-durability. Parent-sync durability and phase-aware cancellation preparation
-are accepted; restart intent handling remains open. Preserve fresh-client
+durability. Parent-sync durability, phase-aware cancellation preparation,
+and terminal intent restart confirmation are accepted. Preserve fresh-client
 refusal while an earlier cleanup is held. No snapshot-derived deletion/resume,
 live library mutation, legacy support, or C4 importer change is admitted.
 
