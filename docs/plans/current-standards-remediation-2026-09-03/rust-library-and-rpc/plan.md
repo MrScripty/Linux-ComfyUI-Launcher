@@ -3,24 +3,32 @@
 **Plan status:** `Active`
 
 **Current phase:** Milestone 1 is accepted. Milestone 2's C3 core recovery,
-legacy relocation, cancellation-quarantine, and network-wait pause checkpoints
-are verified for incremental integration. Full C3 remains active and unaccepted. Milestone 2 remains producer
+cancellation-quarantine, network/queued pause, and current-only cutover checkpoints
+are verified for incremental integration. Old partial relocation is retired.
+Full C3 remains active and unaccepted. Milestone 2 remains producer
 contract work that is valid for loopback desktop RPC and local core IPC.
 `RUST-I1` is resolved: desktop RPC is loopback-only and LAN support is removed.
 
-**Next slice:** Complete C3 queued-pause ownership (`RUST-I9`) using the existing
-task owner and public pause/status seam. A started successor must settle pause
-while a paused destination head retains its claim, without destination effects
-or loss of its admission/FIFO position. Preserve the verified network-wait
-pause, recovery, queue, cancellation, and relocation regressions. The additive
+**Next slice:** Complete the remaining C3 current-format unresolved-state restore
+contract, preserving exact queue, revocation, quarantine, and ticket custody.
+Unresolved Recovery admission currently fails closed; do not omit that owner
+or infer fresh recovery authority from a persisted snapshot. The current-only
+cutover (`RUST-I10`) and queued pause (`RUST-I9`) are accepted incrementally.
+Runtime schema 4 requires ordinary durable admission and rejects old formats
+without mutation. The two distinct local paused records were converted once
+with a verified backup and unchanged files; the operator converter is retired,
+not shipped. Automatic finishing preserves FIFO and original-task completion
+handoff. The additive
 `resume_partial_download_with_ticket` is available to core callers; existing
 repo/path consumers retain their prior contract until explicitly migrated.
-No fresh ticket is synthesized for legacy calls. Unrelated Result-shape,
+No fresh ticket is synthesized for existing repo/path calls. Unrelated Result-shape,
 reconciliation, RPC, and UI work remains held. Hard-process-crash recovery,
 comprehensive unresolved-state restore, admitted relocation, guard-free effects,
 and C4 importer ownership remain open. Exact evidence is in the ledger:
-full core package tests pass in both feature configurations; strict core and
-supported-workspace Clippy pass without warning suppression.
+the current cutover passed full core package tests in both feature
+configurations and strict core/supported-workspace Clippy without warning
+suppression. The development RPC backend was rebuilt; release and GUI
+acceptance remain separate.
 C3 lifecycle integration and C4 importer integration proceed in
 that order; they are reviewable checkpoints, not independently shippable claims.
 The accepted Slice B
@@ -89,8 +97,8 @@ identity; nested symlinks are rejected. Model, creation-anchor, and nested file
 parent replacement cannot redirect capability effects. Marker publication uses
 the existing atomic outcome algebra through a held parent, including directory
 creation sync. C3 now routes ordinary start and admitted resume/cancellation
-through this capability and rejects unconfigured starts. Legacy relocation and
-runtime reservation identity are integrated; admitted relocation and the
+through this capability and rejects unconfigured starts. Runtime reservation
+identity is integrated; old-record relocation is being retired. Admitted relocation and the
 remaining lifecycle effects still need completion.
 Only Linux execution is evidenced; this is not cross-platform acceptance or a
 full builder-startup test.
@@ -99,9 +107,9 @@ full builder-startup test.
 and real partial-file writes, then an orderly Error before reopening; it is not
 a process-crash or live Hugging Face service claim. The earlier marker-failure
 and seeded-final-file regressions retain their narrower meaning. The unaccepted
-queue draft uses held identities and one retained capability per state, but
-legacy relocation now transfers path and retained authority together, with
-Pending source/target custody on uncertainty. The physical
+queue draft uses held identities and one retained capability per state. The
+user no longer requires old-record relocation; its previously verified execution
+path and pending-intent machinery are being removed. The physical
 destination mutex remains; comprehensive restore still needs task ownership
 and hidden/Pending-state reconciliation. Verified cleanup history now restores
 without mutation authority; Pending state and active quarantine queues still
@@ -118,7 +126,6 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   `rust/crates/pumas-core/src/model_library/hf/types.rs`,
   `rust/crates/pumas-core/src/model_library/hf/mod.rs`,
   `rust/crates/pumas-core/src/model_library/download_store.rs`,
-  the existing untracked
   `rust/crates/pumas-core/src/model_library/download_recovery.rs`,
   `rust/crates/pumas-core/src/api/builder.rs`,
   `rust/crates/pumas-core/src/api/hf.rs` (additive ticket recovery and regressions only),
@@ -151,14 +158,17 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   authority, orders restore by durable ordinal, and wakes only after exact
   generation plus durable/published terminal release. No physical async mutex
   is held across effect work, signals, or callbacks.
-- **Persistence invariant:** version 3 strictly migrates legacy/v1/v2 rows as
-  recoverable state, owns ordinary row/admission/FIFO truth, and exclusively
+- **Persistence invariant:** version 4 is the only runtime format. It rejects
+  old formats and ordinary resumable rows without exact admissions, owns
+  ordinary row/admission/FIFO truth, and exclusively
   owns full-snapshot lifecycle quarantine. Pending cleanup is independent of
   sticky provenance. Clean Pending removal and sticky Pending-to-Verified use
   exact attempt/release proofs; Recovery quarantine preserves the durable
   revocation tombstone. Unknown publication never authorizes verification,
-  cancellation, queue release, or empty restore. Stale save/status/relocation
-  rejects every quarantined ID.
+  cancellation, queue release, or empty restore. Stale status writers reject
+  every quarantined ID. Old-format conversion is an explicit one-time operation
+  outside the shipped library, with exact-byte backup, exclusive writer
+  ownership, complete pre-publication validation, and durable atomic replacement.
 - **Execution/publication invariant:** capability-relative marker staging,
   file sync, atomic rename, and parent sync use the accepted Slice A outcome
   algebra. Directory, marker, persistence, pause, restore, relocation, and
@@ -186,40 +196,33 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   library callers retain their behavior; HF restoration must not regain ambient
   filesystem authority or duplicate the policy. This replaces the prior
   nine-file count limit, not the product, consumer, or dependency boundaries.
-- **Relocation scope approved:** the user approved coordinated migration and
-  owned relocation after PRG-I24. The existing public relocation entry point
-  owns preflight, physical movement, marker publication, persistence, and
-  state/queue transfer. Its only production caller, `api/migration.rs`, delegates
-  those effects and must not ignore refusal or roll back an unknown outcome.
-  A partial directory without a tracked owner remains explicitly skipped with
-  a report reason; no ambient move substitutes for missing lifecycle authority.
-  Complete-model migration is unchanged.
-  This checkpoint supports legacy dormant downloads; existing admitted/recovery
-  refusal moves before all effects. Admitted queue-graph evolution remains C3
-  work, not an accepted capability or a new silent disablement.
-  A durable intent precedes movement and reserves both identities. Unknown
-  outcomes preserve records and block conflicting work, including after reopen;
-  no automatic rollback or guessed restart placement is admitted.
-  Cancellation waits for the owned relocation result and re-reads authority.
-  Root owns caller/records, store_checkpoint owns `download_store.rs`,
-  destination_checkpoint owns the four HF files, and a separately assigned
-  capability owner may edit only `download_recovery.rs`. Cargo runs serialize;
-  no worker commits or edits another owner's files.
-  Acceptance: real temporary-directory/store relocation and public migration
-  orchestration, exact refusal without movement, cancellation, collision and
-  publication-failure preservation, then affected default/no-default suites.
-  These are automated integration/contract claims on the local Linux filesystem;
-  other-platform and hard-process-crash acceptance remain separate.
-  Composed-design review is applicable: filesystem authority stays in the held
-  capability, durable intent in the store, task/cancellation and queue custody
-  in HF, and report/index projection in migration. Moving a model necessarily
-  coordinates these owners; callers no longer know rename/rollback ordering.
-  Filesystem mechanism changes stay in the capability and publication mechanics
-  in the store; migration consumes a settled result, not either representation.
-  The intent is necessary to preserve bytes and exclude both destinations after
-  interruption; deleting it moves that obligation back to callers and restore.
-  Reuse existing task, atomic publisher, capability and queue owners; no general
-  migration framework, additional runtime or independent registry is admitted.
+- **Current-only cutover scope approved:** the user superseded ongoing
+  old-download compatibility with a one-time local conversion. Root owns the
+  exact `api/state.rs` caller hunk, records, live-data preflight and publication;
+  store_checkpoint owns the schema and store tests; destination_checkpoint owns
+  HF production lifecycle/types; audit_standards owns the HF test region,
+  capability pruning, and migration-caller pruning. plan_cleanup owns only a
+  throwaway offline converter, never normal
+  runtime source or live data. Cargo runs serialize; workers do not commit.
+  Remove old-record relocation execution and its unused unsafe move machinery.
+  `api/migration.rs` truthfully reports partial-directory moves as unsupported
+  without effects; complete-model migration remains unchanged. Admitted
+  relocation is still C3 work and is not implicitly implemented here.
+  The converter accepts the inspected unversioned paused-record shape only,
+  rejects ambiguous shared destinations or unresolved histories, binds current
+  held-root identities, preserves payload/marker bytes and complete snapshots,
+  and gives distinct destinations independent fresh admissions. Backup and
+  candidate durability precede guarded replacement. Unknown publication retains
+  recovery artifacts and never triggers automatic rollback. After successful
+  local cutover the converter is retired from execution, not embedded in startup.
+  Acceptance: real temporary-file conversion/failure/refusal and fresh runtime
+  restore; live exact-backup and identity/selection/byte preservation; current
+  queued pause/resume/marker/cancellation and automatic finishing with
+  original-task completion handoff; unchanged full-model migration; then
+  dual package and strict lint gates on the isolated source. No live download,
+  GUI, cross-platform or hard-process-crash claim follows. Composed ownership
+  stays in the existing store, task, queue, and capability owners; no generic
+  migration framework or permanent compatibility registry is added.
 - **Held boundaries:** no further source expansion, public constructor/wire outcome,
   manifest, RPC/IPC/UniFFI, frontend/Electron, package/generated/CI, or shared-
   document mutation. The metadata files expose only the existing atomic writer

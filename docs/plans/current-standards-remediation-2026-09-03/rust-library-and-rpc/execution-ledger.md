@@ -1822,6 +1822,104 @@
   effects/publication, hard-process-crash proof, and C4 importer ownership
   remain open. No GUI, release, or cross-platform acceptance is claimed.
 
+### 2026-09-04 — Queued Pause Exposes Missing Durable Legacy Ownership
+
+- The public queued-pause regression failed while a paused predecessor held
+  the destination. A draft select on the existing generation wakeup settles
+  pause without entering destination work or releasing the FIFO claim.
+- The next real HTTP regression found that pre-execution pause discards the
+  pending marker setup. The draft regenerates admitted-resume markers after
+  queue acquisition from the exact strict admission snapshot and canonical
+  `requested_payload_files`, using the same serializer as original start.
+  Restored per-file sizes are not authoritative selection data. Same-client
+  pause/resume now passes: no request before head release, exact marker during
+  held headers, and successful real payload transfer afterward.
+- A strengthened fresh-client regression remains red: a successor issues HTTP
+  before its legacy predecessor is released. The initial immediate Queued
+  assertion missed this race and is not FIFO evidence. Store admission ordinals
+  omit legacy incumbents; restore sorts admitted entries ahead of the legacy
+  fallback. Independent review confirms the missing durable predecessor proof.
+- Freeze the source draft and retain the failing restart oracle. `RUST-I10`
+  requires a decision on durable legacy ownership/migration before extending
+  the two-file implementation. A guessed legacy-first sort, replacement with
+  an easier all-admitted fixture, or silent restore refusal cannot satisfy the
+  selected transparent restart claim. Source is not committed or accepted;
+  full package and lint verification remain pending after that decision.
+- Standards revision `bf9eafa6` has no applicable normative Markdown changes
+  since `97789165`. The isolated archive
+  `/tmp/pumas-queued-pause-candidate.9CQOAU` currently contains only committed
+  `c04dd119`; it has not been populated or verified with this source draft.
+
+### 2026-09-04 — Current-Only Cutover Implementation
+
+- The user explicitly authorized updating the existing library once and
+  dropping legacy support. Runtime schema v4 rejects earlier documents and
+  unadmitted ordinary snapshots without conversion. This changes the selected
+  contract; the preceding legacy restart failure remains causal evidence.
+- Read-only inspection found two paused unversioned records in distinct
+  destinations, with explicit payload selections matching their markers.
+  Source SHA-256 is
+  `060e438e72dd86683398d8a5cb7dc1cfc3c33dbf90e07be6b4093291eb83beb0`.
+  File-preservation hashes were captured outside the repository. No live
+  publication has occurred. The converter is temporary operator tooling,
+  not a startup fallback or shipped compatibility layer.
+- Store and lifecycle owners removed unowned ordinary mutation/relocation
+  paths and introduced an exact admitted recovery handoff preserving queue
+  position and snapshot provenance. Partial-download relocation reports
+  unsupported; ordinary completed-model migration remains unchanged.
+- The isolated candidate has now been populated with selected source and
+  the exact migration caller hunk, excluding unrelated working-tree drafts.
+  Its first production check found a removed constructor still used by the
+  committed caller; the constructor was restored. Initial strict Clippy found
+  a cancellation loop made obsolete by relocation removal; it is now a direct
+  block. Neither diagnostic was suppressed.
+- Store tests pass: 39 tests and two existing ignored subprocess helpers.
+  Current automatic finishing first reproduced a missing-implementation RED,
+  then passed with a no-network owned finalizer and exact queue settlement.
+  Independent review found a second race: public status observation could
+  retire that owner before restore collected its importer result. The
+  deterministic regression reproduced zero completion records instead of one;
+  the retained task now hands off its own result, preserving a same-ID successor.
+  The isolated regression is GREEN, and independent review reports no further
+  narrow blocker. Full core package tests now pass in both default and
+  no-default-feature configurations: 1,064 library tests, 96 integration tests,
+  and six doctests per configuration (1,166 passes; three existing library
+  helpers and eight existing doctests ignored). The reduced count reflects
+  removal of obsolete compatibility/relocation tests, not new ignores.
+  Strict core Clippy passes for both `--all-targets --all-features` and
+  `--all-targets --no-default-features`; strict supported-workspace Clippy
+  passes with `--workspace --all-targets --all-features --exclude pumas_rustler`.
+  Every invocation used `-D warnings`, offline dependencies, and the isolated
+  candidate. No unrelated working-tree drafts were used as acceptance evidence.
+- The temporary converter compiles and its three fixture tests pass. Live
+  dry-run produced an exact synced backup and a schema-v4 candidate preserving
+  both original snapshots field-for-field. Candidate hash:
+  `cfdfd4c1be9c38d247052f497b5628c04bdce4f0098e81ec26b5509d3d4fb7d5`.
+  Private artifacts and operator provenance are retained outside application
+  data and excluded from the source commit. After final stopped-writer and hash
+  checks, publication returned `durable_verified`. Readback exactly matches the
+  candidate; both snapshots and the original backup are preserved. All 22
+  existing files retain their hashes and all 38 previously absent paths remain
+  absent. No model, auxiliary, partial-file, marker, or metadata bytes changed;
+  both downloads remain paused. The temporary converter is not shipped and its
+  execute permissions were removed after proof; private source/provenance remains.
+- The development `pumas-rpc` binary builds from the accepted isolated source,
+  and its `--help` entry point passes. Release/package binaries were not rebuilt
+  and must be rebuilt before using schema-v4 data. No GUI, live Hugging Face,
+  cross-platform, hard-process-crash, comprehensive unresolved-state restore,
+  admitted relocation, or C4 importer-ownership acceptance is claimed.
+- Accept RUST-I9/RUST-I10 as an incremental C3 checkpoint. Frozen critical
+  source hashes: `download_store.rs`
+  `51077c83c5e79ae8418b3fed80cd1663295073511a25bfec59801189a1b17193`;
+  `hf/download.rs`
+  `db0a897735b8375e1a00d817f10d328d3bff750de3af08296ed3f3d258ddbf88`.
+  Standards revision `1609c304` has no applicable normative changes from the
+  previously routed revision. Five plan contracts, scoped rustfmt, and diff
+  whitespace checks pass. The isolated archive is not a registered worktree;
+  no branch or commit reachability was changed. Live personal tracking data,
+  private backup artifacts, unrelated drafts, and the original staged UniFFI
+  change are excluded from the source commit. Full C3/Milestone 2 stay pending.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):

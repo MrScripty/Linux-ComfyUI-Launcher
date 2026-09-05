@@ -16,7 +16,7 @@ use super::HuggingFaceClient;
 use crate::error::{PumasError, Result};
 use crate::model_library::download_store::{
     DownloadAdmissionDomain, DownloadAdmissionRequest, DownloadAdmissionTransition,
-    DownloadPersistence, LegacyRelocationRequest, LifecycleCleanupDisposition, LifecycleQuarantine,
+    DownloadPersistence, LifecycleCleanupDisposition, LifecycleQuarantine,
     LifecycleQuarantineDomain, PersistedDownload,
 };
 use crate::model_library::partial_download::{
@@ -301,8 +301,31 @@ enum DownloadFile {
 }
 
 struct DownloadStartSetup {
-    persisted_download: Option<PersistedDownload>,
     marker_contents: String,
+}
+
+fn serialize_download_marker(
+    request: &DownloadRequest,
+    selected_filenames: Vec<String>,
+    evidence: Option<&crate::models::HuggingFaceEvidence>,
+) -> Result<String> {
+    let selected_artifact =
+        SelectedArtifactIdentity::from_download_request(request, Some(selected_filenames));
+    serde_json::to_string_pretty(&serde_json::json!({
+        "repo_id": request.repo_id,
+        "family": request.family,
+        "official_name": request.official_name,
+        "model_type": request.model_type,
+        "pipeline_tag": request.pipeline_tag,
+        "bundle_format": request.bundle_format,
+        "pipeline_class": request.pipeline_class,
+        "selected_artifact": selected_artifact,
+        "huggingface_evidence": evidence,
+    }))
+    .map_err(|error| PumasError::Json {
+        message: "failed to serialize download marker".into(),
+        source: Some(error),
+    })
 }
 
 #[derive(Clone)]
@@ -412,150 +435,8 @@ impl CancellationPersistence {
                     "Download queue settlement was not confirmed".into(),
                 ));
             }
-        } else if !self.store.is_revoked(&self.download_id)? {
-            self.store.remove(&self.download_id)?;
         }
         Ok(())
-    }
-}
-
-enum RelocationPublication {
-    Durable,
-    NotPublished(PumasError),
-    Indeterminate(PumasError),
-}
-
-async fn publish_relocation_transition<F>(
-    context: &TaskContext,
-    operation: &'static str,
-    publish: F,
-) -> RelocationPublication
-where
-    F: FnOnce() -> Result<crate::metadata::AtomicPublishResult> + Send + 'static,
-{
-    match context.run_blocking_named(operation, publish).await {
-        Ok(Ok(Ok(crate::metadata::AtomicPublication::Durable))) => RelocationPublication::Durable,
-        Ok(Err(error)) => RelocationPublication::NotPublished(error),
-        Ok(Ok(Err(error))) => RelocationPublication::NotPublished(error.into_error()),
-        Ok(Ok(Ok(crate::metadata::AtomicPublication::PublishedDurabilityUnknown { error })))
-        | Ok(Ok(Ok(crate::metadata::AtomicPublication::VisibilityUnknown { error, .. }))) => {
-            RelocationPublication::Indeterminate(error)
-        }
-        Err(error) => RelocationPublication::Indeterminate(PumasError::Other(format!(
-            "Download relocation publication owner failed: {error}"
-        ))),
-    }
-}
-
-enum RelocationResolution {
-    Original(PumasError),
-    Moved(crate::model_library::DownloadRecoveryDestination),
-    Pending(
-        PumasError,
-        Option<crate::model_library::DownloadRecoveryDestination>,
-    ),
-}
-
-struct PreparedLegacyRelocation {
-    persistence: Arc<DownloadPersistence>,
-    attempt: String,
-    expected: PersistedDownload,
-    request: LegacyRelocationRequest,
-    source: crate::model_library::DownloadRecoveryDestination,
-    target: crate::model_library::DownloadRecoveryDestination,
-    marker: Option<serde_json::Value>,
-}
-
-async fn execute_legacy_relocation(
-    context: &TaskContext,
-    operation: PreparedLegacyRelocation,
-) -> RelocationResolution {
-    let PreparedLegacyRelocation {
-        persistence,
-        attempt,
-        expected,
-        request,
-        source,
-        target,
-        marker,
-    } = operation;
-    let id = expected.download_id.clone();
-    let begin = publish_relocation_transition(context, "persist legacy relocation intent", {
-        let persistence = persistence.clone();
-        let attempt = attempt.clone();
-        move || persistence.begin_legacy_relocation(&attempt, &expected, &request)
-    })
-    .await;
-    match begin {
-        RelocationPublication::Durable => {}
-        RelocationPublication::NotPublished(error) => return RelocationResolution::Original(error),
-        RelocationPublication::Indeterminate(error) => {
-            return RelocationResolution::Pending(error, None)
-        }
-    }
-    let moved = match context
-        .run_blocking_named("move legacy download directory", move || {
-            source.move_to_absent(&target)
-        })
-        .await
-    {
-        Ok(Ok(destination)) => destination,
-        Ok(Err(crate::model_library::download_recovery::DestinationMoveError::NotMoved(error))) => {
-            let abort = publish_relocation_transition(context, "abort legacy relocation intent", {
-                let persistence = persistence.clone();
-                let attempt = attempt.clone();
-                let id = id.clone();
-                move || persistence.abort_legacy_relocation(&id, &attempt)
-            })
-            .await;
-            return match abort {
-                RelocationPublication::Durable => RelocationResolution::Original(error.into()),
-                RelocationPublication::NotPublished(error)
-                | RelocationPublication::Indeterminate(error) => {
-                    RelocationResolution::Pending(error, None)
-                }
-            };
-        }
-        Ok(Err(crate::model_library::download_recovery::DestinationMoveError::Indeterminate(
-            error,
-        ))) => return RelocationResolution::Pending(error.into(), None),
-        Err(error) => {
-            return RelocationResolution::Pending(
-                PumasError::Other(format!("Download relocation move owner failed: {error}")),
-                None,
-            )
-        }
-    };
-    if let Some(marker) = marker {
-        match publish_relocation_transition(context, "publish relocated download marker", {
-            let moved = moved.clone();
-            move || Ok(moved.write_marker(&marker))
-        })
-        .await
-        {
-            RelocationPublication::Durable => {}
-            RelocationPublication::NotPublished(error)
-            | RelocationPublication::Indeterminate(error) => {
-                return RelocationResolution::Pending(error, Some(moved))
-            }
-        }
-    }
-    if !matches!(context.drain_blocking().await, Ok(0)) {
-        return RelocationResolution::Pending(
-            PumasError::Other("Download relocation effects did not drain successfully".into()),
-            Some(moved),
-        );
-    }
-    match publish_relocation_transition(context, "finish legacy relocation intent", move || {
-        persistence.finish_legacy_relocation(&id, &attempt)
-    })
-    .await
-    {
-        RelocationPublication::Durable => RelocationResolution::Moved(moved),
-        RelocationPublication::NotPublished(error)
-        | RelocationPublication::Indeterminate(error) => {
-            RelocationResolution::Pending(error, Some(moved))
-        }
     }
 }
 
@@ -582,58 +463,174 @@ struct PreparedDownloadTask {
     destination_lock: Arc<TokioMutex<()>>,
     start_setup: Option<DownloadStartSetup>,
     persist_queued_status: bool,
+    restore_finalization: Option<DownloadStatus>,
 }
 
 impl PreparedDownloadTask {
+    async fn finalize_restored(
+        &self,
+        context: &TaskContext,
+        initial_status: DownloadStatus,
+    ) -> Result<()> {
+        let destination_guard = self.destination_lock.clone().lock_owned().await;
+        let (attempt, total_bytes) = {
+            let mut states = self.downloads.write().await;
+            let state = current_worker_state(
+                &mut states,
+                &self.download_id,
+                context,
+                &[DownloadStatus::Queued, DownloadStatus::Downloading],
+            )?;
+            let attempt = state
+                .admission
+                .as_ref()
+                .ok_or_else(|| PumasError::Config {
+                    message: "Restore finalization requires durable admission".into(),
+                })?
+                .attempt_id
+                .clone();
+            state.status = DownloadStatus::Downloading;
+            (attempt, state.total_bytes)
+        };
+        let complete = context
+            .run_fallible_blocking_named("finalize restored download files", {
+                let destination = self.destination.capability().clone();
+                let filenames = self
+                    .files
+                    .iter()
+                    .map(|file| file.filename.clone())
+                    .collect::<Vec<_>>();
+                move || -> Result<bool> {
+                    let sizes =
+                        infer_expected_sizes_with_files(&destination, &filenames, total_bytes)?;
+                    Ok(
+                        finalize_download_artifact_with_files(&destination, &filenames, &sizes)?
+                            .complete,
+                    )
+                }
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!("Restore finalization owner failed: {error}"))
+            })??;
+        if !matches!(context.drain_blocking().await, Ok(0)) {
+            return Err(PumasError::Other(
+                "Restore finalization effects did not drain".into(),
+            ));
+        }
+        {
+            let mut states = self.downloads.write().await;
+            let state = current_worker_state(
+                &mut states,
+                &self.download_id,
+                context,
+                &[DownloadStatus::Downloading],
+            )?;
+            if !complete {
+                state.status = initial_status;
+                state.task_registered = false;
+                return Err(PumasError::DownloadPaused);
+            }
+            // The file set is committed. A later pause must not interrupt its
+            // exact durable settlement; cancellation still owns replacement.
+            state.files_completed = state.files.len();
+        }
+        let persistence = self.persistence.clone().ok_or_else(|| PumasError::Config {
+            message: "Restore finalization persistence is unavailable".into(),
+        })?;
+        let id = self.download_id.clone();
+        let settled = context
+            .run_fallible_blocking_named("settle restored download admission", move || {
+                persistence.settle_queue_admission(&id, &attempt)
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!("Restore settlement owner failed: {error}"))
+            })??;
+        if !settled || !matches!(context.drain_blocking().await, Ok(0)) {
+            return Err(PumasError::Other(
+                "Restore finalization settlement was not confirmed".into(),
+            ));
+        }
+        {
+            let mut states = self.downloads.write().await;
+            let state = current_worker_state(
+                &mut states,
+                &self.download_id,
+                context,
+                &[DownloadStatus::Downloading],
+            )?;
+            state.status = DownloadStatus::Completed;
+            state.progress = 1.0;
+            state.task_registered = false;
+            state.speed = 0.0;
+        }
+        drop(destination_guard);
+        publish_download_snapshot_from_parts(&self.download_publications).await;
+        Ok(())
+    }
+
     fn prepare_owned(self, owner: &Arc<DownloadTaskOwner>, role: TaskRole) -> OwnedPreparedTask {
         let download_id = self.download_id.clone();
-        owner.prepare(download_id, role, move |task_context| {
-            self.run_owned(task_context)
+        owner.prepare(download_id, role, move |task_context| async move {
+            // This worker owns and projects its failures; ordinary starts do
+            // not have a second consumer for the settled internal outcome.
+            let _ = self.run_owned(task_context).await;
         })
     }
 
-    async fn run_owned(self, task_context: TaskContext) {
+    async fn run_owned(self, task_context: TaskContext) -> Result<bool> {
         use futures::FutureExt;
 
         let destination_path = self.destination.identity();
         let destination_domain = self.destination.domain();
-        let acquired = self
-            .destination_executions
-            .wait_for_turn(
+        let acquired = tokio::select! {
+            biased;
+            _ = task_context.pause_requested(&self.pause_flag) => None,
+            acquired = self.destination_executions.wait_for_turn(
                 &destination_path,
                 task_context.download_id(),
                 destination_domain,
                 task_context.generation(),
-            )
-            .await;
-        let outcome = if acquired {
-            AssertUnwindSafe(HuggingFaceClient::run_download(
-                self.client,
-                self.downloads.clone(),
-                self.download_publications.clone(),
-                &self.download_id,
-                &self.repo_id,
-                &self.files,
-                &self.destination,
-                self.cancel_flag,
-                self.pause_flag,
-                self.persistence.clone(),
-                self.terminal_cleanup_persistence.clone(),
-                self.completion_callback,
-                self.aux_complete_callback,
-                self.auth_header,
-                task_context.clone(),
-                self.destination_lock,
-                self.start_setup,
-                self.persist_queued_status,
-                #[cfg(test)]
-                self.download_base_url,
-            ))
-            .catch_unwind()
-            .await
-        } else {
-            Ok(Err(PumasError::DownloadCancelled))
+            ) => Some(acquired),
         };
+        let outcome =
+            if let (Some(true), Some(initial_status)) = (acquired, self.restore_finalization) {
+                AssertUnwindSafe(self.finalize_restored(&task_context, initial_status))
+                    .catch_unwind()
+                    .await
+            } else if acquired == Some(true) {
+                AssertUnwindSafe(HuggingFaceClient::run_download(
+                    self.client,
+                    self.downloads.clone(),
+                    self.download_publications.clone(),
+                    &self.download_id,
+                    &self.repo_id,
+                    &self.files,
+                    &self.destination,
+                    self.cancel_flag,
+                    self.pause_flag,
+                    self.persistence.clone(),
+                    self.terminal_cleanup_persistence.clone(),
+                    self.completion_callback,
+                    self.aux_complete_callback,
+                    self.auth_header,
+                    task_context.clone(),
+                    self.destination_lock,
+                    self.start_setup,
+                    self.persist_queued_status,
+                    #[cfg(test)]
+                    self.download_base_url,
+                ))
+                .catch_unwind()
+                .await
+            } else {
+                Ok(Err(if acquired.is_none() {
+                    PumasError::DownloadPaused
+                } else {
+                    PumasError::DownloadCancelled
+                }))
+            };
         let mut result = match outcome {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -662,7 +659,7 @@ impl PreparedDownloadTask {
         // Paused and failed downloads retain destination authority for their
         // resumable artifacts. Only verified successful completion releases
         // the reservation; cancellation transfers it to its finalizer.
-        if acquired && result.is_ok() {
+        if acquired == Some(true) && result.is_ok() {
             self.destination_executions.release(
                 &destination_path,
                 task_context.download_id(),
@@ -711,14 +708,14 @@ impl PreparedDownloadTask {
         };
         let nested_failures = task_context.drain_blocking().await.unwrap_or(1);
 
-        if let Err(error) = result {
+        if let Err(error) = &result {
             if matches!(error, PumasError::DownloadPaused) {
                 info!("Download paused for {}", self.repo_id);
-                return;
+                return Ok(false);
             }
             if matches!(error, PumasError::DownloadCancelled) {
                 info!("Download cancelled for {}", self.repo_id);
-                return;
+                return Ok(false);
             }
             error!("Download failed for {}: {}", self.repo_id, error);
             let projected = {
@@ -752,7 +749,13 @@ impl PreparedDownloadTask {
                 "Download task for {} observed {} nested blocking failure(s)",
                 self.repo_id, nested_failures
             );
+            if result.is_ok() {
+                return Err(PumasError::Other(
+                    "Download completion effects did not drain".into(),
+                ));
+            }
         }
+        result.map(|()| true)
     }
 }
 
@@ -1592,7 +1595,10 @@ impl HuggingFaceClient {
                                     DownloadStatus::Paused,
                                 )
                             } else {
-                                persistence.update_status(&persisted_id, DownloadStatus::Paused)
+                                Err(PumasError::Config {
+                                    message: "Ordinary reconciliation requires durable admission"
+                                        .into(),
+                                })
                             }
                         },)
                         .await,
@@ -1844,7 +1850,7 @@ impl HuggingFaceClient {
     ///
     /// Reconciles durable admission inventory and restores queue-owned entries
     /// in recorded order, including entries that have not written any bytes.
-    /// Legacy entries still use the existing byte-complete finalization path.
+    /// Old tracking formats require explicit conversion before restoration.
     /// Invalid or unresolved authoritative inventory is returned as an error.
     pub async fn restore_persisted_downloads(&self) -> Result<Vec<DownloadCompletionInfo>> {
         let persistence = match &self.persistence {
@@ -1861,6 +1867,17 @@ impl HuggingFaceClient {
         })
         .await
         .map_err(|error| PumasError::Other(format!("Download restore owner failed: {error}")))??;
+        if inventory
+            .queue_admissions
+            .values()
+            .any(|admission| admission.domain == DownloadAdmissionDomain::Recovery)
+        {
+            return Err(PumasError::Validation {
+                field: "download_recovery".into(),
+                message: "Active recovery custody requires explicit reconciliation before restore"
+                    .into(),
+            });
+        }
         if !inventory.hidden_admissions.is_empty()
             || inventory.quarantines.iter().any(|(id, quarantine)| {
                 quarantine.disposition != LifecycleCleanupDisposition::Verified
@@ -1878,61 +1895,26 @@ impl HuggingFaceClient {
             .filter(|quarantine| quarantine.domain == LifecycleQuarantineDomain::Ambient)
             .map(|quarantine| DownloadState::from_verified_cleanup(&quarantine.snapshot))
             .collect::<Vec<_>>();
-        for (download_id, pending) in &inventory.pending_relocations {
-            let root = self
-                .destination_root
-                .clone()
-                .ok_or_else(|| PumasError::Config {
-                    message: "Pending relocation restore authority is unavailable".into(),
-                })?;
-            let pending = pending.clone();
-            let (source, target) = tokio::task::spawn_blocking(move || -> Result<_> {
-                let source = root.resolve(&pending.snapshot.dest_dir)?.identity();
-                let target = root.resolve(&pending.request.target_dir)?.identity();
-                if source.persisted() != pending.request.source
-                    || target.persisted() != pending.request.target
-                {
-                    return Err(PumasError::Validation {
-                        field: "download_relocation".into(),
-                        message: "Pending relocation destination identity changed".into(),
-                    });
-                }
-                Ok((source, target))
+        let mut entries = inventory
+            .downloads
+            .into_iter()
+            .map(|entry| {
+                let admission = inventory
+                    .queue_admissions
+                    .get(&entry.download_id)
+                    .cloned()
+                    .ok_or_else(|| PumasError::Validation {
+                        field: "download_admission".into(),
+                        message: "Current download snapshot requires durable admission".into(),
+                    })?;
+                Ok((entry, admission))
             })
-            .await
-            .map_err(|error| {
-                PumasError::Other(format!(
-                    "Pending relocation restore inspection failed: {error}"
-                ))
-            })??;
-            if !self.destination_executions.reserve_dormant(
-                source,
-                download_id.clone(),
-                DestinationDomain::Ambient,
-            ) || !self.destination_executions.reserve_dormant(
-                target,
-                download_id.clone(),
-                DestinationDomain::Ambient,
-            ) {
-                return Err(PumasError::Validation {
-                    field: "download_relocation".into(),
-                    message: "Pending relocation reservation could not be restored".into(),
-                });
-            }
-        }
-        let mut entries = inventory.downloads;
-        entries.sort_by_key(|entry| {
-            inventory
-                .queue_admissions
-                .get(&entry.download_id)
-                .map(|admission| admission.position.ordinal)
-                .unwrap_or(u64::MAX)
-        });
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort_by_key(|(_, admission)| admission.position.ordinal);
 
         let mut restored_entries = Vec::new();
-        let mut completed_entries = Vec::new();
 
-        for entry in entries {
+        for (entry, admission) in entries {
             let root = self
                 .destination_root
                 .clone()
@@ -1945,7 +1927,7 @@ impl HuggingFaceClient {
                 .map_err(|error| {
                     PumasError::Other(format!("Download restore authority owner failed: {error}"))
                 })??;
-            if let Some(admission) = inventory.queue_admissions.get(&entry.download_id) {
+            {
                 if admission.domain != DownloadAdmissionDomain::Ambient {
                     return Err(PumasError::Other(
                         "Recovery admission requires ticket reconciliation".into(),
@@ -1989,173 +1971,18 @@ impl HuggingFaceClient {
                     }),
                     DownloadDestination::Managed(destination),
                 ));
-                continue;
             }
-            let all_filenames = if entry.filenames.is_empty() {
-                vec![entry.filename.clone()]
-            } else {
-                entry.filenames.clone()
-            };
-            let mut expected_sizes = match tokio::task::spawn_blocking({
-                let destination = destination.clone();
-                let filenames = all_filenames.clone();
-                let total_size = entry.total_bytes;
-                move || infer_expected_sizes_with_files(&destination, &filenames, total_size)
-            })
-            .await
-            {
-                Ok(Ok(sizes)) => sizes,
-                Ok(Err(error)) => {
-                    return Err(error);
-                }
-                Err(error) => {
-                    return Err(PumasError::Other(format!(
-                        "Download restore inspection failed: {error}"
-                    )));
-                }
-            };
-            if all_filenames.len() > 1 {
-                let has_unfinalized_part = tokio::task::spawn_blocking({
-                    let destination = destination.clone();
-                    let filenames = all_filenames.clone();
-                    move || -> Result<bool> {
-                        for filename in filenames {
-                            if destination.file_len(&filename)?.is_none()
-                                && destination.part_len(&filename)?.is_some()
-                            {
-                                return Ok(true);
-                            }
-                        }
-                        Ok(false)
-                    }
-                })
-                .await
-                .map_err(|error| {
-                    PumasError::Other(format!("Download restore inspection failed: {error}"))
-                })??;
-                if has_unfinalized_part {
-                    match self.get_repo_files(&entry.repo_id).await {
-                        Ok(tree) => {
-                            expected_sizes.extend(
-                                tree.lfs_files
-                                    .into_iter()
-                                    .map(|file| (file.filename, file.size)),
-                            );
-                        }
-                        Err(error) => {
-                            debug!(
-                                "Could not resolve per-file sizes while restoring {}: {}",
-                                entry.download_id, error
-                            );
-                        }
-                    }
-                }
-            }
-
-            let finalization = match tokio::task::spawn_blocking({
-                let destination = destination.clone();
-                let filenames = all_filenames.clone();
-                move || {
-                    finalize_download_artifact_with_files(&destination, &filenames, &expected_sizes)
-                }
-            })
-            .await
-            {
-                Ok(Ok(finalization)) => finalization,
-                Ok(Err(error)) => {
-                    return Err(error);
-                }
-                Err(error) => {
-                    return Err(PumasError::Other(format!(
-                        "Download restore finalization failed: {error}"
-                    )));
-                }
-            };
-
-            if finalization.complete {
-                info!(
-                    "Auto-finalized persisted download {} ({} promoted file{})",
-                    entry.download_id,
-                    finalization.promoted_files,
-                    if finalization.promoted_files == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                );
-                Self::remove_persisted_download(persistence.clone(), entry.download_id.clone())
-                    .await;
-                completed_entries.push(entry);
-                continue;
-            }
-
-            let disk_state = tokio::task::spawn_blocking({
-                let destination = destination.clone();
-                let filenames = all_filenames.clone();
-                move || -> Result<_> {
-                    let mut found = false;
-                    let mut bytes = 0u64;
-                    for filename in filenames {
-                        if let Some(length) = destination
-                            .file_len(&filename)?
-                            .or(destination.part_len(&filename)?)
-                        {
-                            found = true;
-                            bytes = bytes.checked_add(length).ok_or_else(|| {
-                                PumasError::Other("Download byte count overflow".into())
-                            })?;
-                        }
-                    }
-                    Ok((found, bytes))
-                }
-            })
-            .await
-            .map_err(|error| {
-                PumasError::Other(format!("Download restore inspection failed: {error}"))
-            })??;
-            let (has_any_file, downloaded_bytes) = disk_state;
-            if !has_any_file {
-                info!(
-                    "Removing stale persisted download {} (no files on disk)",
-                    entry.download_id
-                );
-                Self::remove_persisted_download(persistence.clone(), entry.download_id.clone())
-                    .await;
-                continue;
-            }
-            restored_entries.push((
-                entry,
-                downloaded_bytes,
-                None,
-                DownloadDestination::Managed(destination),
-            ));
         }
 
-        let completion_infos = completed_entries
-            .into_iter()
-            .map(|entry| {
-                let filenames = if entry.filenames.is_empty() {
-                    vec![entry.filename.clone()]
-                } else {
-                    entry.filenames.clone()
-                };
-                DownloadCompletionInfo {
-                    download_id: entry.download_id,
-                    dest_dir: entry.dest_dir,
-                    filename: entry.filename,
-                    filenames,
-                    download_request: entry.download_request,
-                    known_sha256: entry.known_sha256,
-                    huggingface_evidence: entry.huggingface_evidence,
-                }
-            })
-            .collect::<Vec<_>>();
-
         if restored_entries.is_empty() && verified_failures.is_empty() {
-            return Ok(completion_infos);
+            return Ok(Vec::new());
         }
 
         info!("Restoring {} persisted downloads", restored_entries.len());
+        let restored_ids = restored_entries
+            .iter()
+            .map(|(entry, _, _, _)| entry.download_id.clone())
+            .collect::<Vec<_>>();
         let mut downloads = self.downloads.write().await;
 
         for state in verified_failures {
@@ -2193,7 +2020,164 @@ impl HuggingFaceClient {
         }
         drop(downloads);
         self.publish_download_snapshot().await;
-        Ok(completion_infos)
+        let mut completed = Vec::new();
+        for id in restored_ids {
+            if let Some(info) = self.finalize_restored_download(&id).await? {
+                completed.push(info);
+            }
+        }
+        Ok(completed)
+    }
+
+    async fn finalize_restored_download(
+        &self,
+        download_id: &str,
+    ) -> Result<Option<DownloadCompletionInfo>> {
+        let (info, files, destination, admission, initial_status) = {
+            let states = self.downloads.read().await;
+            let Some(state) = states.get(download_id) else {
+                return Ok(None);
+            };
+            if !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                || state.lifecycle_failure_unverified
+                || self.download_tasks.contains(download_id)
+            {
+                return Ok(None);
+            }
+            let Some(destination) = state.destination.clone() else {
+                return Ok(None);
+            };
+            if !self.destination_executions.is_first(
+                &destination.identity(),
+                download_id,
+                DestinationDomain::Ambient,
+            ) {
+                return Ok(None);
+            }
+            let info = DownloadCompletionInfo {
+                download_id: download_id.into(),
+                dest_dir: state.dest_dir.clone(),
+                filename: state.filename.clone(),
+                filenames: state
+                    .files
+                    .iter()
+                    .map(|file| file.filename.clone())
+                    .collect(),
+                download_request: state.download_request.clone().ok_or_else(|| {
+                    PumasError::Config {
+                        message: "Restore finalization request is unavailable".into(),
+                    }
+                })?,
+                known_sha256: state.known_sha256.clone(),
+                huggingface_evidence: state.huggingface_evidence.clone(),
+            };
+            (
+                info,
+                state.files.clone(),
+                destination,
+                state.admission.clone(),
+                state.status,
+            )
+        };
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+        let mut prepared_download = self
+            .prepare_download_task(
+                download_id.into(),
+                info.download_request.repo_id.clone(),
+                files,
+                destination.clone(),
+                cancel_flag.clone(),
+                pause_flag.clone(),
+                None,
+                None,
+                self.persistence.clone(),
+                self.persistence.clone(),
+            )
+            .await;
+        prepared_download.restore_finalization = Some(initial_status);
+        let (finished_sender, finished) = tokio::sync::oneshot::channel();
+        let result_states = self.downloads.clone();
+        let prepared = self.download_tasks.prepare(
+            download_id.into(),
+            TaskRole::Worker,
+            move |context| async move {
+                let result = prepared_download.run_owned(context.clone()).await;
+                if result.as_ref().is_ok_and(|complete| *complete) {
+                    let mut states = result_states.write().await;
+                    if context.is_current_role(TaskRole::Worker)
+                        && states
+                            .get(&info.download_id)
+                            .is_some_and(|state| state.status == DownloadStatus::Completed)
+                    {
+                        states.remove(&info.download_id);
+                    }
+                }
+                // The exact worker outcome survives UI-state clearing and
+                // normal owner retirement. Never infer this result by ID.
+                let _ = finished_sender.send(result.map(|complete| complete.then_some(info)));
+            },
+        );
+        let installed = {
+            let mut states = self.downloads.write().await;
+            let Some(state) = states.get_mut(download_id) else {
+                return Ok(None);
+            };
+            if !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                || state.lifecycle_failure_unverified
+                || self.download_tasks.contains(download_id)
+                || !state.matches_destination(&destination.identity())
+                || state.admission.as_ref().map(|value| &value.attempt_id)
+                    != admission.as_ref().map(|value| &value.attempt_id)
+                || !self.destination_executions.is_first(
+                    &destination.identity(),
+                    download_id,
+                    DestinationDomain::Ambient,
+                )
+            {
+                return Ok(None);
+            }
+            let Ok(installed) = self.download_tasks.install_gated(prepared) else {
+                return Ok(None);
+            };
+            if !self.destination_executions.reserve(
+                destination.identity(),
+                download_id.into(),
+                DestinationDomain::Ambient,
+                installed.generation().clone(),
+            ) {
+                drop(installed);
+                drop(states);
+                self.download_tasks.rescue_abandoned();
+                return Ok(None);
+            }
+            state.cancel_flag = cancel_flag;
+            state.pause_flag = pause_flag;
+            state.status = DownloadStatus::Queued;
+            state.task_registered = true;
+            installed
+        };
+        let generation = installed.generation().clone();
+        installed.start();
+        let result = finished
+            .await
+            .map_err(|_| PumasError::Other("Restore finalization owner did not finish".into()))?;
+        while self
+            .download_tasks
+            .generation_is_current(download_id, &generation)
+            && self
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| !task.finished)
+        {
+            tokio::task::yield_now().await;
+        }
+        #[cfg(test)]
+        self.download_tasks
+            .observe_ambient_admission("restore-finalization-result", download_id);
+        self.observe_finished_download_tasks().await;
+        self.publish_download_snapshot().await;
+        result
     }
 
     /// Start a model download (supports multi-file models).
@@ -2454,18 +2438,11 @@ impl HuggingFaceClient {
                 .iter()
                 .map(|file| file.filename.clone())
                 .collect::<Vec<_>>();
-            let selected_filenames = files
-                .iter()
-                .filter(|file| file.size.is_some())
-                .map(|file| file.filename.clone())
-                .collect::<Vec<_>>();
             let known_sha256 = files
                 .iter()
                 .filter(|file| file.size.is_some())
                 .max_by_key(|file| file.size.unwrap_or(0))
                 .and_then(|file| file.sha256.clone());
-            let selected_artifact =
-                SelectedArtifactIdentity::from_download_request(request, Some(selected_filenames));
             let mut huggingface_evidence = remote_evidence.clone();
             if let Some(ref mut evidence) = huggingface_evidence {
                 Self::enrich_huggingface_evidence_for_download(
@@ -2488,21 +2465,11 @@ impl HuggingFaceClient {
                 known_sha256: known_sha256.clone(),
                 huggingface_evidence: huggingface_evidence.clone(),
             });
-            let marker_contents = serde_json::to_string_pretty(&serde_json::json!({
-                "repo_id": request.repo_id,
-                "family": request.family,
-                "official_name": request.official_name,
-                "model_type": request.model_type,
-                "pipeline_tag": request.pipeline_tag,
-                "bundle_format": request.bundle_format,
-                "pipeline_class": request.pipeline_class,
-                "selected_artifact": selected_artifact,
-                "huggingface_evidence": huggingface_evidence,
-            }))
-            .map_err(|error| PumasError::Json {
-                message: "failed to serialize download marker".to_string(),
-                source: Some(error),
-            })?;
+            let marker_contents = serialize_download_marker(
+                request,
+                requested_payload_files.clone(),
+                huggingface_evidence.as_ref(),
+            )?;
             let admission_request = DownloadAdmissionRequest {
                 snapshot: persisted_download.clone().ok_or_else(|| {
                     PumasError::Other("Durable download snapshot unavailable".into())
@@ -2531,11 +2498,9 @@ impl HuggingFaceClient {
                 terminal_cleanup_persistence: self.persistence.clone(),
                 auth_header,
                 destination_lock,
-                start_setup: Some(DownloadStartSetup {
-                    persisted_download: None,
-                    marker_contents,
-                }),
+                start_setup: Some(DownloadStartSetup { marker_contents }),
                 persist_queued_status: false,
+                restore_finalization: None,
             };
             let state = DownloadState {
                 download_id: download_id.clone(),
@@ -2557,7 +2522,6 @@ impl HuggingFaceClient {
                 dest_dir: dest_dir.to_path_buf(),
                 ambient_authority_blocked: false,
                 admission: None,
-                pending_relocation: None,
                 revoked_snapshot: None,
                 destination: Some(DownloadDestination::Managed(destination.clone())),
                 filename: first_filename,
@@ -2671,7 +2635,7 @@ impl HuggingFaceClient {
                     let _ = admission_sender.send(Ok(()));
                     admission_completed.send_replace(true);
                     drop(admission_completed);
-                    prepared_download.run_owned(task_context).await;
+                    let _ = prepared_download.run_owned(task_context).await;
                 },
             );
             match self.download_tasks.install_gated(prepared) {
@@ -2767,6 +2731,7 @@ impl HuggingFaceClient {
             destination_lock,
             start_setup: None,
             persist_queued_status: false,
+            restore_finalization: None,
         }
     }
 
@@ -2913,7 +2878,9 @@ impl HuggingFaceClient {
                                 DownloadStatus::Paused,
                             )
                         } else {
-                            persistence.update_status(&persisted_id, DownloadStatus::Paused)
+                            Err(PumasError::Config {
+                                message: "Ordinary pause requires durable admission".into(),
+                            })
                         }
                     })
                     .await,
@@ -3042,27 +3009,6 @@ impl HuggingFaceClient {
         destination.prepare(&task_context).await?;
 
         if let Some(start_setup) = start_setup {
-            if let Some(persisted_download) = start_setup.persisted_download {
-                let persistence = persistence.clone().ok_or_else(|| {
-                    PumasError::Other(
-                        "download setup lost its configured persistence owner".to_string(),
-                    )
-                })?;
-                match task_context
-                    .run_fallible_blocking_named("persist admitted download", move || {
-                        persistence.save(&persisted_download)
-                    })
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => return Err(error),
-                    Err(error) => {
-                        return Err(PumasError::Other(format!(
-                            "failed to observe admitted-download persistence: {error}"
-                        )));
-                    }
-                }
-            }
             destination
                 .write_marker(&task_context, start_setup.marker_contents)
                 .await?;
@@ -3080,6 +3026,49 @@ impl HuggingFaceClient {
                 .get(download_id)
                 .and_then(|state| state.admission.as_ref())
                 .map(|admission| admission.attempt_id.clone());
+            if let Some(attempt) = attempt.as_ref() {
+                let marker = task_context
+                    .run_fallible_blocking_named("read admitted resume marker", {
+                        let persistence = persistence.clone();
+                        let persisted_id = persisted_id.clone();
+                        let attempt = attempt.clone();
+                        let identity = destination.identity().persisted();
+                        move || -> Result<String> {
+                            let inventory = persistence.load_lifecycle_inventory_strict()?;
+                            let admission = inventory
+                                .queue_admissions
+                                .get(&persisted_id)
+                                .filter(|admission| {
+                                    admission.attempt_id == attempt
+                                        && admission.domain == DownloadAdmissionDomain::Ambient
+                                        && admission.destination == identity
+                                })
+                                .ok_or_else(|| PumasError::Validation {
+                                    field: "download_admission".into(),
+                                    message: "Resume marker requires its exact active admission"
+                                        .into(),
+                                })?;
+                            let snapshot = inventory
+                                .downloads
+                                .iter()
+                                .find(|snapshot| snapshot.download_id == persisted_id)
+                                .ok_or_else(|| PumasError::Validation {
+                                    field: "download_admission".into(),
+                                    message: "Resume marker snapshot is unavailable".into(),
+                                })?;
+                            serialize_download_marker(
+                                &snapshot.download_request,
+                                admission.requested_payload_files.clone(),
+                                snapshot.huggingface_evidence.as_ref(),
+                            )
+                        }
+                    })
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!("Download resume marker owner failed: {error}"))
+                    })??;
+                destination.write_marker(&task_context, marker).await?;
+            }
             match task_context
                 .run_fallible_blocking_named("persist admitted download resume", move || {
                     if let Some(attempt) = attempt {
@@ -3089,7 +3078,9 @@ impl HuggingFaceClient {
                             DownloadStatus::Queued,
                         )
                     } else {
-                        persistence.update_status(&persisted_id, DownloadStatus::Queued)
+                        Err(PumasError::Config {
+                            message: "Ordinary resume requires durable admission".into(),
+                        })
                     }
                 })
                 .await
@@ -3454,14 +3445,6 @@ impl HuggingFaceClient {
                         if !e.is_retryable() || cancel_flag.load(Ordering::Relaxed) {
                             if cancel_flag.load(Ordering::Relaxed) {
                                 let _ = destination.remove_part(&task_context, filename).await;
-                                if let Some(ref persistence) = persistence {
-                                    Self::remove_persisted_download_owned(
-                                        &task_context,
-                                        persistence.clone(),
-                                        download_id.to_string(),
-                                    )
-                                    .await;
-                                }
                             }
                             return Err(e);
                         }
@@ -3616,15 +3599,19 @@ impl HuggingFaceClient {
         // Persistence cleanup is part of successful completion. It is
         // registered with the same task owner and must finish before the final
         // drain, Completed projection, or recovery-capability release.
-        if let Some(ref persistence) = terminal_cleanup_persistence {
+        let completion_admission = downloads.read().await.get(download_id).and_then(|state| {
+            state
+                .admission
+                .as_ref()
+                .map(|entry| entry.attempt_id.clone())
+        });
+        if let Some(persistence) = terminal_cleanup_persistence
+            .as_ref()
+            .filter(|_| completion_admission.is_some() || !destination.is_recovery())
+        {
             let persistence = persistence.clone();
             let persisted_id = download_id.to_string();
-            let attempt = downloads.read().await.get(download_id).and_then(|state| {
-                state
-                    .admission
-                    .as_ref()
-                    .map(|entry| entry.attempt_id.clone())
-            });
+            let attempt = completion_admission;
             match task_context
                 .run_fallible_blocking_named("remove completed persisted download", move || {
                     if let Some(attempt) = attempt {
@@ -3636,7 +3623,9 @@ impl HuggingFaceClient {
                             ))
                         }
                     } else {
-                        persistence.remove(&persisted_id)
+                        Err(PumasError::Config {
+                            message: "Ordinary completion requires durable admission".into(),
+                        })
                     }
                 })
                 .await
@@ -3925,7 +3914,9 @@ impl HuggingFaceClient {
                 if let Some(attempt) = admission_attempt {
                     persistence.update_admitted_status(&download_id, &attempt, status)
                 } else {
-                    persistence.update_status(&download_id, status)
+                    Err(PumasError::Config {
+                        message: "Ordinary status persistence requires durable admission".into(),
+                    })
                 }
             })
             .await
@@ -3935,25 +3926,6 @@ impl HuggingFaceClient {
                 "failed to observe persisted download status: {error}"
             ))),
         }
-    }
-
-    async fn remove_persisted_download(persistence: Arc<DownloadPersistence>, download_id: String) {
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = persistence.remove(&download_id);
-        })
-        .await;
-    }
-
-    async fn remove_persisted_download_owned(
-        task_context: &TaskContext,
-        persistence: Arc<DownloadPersistence>,
-        download_id: String,
-    ) {
-        let _ = task_context
-            .run_fallible_blocking_named("remove persisted download", move || {
-                persistence.remove(&download_id)
-            })
-            .await;
     }
 
     async fn persisted_download_is_revoked(
@@ -3978,25 +3950,11 @@ impl HuggingFaceClient {
 
     /// Cancel a download.
     pub async fn cancel_download(&self, download_id: &str) -> Result<bool> {
-        let finalizer = loop {
+        let finalizer = {
             let mut download_states = self.downloads.write().await;
-            if let Some(mut completion) = self.download_tasks.relocation_completion(download_id) {
-                if !*completion.borrow() {
-                    drop(download_states);
-                    completion.wait_for(|settled| *settled).await.map_err(|_| {
-                        PumasError::Other("Download relocation did not settle".into())
-                    })?;
-                    continue;
-                }
-            }
             let Some(state) = download_states.get_mut(download_id) else {
                 return Ok(false);
             };
-            if state.pending_relocation.is_some() {
-                return Err(PumasError::Other(
-                    "Download relocation requires reconciliation before cancellation".into(),
-                ));
-            }
             if matches!(
                 state.status,
                 DownloadStatus::Completed | DownloadStatus::Cancelled
@@ -4210,13 +4168,6 @@ impl HuggingFaceClient {
                 super::lifecycle::CancelTransition::Started(finalizer)
                 | super::lifecycle::CancelTransition::Existing(finalizer) => finalizer,
                 super::lifecycle::CancelTransition::AlreadyRunning => return Ok(true),
-                super::lifecycle::CancelTransition::Relocating(mut completion) => {
-                    drop(download_states);
-                    completion.wait_for(|settled| *settled).await.map_err(|_| {
-                        PumasError::Other("Download relocation did not settle".into())
-                    })?;
-                    continue;
-                }
             };
             let reservation_bound = self.destination_executions.reserve(
                 cleanup_identity,
@@ -4226,13 +4177,13 @@ impl HuggingFaceClient {
             );
             if !reservation_bound {
                 drop(finalizer);
-                break None;
+                None
             } else {
                 state.cancel_flag.store(true, Ordering::Relaxed);
                 state.status = DownloadStatus::Cancelling;
                 state.speed = 0.0;
                 state.task_registered = true;
-                break Some(finalizer);
+                Some(finalizer)
             }
         };
         let Some(finalizer) = finalizer else {
@@ -4382,14 +4333,6 @@ impl HuggingFaceClient {
 
         let launch_plan = {
             let downloads = self.downloads.read().await;
-            if downloads.values().any(|state| {
-                state.pending_relocation.as_ref().is_some_and(|pending| {
-                    state.matches_destination(&verified.destination.identity())
-                        || pending.target.identity() == verified.destination.identity()
-                })
-            }) {
-                return Ok(RecoveryDownloadAdmission::ContextMismatch);
-            }
             match recovery_context(
                 &downloads,
                 &verified.destination.identity(),
@@ -4480,7 +4423,7 @@ impl HuggingFaceClient {
                                         "download recovery persistence task failed: {error}"
                                     ))
                                 })??;
-                            {
+                            let (snapshot, admission_attempt) = {
                                 let mut states = downloads.write().await;
                                 if !task_context.is_current_role(TaskRole::RecoveryTransition) {
                                     return Ok(RecoveryDownloadAdmission::ContextMismatch);
@@ -4491,15 +4434,25 @@ impl HuggingFaceClient {
                                 if !state.matches_destination(&transition_destination.identity()) {
                                     return Ok(RecoveryDownloadAdmission::ContextMismatch);
                                 }
+                                let snapshot = snapshot.or_else(|| state.revoked_snapshot.clone());
                                 if snapshot.is_some() {
-                                    state.revoked_snapshot = snapshot;
+                                    state.revoked_snapshot = snapshot.clone();
                                 }
-                            }
+                                (snapshot, state.admission.as_ref().map(|entry| entry.attempt_id.clone()))
+                            };
                             let persisted_id = transition_download_id.clone();
                             task_context
                                 .run_fallible_blocking_named(
                                     "revoke persisted recovery authority",
-                                    move || persistence.revoke(&persisted_id),
+                                    move || match (admission_attempt, snapshot) {
+                                        (Some(attempt), Some(snapshot)) => persistence.revoke_admitted_for_recovery(
+                                            &persisted_id, &attempt, &snapshot)?.into_result(),
+                                        (None, None) => persistence.revoke(&persisted_id),
+                                        _ => Err(PumasError::Validation {
+                                            field: "download_recovery".into(),
+                                            message: "Tracked recovery requires its exact admitted snapshot".into(),
+                                        }),
+                                    },
                                 )
                                 .await
                                 .map_err(|error| {
@@ -4524,11 +4477,10 @@ impl HuggingFaceClient {
                             );
                             let inactive =
                                 states.get(&transition_download_id).is_some_and(|state| {
-                                    state.pending_relocation.is_none()
-                                        && matches!(
-                                            state.status,
-                                            DownloadStatus::Paused | DownloadStatus::Error
-                                        )
+                                    matches!(
+                                        state.status,
+                                        DownloadStatus::Paused | DownloadStatus::Error
+                                    )
                                 });
                             if !exact || !inactive || !task_context.promote_role(TaskRole::Worker) {
                                 return Ok(RecoveryDownloadAdmission::ContextMismatch);
@@ -4582,7 +4534,7 @@ impl HuggingFaceClient {
                         matches!(&result, Ok(RecoveryDownloadAdmission::Resumed { .. }));
                     let _ = result_sender.send(result);
                     if run_worker {
-                        prepared_download.run_owned(task_context).await;
+                        let _ = prepared_download.run_owned(task_context).await;
                     }
                 },
             );
@@ -4596,8 +4548,7 @@ impl HuggingFaceClient {
                     } if current_id == *download_id
                 );
                 let inactive = states.get(download_id).is_some_and(|state| {
-                    state.pending_relocation.is_none()
-                        && matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
+                    matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
                 });
                 if exact && inactive {
                     if let Ok(installed) = self.download_tasks.install_gated(prepared_transition) {
@@ -4663,36 +4614,9 @@ impl HuggingFaceClient {
         let RecoveryLaunchPlan::New { download_id } = launch_plan else {
             unreachable!("existing recovery returned from its transition owner")
         };
-        if let Some(persistence) = self.persistence.clone() {
-            let identity = verified.destination.identity().persisted();
-            let pending = tokio::task::spawn_blocking(move || -> Result<bool> {
-                Ok(persistence
-                    .load_lifecycle_inventory_strict()?
-                    .pending_relocations
-                    .values()
-                    .any(|pending| {
-                        pending.request.source == identity || pending.request.target == identity
-                    }))
-            })
-            .await
-            .map_err(|error| {
-                PumasError::Other(format!("Recovery relocation inspection failed: {error}"))
-            })??;
-            if pending {
-                return Ok(RecoveryDownloadAdmission::ContextMismatch);
-            }
-        }
         let prepared = prepared_download.prepare_owned(&self.download_tasks, TaskRole::Worker);
         let installed = {
             let mut downloads = self.downloads.write().await;
-            if downloads.values().any(|state| {
-                state.pending_relocation.as_ref().is_some_and(|pending| {
-                    state.matches_destination(&verified.destination.identity())
-                        || pending.target.identity() == verified.destination.identity()
-                })
-            }) {
-                return Ok(RecoveryDownloadAdmission::ContextMismatch);
-            }
             if matches!(
                 recovery_context(
                     &downloads,
@@ -4736,7 +4660,6 @@ impl HuggingFaceClient {
                             dest_dir: dest_dir.to_path_buf(),
                             ambient_authority_blocked: true,
                             admission: None,
-                            pending_relocation: None,
                             revoked_snapshot: None,
                             destination: Some(DownloadDestination::Recovery(
                                 verified.destination.clone(),
@@ -4770,459 +4693,6 @@ impl HuggingFaceClient {
     pub async fn get_download_status(&self, download_id: &str) -> Option<DownloadStatus> {
         let downloads = self.downloads.read().await;
         downloads.get(download_id).map(|state| state.status)
-    }
-
-    /// Relocate a tracked download destination directory.
-    ///
-    /// Owns the physical move, marker publication and persisted legacy metadata
-    /// update. Callers must not move first or roll back an uncertain result.
-    /// Only dormant legacy downloads are supported; admitted and recovery
-    /// destinations are refused before any filesystem effect.
-    pub async fn relocate_download_destination(
-        &self,
-        download_id: &str,
-        new_dest_dir: &Path,
-        new_model_type: Option<&str>,
-        new_family: Option<&str>,
-    ) -> Result<bool> {
-        self.relocate_download_destination_owned(
-            download_id,
-            None,
-            new_dest_dir,
-            new_model_type,
-            new_family,
-        )
-        .await
-    }
-
-    pub(crate) async fn relocate_download_destination_from(
-        &self,
-        download_id: &str,
-        expected_source: &Path,
-        new_dest_dir: &Path,
-        new_model_type: Option<&str>,
-        new_family: Option<&str>,
-    ) -> Result<bool> {
-        let root = self
-            .destination_root
-            .clone()
-            .ok_or_else(|| PumasError::Config {
-                message: "Download relocation root authority is unavailable".into(),
-            })?;
-        let expected_source = expected_source.to_path_buf();
-        let expected = tokio::task::spawn_blocking(move || {
-            root.resolve(&expected_source)
-                .map(|source| source.identity())
-        })
-        .await
-        .map_err(|error| {
-            PumasError::Other(format!(
-                "Download relocation source inspection failed: {error}"
-            ))
-        })??;
-        self.relocate_download_destination_owned(
-            download_id,
-            Some(expected),
-            new_dest_dir,
-            new_model_type,
-            new_family,
-        )
-        .await
-    }
-
-    pub(crate) async fn download_owner_for_move(
-        &self,
-        source_dir: &Path,
-    ) -> Result<Option<String>> {
-        let root = self
-            .destination_root
-            .clone()
-            .ok_or_else(|| PumasError::Config {
-                message: "Download relocation root authority is unavailable".into(),
-            })?;
-        let persistence = self.persistence.clone().ok_or_else(|| PumasError::Config {
-            message: "Download relocation persistence is unavailable".into(),
-        })?;
-        let source_dir = source_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let source = root.resolve(&source_dir)?.identity().persisted();
-            let inventory = persistence.load_lifecycle_inventory_strict()?;
-            if inventory
-                .pending_relocations
-                .values()
-                .any(|pending| pending.request.source == source || pending.request.target == source)
-            {
-                return Err(PumasError::Validation {
-                    field: "download_relocation".into(),
-                    message: "An unresolved relocation owns this destination".into(),
-                });
-            }
-            let mut owner = None;
-            for entry in inventory
-                .downloads
-                .iter()
-                .chain(inventory.quarantines.values().map(|entry| &entry.snapshot))
-                .chain(
-                    inventory
-                        .hidden_admissions
-                        .values()
-                        .map(|entry| &entry.request.snapshot),
-                )
-            {
-                if root.resolve(&entry.dest_dir)?.identity().persisted() == source {
-                    if owner.is_some() {
-                        return Err(PumasError::Validation {
-                            field: "download_relocation".into(),
-                            message: "Multiple downloads own this destination".into(),
-                        });
-                    }
-                    owner = Some(entry.download_id.clone());
-                }
-            }
-            Ok(owner)
-        })
-        .await
-        .map_err(|error| {
-            PumasError::Other(format!(
-                "Failed to inspect migration download ownership: {error}"
-            ))
-        })?
-    }
-
-    async fn relocate_download_destination_owned(
-        &self,
-        download_id: &str,
-        expected_source: Option<crate::model_library::download_recovery::DestinationIdentity>,
-        new_dest_dir: &Path,
-        new_model_type: Option<&str>,
-        new_family: Option<&str>,
-    ) -> Result<bool> {
-        use futures::FutureExt;
-        self.observe_finished_download_tasks().await;
-        if self
-            .download_tasks
-            .snapshot(download_id)
-            .is_some_and(|task| task.role == TaskRole::RecoveryTransition)
-        {
-            return Ok(false);
-        }
-        if let Some(persistence) = self.persistence.clone() {
-            if Self::persisted_download_is_revoked(persistence, download_id.to_string()).await? {
-                return Ok(false);
-            }
-        }
-        #[cfg(test)]
-        self.download_tasks
-            .observe_ambient_admission("relocate", download_id);
-        let source = {
-            let downloads = self.downloads.read().await;
-            if self.download_tasks.contains(download_id) {
-                return Ok(false);
-            }
-            let Some(state) = downloads.get(download_id) else {
-                return Ok(false);
-            };
-            if expected_source
-                .as_ref()
-                .is_some_and(|expected| !state.matches_destination(expected))
-            {
-                return Ok(false);
-            }
-            if state.admission.is_some() {
-                return Err(PumasError::Other(
-                    "Queue-admitted download relocation is not supported".into(),
-                ));
-            }
-            if state.recovery_destination().is_some()
-                || state.ambient_authority_blocked
-                || state.pending_relocation.is_some()
-                || !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
-            {
-                return Ok(false);
-            }
-            state
-                .destination
-                .as_ref()
-                .ok_or_else(|| PumasError::Config {
-                    message: "Download relocation source authority is unavailable".into(),
-                })?
-                .capability()
-                .clone()
-        };
-        let root = self
-            .destination_root
-            .clone()
-            .ok_or_else(|| PumasError::Config {
-                message: "Download relocation root authority is unavailable".into(),
-            })?;
-        let persistence = self.persistence.clone().ok_or_else(|| PumasError::Config {
-            message: "Download relocation persistence is unavailable".into(),
-        })?;
-        let target_path = new_dest_dir.to_path_buf();
-        let (target, expected, mut marker) = tokio::task::spawn_blocking({
-            let source = source.clone();
-            let persistence = persistence.clone();
-            let id = download_id.to_string();
-            move || -> Result<_> {
-                let target = root.resolve(&target_path)?;
-                source.preflight_move_to_absent(&target)?;
-                let marker = source.read_marker()?;
-                let inventory = persistence.load_lifecycle_inventory_strict()?;
-                for entry in inventory
-                    .downloads
-                    .iter()
-                    .chain(inventory.quarantines.values().map(|entry| &entry.snapshot))
-                    .chain(
-                        inventory
-                            .hidden_admissions
-                            .values()
-                            .map(|entry| &entry.request.snapshot),
-                    )
-                {
-                    if entry.download_id != id {
-                        let identity = root.resolve(&entry.dest_dir)?.identity();
-                        if identity == source.identity() || identity == target.identity() {
-                            return Err(PumasError::Validation {
-                                field: "download_relocation".into(),
-                                message:
-                                    "Another persisted download owns the relocation destination"
-                                        .into(),
-                            });
-                        }
-                    }
-                }
-                let expected = inventory
-                    .downloads
-                    .into_iter()
-                    .find(|entry| entry.download_id == id)
-                    .ok_or_else(|| PumasError::NotFound {
-                        resource: "persisted legacy download relocation source".into(),
-                    })?;
-                if root.resolve(&expected.dest_dir)?.identity() != source.identity() {
-                    return Err(PumasError::Other(
-                        "Persisted relocation source disagrees with held authority".into(),
-                    ));
-                }
-                Ok((target, expected, marker))
-            }
-        })
-        .await
-        .map_err(|error| {
-            PumasError::Other(format!(
-                "Download relocation preflight owner failed: {error}"
-            ))
-        })??;
-        let model_type = new_model_type.map(str::to_string);
-        let family = new_family.map(str::to_string);
-        if let Some(marker) = marker.as_mut() {
-            let object = marker
-                .as_object_mut()
-                .ok_or_else(|| PumasError::Validation {
-                    field: "download_marker".into(),
-                    message: "Expected a marker object".into(),
-                })?;
-            if let Some(model_type) = model_type.as_ref() {
-                object.insert("model_type".into(), model_type.clone().into());
-            }
-            if let Some(family) = family.as_ref() {
-                object.insert("family".into(), family.clone().into());
-                object.insert("architecture_family".into(), family.clone().into());
-            }
-        }
-        let request = LegacyRelocationRequest {
-            source: source.identity().persisted(),
-            target: target.identity().persisted(),
-            target_dir: target.display_path().to_path_buf(),
-            model_type: model_type.clone(),
-            family: family.clone(),
-        };
-        let attempt = uuid::Uuid::new_v4().to_string();
-        let source_identity = source.identity();
-        let target_identity = target.identity();
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        let (completed, completion) = tokio::sync::watch::channel(false);
-        let prepared =
-            self.download_tasks
-                .prepare(download_id.to_string(), TaskRole::RelocationTransition, {
-                    let states = self.downloads.clone();
-                    let publications = self.download_publications.clone();
-                    let queues = self.destination_executions.clone();
-                    let id = download_id.to_string();
-                    let attempt = attempt.clone();
-                    let target = target.clone();
-                    let source_identity = source_identity.clone();
-                    let target_identity = target_identity.clone();
-                    move |context| async move {
-                        let resolution = AssertUnwindSafe(execute_legacy_relocation(
-                            &context,
-                            PreparedLegacyRelocation {
-                                persistence,
-                                attempt: attempt.clone(),
-                                expected,
-                                request,
-                                source,
-                                target,
-                                marker,
-                            },
-                        ))
-                        .catch_unwind()
-                        .await;
-                        let mut resolution = match resolution {
-                            Ok(resolution) => resolution,
-                            Err(_) => RelocationResolution::Pending(
-                                PumasError::Other("Download relocation owner panicked".into()),
-                                None,
-                            ),
-                        };
-                        if !matches!(context.drain_blocking().await, Ok(0)) {
-                            let moved = match resolution {
-                                RelocationResolution::Moved(target)
-                                | RelocationResolution::Pending(_, Some(target)) => Some(target),
-                                _ => None,
-                            };
-                            resolution = RelocationResolution::Pending(
-                                PumasError::Other(
-                                    "Download relocation work did not drain successfully".into(),
-                                ),
-                                moved,
-                            );
-                        }
-                        let mut released = None;
-                        let result = {
-                            let mut states = states.write().await;
-                            let state = states.get_mut(&id).filter(|state| {
-                                context.is_current_role(TaskRole::RelocationTransition)
-                                    && state
-                                        .pending_relocation
-                                        .as_ref()
-                                        .is_some_and(|pending| pending.attempt_id == attempt)
-                            });
-                            if let Some(state) = state {
-                                state.task_registered = false;
-                                match resolution {
-                                    RelocationResolution::Original(error) => {
-                                        released = queues.release_deferred(
-                                            &target_identity,
-                                            &id,
-                                            DestinationDomain::Ambient,
-                                            context.generation(),
-                                        );
-                                        if released.is_some() {
-                                            state.pending_relocation = None;
-                                            state.ambient_authority_blocked = false;
-                                        } else {
-                                            state.status = DownloadStatus::Error;
-                                            state.lifecycle_failure_unverified = true;
-                                        }
-                                        Err(error)
-                                    }
-                                    RelocationResolution::Moved(destination) => {
-                                        state.dest_dir = destination.display_path().to_path_buf();
-                                        state.destination =
-                                            Some(DownloadDestination::Managed(destination.clone()));
-                                        if let Some(request) = state.download_request.as_mut() {
-                                            if let Some(model_type) = model_type {
-                                                request.model_type = Some(model_type);
-                                            }
-                                            if let Some(family) = family {
-                                                request.family = family;
-                                            }
-                                        }
-                                        released = queues.release_deferred(
-                                            &source_identity,
-                                            &id,
-                                            DestinationDomain::Ambient,
-                                            context.generation(),
-                                        );
-                                        if released.is_some() {
-                                            state.pending_relocation = None;
-                                            state.ambient_authority_blocked = false;
-                                            Ok(true)
-                                        } else {
-                                            state.status = DownloadStatus::Error;
-                                            state.lifecycle_failure_unverified = true;
-                                            Err(PumasError::Other(
-                                            "Relocated download source reservation did not settle"
-                                                .into(),
-                                        ))
-                                        }
-                                    }
-                                    RelocationResolution::Pending(error, moved) => {
-                                        if let (Some(pending), Some(moved)) =
-                                            (state.pending_relocation.as_mut(), moved)
-                                        {
-                                            pending.target = moved;
-                                        }
-                                        state.status = DownloadStatus::Error;
-                                        state.error = Some(
-                                            "Download relocation requires reconciliation".into(),
-                                        );
-                                        state.lifecycle_failure_unverified = true;
-                                        Err(error)
-                                    }
-                                }
-                            } else {
-                                Err(PumasError::Other(
-                                    "Download relocation lost its state owner".into(),
-                                ))
-                            }
-                        };
-                        publish_download_snapshot_from_parts(&publications).await;
-                        if let Some(released) = released {
-                            released.wake();
-                        }
-                        completed.send_replace(true);
-                        let _ = result_sender.send(result);
-                    }
-                });
-        let installed = {
-            let mut states = self.downloads.write().await;
-            let Some(state) = states.get_mut(download_id) else {
-                return Ok(false);
-            };
-            if self.download_tasks.contains(download_id)
-                || !state.matches_destination(&source_identity)
-                || state.admission.is_some()
-                || state.recovery_destination().is_some()
-                || state.pending_relocation.is_some()
-                || state.ambient_authority_blocked
-                || !matches!(state.status, DownloadStatus::Paused | DownloadStatus::Error)
-            {
-                return Ok(false);
-            }
-            let installed = match self.download_tasks.install_gated(prepared) {
-                Ok(installed) => installed,
-                Err(_) => return Ok(false),
-            };
-            if !self.download_tasks.bind_relocation_completion(
-                download_id,
-                installed.generation(),
-                completion,
-            ) || !self.destination_executions.reserve_relocation(
-                source_identity,
-                target_identity,
-                download_id.to_string(),
-                installed.generation().clone(),
-            ) {
-                drop(installed);
-                drop(states);
-                self.download_tasks.rescue_abandoned();
-                return Err(PumasError::Other(
-                    "Download relocation destination is already owned".into(),
-                ));
-            }
-            state.pending_relocation = Some(super::types::PendingDownloadRelocation {
-                attempt_id: attempt,
-                target,
-            });
-            state.ambient_authority_blocked = true;
-            state.task_registered = true;
-            installed
-        };
-        installed.start();
-        result_receiver
-            .await
-            .map_err(|_| PumasError::Other("Download relocation result was unavailable".into()))?
     }
 
     /// Pause an active download. Preserves the `.part` file for later resume.
@@ -5373,6 +4843,11 @@ impl HuggingFaceClient {
             {
                 return Ok(false);
             }
+            if state.admission.is_none() || self.persistence.is_none() {
+                return Err(PumasError::Config {
+                    message: "Ordinary resume requires current durable admission".into(),
+                });
+            }
             (
                 state.repo_id.clone(),
                 state.files.clone(),
@@ -5471,6 +4946,67 @@ impl HuggingFaceClient {
 
 #[cfg(test)]
 mod tests {
+    fn admit_snapshot_fixture(
+        store: &DownloadPersistence,
+        snapshot: &PersistedDownload,
+        destination: &crate::model_library::DownloadRecoveryDestination,
+    ) -> String {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let files = if snapshot.filenames.is_empty() {
+            vec![snapshot.filename.clone()]
+        } else {
+            snapshot.filenames.clone()
+        };
+        let request = DownloadAdmissionRequest {
+            snapshot: snapshot.clone(),
+            domain: DownloadAdmissionDomain::Ambient,
+            destination: destination.identity().persisted(),
+            requested_payload_files: files.clone(),
+            execution_files: files,
+        };
+        store
+            .admit_download(&attempt_id, &request)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        attempt_id
+    }
+
+    fn persist_state_fixture(store: &DownloadPersistence, state: &mut DownloadState) {
+        let attempt_id = admit_snapshot_fixture(
+            store,
+            &persisted_recovery_test_state(state),
+            state.destination.as_ref().unwrap().capability(),
+        );
+        state.admission = Some(super::super::types::AdmittedDownload { attempt_id });
+    }
+
+    fn admit_snapshot_at_root(
+        store: &DownloadPersistence,
+        snapshot: &PersistedDownload,
+        root: &Path,
+    ) -> String {
+        let held = crate::model_library::download_recovery::DownloadDestinationRoot::open(root)
+            .unwrap()
+            .resolve(&snapshot.dest_dir)
+            .unwrap();
+        admit_snapshot_fixture(store, snapshot, &held)
+    }
+
+    fn revoke_state_fixture(store: &DownloadPersistence, state: &mut DownloadState) {
+        let snapshot = persisted_recovery_test_state(state);
+        store
+            .revoke_admitted_for_recovery(
+                &state.download_id,
+                &state.admission.as_ref().unwrap().attempt_id,
+                &snapshot,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        state.revoked_snapshot = Some(snapshot);
+    }
+
     fn destination_identity(
         client: &HuggingFaceClient,
         path: &Path,
@@ -5485,7 +5021,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn restored_legacy_root_alias_blocks_a_canonical_successor() {
+    async fn restored_admitted_root_alias_blocks_a_canonical_successor() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("library");
         let alias = temp.path().join("library-alias");
@@ -5497,13 +5033,11 @@ mod tests {
         std::fs::create_dir(destination.join(".pumas_download")).unwrap();
         let mut client = configured_download_client(temp.path().join("cache")).unwrap();
         client.configure_download_destination_root(&root).unwrap();
-        let legacy_id = uuid::Uuid::new_v4().to_string();
-        client
-            .persistence
-            .as_ref()
-            .unwrap()
-            .save(&PersistedDownload {
-                download_id: legacy_id.clone(),
+        let head_id = uuid::Uuid::new_v4().to_string();
+        admit_snapshot_at_root(
+            client.persistence.as_ref().unwrap(),
+            &PersistedDownload {
+                download_id: head_id.clone(),
                 repo_id: "acme/first".into(),
                 filename: "first.gguf".into(),
                 filenames: vec!["first.gguf".into()],
@@ -5514,11 +5048,12 @@ mod tests {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 known_sha256: None,
                 huggingface_evidence: None,
-            })
-            .unwrap();
+            },
+            &root,
+        );
         client.restore_persisted_downloads().await.unwrap();
         assert_eq!(
-            client.get_download_status(&legacy_id).await,
+            client.get_download_status(&head_id).await,
             Some(DownloadStatus::Paused)
         );
         cache_repo_tree(
@@ -5569,10 +5104,10 @@ mod tests {
         std::fs::remove_dir(destination.join(".pumas_download")).unwrap();
         // Known final bytes keep this queue-order oracle independent of HTTP.
         std::fs::write(destination.join("second.gguf"), b"complete").unwrap();
-        assert!(client.cancel_download(&legacy_id).await.unwrap());
+        assert!(client.cancel_download(&head_id).await.unwrap());
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if client.get_download_status(&legacy_id).await == Some(DownloadStatus::Cancelled)
+                if client.get_download_status(&head_id).await == Some(DownloadStatus::Cancelled)
                     && client.get_download_status(&successor).await
                         == Some(DownloadStatus::Completed)
                 {
@@ -5585,6 +5120,197 @@ mod tests {
         .expect("exact incumbent cancellation must release the canonical successor");
         assert!(!destination.join("first.gguf.part").exists());
     }
+    #[tokio::test]
+    async fn queued_pause_preserves_destination_and_restarts_at_its_fifo_position() {
+        assert_queued_pause_resume_preserves_marker(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn queued_pause_resumes_with_its_marker_in_the_same_client() {
+        assert_queued_pause_resume_preserves_marker(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn restored_implicit_selection_preserves_queued_marker_until_its_turn() {
+        assert_queued_pause_resume_preserves_marker(true, true).await;
+    }
+
+    async fn assert_queued_pause_resume_preserves_marker(restart: bool, implicit: bool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let temp = TempDir::new().unwrap();
+        let destination = temp.path().join("model");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("first.gguf.part"), b"old").unwrap();
+        let marker = br#"{"repo_id":"acme/first","sentinel":"untouched"}"#;
+        std::fs::write(destination.join(".pumas_download"), marker).unwrap();
+        let client = configured_download_client(temp.path().join("cache")).unwrap();
+        let head = uuid::Uuid::new_v4().to_string();
+        admit_snapshot_at_root(
+            client.persistence.as_ref().unwrap(),
+            &PersistedDownload {
+                download_id: head.clone(),
+                repo_id: "acme/first".into(),
+                filename: "first.gguf".into(),
+                filenames: vec!["first.gguf".into()],
+                dest_dir: destination.clone(),
+                total_bytes: Some(8),
+                status: DownloadStatus::Paused,
+                download_request: recovery_test_request("acme/first", &["first.gguf".into()]),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                known_sha256: None,
+                huggingface_evidence: None,
+            },
+            temp.path(),
+        );
+        client.restore_persisted_downloads().await.unwrap();
+        cache_repo_tree(
+            &client,
+            "acme/second",
+            vec![LfsFileInfo {
+                filename: "second.gguf".into(),
+                size: 8,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let mut successor_request = recovery_test_request("acme/second", &["second.gguf".into()]);
+        if implicit {
+            successor_request.filename = None;
+            successor_request.filenames = None;
+        }
+        let successor = client
+            .start_download(&successor_request, &destination, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.get_download_status(&successor).await,
+            Some(DownloadStatus::Queued)
+        );
+        assert!(client.pause_download(&successor).await.unwrap());
+        let paused = tokio::time::timeout(Duration::from_millis(500), async {
+            while client.get_download_status(&successor).await != Some(DownloadStatus::Paused) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if paused.is_err() {
+            client.cancel_download(&successor).await.unwrap();
+            client.cancel_download(&head).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client
+                .download_tasks
+                .snapshot(&successor)
+                .is_some_and(|task| !task.finished)
+                || client
+                    .download_tasks
+                    .snapshot(&head)
+                    .is_some_and(|task| !task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            paused.is_ok(),
+            "queued pause must settle while the dormant head retains its claim"
+        );
+        assert_eq!(
+            std::fs::read(destination.join(".pumas_download")).unwrap(),
+            marker
+        );
+        assert_eq!(
+            std::fs::read(destination.join("first.gguf.part")).unwrap(),
+            b"old"
+        );
+        assert!(!destination.join("second.gguf.part").exists());
+        let mut restarted = if restart {
+            drop(client);
+            let restored = configured_download_client(temp.path().join("cache")).unwrap();
+            restored.restore_persisted_downloads().await.unwrap();
+            restored
+        } else {
+            client
+        };
+        assert_eq!(
+            restarted.get_download_status(&successor).await,
+            Some(DownloadStatus::Paused)
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        restarted.set_test_download_base_url(format!("http://{}", listener.local_addr().unwrap()));
+        let (requested_sender, mut requested) = tokio::sync::oneshot::channel();
+        let (release_sender, release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert!(headers.len() < 4096);
+                headers.push(socket.read_u8().await.unwrap());
+            }
+            requested_sender.send(()).unwrap();
+            release.await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\ncomplete",
+                )
+                .await
+                .unwrap();
+        });
+        assert!(restarted.resume_download(&successor).await.unwrap());
+        assert_eq!(
+            restarted.get_download_status(&successor).await,
+            Some(DownloadStatus::Queued)
+        );
+        let bypassed = tokio::time::timeout(Duration::from_millis(250), &mut requested)
+            .await
+            .is_ok();
+        let unchanged_marker = std::fs::read(destination.join(".pumas_download")).ok();
+        assert!(restarted.cancel_download(&head).await.unwrap());
+        if !bypassed {
+            tokio::time::timeout(Duration::from_secs(3), requested)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let resumed_marker = std::fs::read(destination.join(".pumas_download"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        release_sender.send(()).unwrap();
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while restarted.get_download_status(&successor).await != Some(DownloadStatus::Completed)
+                || restarted
+                    .download_tasks
+                    .snapshot(&successor)
+                    .is_some_and(|task| !task.finished)
+                || restarted
+                    .download_tasks
+                    .snapshot(&head)
+                    .is_some_and(|task| !task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            restarted.get_download_status(&head).await,
+            Some(DownloadStatus::Cancelled)
+        );
+        assert!(
+            !bypassed,
+            "resumed successor must wait for the dormant head"
+        );
+        assert_eq!(unchanged_marker.as_deref(), Some(marker.as_slice()));
+        let resumed_marker = resumed_marker.expect("successor must publish its marker before HTTP");
+        assert_eq!(resumed_marker["repo_id"], "acme/second");
+        assert_eq!(
+            resumed_marker["selected_artifact"]["selected_filenames"],
+            serde_json::json!(["second.gguf"])
+        );
+    }
+
     #[tokio::test]
     async fn transferred_partial_survives_interrupted_response_and_fresh_owner_cancel() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6038,12 +5764,12 @@ mod tests {
             .await
             .unwrap();
             std::fs::remove_dir(destination.join(".pumas_download")).unwrap();
-            std::fs::write(destination.join("weights.gguf"), b"done").unwrap();
             if restart {
                 drop(client);
                 client = configured_download_client(temp.path().join("cache")).unwrap();
                 client.restore_persisted_downloads().await.unwrap();
             }
+            std::fs::write(destination.join("weights.gguf"), b"done").unwrap();
             assert!(client.resume_download(&id).await.unwrap());
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -6283,6 +6009,37 @@ mod tests {
         assert!(client.list_downloads().await.is_empty());
         assert_eq!(std::fs::read(path).unwrap(), b"not-json");
     }
+    #[tokio::test]
+    async fn restore_rejects_old_tracking_formats_without_migrating_or_touching_files() {
+        for version in [None, Some(1), Some(2), Some(3)] {
+            let temp = TempDir::new().unwrap();
+            let client = configured_download_client(temp.path().join("cache")).unwrap();
+            let destination = temp.path().join("model");
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(destination.join("weights.gguf.part"), b"partial").unwrap();
+            std::fs::write(destination.join(".pumas_download"), b"marker").unwrap();
+            let mut document = serde_json::json!({"downloads": {}});
+            if let Some(version) = version {
+                document["schema_version"] = version.into();
+            }
+            let bytes = serde_json::to_vec(&document).unwrap();
+            let tracking = temp.path().join("downloads.json");
+            std::fs::write(&tracking, &bytes).unwrap();
+            assert!(matches!(client.restore_persisted_downloads().await,
+                Err(PumasError::Validation { field, .. }) if field == "downloads.schema_version"));
+            assert!(client.list_downloads().await.is_empty());
+            assert_eq!(std::fs::read(&tracking).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(destination.join("weights.gguf.part")).unwrap(),
+                b"partial"
+            );
+            assert_eq!(
+                std::fs::read(destination.join(".pumas_download")).unwrap(),
+                b"marker"
+            );
+        }
+    }
+
     fn configured_download_client(cache_dir: impl Into<PathBuf>) -> Result<HuggingFaceClient> {
         let cache_dir = cache_dir.into();
         let root = if cache_dir.file_name().is_some_and(|name| name == "cache") {
@@ -6500,7 +6257,6 @@ mod tests {
             dest_dir: verified.destination.display_path().to_path_buf(),
             ambient_authority_blocked: false,
             admission: None,
-            pending_relocation: None,
             revoked_snapshot: None,
             destination: Some(DownloadDestination::Recovery(verified.destination.clone())),
             filename: verified.files[0].clone(),
@@ -7463,9 +7219,7 @@ mod tests {
         let download_id = "ambient-resume-missing-row";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -7500,7 +7254,15 @@ mod tests {
             .await
             .expect("resumed Worker must own the Queued persistence update")
             .unwrap();
-        persistence.remove(download_id).unwrap();
+        let attempt_id = client.downloads.read().await[download_id]
+            .admission
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone();
+        assert!(persistence
+            .settle_queue_admission(download_id, &attempt_id)
+            .unwrap());
         release_sender.send(()).unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -8073,9 +7835,7 @@ mod tests {
         let download_id = "tracked-recovery";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -8107,7 +7867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_revocation_reserves_actual_download_from_generic_resume_and_relocate() {
+    async fn recovery_revocation_reserves_actual_download_from_generic_resume() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
@@ -8128,9 +7888,7 @@ mod tests {
         let download_id = "reserved-revocation";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -8171,18 +7929,11 @@ mod tests {
             client.resume_download(download_id),
         )
         .await;
-        let relocated = temp.path().join("relocated");
-        let relocate = tokio::time::timeout(
-            Duration::from_millis(100),
-            client.relocate_download_destination(download_id, &relocated, None, None),
-        )
-        .await;
         lock_file.unlock().unwrap();
 
         assert!(reservation
             .is_some_and(|task| { task.role == TaskRole::RecoveryTransition && !task.finished }));
         assert!(matches!(resume, Ok(Ok(false))));
-        assert!(matches!(relocate, Ok(Ok(false))));
 
         assert!(matches!(
             admission.await.unwrap().unwrap(),
@@ -8197,69 +7948,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_relocate_rechecks_transition_installed_after_its_initial_snapshot() {
-        let temp = TempDir::new().unwrap();
-        let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
-        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
-        let download_id = "relocate-stale-transition-check";
-        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
-        state.make_managed_for_test();
-        let original_dest = state.dest_dir.clone();
-        let mut downloads_guard = client.downloads.write().await;
-        downloads_guard.insert(download_id.to_string(), state);
-
-        let (checked_sender, checked) = tokio::sync::oneshot::channel();
-        let checked_sender = Arc::new(std::sync::Mutex::new(Some(checked_sender)));
-        client.download_tasks.set_snapshot_observer(Some(Arc::new({
-            let checked_sender = checked_sender.clone();
-            move |observed_id, snapshot| {
-                if observed_id == download_id && snapshot.is_none() {
-                    if let Some(sender) = checked_sender.lock().unwrap().take() {
-                        let _ = sender.send(());
-                    }
-                }
-            }
-        })));
-        let relocated = temp.path().join("relocated");
-        let relocation = {
-            let client = client.clone();
-            let relocated = relocated.clone();
-            tokio::spawn(async move {
-                client
-                    .relocate_download_destination(download_id, &relocated, None, None)
-                    .await
-            })
-        };
-        checked.await.unwrap();
-        client.download_tasks.set_snapshot_observer(None);
-        let (promote, promoted) = install_promotable_recovery_transition(&client, download_id);
-        drop(downloads_guard);
-
-        assert!(!relocation.await.unwrap().unwrap());
-        let downloads = client.downloads.read().await;
-        let state = downloads.get(download_id).unwrap();
-        assert_eq!(state.dest_dir, original_dest);
-        assert_eq!(state.status, DownloadStatus::Paused);
-        drop(downloads);
-        promote.send(()).unwrap();
-        promoted.await.unwrap();
-        assert!(client
-            .download_tasks
-            .snapshot(download_id)
-            .is_some_and(|task| { task.role == TaskRole::Worker && !task.finished }));
-        assert!(client.cancel_download(download_id).await.unwrap());
-    }
-
-    #[tokio::test]
     async fn generic_resume_rechecks_transition_installed_after_its_initial_snapshot() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "resume-stale-transition-check";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
+        persist_state_fixture(&persistence, &mut state);
         let mut downloads_guard = client.downloads.write().await;
         downloads_guard.insert(download_id.to_string(), state);
 
@@ -8300,109 +8000,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_relocate_refuses_after_transition_durably_revokes_and_disappears() {
-        let temp = TempDir::new().unwrap();
-        let library_root = temp.path().join("library");
-        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
-        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
-        client.set_persistence(persistence.clone());
-        let client = Arc::new(client);
-        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
-        let download_id = "relocate-after-revoked-transition";
-        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
-        state.make_managed_for_test();
-        let original_dest = state.dest_dir.clone();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
-        client
-            .downloads
-            .write()
-            .await
-            .insert(download_id.to_string(), state);
-
-        let (admission_sender, admission_reached) = std::sync::mpsc::channel();
-        let admission_sender = Arc::new(std::sync::Mutex::new(Some(admission_sender)));
-        let (release_sender, release) = std::sync::mpsc::channel();
-        let release = Arc::new(std::sync::Mutex::new(release));
-        client
-            .download_tasks
-            .set_ambient_admission_observer(Some(Arc::new({
-                let admission_sender = admission_sender.clone();
-                let release = release.clone();
-                move |operation, observed_id| {
-                    if operation == "relocate" && observed_id == download_id {
-                        if let Some(sender) = admission_sender.lock().unwrap().take() {
-                            let _ = sender.send(());
-                            let _ = release.lock().unwrap().recv();
-                        }
-                    }
-                }
-            })));
-        let transition_client = client.clone();
-        let transition_persistence = persistence.clone();
-        let transition_thread = std::thread::spawn(move || {
-            admission_reached.recv().unwrap();
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let prepared = transition_client.download_tasks.prepare(
-                    download_id.to_string(),
-                    TaskRole::RecoveryTransition,
-                    |_| async {},
-                );
-                let installed = {
-                    let mut downloads = transition_client.downloads.write().await;
-                    let installed = transition_client
-                        .download_tasks
-                        .install_gated(prepared)
-                        .unwrap();
-                    downloads
-                        .get_mut(download_id)
-                        .unwrap()
-                        .ambient_authority_blocked = true;
-                    installed
-                };
-                installed.start();
-                tokio::task::spawn_blocking(move || transition_persistence.revoke(download_id))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                loop {
-                    if transition_client
-                        .download_tasks
-                        .observe_finished(download_id)
-                        .await
-                        .is_some()
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                assert!(!transition_client.download_tasks.contains(download_id));
-                release_sender.send(()).unwrap();
-            });
-        });
-
-        let relocated = temp.path().join("relocated");
-        assert!(!client
-            .relocate_download_destination(download_id, &relocated, None, None)
-            .await
-            .unwrap());
-        transition_thread.join().unwrap();
-        client.download_tasks.set_ambient_admission_observer(None);
-        let downloads = client.downloads.read().await;
-        let state = downloads.get(download_id).unwrap();
-        assert_eq!(state.dest_dir, original_dest);
-        assert!(state.ambient_authority_blocked);
-        assert_eq!(state.status, DownloadStatus::Paused);
-        drop(downloads);
-        assert!(persistence.is_revoked(download_id).unwrap());
-    }
-
-    #[tokio::test]
     async fn generic_resume_refuses_after_transition_durably_revokes_and_disappears() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
@@ -8414,9 +8011,7 @@ mod tests {
         let download_id = "resume-after-revoked-transition";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -8468,10 +8063,22 @@ mod tests {
                     installed
                 };
                 installed.start();
-                tokio::task::spawn_blocking(move || transition_persistence.revoke(download_id))
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let (attempt_id, snapshot) = {
+                    let downloads = transition_client.downloads.read().await;
+                    let state = &downloads[download_id];
+                    (
+                        state.admission.as_ref().unwrap().attempt_id.clone(),
+                        persisted_recovery_test_state(state),
+                    )
+                };
+                tokio::task::spawn_blocking(move || {
+                    transition_persistence
+                        .revoke_admitted_for_recovery(download_id, &attempt_id, &snapshot)?
+                        .into_result()
+                })
+                .await
+                .unwrap()
+                .unwrap();
                 loop {
                     if transition_client
                         .download_tasks
@@ -8501,99 +8108,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_relocate_refuses_transition_replaced_by_cancel_finalizer() {
-        let temp = TempDir::new().unwrap();
-        let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
-        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
-        let download_id = "relocate-cancel-finalizer-reservation";
-        let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
-        state.make_managed_for_test();
-        let original_dest = state.dest_dir.clone();
-        client
-            .downloads
-            .write()
-            .await
-            .insert(download_id.to_string(), state);
-
-        let (admission_sender, admission_reached) = std::sync::mpsc::channel();
-        let admission_sender = Arc::new(std::sync::Mutex::new(Some(admission_sender)));
-        let (release_sender, release) = std::sync::mpsc::channel();
-        let release = Arc::new(std::sync::Mutex::new(release));
-        client
-            .download_tasks
-            .set_ambient_admission_observer(Some(Arc::new({
-                let admission_sender = admission_sender.clone();
-                let release = release.clone();
-                move |operation, observed_id| {
-                    if operation == "relocate" && observed_id == download_id {
-                        if let Some(sender) = admission_sender.lock().unwrap().take() {
-                            let _ = sender.send(());
-                            let _ = release.lock().unwrap().recv();
-                        }
-                    }
-                }
-            })));
-        let cancel_client = client.clone();
-        let (settled_sender, settled) = tokio::sync::oneshot::channel();
-        let cancel_thread = std::thread::spawn(move || {
-            admission_reached.recv().unwrap();
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let prepared = cancel_client.download_tasks.prepare(
-                    download_id.to_string(),
-                    TaskRole::RecoveryTransition,
-                    |_| async {
-                        std::future::pending::<()>().await;
-                    },
-                );
-                cancel_client
-                    .download_tasks
-                    .install_gated(prepared)
-                    .unwrap()
-                    .start();
-                assert!(cancel_client.cancel_download(download_id).await.unwrap());
-                assert!(cancel_client
-                    .download_tasks
-                    .snapshot(download_id)
-                    .is_some_and(|task| task.role == TaskRole::CancelFinalizer));
-                release_sender.send(()).unwrap();
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    loop {
-                        let terminal = cancel_client
-                            .downloads
-                            .read()
-                            .await
-                            .get(download_id)
-                            .is_some_and(|state| state.status != DownloadStatus::Cancelling);
-                        if terminal {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
-                let _ = settled_sender.send(());
-            });
-        });
-
-        let relocated = temp.path().join("relocated");
-        assert!(!client
-            .relocate_download_destination(download_id, &relocated, None, None)
-            .await
-            .unwrap());
-        settled.await.unwrap();
-        cancel_thread.join().unwrap();
-        client.download_tasks.set_ambient_admission_observer(None);
-        let downloads = client.downloads.read().await;
-        assert_eq!(downloads.get(download_id).unwrap().dest_dir, original_dest);
-    }
-
-    #[tokio::test]
     async fn dropped_recovery_caller_cannot_detach_revocation_to_worker_handoff() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
@@ -8615,9 +8129,7 @@ mod tests {
         let download_id = "dropped-revocation-caller";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -8706,9 +8218,7 @@ mod tests {
         let download_id = "cancel-revocation";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -8851,15 +8361,16 @@ mod tests {
         let download_id = "revoked-ambient";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
             .await
             .insert(download_id.to_string(), state);
-        persistence.revoke(download_id).unwrap();
+        revoke_state_fixture(
+            &persistence,
+            client.downloads.write().await.get_mut(download_id).unwrap(),
+        );
 
         assert!(!client.resume_download(download_id).await.unwrap());
         let downloads = client.downloads.read().await;
@@ -8987,9 +8498,7 @@ mod tests {
         let download_id = "tracked-recovery-completion";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -9087,9 +8596,7 @@ mod tests {
         let download_id = "tracked-recovery-cleanup-failure";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -9190,7 +8697,7 @@ mod tests {
             known_sha256: Some("b".repeat(64)),
             huggingface_evidence: None,
         };
-        persistence.save(&original).unwrap();
+        admit_snapshot_fixture(&persistence, &original, &verified.destination);
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
         client
             .configure_download_destination_root(&library_root)
@@ -9363,9 +8870,7 @@ mod tests {
         let cancel_flag = state.cancel_flag.clone();
         let pause_flag = state.pause_flag.clone();
         let files = state.files.clone();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -9807,9 +9312,7 @@ mod tests {
         let cancel_flag = state.cancel_flag.clone();
         let pause_flag = state.pause_flag.clone();
         let files = state.files.clone();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -9905,9 +9408,7 @@ mod tests {
         let cancel_flag = state.cancel_flag.clone();
         let pause_flag = state.pause_flag.clone();
         let files = state.files.clone();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -10105,9 +9606,7 @@ mod tests {
         let download_id = "ordinary-resume";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -10164,11 +9663,15 @@ mod tests {
     async fn cancelling_ordinary_resume_before_commit_preserves_paused_state() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancelled-ordinary-resume";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
+        persist_state_fixture(&persistence, &mut state);
         client
             .downloads
             .write()
@@ -10218,7 +9721,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_resume_caller_after_commit_keeps_started_owner_in_both_modes() {
         let temp = TempDir::new().unwrap();
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        client.set_persistence(persistence.clone());
+        let client = Arc::new(client);
 
         for recovery in [false, true] {
             let mode = if recovery { "recovery" } else { "ambient" };
@@ -10229,6 +9735,7 @@ mod tests {
                 recovery_test_state(&verified, &download_id, DownloadStatus::Paused, false);
             if !recovery {
                 state.make_managed_for_test();
+                persist_state_fixture(&persistence, &mut state);
             }
             client
                 .downloads
@@ -10418,9 +9925,7 @@ mod tests {
         let download_id = "pause-corrupt-persistence";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         let files = state.files.clone();
         let cancel_flag = state.cancel_flag.clone();
         let pause_flag = state.pause_flag.clone();
@@ -12247,16 +11752,23 @@ mod tests {
             } else {
                 "ownerless-ambient-cleanup"
             };
-            let mut state =
-                recovery_test_state(&verified, download_id, DownloadStatus::Downloading, false);
+            let mut state = recovery_test_state(
+                &verified,
+                download_id,
+                if recovery {
+                    DownloadStatus::Paused
+                } else {
+                    DownloadStatus::Downloading
+                },
+                false,
+            );
             if !recovery {
                 state.make_managed_for_test();
             }
-            persistence
-                .save(&persisted_recovery_test_state(&state))
-                .unwrap();
+            persist_state_fixture(&persistence, &mut state);
             if recovery {
-                persistence.revoke(download_id).unwrap();
+                revoke_state_fixture(&persistence, &mut state);
+                state.status = DownloadStatus::Downloading;
             }
             client
                 .downloads
@@ -12367,16 +11879,25 @@ mod tests {
             } else {
                 "ownerless-ambient-failure"
             };
-            let mut state =
-                recovery_test_state(&verified, download_id, DownloadStatus::Downloading, false);
+            let mut state = recovery_test_state(
+                &verified,
+                download_id,
+                if recovery {
+                    DownloadStatus::Paused
+                } else {
+                    DownloadStatus::Downloading
+                },
+                false,
+            );
             if !recovery {
                 state.make_managed_for_test();
             }
             let original = persisted_recovery_test_state(&state);
-            persistence.save(&original).unwrap();
+            persist_state_fixture(&persistence, &mut state);
             if recovery {
-                persistence.revoke(download_id).unwrap();
+                revoke_state_fixture(&persistence, &mut state);
                 state.revoked_snapshot = Some(original.clone());
+                state.status = DownloadStatus::Downloading;
             }
             client
                 .downloads
@@ -12680,7 +12201,6 @@ mod tests {
         let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
         let cancel_flag = state.cancel_flag.clone();
         let pause_flag = state.pause_flag.clone();
-        pause_flag.store(true, Ordering::Relaxed);
         client
             .downloads
             .write()
@@ -12696,7 +12216,11 @@ mod tests {
             .set_worker_projection_observer(Some(Arc::new({
                 let projection_sender = projection_sender.clone();
                 let release = release.clone();
+                let pause_flag = pause_flag.clone();
                 move |projection| {
+                    if projection == "worker-entry" {
+                        pause_flag.store(true, Ordering::Relaxed);
+                    }
                     if projection == "pause-before-destination" {
                         if let Some(sender) = projection_sender.lock().unwrap().take() {
                             let _ = sender.send(());
@@ -13256,60 +12780,6 @@ mod tests {
         .expect("cancel finalizer should settle the resumed recovery");
     }
 
-    #[tokio::test]
-    async fn recovery_relocation_refuses_without_mutating_state_or_persistence() {
-        let temp = TempDir::new().unwrap();
-        let library_root = temp.path().join("library");
-        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
-        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
-        client.set_persistence(persistence.clone());
-        let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
-        let download_id = "recovery-relocate";
-        let state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
-        client
-            .downloads
-            .write()
-            .await
-            .insert(download_id.to_string(), state);
-        let old_dest = verified.destination.display_path().to_path_buf();
-
-        assert!(!client
-            .relocate_download_destination(
-                download_id,
-                &temp.path().join("other"),
-                Some("reranker"),
-                Some("other"),
-            )
-            .await
-            .unwrap());
-        let downloads = client.downloads.read().await;
-        let state = downloads.get(download_id).unwrap();
-        assert_eq!(state.dest_dir, old_dest);
-        assert!(state.recovery_destination().is_some());
-        assert_eq!(
-            state
-                .download_request
-                .as_ref()
-                .unwrap()
-                .model_type
-                .as_deref(),
-            Some("llm")
-        );
-        assert_eq!(state.download_request.as_ref().unwrap().family, "acme");
-        drop(downloads);
-        let persisted = persistence.load_all();
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].dest_dir, old_dest);
-        assert_eq!(
-            persisted[0].download_request.model_type.as_deref(),
-            Some("llm")
-        );
-        assert_eq!(persisted[0].download_request.family, "acme");
-    }
-
     #[test]
     fn persisted_download_restore_never_recreates_recovery_authority() {
         let temp = TempDir::new().unwrap();
@@ -13529,7 +12999,6 @@ mod tests {
                 dest_dir: destination.clone(),
                 ambient_authority_blocked: false,
                 admission: None,
-                pending_relocation: None,
                 revoked_snapshot: None,
                 destination: Some(DownloadDestination::Managed(held.clone())),
                 filename: "weights-1.gguf".to_string(),
@@ -13616,7 +13085,6 @@ mod tests {
                 dest_dir: destination.clone(),
                 ambient_authority_blocked: false,
                 admission: None,
-                pending_relocation: None,
                 revoked_snapshot: None,
                 destination: Some(DownloadDestination::Managed(held.clone())),
                 filename: "other.gguf".to_string(),
@@ -13642,142 +13110,18 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_relocate_download_destination_updates_state_and_persistence() {
-        let tmp = TempDir::new().unwrap();
-        let mut client = HuggingFaceClient::new(tmp.path()).unwrap();
-        client
-            .configure_download_destination_root(tmp.path())
-            .unwrap();
-        let persistence = Arc::new(DownloadPersistence::new(tmp.path()));
-        client.set_persistence(persistence.clone());
-
-        let download_id = "dl-relocate".to_string();
-        let old_dest = tmp.path().join("old");
-        let new_dest = tmp.path().join("new");
-        std::fs::create_dir_all(&old_dest).unwrap();
-
-        let request = DownloadRequest {
-            repo_id: "owner/model".to_string(),
-            family: "oldfam".to_string(),
-            official_name: "Model".to_string(),
-            model_type: Some("llm".to_string()),
-            quant: None,
-            filename: None,
-            filenames: None,
-            pipeline_tag: Some("text-generation".to_string()),
-            bundle_format: None,
-            pipeline_class: None,
-            release_date: None,
-            download_url: None,
-            model_card_json: None,
-            license_status: None,
-        };
-
-        persistence
-            .save(&PersistedDownload {
-                download_id: download_id.clone(),
-                repo_id: "owner/model".to_string(),
-                filename: "model.safetensors".to_string(),
-                filenames: vec!["model.safetensors".to_string()],
-                dest_dir: old_dest.clone(),
-                total_bytes: Some(1024),
-                status: DownloadStatus::Paused,
-                download_request: request.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                known_sha256: None,
-                huggingface_evidence: None,
-            })
-            .unwrap();
-
-        {
-            let mut downloads = client.downloads.write().await;
-            downloads.insert(
-                download_id.clone(),
-                DownloadState {
-                    download_id: download_id.clone(),
-                    repo_id: "owner/model".to_string(),
-                    status: DownloadStatus::Paused,
-                    progress: 0.5,
-                    downloaded_bytes: 512,
-                    total_bytes: Some(1024),
-                    speed: 0.0,
-                    cancel_flag: Arc::new(AtomicBool::new(false)),
-                    pause_flag: Arc::new(AtomicBool::new(false)),
-                    error: None,
-                    retry_attempt: 0,
-                    retry_limit: None,
-                    retrying: false,
-                    next_retry_delay_seconds: None,
-                    task_registered: false,
-                    lifecycle_failure_unverified: false,
-                    dest_dir: old_dest.clone(),
-                    ambient_authority_blocked: false,
-                    admission: None,
-                    pending_relocation: None,
-                    revoked_snapshot: None,
-                    destination: Some(DownloadDestination::Managed(
-                        client
-                            .destination_root
-                            .as_ref()
-                            .unwrap()
-                            .resolve(&old_dest)
-                            .unwrap(),
-                    )),
-                    filename: "model.safetensors".to_string(),
-                    files: vec![FileToDownload {
-                        filename: "model.safetensors".to_string(),
-                        size: Some(1024),
-                        sha256: None,
-                    }],
-                    files_completed: 0,
-                    download_request: Some(request.clone()),
-                    known_sha256: None,
-                    huggingface_evidence: None,
-                },
-            );
-        }
-
-        assert!(client
-            .relocate_download_destination(
-                &download_id,
-                &new_dest,
-                Some("reranker"),
-                Some("forturne"),
-            )
-            .await
-            .unwrap());
-
-        let status = client.get_download_status(&download_id).await;
-        assert_eq!(status, Some(DownloadStatus::Paused));
-        let found = client.find_download_id_by_dest_dir(&new_dest).await;
-        assert_eq!(found.as_deref(), Some(download_id.as_str()));
-
-        let entry = persistence
-            .load_all()
-            .into_iter()
-            .find(|entry| entry.download_id == download_id)
-            .unwrap();
-        assert_eq!(entry.dest_dir, new_dest);
-        assert_eq!(
-            entry.download_request.model_type.as_deref(),
-            Some("reranker")
-        );
-        assert_eq!(entry.download_request.family, "forturne");
-    }
-
-    async fn legacy_relocation_fixture(root: &Path) -> (Arc<HuggingFaceClient>, PathBuf, PathBuf) {
+    async fn admitted_download_fixture(root: &Path) -> (Arc<HuggingFaceClient>, PathBuf) {
         let mut client = HuggingFaceClient::new(root.join("cache")).unwrap();
         client.configure_download_destination_root(root).unwrap();
         let persistence = Arc::new(DownloadPersistence::new(root));
         let source = root.join("source");
-        let target = root.join("target");
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("weights.gguf.part"), b"abc").unwrap();
         let request = recovery_test_request("owner/model", &["weights.gguf".into()]);
-        persistence
-            .save(&PersistedDownload {
-                download_id: "legacy-move".into(),
+        admit_snapshot_at_root(
+            &persistence,
+            &PersistedDownload {
+                download_id: "admitted-cleanup".into(),
                 repo_id: request.repo_id.clone(),
                 filename: "weights.gguf".into(),
                 filenames: vec!["weights.gguf".into()],
@@ -13788,65 +13132,18 @@ mod tests {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 known_sha256: None,
                 huggingface_evidence: None,
-            })
-            .unwrap();
+            },
+            root,
+        );
         client.set_persistence(persistence);
         client.restore_persisted_downloads().await.unwrap();
-        (Arc::new(client), source, target)
-    }
-
-    #[tokio::test]
-    async fn legacy_relocation_definite_abort_allows_retry_and_move_back() {
-        let temp = TempDir::new().unwrap();
-        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
-        let collide_once = Arc::new(AtomicBool::new(true));
-        client.download_tasks.set_blocking_observer(Some(Arc::new({
-            let target = target.clone();
-            move |operation| {
-                if operation == "move legacy download directory"
-                    && collide_once.swap(false, Ordering::SeqCst)
-                {
-                    std::fs::create_dir(&target).unwrap();
-                }
-            }
-        })));
-        assert!(client
-            .relocate_download_destination("legacy-move", &target, None, None)
-            .await
-            .is_err());
-        assert_eq!(
-            std::fs::read(source.join("weights.gguf.part")).unwrap(),
-            b"abc"
-        );
-        assert!(client
-            .persistence()
-            .unwrap()
-            .load_lifecycle_inventory_strict()
-            .unwrap()
-            .pending_relocations
-            .is_empty());
-        std::fs::remove_dir(&target).unwrap();
-        client.download_tasks.set_blocking_observer(None);
-        assert!(client
-            .relocate_download_destination("legacy-move", &target, None, None)
-            .await
-            .unwrap());
-        assert!(!source.exists());
-        assert!(client
-            .relocate_download_destination("legacy-move", &source, None, None)
-            .await
-            .unwrap());
-        assert_eq!(
-            std::fs::read(source.join("weights.gguf.part")).unwrap(),
-            b"abc"
-        );
-        assert!(!target.exists());
+        (Arc::new(client), source)
     }
 
     #[tokio::test]
     async fn cancelling_persisted_download_quarantines_before_cleanup_and_restart() {
         let temp = TempDir::new().unwrap();
-        let (client, source, _) = legacy_relocation_fixture(temp.path()).await;
+        let (client, source) = admitted_download_fixture(temp.path()).await;
         let (entered_sender, entered) = tokio::sync::oneshot::channel();
         let entered_sender = Arc::new(std::sync::Mutex::new(Some(entered_sender)));
         let (release_sender, release) = std::sync::mpsc::channel();
@@ -13861,7 +13158,7 @@ mod tests {
                     }
                 }
             })));
-        assert!(client.cancel_download("legacy-move").await.unwrap());
+        assert!(client.cancel_download("admitted-cleanup").await.unwrap());
         tokio::time::timeout(Duration::from_secs(3), entered)
             .await
             .unwrap()
@@ -13881,7 +13178,8 @@ mod tests {
         );
         assert_eq!(retained, b"abc");
         tokio::time::timeout(Duration::from_secs(3), async {
-            while client.get_download_status("legacy-move").await != Some(DownloadStatus::Cancelled)
+            while client.get_download_status("admitted-cleanup").await
+                != Some(DownloadStatus::Cancelled)
             {
                 tokio::task::yield_now().await;
             }
@@ -13890,160 +13188,6 @@ mod tests {
         .unwrap();
         reopened.restore_persisted_downloads().await.unwrap();
         assert!(reopened.list_downloads().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn legacy_relocation_dropped_caller_and_cancel_wait_for_owned_move() {
-        let temp = TempDir::new().unwrap();
-        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
-        let (entered_sender, entered) = tokio::sync::oneshot::channel();
-        let entered_sender = Arc::new(std::sync::Mutex::new(Some(entered_sender)));
-        let (release_sender, release) = std::sync::mpsc::channel();
-        let release = Arc::new(std::sync::Mutex::new(release));
-        client
-            .download_tasks
-            .set_blocking_observer(Some(Arc::new(move |operation| {
-                if operation == "move legacy download directory" {
-                    if let Some(sender) = entered_sender.lock().unwrap().take() {
-                        let _ = sender.send(());
-                        let _ = release.lock().unwrap().recv();
-                    }
-                }
-            })));
-        let caller = tokio::spawn({
-            let client = client.clone();
-            let target = target.clone();
-            async move {
-                client
-                    .relocate_download_destination("legacy-move", &target, None, None)
-                    .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(3), entered)
-            .await
-            .unwrap()
-            .unwrap();
-        caller.abort();
-        let mut cancel = tokio::spawn({
-            let client = client.clone();
-            async move { client.cancel_download("legacy-move").await }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut cancel)
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            std::fs::read(source.join("weights.gguf.part")).unwrap(),
-            b"abc"
-        );
-        assert!(!target.exists());
-        release_sender.send(()).unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(3), cancel)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap());
-        client.download_tasks.set_blocking_observer(None);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while client.get_download_status("legacy-move").await != Some(DownloadStatus::Cancelled)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancel must settle against the relocated capability");
-        assert_eq!(
-            client.get_download_status("legacy-move").await,
-            Some(DownloadStatus::Cancelled)
-        );
-        assert!(!source.exists());
-        assert!(!target.join("weights.gguf.part").exists());
-        let mut reopened = HuggingFaceClient::new(temp.path().join("reopened")).unwrap();
-        reopened
-            .configure_download_destination_root(temp.path())
-            .unwrap();
-        reopened.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
-        reopened.restore_persisted_downloads().await.unwrap();
-        assert!(reopened.list_downloads().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn legacy_relocation_refuses_persisted_target_incumbent_before_move() {
-        let temp = TempDir::new().unwrap();
-        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
-        let persistence = client.persistence().unwrap();
-        let mut incumbent = persistence.load_all().pop().unwrap();
-        incumbent.download_id = "target-incumbent".into();
-        incumbent.dest_dir = target.clone();
-        persistence.save(&incumbent).unwrap();
-        assert!(client
-            .relocate_download_destination("legacy-move", &target, None, None)
-            .await
-            .is_err());
-        assert!(!target.exists());
-        assert_eq!(
-            std::fs::read(source.join("weights.gguf.part")).unwrap(),
-            b"abc"
-        );
-        assert!(persistence
-            .load_lifecycle_inventory_strict()
-            .unwrap()
-            .pending_relocations
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn pending_legacy_relocation_restore_hides_row_and_blocks_both_destinations() {
-        let temp = TempDir::new().unwrap();
-        let (client, source, target) = legacy_relocation_fixture(temp.path()).await;
-        let persistence = client.persistence().unwrap();
-        let expected = persistence.load_all().pop().unwrap();
-        let root = client.destination_root.as_ref().unwrap();
-        let request = LegacyRelocationRequest {
-            source: root.resolve(&source).unwrap().identity().persisted(),
-            target: root.resolve(&target).unwrap().identity().persisted(),
-            target_dir: target.clone(),
-            model_type: None,
-            family: None,
-        };
-        assert!(matches!(
-            persistence
-                .begin_legacy_relocation(&uuid::Uuid::new_v4().to_string(), &expected, &request)
-                .unwrap()
-                .unwrap(),
-            crate::metadata::AtomicPublication::Durable
-        ));
-        let mut reopened = HuggingFaceClient::new(temp.path().join("reopened")).unwrap();
-        reopened
-            .configure_download_destination_root(temp.path())
-            .unwrap();
-        reopened.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
-        reopened.restore_persisted_downloads().await.unwrap();
-        assert!(reopened.list_downloads().await.is_empty());
-        cache_repo_tree(
-            &reopened,
-            "other/model",
-            vec![LfsFileInfo {
-                filename: "weights.gguf".into(),
-                size: 8,
-                sha256: "a".repeat(64),
-            }],
-            Vec::new(),
-        );
-        let successor = recovery_test_request("other/model", &["weights.gguf".into()]);
-        for destination in [&source, &target] {
-            assert!(reopened.download_owner_for_move(destination).await.is_err());
-            assert!(reopened
-                .start_download(&successor, destination, None)
-                .await
-                .is_err());
-        }
-        assert_eq!(
-            std::fs::read(source.join("weights.gguf.part")).unwrap(),
-            b"abc"
-        );
-        assert!(!target.exists());
     }
 
     #[tokio::test]
@@ -14093,7 +13237,6 @@ mod tests {
                     dest_dir: tmp.path().join("owner-model"),
                     ambient_authority_blocked: false,
                     admission: None,
-                    pending_relocation: None,
                     revoked_snapshot: None,
                     destination: None,
                     filename: "model.safetensors".to_string(),
@@ -14173,7 +13316,6 @@ mod tests {
                     dest_dir: tmp.path().join("owner-multi-file"),
                     ambient_authority_blocked: false,
                     admission: None,
-                    pending_relocation: None,
                     revoked_snapshot: None,
                     destination: None,
                     filename: "config.json".to_string(),
@@ -14257,7 +13399,6 @@ mod tests {
                     dest_dir: tmp.path().join("owner-multi-file"),
                     ambient_authority_blocked: false,
                     admission: None,
-                    pending_relocation: None,
                     revoked_snapshot: None,
                     destination: None,
                     filename: "config.json".to_string(),
@@ -14319,8 +13460,9 @@ mod tests {
             license_status: None,
         };
 
-        persistence
-            .save(&PersistedDownload {
+        let attempt_id = admit_snapshot_at_root(
+            &persistence,
+            &PersistedDownload {
                 download_id: download_id.clone(),
                 repo_id: "owner/model".to_string(),
                 filename: "model.Q4_K_M.gguf".to_string(),
@@ -14332,8 +13474,9 @@ mod tests {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 known_sha256: None,
                 huggingface_evidence: None,
-            })
-            .unwrap();
+            },
+            tmp.path(),
+        );
 
         {
             let mut downloads = client.downloads.write().await;
@@ -14358,10 +13501,16 @@ mod tests {
                     lifecycle_failure_unverified: false,
                     dest_dir: tmp.path().join("owner-model"),
                     ambient_authority_blocked: false,
-                    admission: None,
-                    pending_relocation: None,
+                    admission: Some(super::super::types::AdmittedDownload { attempt_id }),
                     revoked_snapshot: None,
-                    destination: None,
+                    destination: Some(super::super::types::DownloadDestination::Managed(
+                        crate::model_library::download_recovery::DownloadDestinationRoot::open(
+                            tmp.path(),
+                        )
+                        .unwrap()
+                        .resolve(&tmp.path().join("owner-model"))
+                        .unwrap(),
+                    )),
                     filename: "model.Q4_K_M.gguf".to_string(),
                     files: vec![FileToDownload {
                         filename: "model.Q4_K_M.gguf".to_string(),
@@ -14508,9 +13657,7 @@ mod tests {
         let mut state =
             recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true);
         state.make_managed_for_test();
-        persistence
-            .save(&persisted_recovery_test_state(&state))
-            .unwrap();
+        persist_state_fixture(&persistence, &mut state);
         let mut downloads_guard = client.downloads.write().await;
         downloads_guard.insert(download_id.to_string(), state);
 
@@ -14624,8 +13771,9 @@ mod tests {
         std::fs::write(dest_dir.join(".pumas_download"), b"{}").unwrap();
 
         let persistence = Arc::new(DownloadPersistence::new(tmp.path()));
-        persistence
-            .save(&PersistedDownload {
+        admit_snapshot_at_root(
+            &persistence,
+            &PersistedDownload {
                 download_id: "ready-download".to_string(),
                 repo_id: "owner/model".to_string(),
                 filename: "model.gguf".to_string(),
@@ -14652,8 +13800,9 @@ mod tests {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 known_sha256: None,
                 huggingface_evidence: None,
-            })
-            .unwrap();
+            },
+            tmp.path(),
+        );
 
         let mut client = HuggingFaceClient::new(tmp.path()).unwrap();
         client.set_persistence(persistence.clone());
@@ -14668,6 +13817,203 @@ mod tests {
         assert_eq!(std::fs::read(dest_dir.join("model.gguf")).unwrap(), b"done");
         assert!(!dest_dir.join("model.gguf.part").exists());
         assert!(!dest_dir.join(".pumas_download").exists());
+    }
+
+    #[tokio::test]
+    async fn restore_completion_handoff_survives_public_retirement_and_preserves_successor() {
+        let temp = TempDir::new().unwrap();
+        let library_root = temp.path().join("library");
+        let verified = verified_recovery(&library_root, "acme/original", &["original.gguf"]);
+        let download_id = "restore-completion-handoff";
+        let mut original =
+            recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
+        original.make_managed_for_test();
+        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+        persist_state_fixture(&persistence, &mut original);
+        std::fs::write(
+            verified
+                .destination
+                .display_path()
+                .join("original.gguf.part"),
+            b"done",
+        )
+        .unwrap();
+        std::fs::write(
+            verified.destination.display_path().join(".pumas_download"),
+            b"{}",
+        )
+        .unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
+        client.set_persistence(persistence);
+        let client = Arc::new(client);
+        let (reached_sender, reached) = tokio::sync::oneshot::channel();
+        let reached_sender = Arc::new(std::sync::Mutex::new(Some(reached_sender)));
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let release = Arc::new(std::sync::Mutex::new(release));
+        client
+            .download_tasks
+            .set_ambient_admission_observer(Some(Arc::new({
+                let reached_sender = reached_sender.clone();
+                let release = release.clone();
+                move |operation, observed_id| {
+                    if operation == "restore-finalization-result" && observed_id == download_id {
+                        if let Some(sender) = reached_sender.lock().unwrap().take() {
+                            let _ = sender.send(());
+                            let _ = release.lock().unwrap().recv();
+                        }
+                    }
+                }
+            })));
+        let restore = std::thread::spawn({
+            let client = client.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(client.restore_persisted_downloads())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), reached)
+            .await
+            .expect("restore must reach its completed result handoff")
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !client
+                .download_tasks
+                .snapshot(download_id)
+                .is_some_and(|task| task.finished)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original owner must finish independently of its result consumer");
+
+        let listed = client.list_downloads().await;
+        assert!(listed
+            .iter()
+            .filter(|entry| entry.download_id == download_id)
+            .all(|entry| entry.status == DownloadStatus::Completed));
+        assert_eq!(
+            std::fs::read(verified.destination.display_path().join("original.gguf")).unwrap(),
+            b"done"
+        );
+        assert!(
+            !client.download_tasks.contains(download_id),
+            "public observation must retire the original completed owner before result extraction"
+        );
+
+        // Install a distinct runtime generation to prove result extraction is
+        // not an ID-only removal of whichever state happens to be present.
+        let replacement =
+            verified_recovery(&library_root, "acme/replacement", &["replacement.gguf"]);
+        let (finish_sender, finish) = tokio::sync::oneshot::channel();
+        let prepared = client.download_tasks.prepare(
+            download_id.into(),
+            TaskRole::Worker,
+            move |_| async move {
+                let _ = finish.await;
+            },
+        );
+        let installed = {
+            let mut states = client.downloads.write().await;
+            let installed = client.download_tasks.install_gated(prepared).unwrap();
+            states.insert(
+                download_id.into(),
+                recovery_test_state(&replacement, download_id, DownloadStatus::Downloading, true),
+            );
+            installed
+        };
+        let successor_generation = installed.generation().clone();
+        installed.start();
+        release_sender.send(()).unwrap();
+        let completed = restore.join().unwrap().unwrap();
+        let successor_preserved = client
+            .download_tasks
+            .generation_is_current(download_id, &successor_generation);
+        let replacement_filename = client
+            .downloads
+            .read()
+            .await
+            .get(download_id)
+            .map(|state| state.filename.clone());
+        let repeated = client.restore_persisted_downloads().await.unwrap();
+        client.download_tasks.set_ambient_admission_observer(None);
+        finish_sender.send(()).unwrap();
+
+        assert_eq!(
+            completed.len(),
+            1,
+            "the original owned completion must survive observer retirement"
+        );
+        assert_eq!(completed[0].download_id, download_id);
+        assert_eq!(completed[0].filename, "original.gguf");
+        assert_eq!(completed[0].dest_dir, verified.destination.display_path());
+        assert!(successor_preserved);
+        assert_eq!(replacement_filename.as_deref(), Some("replacement.gguf"));
+        assert!(
+            repeated.is_empty(),
+            "the original completion must only be returned once"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_auto_finalize_complete_follower_before_incomplete_head() {
+        let temp = TempDir::new().unwrap();
+        let client = configured_download_client(temp.path().join("cache")).unwrap();
+        let destination = temp.path().join("model");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("head.gguf.part"), b"old").unwrap();
+        std::fs::write(destination.join("follower.gguf.part"), b"done").unwrap();
+        let marker = br#"{"repo_id":"acme/head","sentinel":"untouched"}"#;
+        std::fs::write(destination.join(".pumas_download"), marker).unwrap();
+        for (id, filename, total) in [("head", "head.gguf", 8), ("follower", "follower.gguf", 4)] {
+            admit_snapshot_at_root(
+                client.persistence.as_ref().unwrap(),
+                &PersistedDownload {
+                    download_id: id.into(),
+                    repo_id: format!("acme/{id}"),
+                    filename: filename.into(),
+                    filenames: vec![filename.into()],
+                    dest_dir: destination.clone(),
+                    total_bytes: Some(total),
+                    status: DownloadStatus::Paused,
+                    download_request: recovery_test_request(
+                        &format!("acme/{id}"),
+                        &[filename.into()],
+                    ),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    known_sha256: None,
+                    huggingface_evidence: None,
+                },
+                temp.path(),
+            );
+        }
+        assert!(client
+            .restore_persisted_downloads()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(client.list_downloads().await.len(), 2);
+        assert_eq!(
+            std::fs::read(destination.join("head.gguf.part")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("follower.gguf.part")).unwrap(),
+            b"done"
+        );
+        assert_eq!(
+            std::fs::read(destination.join(".pumas_download")).unwrap(),
+            marker
+        );
+        assert!(!destination.join("follower.gguf").exists());
+        assert_eq!(client.persistence.as_ref().unwrap().load_all().len(), 2);
     }
 
     #[tokio::test]
@@ -14728,7 +14074,6 @@ mod tests {
                     dest_dir: tmp.path().join("owner-model"),
                     ambient_authority_blocked: false,
                     admission: None,
-                    pending_relocation: None,
                     revoked_snapshot: None,
                     destination: Some(DownloadDestination::Managed(destination)),
                     filename: "model.safetensors".to_string(),

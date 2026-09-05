@@ -20,12 +20,6 @@ pub(super) enum DownloadDestination {
     Recovery(DownloadRecoveryDestination),
 }
 
-#[derive(Clone)]
-pub(super) struct PendingDownloadRelocation {
-    pub(super) attempt_id: String,
-    pub(super) target: DownloadRecoveryDestination,
-}
-
 impl DownloadDestination {
     pub(super) fn capability(&self) -> &DownloadRecoveryDestination {
         match self {
@@ -160,7 +154,6 @@ pub(crate) struct DownloadState {
     /// Held filesystem authority and explicit provenance. All resumable states
     /// retain it; verified terminal cleanup releases it. Never serialized.
     pub(super) destination: Option<DownloadDestination>,
-    pub(super) pending_relocation: Option<PendingDownloadRelocation>,
     /// Exact former ordinary snapshot retained by owned recovery revocation.
     /// Needed to quarantine later cleanup without reconstructing lost metadata.
     pub(super) revoked_snapshot: Option<super::super::download_store::PersistedDownload>,
@@ -258,25 +251,16 @@ impl DownloadState {
             other => other,
         };
 
-        // Reconstruct file list from persistence.
-        // New-format entries have filenames; legacy entries fall back to filename.
-        let files: Vec<FileToDownload> = if entry.filenames.is_empty() {
-            vec![FileToDownload {
-                filename: entry.filename.clone(),
-                size: entry.total_bytes,
-                sha256: entry.known_sha256.clone(),
-            }]
-        } else {
-            entry
-                .filenames
-                .iter()
-                .map(|f| FileToDownload {
-                    filename: f.clone(),
-                    size: None, // Not persisted per-file; verified on disk
-                    sha256: None,
-                })
-                .collect()
-        };
+        // Current persisted snapshots always contain an explicit file set.
+        let files: Vec<FileToDownload> = entry
+            .filenames
+            .iter()
+            .map(|f| FileToDownload {
+                filename: f.clone(),
+                size: None, // Not persisted per-file; verified on disk
+                sha256: None,
+            })
+            .collect();
 
         Self {
             download_id: entry.download_id.clone(),
@@ -302,7 +286,6 @@ impl DownloadState {
             ambient_authority_blocked: false,
             admission: None,
             destination,
-            pending_relocation: None,
             revoked_snapshot: None,
             filename: entry.filename.clone(),
             files,

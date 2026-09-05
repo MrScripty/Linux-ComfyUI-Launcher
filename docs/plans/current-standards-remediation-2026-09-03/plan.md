@@ -219,11 +219,16 @@ requests or aborts the currently owned async handles; it has no Slice B drain
 or completion claim for running blocking work or finalizer-captured
 predecessors. Its existing test remains narrow unstarted-worker evidence.
 
-**Next slice:** Complete C3 queued-pause ownership (`RUST-I9`) under the focused
-Rust plan: a started successor must settle pause without waiting for its paused
-destination predecessor, retaining exact admission and FIFO position. Preserve
-the verified network-wait pause, recovery, cancellation, and relocation
-regressions. Ticket recovery is additive; existing transport callers retain
+**Next slice:** Complete the remaining C3 current-format unresolved-state restore
+contract before broader transport/UI integration. The current-only cutover
+(`RUST-I10`) and queued pause (`RUST-I9`) are accepted incremental checkpoints:
+the two local records were converted once with verified backup and unchanged
+files. Schema 4 requires current queue ownership; no historical FIFO is guessed.
+The focused Rust plan owns exact evidence and remaining lifecycle boundaries.
+Preserve the verified network-wait pause, recovery, and cancellation
+regressions. Retire obsolete partial-relocation tests with that unsupported
+runtime path; completed-model migration remains supported. Ticket recovery is
+additive; existing transport callers retain
 their old method until explicitly migrated. RPC, bindings, and UI remain held.
 The interrupted-response → fresh-owner restore → cancel path now
 transfers real bytes through loopback HTTP. The narrow admission checkpoint

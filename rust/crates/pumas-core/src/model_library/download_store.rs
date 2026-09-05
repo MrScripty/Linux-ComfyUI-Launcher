@@ -1,8 +1,8 @@
 //! Download persistence for crash recovery and restart resume.
 //!
 //! The versioned JSON store retains resumable snapshots, exact-attempt admission
-//! and release records, recovery revocations, cleanup quarantines, and pending
-//! relocation intents. Strict inventory hides unresolved ownership transitions;
+//! and release records, recovery revocations, and cleanup quarantines.
+//! Strict inventory hides unresolved ownership transitions;
 //! durable terminal proofs may outlive the resumable snapshot they protect.
 
 use crate::error::Result;
@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-const DOWNLOAD_STORE_SCHEMA_VERSION: u32 = 3;
+const DOWNLOAD_STORE_SCHEMA_VERSION: u32 = 4;
 const DOWNLOAD_STORE_LOCK_FILE: &str = ".downloads.lock";
 
 /// A single persisted download entry.
@@ -29,11 +29,10 @@ const DOWNLOAD_STORE_LOCK_FILE: &str = ".downloads.lock";
 pub struct PersistedDownload {
     pub download_id: String,
     pub repo_id: String,
-    /// Primary filename (first file or legacy single-file download).
+    /// Primary filename, included in `filenames`.
     pub filename: String,
     /// All filenames in this download (for multi-file models).
-    /// Empty means legacy single-file download (use `filename` field).
-    #[serde(default)]
+    /// Always explicit and non-empty in the current persisted format.
     pub filenames: Vec<String>,
     pub dest_dir: PathBuf,
     pub total_bytes: Option<u64>,
@@ -77,30 +76,6 @@ pub(crate) struct PersistedDownloadInventory {
     pub(crate) quarantines: BTreeMap<String, LifecycleQuarantine>,
     pub(crate) hidden_admissions: BTreeMap<String, HiddenDownloadAdmission>,
     pub(crate) queue_admissions: BTreeMap<String, PersistedQueueAdmission>,
-    pub(crate) pending_relocations: BTreeMap<String, PendingLegacyRelocation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LegacyRelocationRequest {
-    pub(crate) source: PersistedDestinationIdentity,
-    pub(crate) target: PersistedDestinationIdentity,
-    pub(crate) target_dir: PathBuf,
-    pub(crate) model_type: Option<String>,
-    pub(crate) family: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PendingLegacyRelocation {
-    pub(crate) request: LegacyRelocationRequest,
-    pub(crate) snapshot: PersistedDownload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedLegacyRelocation {
-    attempt_id: String,
-    request: LegacyRelocationRequest,
 }
 
 /// Non-authorizing equality identity for one destination below the configured
@@ -298,8 +273,6 @@ struct DownloadStoreData {
     queue_admissions: BTreeMap<String, PersistedQueueAdmission>,
     #[serde(default)]
     released_queue_admissions: BTreeMap<String, PersistedQueueAdmission>,
-    #[serde(default)]
-    pending_relocations: BTreeMap<String, PersistedLegacyRelocation>,
 }
 
 impl DownloadStoreData {
@@ -312,30 +285,8 @@ impl DownloadStoreData {
             admission_attempts: BTreeMap::new(),
             queue_admissions: BTreeMap::new(),
             released_queue_admissions: BTreeMap::new(),
-            pending_relocations: BTreeMap::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VersionOneDownloadStoreData {
-    schema_version: u32,
-    downloads: Vec<PersistedDownload>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VersionTwoDownloadStoreData {
-    schema_version: u32,
-    downloads: Vec<PersistedDownload>,
-    recovery_revocations: BTreeMap<String, PersistedRecoveryRevocation>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyDownloadStoreData {
-    downloads: Vec<PersistedDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +294,26 @@ struct LegacyDownloadStoreData {
 struct PersistedRecoveryRevocation {
     attempt_id: String,
     disposition: PersistedRevocationDisposition,
+    origin: PersistedRecoveryOrigin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PersistedRecoveryOrigin {
+    Unadmitted,
+    Admitted {
+        admission_attempt_id: String,
+        snapshot: Box<PersistedDownload>,
+    },
+}
+
+impl PersistedRecoveryOrigin {
+    fn snapshot(&self) -> Option<&PersistedDownload> {
+        match self {
+            Self::Unadmitted => None,
+            Self::Admitted { snapshot, .. } => Some(snapshot),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -367,10 +338,8 @@ pub struct DownloadPersistence {
 enum StoreOperation {
     Load,
     Admit,
-    Save,
     Remove,
     UpdateStatus,
-    Relocate,
     Revoke,
 }
 
@@ -440,7 +409,7 @@ pub(crate) enum RecoveryRevocation {
 }
 
 impl RecoveryRevocation {
-    fn into_legacy_result(self) -> Result<()> {
+    pub(crate) fn into_result(self) -> Result<()> {
         match self {
             Self::Durable { source, attempt_id } => {
                 debug!("Recovery revocation {attempt_id} is durable ({source:?})");
@@ -498,6 +467,25 @@ impl DownloadPersistence {
             publisher: Arc::new(AtomicDownloadStorePublisher),
             observer: Arc::new(NoopStoreTransactionObserver),
         }
+    }
+
+    /// Build a current admission fixture, never an unowned resumable row.
+    #[cfg(test)]
+    pub(crate) fn admit_test_download(&self, snapshot: &PersistedDownload) -> Result<String> {
+        let attempt = Uuid::new_v4().to_string();
+        let files = snapshot.filenames.clone();
+        let request = DownloadAdmissionRequest {
+            snapshot: snapshot.clone(),
+            domain: DownloadAdmissionDomain::Ambient,
+            destination: PersistedDestinationIdentity {
+                library_root: "store-test-root".into(),
+                relative_target: snapshot.dest_dir.to_string_lossy().into_owned(),
+            },
+            requested_payload_files: files.clone(),
+            execution_files: files,
+        };
+        self.admit_download(&attempt, &request)?.into_result()?;
+        Ok(attempt)
     }
 
     #[cfg(test)]
@@ -607,56 +595,6 @@ impl DownloadPersistence {
         Ok(true)
     }
 
-    /// Upsert a download entry (insert or update by download_id).
-    pub fn save(&self, download: &PersistedDownload) -> Result<()> {
-        let transaction = self.transaction(StoreOperation::Save)?;
-        let mut data = self.load_data_strict(&transaction)?;
-        reject_queue_mutation(&data, &download.download_id)?;
-        reject_pending_relocation_path(&data, &download.dest_dir)?;
-        if data
-            .recovery_revocations
-            .contains_key(&download.download_id)
-            || data
-                .lifecycle_quarantines
-                .contains_key(&download.download_id)
-            || data
-                .released_queue_admissions
-                .contains_key(&download.download_id)
-        {
-            return Err(crate::PumasError::Other(
-                "Refusing to persist a revoked or lifecycle-quarantined download".to_string(),
-            ));
-        }
-        if let Some(existing) = data
-            .downloads
-            .iter_mut()
-            .find(|d| d.download_id == download.download_id)
-        {
-            *existing = download.clone();
-        } else {
-            data.downloads.push(download.clone());
-        }
-        self.write_data(&transaction, &mut data)
-    }
-
-    /// Remove a download entry by ID.
-    pub fn remove(&self, download_id: &str) -> Result<()> {
-        let transaction = self.transaction(StoreOperation::Remove)?;
-        let mut data = self.load_data_strict(&transaction)?;
-        reject_queue_mutation(&data, download_id)?;
-        if data.recovery_revocations.contains_key(download_id)
-            || data.lifecycle_quarantines.contains_key(download_id)
-        {
-            return Ok(());
-        }
-        let before = data.downloads.len();
-        data.downloads.retain(|d| d.download_id != download_id);
-        if data.downloads.len() < before {
-            self.write_data(&transaction, &mut data)?;
-        }
-        Ok(())
-    }
-
     /// Load all persisted downloads.
     pub fn load_all(&self) -> Vec<PersistedDownload> {
         match self.load_all_strict() {
@@ -677,11 +615,9 @@ impl DownloadPersistence {
         let mut data = self.load_data_strict(&transaction)?;
         let confirmed = self.confirmed_admission_ids()?;
         data.downloads.retain(|download| {
-            !data.pending_relocations.contains_key(&download.download_id)
-                && data
-                    .queue_admissions
-                    .get(&download.download_id)
-                    .is_none_or(|admission| confirmed.contains(&admission.attempt_id))
+            data.queue_admissions
+                .get(&download.download_id)
+                .is_some_and(|admission| confirmed.contains(&admission.attempt_id))
         });
         Ok(data.downloads)
     }
@@ -690,25 +626,6 @@ impl DownloadPersistence {
         let transaction = self.transaction(StoreOperation::Load)?;
         let mut data = self.load_data_strict(&transaction)?;
         let confirmed = self.confirmed_admission_ids()?;
-        let pending_relocations = data
-            .pending_relocations
-            .iter()
-            .map(|(id, relocation)| {
-                let snapshot = data
-                    .downloads
-                    .iter()
-                    .find(|snapshot| snapshot.download_id == *id)
-                    .expect("validated relocation retains its source row")
-                    .clone();
-                (
-                    id.clone(),
-                    PendingLegacyRelocation {
-                        request: relocation.request.clone(),
-                        snapshot,
-                    },
-                )
-            })
-            .collect();
         let mut hidden_admissions: BTreeMap<String, HiddenDownloadAdmission> = data
             .admission_attempts
             .values()
@@ -742,6 +659,11 @@ impl DownloadPersistence {
                         .get(download_id)
                         .map(|quarantine| &quarantine.snapshot)
                 })
+                .or_else(|| {
+                    data.recovery_revocations
+                        .get(download_id)
+                        .and_then(|revocation| revocation.origin.snapshot())
+                })
                 .expect("validated queue admission has a snapshot owner")
                 .clone();
             hidden_admissions.insert(
@@ -759,10 +681,9 @@ impl DownloadPersistence {
             );
         }
         data.downloads.retain(|download| {
-            !data.pending_relocations.contains_key(&download.download_id)
-                && !unconfirmed_ids
-                    .iter()
-                    .any(|download_id| download_id == &download.download_id)
+            !unconfirmed_ids
+                .iter()
+                .any(|download_id| download_id == &download.download_id)
         });
         data.queue_admissions
             .retain(|_, admission| confirmed.contains(&admission.attempt_id));
@@ -770,7 +691,6 @@ impl DownloadPersistence {
             crate::PumasError::Other("Download cleanup confirmation lock is poisoned".into())
         })?;
         Ok(PersistedDownloadInventory {
-            pending_relocations,
             downloads: data.downloads,
             quarantines: data
                 .lifecycle_quarantines
@@ -819,15 +739,6 @@ impl DownloadPersistence {
         let transaction = self.transaction(StoreOperation::Admit)?;
         let mut data = self.load_data_strict(&transaction)?;
         let download_id = request.snapshot.download_id.as_str();
-        reject_pending_relocation(&data, download_id)?;
-        if data.pending_relocations.values().any(|relocation| {
-            relocation.request.source == request.destination
-                || relocation.request.target == request.destination
-        }) {
-            return Err(relocation_error(
-                "Destination is reserved by a pending relocation",
-            ));
-        }
         if data.recovery_revocations.contains_key(download_id)
             || data.lifecycle_quarantines.contains_key(download_id)
             || data.released_queue_admissions.contains_key(download_id)
@@ -963,8 +874,6 @@ impl DownloadPersistence {
         let transaction = self.transaction(StoreOperation::UpdateStatus)?;
         let mut data = self.load_data_strict(&transaction)?;
         let download_id = snapshot.download_id.clone();
-        reject_pending_relocation(&data, &download_id)?;
-        reject_pending_relocation_path(&data, &snapshot.dest_dir)?;
         if let Some(existing) = data
             .downloads
             .iter()
@@ -999,6 +908,15 @@ impl DownloadPersistence {
                         "Recovery lifecycle quarantine requires a durable revocation tombstone"
                             .to_string(),
                     ));
+                }
+                if revocation.origin.snapshot().is_some_and(|original| {
+                    !persisted_download_identity_matches(original, snapshot)
+                }) {
+                    return Err(crate::PumasError::Validation {
+                        field: "downloads.lifecycle_quarantines".into(),
+                        message: "Recovery quarantine must preserve the retained admitted snapshot"
+                            .into(),
+                    });
                 }
             }
         }
@@ -1144,7 +1062,7 @@ impl DownloadPersistence {
     /// Remove a download through the versioned publication Interface and
     /// prevent stale writers from recreating its ambient destination authority.
     pub(crate) fn revoke(&self, download_id: &str) -> Result<()> {
-        self.revoke_for_recovery(download_id)?.into_legacy_result()
+        self.revoke_for_recovery(download_id)?.into_result()
     }
 
     /// Publish revocation and retain fail-closed state if durability is unknown.
@@ -1153,6 +1071,12 @@ impl DownloadPersistence {
         let mut data = self.load_data_strict(&transaction)?;
         reject_queue_mutation(&data, download_id)?;
         if let Some(existing) = data.recovery_revocations.get(download_id) {
+            if !matches!(existing.origin, PersistedRecoveryOrigin::Unadmitted) {
+                return Err(crate::PumasError::Validation {
+                    field: "downloads.recovery_revocations".into(),
+                    message: "Admitted recovery requires its exact owner transition".into(),
+                });
+            }
             if existing.disposition == PersistedRevocationDisposition::Durable {
                 return Ok(RecoveryRevocation::Durable {
                     source: RecoveryRevocationSource::Persisted,
@@ -1169,6 +1093,7 @@ impl DownloadPersistence {
             PersistedRecoveryRevocation {
                 attempt_id: attempt_id.clone(),
                 disposition: PersistedRevocationDisposition::DurabilityUnknown,
+                origin: PersistedRecoveryOrigin::Unadmitted,
             },
         );
         validate_store_data(&data)?;
@@ -1202,6 +1127,117 @@ impl DownloadPersistence {
             .load_data_strict(&transaction)?
             .recovery_revocations
             .contains_key(download_id))
+    }
+
+    /// Transfer this exact inactive admission to ticket recovery without
+    /// releasing its queue position or widening the ticket's filesystem rights.
+    pub(crate) fn revoke_admitted_for_recovery(
+        &self,
+        download_id: &str,
+        admission_attempt_id: &str,
+        expected: &PersistedDownload,
+    ) -> Result<RecoveryRevocation> {
+        let transaction = self.transaction(StoreOperation::Revoke)?;
+        let mut data = self.load_data_strict(&transaction)?;
+        let mismatch = || crate::PumasError::Validation {
+            field: "downloads.recovery_revocations".into(),
+            message: "Recovery handoff requires the exact inactive admitted snapshot and attempt"
+                .into(),
+        };
+        let admission = data
+            .queue_admissions
+            .get(download_id)
+            .ok_or_else(mismatch)?;
+        if admission.attempt_id != admission_attempt_id
+            || expected.download_id != download_id
+            || !matches!(
+                expected.status,
+                DownloadStatus::Paused | DownloadStatus::Error
+            )
+            || data.lifecycle_quarantines.contains_key(download_id)
+        {
+            return Err(mismatch());
+        }
+        let (attempt_id, already_durable) = if let Some(existing) =
+            data.recovery_revocations.get(download_id)
+        {
+            let PersistedRecoveryOrigin::Admitted {
+                admission_attempt_id: original,
+                snapshot,
+            } = &existing.origin
+            else {
+                return Err(mismatch());
+            };
+            if original != admission_attempt_id || !persisted_download_matches(snapshot, expected) {
+                return Err(mismatch());
+            }
+            (
+                existing.attempt_id.clone(),
+                existing.disposition == PersistedRevocationDisposition::Durable,
+            )
+        } else {
+            let snapshot = data
+                .downloads
+                .iter()
+                .find(|entry| entry.download_id == download_id)
+                .ok_or_else(mismatch)?;
+            if admission.domain != DownloadAdmissionDomain::Ambient
+                || !self
+                    .confirmed_admission_ids()?
+                    .contains(admission_attempt_id)
+                || !persisted_download_matches(snapshot, expected)
+            {
+                return Err(mismatch());
+            }
+            let attempt_id = Uuid::new_v4().to_string();
+            data.recovery_revocations.insert(
+                download_id.into(),
+                PersistedRecoveryRevocation {
+                    attempt_id: attempt_id.clone(),
+                    disposition: PersistedRevocationDisposition::DurabilityUnknown,
+                    origin: PersistedRecoveryOrigin::Admitted {
+                        admission_attempt_id: admission_attempt_id.into(),
+                        snapshot: Box::new(expected.clone()),
+                    },
+                },
+            );
+            data.downloads
+                .retain(|entry| entry.download_id != download_id);
+            data.queue_admissions
+                .get_mut(download_id)
+                .expect("exact admission checked above")
+                .domain = DownloadAdmissionDomain::Recovery;
+            (attempt_id, false)
+        };
+        if !already_durable {
+            validate_store_data(&data)?;
+            if let Some(outcome) = revocation_publication_outcome(
+                RecoveryRevocationPhase::Intent,
+                self.publisher.publish(&transaction.target, &data),
+            ) {
+                return Ok(outcome);
+            }
+            data.recovery_revocations
+                .get_mut(download_id)
+                .expect("owned revocation retained")
+                .disposition = PersistedRevocationDisposition::Durable;
+        }
+        validate_store_data(&data)?;
+        if let Some(outcome) = revocation_publication_outcome(
+            RecoveryRevocationPhase::Confirmation,
+            self.publisher.publish(&transaction.target, &data),
+        ) {
+            return Ok(outcome);
+        }
+        self.confirm_admission(admission_attempt_id)?;
+        Ok(RecoveryRevocation::Durable {
+            source: if already_durable {
+                RecoveryRevocationSource::Persisted
+            } else {
+                RecoveryRevocationSource::NewlyPublished
+            },
+            attempt_id,
+        })
     }
 
     /// Change only the status of this owner's confirmed, exact admission.
@@ -1246,154 +1282,6 @@ impl DownloadPersistence {
         Ok(true)
     }
 
-    pub(crate) fn update_status(&self, download_id: &str, status: DownloadStatus) -> Result<bool> {
-        let transaction = self.transaction(StoreOperation::UpdateStatus)?;
-        let mut data = self.load_data_strict(&transaction)?;
-        reject_pending_relocation(&data, download_id)?;
-        if data.recovery_revocations.contains_key(download_id)
-            || data.lifecycle_quarantines.contains_key(download_id)
-            || data.queue_admissions.contains_key(download_id)
-        {
-            return Ok(false);
-        }
-        let Some(entry) = data
-            .downloads
-            .iter_mut()
-            .find(|entry| entry.download_id == download_id)
-        else {
-            return Ok(false);
-        };
-        entry.status = status;
-        self.write_data(&transaction, &mut data)?;
-        Ok(true)
-    }
-
-    /// Park both destinations before the lifecycle owner performs any move.
-    /// The retained source row is hidden until finish or a proved-not-moved abort.
-    pub(crate) fn begin_legacy_relocation(
-        &self,
-        attempt_id: &str,
-        expected: &PersistedDownload,
-        request: &LegacyRelocationRequest,
-    ) -> Result<AtomicPublishResult> {
-        Uuid::parse_str(attempt_id).map_err(|_| relocation_error("Invalid relocation attempt"))?;
-        validate_relocation_request(request)?;
-        let transaction = self.transaction(StoreOperation::Relocate)?;
-        let mut data = self.load_data_strict(&transaction)?;
-        let id = &expected.download_id;
-        if data.queue_admissions.contains_key(id)
-            || data.released_queue_admissions.contains_key(id)
-            || data.recovery_revocations.contains_key(id)
-            || data.lifecycle_quarantines.contains_key(id)
-            || data
-                .admission_attempts
-                .values()
-                .any(|entry| entry.request.snapshot.download_id == *id)
-        {
-            return Err(relocation_error(
-                "Relocation requires an ordinary legacy owner",
-            ));
-        }
-        let current = data
-            .downloads
-            .iter()
-            .find(|entry| entry.download_id == *id)
-            .ok_or_else(|| relocation_error("Relocation source is missing"))?;
-        if !persisted_download_matches(current, expected) {
-            return Err(relocation_error("Relocation source snapshot changed"));
-        }
-        if !matches!(
-            current.status,
-            DownloadStatus::Paused | DownloadStatus::Error
-        ) {
-            return Err(relocation_error("Relocation source must be inactive"));
-        }
-        if let Some(existing) = data.pending_relocations.get(id) {
-            if existing.attempt_id != attempt_id || existing.request != *request {
-                return Err(relocation_error("Relocation attempt identity mismatch"));
-            }
-        } else {
-            if data
-                .pending_relocations
-                .values()
-                .any(|entry| entry.attempt_id == attempt_id)
-                || data.admission_attempts.contains_key(attempt_id)
-                || data
-                    .queue_admissions
-                    .values()
-                    .chain(data.released_queue_admissions.values())
-                    .any(|entry| entry.attempt_id == attempt_id)
-            {
-                return Err(relocation_error(
-                    "Relocation attempt already belongs to another owner",
-                ));
-            }
-            data.pending_relocations.insert(
-                id.clone(),
-                PersistedLegacyRelocation {
-                    attempt_id: attempt_id.to_string(),
-                    request: request.clone(),
-                },
-            );
-        }
-        validate_store_data(&data)?;
-        Ok(self.publisher.publish(&transaction.target, &data))
-    }
-
-    /// Called only after the lifecycle owner proves the move, marker, and
-    /// affected directory syncs durable. A visible target-only document is
-    /// therefore safe to restore even if the publication acknowledgement fails.
-    pub(crate) fn finish_legacy_relocation(
-        &self,
-        download_id: &str,
-        attempt_id: &str,
-    ) -> Result<AtomicPublishResult> {
-        self.complete_legacy_relocation(download_id, attempt_id, true)
-    }
-
-    /// Called only when the lifecycle owner proves no physical mutation occurred.
-    /// Missing intents are conflicts, not permission to repeat physical effects.
-    pub(crate) fn abort_legacy_relocation(
-        &self,
-        download_id: &str,
-        attempt_id: &str,
-    ) -> Result<AtomicPublishResult> {
-        self.complete_legacy_relocation(download_id, attempt_id, false)
-    }
-
-    fn complete_legacy_relocation(
-        &self,
-        download_id: &str,
-        attempt_id: &str,
-        moved: bool,
-    ) -> Result<AtomicPublishResult> {
-        let transaction = self.transaction(StoreOperation::Relocate)?;
-        let mut data = self.load_data_strict(&transaction)?;
-        let relocation = data.pending_relocations.get(download_id).ok_or_else(|| {
-            relocation_error("Relocation intent is missing; inspect authoritative state")
-        })?;
-        if relocation.attempt_id != attempt_id {
-            return Err(relocation_error("Relocation attempt identity mismatch"));
-        }
-        if moved {
-            let row = data
-                .downloads
-                .iter_mut()
-                .find(|row| row.download_id == download_id)
-                .expect("validated relocation retains source row");
-            row.dest_dir = relocation.request.target_dir.clone();
-            if let Some(model_type) = &relocation.request.model_type {
-                row.download_request.model_type = Some(model_type.clone());
-            }
-            if let Some(family) = &relocation.request.family {
-                row.download_request.family = family.clone();
-            }
-        }
-        data.pending_relocations.remove(download_id);
-        validate_store_data(&data)?;
-        Ok(self.publisher.publish(&transaction.target, &data))
-    }
-
     fn transaction(&self, operation: StoreOperation) -> Result<StoreTransaction<'_>> {
         let instance_guard = self.mutation.lock().map_err(|_| {
             crate::PumasError::Other("Download persistence lock is poisoned".to_string())
@@ -1418,77 +1306,25 @@ impl DownloadPersistence {
         let Some(value) = transaction.target.read_json::<serde_json::Value>()? else {
             return Ok(DownloadStoreData::empty());
         };
-        let data = match value.get("schema_version") {
-            Some(version) => match version.as_u64() {
-                Some(3) => {
-                    serde_json::from_value::<DownloadStoreData>(value).map_err(|source| {
-                        crate::PumasError::Json {
-                            message: format!(
-                                "Failed to parse versioned download store {}: {source}",
-                                self.path.display()
-                            ),
-                            source: Some(source),
-                        }
-                    })?
-                }
-                Some(2) => {
-                    let old = serde_json::from_value::<VersionTwoDownloadStoreData>(value)
-                        .map_err(|source| crate::PumasError::Json {
-                            message: format!(
-                                "Failed to parse v2 download store {}: {source}",
-                                self.path.display()
-                            ),
-                            source: Some(source),
-                        })?;
-                    debug_assert_eq!(old.schema_version, 2);
-                    DownloadStoreData {
-                        downloads: old.downloads,
-                        recovery_revocations: old.recovery_revocations,
-                        ..DownloadStoreData::empty()
-                    }
-                }
-                Some(1) => {
-                    let old = serde_json::from_value::<VersionOneDownloadStoreData>(value)
-                        .map_err(|source| crate::PumasError::Json {
-                            message: format!(
-                                "Failed to parse v1 download store {}: {source}",
-                                self.path.display()
-                            ),
-                            source: Some(source),
-                        })?;
-                    debug_assert_eq!(old.schema_version, 1);
-                    DownloadStoreData {
-                        downloads: old.downloads,
-                        ..DownloadStoreData::empty()
-                    }
-                }
-                _ => {
-                    return Err(crate::PumasError::Validation {
-                        field: "downloads.schema_version".to_string(),
-                        message: format!(
-                            "Unsupported download store schema version in {}",
-                            self.path.display()
-                        ),
-                    });
-                }
-            },
-            None => {
-                let legacy =
-                    serde_json::from_value::<LegacyDownloadStoreData>(value).map_err(|source| {
-                        crate::PumasError::Json {
-                            message: format!(
-                                "Failed to parse legacy download store {}: {source}",
-                                self.path.display()
-                            ),
-                            source: Some(source),
-                        }
-                    })?;
-                DownloadStoreData {
-                    downloads: legacy.downloads,
-                    ..DownloadStoreData::empty()
-                }
+        if value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(4)
+        {
+            return Err(crate::PumasError::Validation {
+                field: "downloads.schema_version".into(),
+                message: "Download store requires schema version 4; migrate older data explicitly before starting the application".into(),
+            });
+        }
+        let data = serde_json::from_value::<DownloadStoreData>(value).map_err(|source| {
+            crate::PumasError::Json {
+                message: format!(
+                    "Failed to parse current download store {}: {source}",
+                    self.path.display()
+                ),
+                source: Some(source),
             }
-        };
+        })?;
         validate_store_data(&data)?;
         Ok(data)
     }
@@ -1523,56 +1359,11 @@ impl DownloadPersistence {
 }
 
 fn reject_queue_mutation(data: &DownloadStoreData, download_id: &str) -> Result<()> {
-    reject_pending_relocation(data, download_id)?;
     if data.queue_admissions.contains_key(download_id) {
         return Err(crate::PumasError::Validation {
             field: "downloads.queue_admissions".into(),
             message: "Queue-owned download requires an exact lifecycle transition".into(),
         });
-    }
-    Ok(())
-}
-
-fn relocation_error(message: &str) -> crate::PumasError {
-    crate::PumasError::Validation {
-        field: "downloads.pending_relocations".into(),
-        message: message.into(),
-    }
-}
-
-fn reject_pending_relocation(data: &DownloadStoreData, download_id: &str) -> Result<()> {
-    if data.pending_relocations.contains_key(download_id) {
-        return Err(relocation_error(
-            "Download is owned by a pending relocation",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_relocation_request(request: &LegacyRelocationRequest) -> Result<()> {
-    if request.source.library_root.trim().is_empty()
-        || request.source.relative_target.trim().is_empty()
-        || request.target.relative_target.trim().is_empty()
-        || request.source.library_root != request.target.library_root
-        || request.source == request.target
-        || request.target_dir.as_os_str().is_empty()
-    {
-        return Err(relocation_error(
-            "Relocation requires distinct destinations under the same root",
-        ));
-    }
-    Ok(())
-}
-
-fn reject_pending_relocation_path(data: &DownloadStoreData, destination: &Path) -> Result<()> {
-    if data.pending_relocations.iter().any(|(id, relocation)| {
-        relocation.request.target_dir == destination
-            || data
-                .downloads
-                .iter()
-                .any(|row| row.download_id == *id && row.dest_dir == destination)
-    }) {
-        return Err(relocation_error("Path is reserved by a pending relocation"));
     }
     Ok(())
 }
@@ -1653,6 +1444,7 @@ fn admission_publication_outcome(
 }
 
 fn validate_admission_request(request: &DownloadAdmissionRequest) -> Result<()> {
+    validate_snapshot_files(&request.snapshot)?;
     if request.snapshot.download_id.trim().is_empty() {
         return Err(crate::PumasError::Validation {
             field: "downloads.admission_attempts".to_string(),
@@ -1695,6 +1487,23 @@ fn validate_admission_request(request: &DownloadAdmissionRequest) -> Result<()> 
             field: "downloads.admission_attempts".to_string(),
             message: "Download admission execution files must be unique and contain the payload"
                 .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_snapshot_files(snapshot: &PersistedDownload) -> Result<()> {
+    let mut files = HashSet::new();
+    if snapshot.filenames.is_empty()
+        || !snapshot.filenames.contains(&snapshot.filename)
+        || snapshot
+            .filenames
+            .iter()
+            .any(|file| file.trim().is_empty() || !files.insert(file))
+    {
+        return Err(crate::PumasError::Validation {
+            field: "downloads.filenames".into(),
+            message: "Current download snapshots require unique explicit filenames including the primary filename".into(),
         });
     }
     Ok(())
@@ -1795,79 +1604,6 @@ fn next_admission_position(
 }
 
 fn validate_store_data(data: &DownloadStoreData) -> Result<()> {
-    let mut relocation_destinations = BTreeSet::new();
-    let mut relocation_attempts = HashSet::new();
-    for (id, relocation) in &data.pending_relocations {
-        validate_relocation_request(&relocation.request)?;
-        Uuid::parse_str(&relocation.attempt_id)
-            .map_err(|_| relocation_error("Invalid relocation attempt"))?;
-        if !relocation_attempts.insert(&relocation.attempt_id)
-            || data.admission_attempts.contains_key(&relocation.attempt_id)
-            || data
-                .queue_admissions
-                .values()
-                .chain(data.released_queue_admissions.values())
-                .any(|entry| entry.attempt_id == relocation.attempt_id)
-        {
-            return Err(relocation_error("Relocation attempt has another owner"));
-        }
-        if !data.downloads.iter().any(|row| {
-            row.download_id == *id
-                && matches!(row.status, DownloadStatus::Paused | DownloadStatus::Error)
-        }) || data.queue_admissions.contains_key(id)
-            || data.released_queue_admissions.contains_key(id)
-            || data.recovery_revocations.contains_key(id)
-            || data.lifecycle_quarantines.contains_key(id)
-            || data
-                .admission_attempts
-                .values()
-                .any(|entry| entry.request.snapshot.download_id == *id)
-        {
-            return Err(relocation_error(
-                "Pending relocation lacks an exclusive inactive legacy row",
-            ));
-        }
-        let source = data
-            .downloads
-            .iter()
-            .find(|row| row.download_id == *id)
-            .expect("relocation source row was validated above");
-        if data
-            .downloads
-            .iter()
-            .filter(|row| row.download_id != *id)
-            .chain(
-                data.lifecycle_quarantines
-                    .values()
-                    .map(|quarantine| &quarantine.snapshot),
-            )
-            .any(|row| {
-                row.dest_dir == source.dest_dir || row.dest_dir == relocation.request.target_dir
-            })
-        {
-            return Err(relocation_error(
-                "Relocation source or target has another legacy owner",
-            ));
-        }
-        for destination in [&relocation.request.source, &relocation.request.target] {
-            if !relocation_destinations.insert(destination) {
-                return Err(relocation_error("Pending relocations overlap destinations"));
-            }
-            if data
-                .queue_admissions
-                .values()
-                .any(|entry| &entry.destination == destination)
-                || data
-                    .admission_attempts
-                    .values()
-                    .any(|entry| &entry.request.destination == destination)
-            {
-                return Err(relocation_error(
-                    "Relocation destination has a queued admission owner",
-                ));
-            }
-        }
-    }
     let mut attempt_ids = HashSet::new();
     for attempt_id in data.admission_attempts.keys().chain(
         data.queue_admissions
@@ -1893,6 +1629,16 @@ fn validate_store_data(data: &DownloadStoreData) -> Result<()> {
     }
     let mut download_ids = HashSet::new();
     for download in &data.downloads {
+        validate_snapshot_files(download)?;
+        if !data.queue_admissions.contains_key(&download.download_id) {
+            return Err(crate::PumasError::Validation {
+                field: "downloads.queue_admissions".into(),
+                message: format!(
+                    "Download {} has no exact admission; explicit migration is required",
+                    download.download_id
+                ),
+            });
+        }
         if !download_ids.insert(download.download_id.as_str()) {
             return Err(crate::PumasError::Validation {
                 field: "downloads.download_id".to_string(),
@@ -1913,6 +1659,34 @@ fn validate_store_data(data: &DownloadStoreData) -> Result<()> {
         }
     }
     for (download_id, revocation) in &data.recovery_revocations {
+        if let PersistedRecoveryOrigin::Admitted {
+            admission_attempt_id,
+            snapshot,
+        } = &revocation.origin
+        {
+            validate_snapshot_files(snapshot)?;
+            let admission = data
+                .queue_admissions
+                .get(download_id)
+                .or_else(|| data.released_queue_admissions.get(download_id));
+            if snapshot.download_id != *download_id
+                || !admission.is_some_and(|admission| {
+                    admission.attempt_id == *admission_attempt_id
+                        && admission.domain == DownloadAdmissionDomain::Recovery
+                })
+            {
+                return Err(crate::PumasError::Validation {
+                    field: "downloads.recovery_revocations".into(),
+                    message: "Admitted revocation has no matching retained recovery queue owner"
+                        .into(),
+                });
+            }
+        } else if data.queue_admissions.contains_key(download_id) {
+            return Err(crate::PumasError::Validation {
+                field: "downloads.recovery_revocations".into(),
+                message: "Unadmitted recovery cannot own an admitted queue record".into(),
+            });
+        }
         if download_id.trim().is_empty() {
             return Err(crate::PumasError::Validation {
                 field: "downloads.recovery_revocations".to_string(),
@@ -1976,6 +1750,11 @@ fn validate_store_data(data: &DownloadStoreData) -> Result<()> {
                     data.lifecycle_quarantines
                         .get(download_id)
                         .map(|quarantine| &quarantine.snapshot)
+                })
+                .or_else(|| {
+                    data.recovery_revocations
+                        .get(download_id)
+                        .and_then(|revocation| revocation.origin.snapshot())
                 })
                 .ok_or_else(|| crate::PumasError::Validation {
                     field: "downloads.queue_admissions".to_string(),
@@ -2051,6 +1830,20 @@ fn validate_store_data(data: &DownloadStoreData) -> Result<()> {
         }
     }
     for (download_id, quarantine) in &data.lifecycle_quarantines {
+        validate_snapshot_files(&quarantine.snapshot)?;
+        if data
+            .recovery_revocations
+            .get(download_id)
+            .and_then(|revocation| revocation.origin.snapshot())
+            .is_some_and(|original| {
+                !persisted_download_identity_matches(original, &quarantine.snapshot)
+            })
+        {
+            return Err(crate::PumasError::Validation {
+                field: "downloads.lifecycle_quarantines".into(),
+                message: "Recovery quarantine conflicts with retained admitted provenance".into(),
+            });
+        }
         if quarantine.snapshot.download_id != *download_id {
             return Err(crate::PumasError::Validation {
                 field: "downloads.lifecycle_quarantines".to_string(),
@@ -2121,6 +1914,207 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    fn runtime_refuses_old_formats_and_unadmitted_current_rows_without_mutation() {
+        for version in [None, Some(1), Some(2), Some(3), Some(4)] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("downloads.json");
+            let mut document = serde_json::json!({
+                "downloads": [persisted("unadmitted")],
+                "recovery_revocations": {},
+                "lifecycle_quarantines": {},
+                "admission_attempts": {},
+                "queue_admissions": {},
+                "released_queue_admissions": {}
+            });
+            if let Some(version) = version {
+                document["schema_version"] = version.into();
+            } else {
+                document = serde_json::json!({"downloads": [persisted("unadmitted")]});
+            }
+            let bytes = serde_json::to_vec_pretty(&document).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let store = DownloadPersistence::new(tmp.path());
+            assert!(
+                store.load_lifecycle_inventory_strict().is_err(),
+                "accepted {version:?}"
+            );
+            assert!(store.reconcile_lifecycle_inventory_strict().is_err());
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn admitted_recovery_handoff_preserves_exact_queue_custody_through_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let store = DownloadPersistence::new(tmp.path());
+        let request = admission_request("recover-head");
+        let attempt = Uuid::new_v4().to_string();
+        store
+            .admit_download(&attempt, &request)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        store
+            .admit_download(&Uuid::new_v4().to_string(), &admission_request("follower"))
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let bytes = std::fs::read(&store.path).unwrap();
+        assert!(store
+            .revoke_admitted_for_recovery(
+                "recover-head",
+                &Uuid::new_v4().to_string(),
+                &request.snapshot
+            )
+            .is_err());
+        let mut stale = request.snapshot.clone();
+        stale.dest_dir = tmp.path().join("wrong");
+        assert!(store
+            .revoke_admitted_for_recovery("recover-head", &attempt, &stale)
+            .is_err());
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        assert!(matches!(
+            store
+                .revoke_admitted_for_recovery("recover-head", &attempt, &request.snapshot)
+                .unwrap(),
+            RecoveryRevocation::Durable { .. }
+        ));
+        let inventory = store.load_lifecycle_inventory_strict().unwrap();
+        let head = &inventory.queue_admissions["recover-head"];
+        assert_eq!(head.attempt_id, attempt);
+        assert_eq!(head.domain, DownloadAdmissionDomain::Recovery);
+        assert_eq!(head.position.ordinal, 0);
+        assert_eq!(head.execution_files, request.execution_files);
+        assert_eq!(head.destination, request.destination);
+        assert_eq!(inventory.downloads.len(), 1);
+        store
+            .begin_lifecycle_quarantine(
+                &request.snapshot,
+                LifecycleQuarantineDomain::Recovery,
+                false,
+            )
+            .unwrap();
+        assert!(store
+            .settle_queue_admission("recover-head", &attempt)
+            .unwrap());
+        let reopened = DownloadPersistence::new(tmp.path());
+        reopened.reconcile_lifecycle_inventory_strict().unwrap();
+        let inventory = reopened.load_lifecycle_inventory_strict().unwrap();
+        assert_eq!(inventory.downloads[0].download_id, "follower");
+        assert_eq!(
+            inventory.queue_admissions["follower"]
+                .position
+                .predecessor
+                .as_ref()
+                .unwrap()
+                .admission_attempt_id,
+            attempt
+        );
+        assert!(inventory.quarantines.is_empty());
+    }
+
+    #[test]
+    fn current_admission_requires_explicit_snapshot_files_without_primary_ordering() {
+        let tmp = TempDir::new().unwrap();
+        let store = DownloadPersistence::new(tmp.path());
+        for filenames in [
+            vec![],
+            vec!["other.gguf".into()],
+            vec!["model.gguf".into(), "model.gguf".into()],
+        ] {
+            let mut request = admission_request("invalid-files");
+            request.snapshot.filenames = filenames;
+            assert!(store
+                .admit_download(&Uuid::new_v4().to_string(), &request)
+                .is_err());
+            assert!(store.load_all_strict().unwrap().is_empty());
+        }
+        let mut request = admission_request("explicit-files");
+        request.snapshot.filenames = vec!["other.gguf".into(), "model.gguf".into()];
+        request.execution_files = request.snapshot.filenames.clone();
+        store
+            .admit_download(&Uuid::new_v4().to_string(), &request)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let fresh = DownloadPersistence::new(tmp.path());
+        fresh.reconcile_lifecycle_inventory_strict().unwrap();
+        assert_eq!(
+            fresh.load_all_strict().unwrap()[0].filenames,
+            request.snapshot.filenames
+        );
+    }
+
+    #[test]
+    fn admitted_recovery_uncertainty_retains_custody_and_requires_exact_republication() {
+        for phase in [
+            RecoveryRevocationPhase::Intent,
+            RecoveryRevocationPhase::Confirmation,
+        ] {
+            for fault in [
+                ScriptedPublication::PublishedDurabilityUnknown,
+                ScriptedPublication::VisibilityUnknownAfterEffect,
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let store = DownloadPersistence::new(tmp.path());
+                let request = admission_request("handoff");
+                let attempt = Uuid::new_v4().to_string();
+                store
+                    .admit_download(&attempt, &request)
+                    .unwrap()
+                    .into_result()
+                    .unwrap();
+                let script = if phase == RecoveryRevocationPhase::Intent {
+                    vec![fault]
+                } else {
+                    vec![ScriptedPublication::Durable, fault]
+                };
+                let uncertain = store.with_test_publisher(Arc::new(ScriptedPublisher::new(script)));
+                let outcome = uncertain
+                    .revoke_admitted_for_recovery("handoff", &attempt, &request.snapshot)
+                    .unwrap();
+                match outcome {
+                    RecoveryRevocation::PublishedDurabilityUnknown { phase: actual, .. }
+                    | RecoveryRevocation::VisibilityUnknown { phase: actual, .. } => {
+                        assert_eq!(actual, phase)
+                    }
+                    other => panic!("uncertain handoff reported {other:?}"),
+                }
+                let fresh = DownloadPersistence::new(tmp.path());
+                assert!(fresh.load_all_strict().unwrap().is_empty());
+                let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
+                assert_eq!(
+                    inventory.hidden_admissions["handoff"].request.domain,
+                    DownloadAdmissionDomain::Recovery
+                );
+                let failed = fresh
+                    .clone()
+                    .with_test_publisher(Arc::new(ScriptedPublisher::new([
+                        ScriptedPublication::NotPublished,
+                    ])));
+                assert!(matches!(
+                    failed
+                        .revoke_admitted_for_recovery("handoff", &attempt, &request.snapshot)
+                        .unwrap(),
+                    RecoveryRevocation::NotPublished { .. }
+                ));
+                assert!(matches!(
+                    fresh
+                        .revoke_admitted_for_recovery("handoff", &attempt, &request.snapshot)
+                        .unwrap(),
+                    RecoveryRevocation::Durable { .. }
+                ));
+                let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
+                assert_eq!(inventory.queue_admissions["handoff"].attempt_id, attempt);
+                assert_eq!(
+                    inventory.queue_admissions["handoff"].domain,
+                    DownloadAdmissionDomain::Recovery
+                );
+            }
+        }
+    }
 
     #[test]
     fn admission_error_conversion_preserves_io_classification_and_uncertainty() {
@@ -2212,86 +2206,6 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_load() {
-        let tmp = TempDir::new().unwrap();
-        let store = DownloadPersistence::new(tmp.path());
-
-        let entry = PersistedDownload {
-            download_id: "dl-1".to_string(),
-            repo_id: "test/model".to_string(),
-            filename: "model.gguf".to_string(),
-            filenames: vec!["model.gguf".to_string()],
-            dest_dir: tmp.path().to_path_buf(),
-            total_bytes: Some(1000),
-            status: DownloadStatus::Paused,
-            download_request: make_request(),
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-            known_sha256: None,
-            huggingface_evidence: None,
-        };
-
-        store.save(&entry).unwrap();
-        let loaded = store.load_all();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].download_id, "dl-1");
-        assert_eq!(loaded[0].status, DownloadStatus::Paused);
-    }
-
-    #[test]
-    fn test_upsert() {
-        let tmp = TempDir::new().unwrap();
-        let store = DownloadPersistence::new(tmp.path());
-
-        let mut entry = PersistedDownload {
-            download_id: "dl-1".to_string(),
-            repo_id: "test/model".to_string(),
-            filename: "model.gguf".to_string(),
-            filenames: vec!["model.gguf".to_string()],
-            dest_dir: tmp.path().to_path_buf(),
-            total_bytes: Some(1000),
-            status: DownloadStatus::Paused,
-            download_request: make_request(),
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-            known_sha256: None,
-            huggingface_evidence: None,
-        };
-
-        store.save(&entry).unwrap();
-        entry.status = DownloadStatus::Error;
-        store.save(&entry).unwrap();
-
-        let loaded = store.load_all();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].status, DownloadStatus::Error);
-    }
-
-    #[test]
-    fn test_remove() {
-        let tmp = TempDir::new().unwrap();
-        let store = DownloadPersistence::new(tmp.path());
-
-        let entry = PersistedDownload {
-            download_id: "dl-1".to_string(),
-            repo_id: "test/model".to_string(),
-            filename: "model.gguf".to_string(),
-            filenames: vec!["model.gguf".to_string()],
-            dest_dir: tmp.path().to_path_buf(),
-            total_bytes: Some(1000),
-            status: DownloadStatus::Paused,
-            download_request: make_request(),
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-            known_sha256: None,
-            huggingface_evidence: None,
-        };
-
-        store.save(&entry).unwrap();
-        assert_eq!(store.load_all().len(), 1);
-
-        store.remove("dl-1").unwrap();
-        assert_eq!(store.load_all().len(), 0);
-    }
-
-    #[test]
     fn test_load_empty() {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
@@ -2299,7 +2213,7 @@ mod tests {
     }
 
     #[test]
-    fn revoked_download_rejects_stale_save_status_and_relocation() {
+    fn revoked_download_rejects_new_admission_and_status_mutation() {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
         let stale = PersistedDownload {
@@ -2315,21 +2229,17 @@ mod tests {
             known_sha256: None,
             huggingface_evidence: None,
         };
-        store.save(&stale).unwrap();
 
         store.revoke("dl-revoked").unwrap();
 
-        assert!(store.save(&stale).is_err());
+        assert!(store.admit_test_download(&stale).is_err());
         assert!(!store
-            .update_status("dl-revoked", DownloadStatus::Error)
-            .unwrap());
-        assert!(store
-            .begin_legacy_relocation(
+            .update_admitted_status(
+                "dl-revoked",
                 &Uuid::new_v4().to_string(),
-                &stale,
-                &legacy_relocation_request(tmp.path().join("elsewhere")),
+                DownloadStatus::Error
             )
-            .is_err());
+            .unwrap());
         assert!(store.load_all().is_empty());
     }
 
@@ -2355,7 +2265,7 @@ mod tests {
             known_sha256: None,
             huggingface_evidence: None,
         };
-        store.save(&entry).unwrap();
+        store.admit_test_download(&entry).unwrap();
         assert_eq!(store.load_all().len(), 1);
     }
 
@@ -2493,7 +2403,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
         let entry = persisted("dl-unknown");
-        store.save(&entry).unwrap();
         let publisher = Arc::new(ScriptedPublisher::new([
             ScriptedPublication::PublishedDurabilityUnknown,
         ]));
@@ -2510,7 +2419,7 @@ mod tests {
         ));
         let fresh = DownloadPersistence::new(tmp.path());
         assert!(fresh.is_revoked("dl-unknown").unwrap());
-        assert!(fresh.save(&entry).is_err());
+        assert!(fresh.admit_test_download(&entry).is_err());
         assert!(matches!(
             fresh.revoke_for_recovery("dl-unknown").unwrap(),
             RecoveryRevocation::Durable {
@@ -2555,7 +2464,6 @@ mod tests {
     ) -> (RecoveryRevocation, RecoveryRevocation) {
         let tmp = TempDir::new().unwrap();
         let entry = persisted(download_id);
-        DownloadPersistence::new(tmp.path()).save(&entry).unwrap();
         let publisher = Arc::new(ScriptedPublisher::new([
             ScriptedPublication::Durable,
             confirmation,
@@ -2565,7 +2473,7 @@ mod tests {
         let initiating = store.revoke_for_recovery(download_id).unwrap();
         let fresh = DownloadPersistence::new(tmp.path());
         assert!(fresh.is_revoked(download_id).unwrap());
-        assert!(fresh.save(&entry).is_err());
+        assert!(fresh.admit_test_download(&entry).is_err());
         let retried = fresh.revoke_for_recovery(download_id).unwrap();
         (initiating, retried)
     }
@@ -2646,8 +2554,6 @@ mod tests {
             ScriptedPublication::VisibilityUnknownBeforeEffect,
         ] {
             let tmp = TempDir::new().unwrap();
-            let entry = persisted("dl-unpublished");
-            DownloadPersistence::new(tmp.path()).save(&entry).unwrap();
             let store = DownloadPersistence::new(tmp.path())
                 .with_test_publisher(Arc::new(ScriptedPublisher::new([scripted])));
 
@@ -2668,7 +2574,7 @@ mod tests {
                     .load_all_strict()
                     .unwrap()
                     .len(),
-                1
+                0
             );
         }
     }
@@ -2697,7 +2603,6 @@ mod tests {
     fn post_effect_visibility_unknown_persists_fail_closed_for_a_fresh_owner() {
         let tmp = TempDir::new().unwrap();
         let entry = persisted("dl-visible-unknown");
-        DownloadPersistence::new(tmp.path()).save(&entry).unwrap();
         let store = DownloadPersistence::new(tmp.path()).with_test_publisher(Arc::new(
             ScriptedPublisher::new([ScriptedPublication::VisibilityUnknownAfterEffect]),
         ));
@@ -2713,7 +2618,7 @@ mod tests {
         ));
         let fresh = DownloadPersistence::new(tmp.path());
         assert!(fresh.is_revoked("dl-visible-unknown").unwrap());
-        assert!(fresh.save(&entry).is_err());
+        assert!(fresh.admit_test_download(&entry).is_err());
     }
 
     struct BlockingObserver {
@@ -2755,7 +2660,6 @@ mod tests {
     fn independent_writer_queued_after_actual_revoke_lock_cannot_recreate() {
         let tmp = TempDir::new().unwrap();
         let entry = persisted("dl-cross-owner");
-        DownloadPersistence::new(tmp.path()).save(&entry).unwrap();
         let (revoke_entered_tx, revoke_entered_rx) = mpsc::channel();
         let (release_revoke_tx, release_revoke_rx) = mpsc::channel();
         let revoke_store =
@@ -2775,7 +2679,7 @@ mod tests {
                 acquired: writer_acquired_tx,
             },
         ));
-        let writer = thread::spawn(move || writer_store.save(&entry));
+        let writer = thread::spawn(move || writer_store.admit_test_download(&entry));
         writer_attempting_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
@@ -2797,20 +2701,19 @@ mod tests {
     }
 
     #[test]
-    fn revoke_queued_after_actual_writer_lock_removes_the_committed_write() {
+    fn revoke_queued_after_actual_admission_lock_cannot_remove_the_committed_owner() {
         let tmp = TempDir::new().unwrap();
         let mut entry = persisted("dl-writer-first");
-        DownloadPersistence::new(tmp.path()).save(&entry).unwrap();
         entry.status = DownloadStatus::Error;
         let (writer_entered_tx, writer_entered_rx) = mpsc::channel();
         let (release_writer_tx, release_writer_rx) = mpsc::channel();
         let writer_store =
             DownloadPersistence::new(tmp.path()).with_test_observer(Arc::new(BlockingObserver {
-                operation: StoreOperation::Save,
+                operation: StoreOperation::Admit,
                 entered: Mutex::new(Some(writer_entered_tx)),
                 release: Mutex::new(Some(release_writer_rx)),
             }));
-        let writer = thread::spawn(move || writer_store.save(&entry));
+        let writer = thread::spawn(move || writer_store.admit_test_download(&entry));
         writer_entered_rx.recv().unwrap();
 
         let (revoke_attempting_tx, revoke_attempting_rx) = mpsc::channel();
@@ -2832,21 +2735,20 @@ mod tests {
         revoke_acquired_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
-        assert!(matches!(
-            revoke.join().unwrap().unwrap(),
-            RecoveryRevocation::Durable { .. }
-        ));
-        assert!(DownloadPersistence::new(tmp.path())
-            .load_all_strict()
-            .unwrap()
-            .is_empty());
+        assert!(revoke.join().unwrap().is_err());
+        let fresh = DownloadPersistence::new(tmp.path());
+        fresh.reconcile_lifecycle_inventory_strict().unwrap();
+        assert_eq!(
+            fresh.load_all_strict().unwrap()[0].download_id,
+            "dl-writer-first"
+        );
     }
 
     struct ChildLockObserver;
 
     impl StoreTransactionObserver for ChildLockObserver {
         fn acquired(&self, operation: StoreOperation) {
-            if operation != StoreOperation::Save {
+            if operation != StoreOperation::Admit {
                 return;
             }
             println!("PUMAS_STORE_LOCK_ACQUIRED");
@@ -2864,15 +2766,14 @@ mod tests {
         };
         let store = DownloadPersistence::new(Path::new(&data_dir))
             .with_test_observer(Arc::new(ChildLockObserver));
-        store.save(&persisted("dl-child-lock")).unwrap();
+        store
+            .admit_test_download(&persisted("dl-child-lock"))
+            .unwrap();
     }
 
     #[test]
     fn os_lock_is_released_when_writer_process_dies() {
         let tmp = TempDir::new().unwrap();
-        DownloadPersistence::new(tmp.path())
-            .save(&persisted("dl-child-lock"))
-            .unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--ignored")
             .arg("--exact")
@@ -3018,34 +2919,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_store_migrates_strictly_on_the_next_mutation() {
-        let tmp = TempDir::new().unwrap();
-        let legacy = serde_json::json!({"downloads": [persisted("dl-legacy")]});
-        std::fs::write(
-            tmp.path().join("downloads.json"),
-            serde_json::to_vec_pretty(&legacy).unwrap(),
-        )
-        .unwrap();
-        let store = DownloadPersistence::new(tmp.path());
-
-        assert_eq!(store.load_all_strict().unwrap().len(), 1);
-        assert!(store
-            .update_status("dl-legacy", DownloadStatus::Error)
-            .unwrap());
-
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(tmp.path().join("downloads.json")).unwrap())
-                .unwrap();
-        assert_eq!(value["schema_version"], DOWNLOAD_STORE_SCHEMA_VERSION);
-        assert!(value.get("store_generation").is_none());
-        assert!(value["recovery_revocations"]
-            .as_object()
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn strict_fresh_read_rejects_unsupported_and_conflicting_v3_documents() {
+    fn strict_fresh_read_rejects_unsupported_and_unowned_v4_documents() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("downloads.json");
         std::fs::write(
@@ -3079,7 +2953,8 @@ mod tests {
                 "recovery_revocations": {
                     "dl-conflict": {
                         "attempt_id": Uuid::new_v4().to_string(),
-                        "disposition": "durable"
+                        "disposition": "durable",
+                        "origin": {"kind": "unadmitted"}
                     }
                 }
             }))
@@ -3092,7 +2967,7 @@ mod tests {
         assert!(matches!(
             conflict,
             crate::PumasError::Validation { ref field, .. }
-                if field == "downloads.recovery_revocations"
+                if field == "downloads.queue_admissions"
         ));
     }
 
@@ -3100,7 +2975,6 @@ mod tests {
     fn durable_revoke_persists_a_confirmed_tombstone_for_a_fresh_owner() {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
-        store.save(&persisted("dl-durable")).unwrap();
 
         let outcome = store.revoke_for_recovery("dl-durable").unwrap();
 
@@ -3123,43 +2997,11 @@ mod tests {
     }
 
     #[test]
-    fn versioned_v1_and_v2_documents_migrate_as_recoverable_v3_state() {
-        for version in [1_u32, 2_u32] {
-            let tmp = TempDir::new().unwrap();
-            let path = tmp.path().join("downloads.json");
-            let mut document = serde_json::json!({
-                "schema_version": version,
-                "downloads": [persisted(&format!("dl-v{version}"))],
-            });
-            if version == 2 {
-                document["recovery_revocations"] = serde_json::json!({});
-            }
-            std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-
-            let store = DownloadPersistence::new(tmp.path());
-            let inventory = store.load_lifecycle_inventory_strict().unwrap();
-            assert_eq!(inventory.downloads.len(), 1);
-            assert!(inventory.quarantines.is_empty());
-
-            assert!(store
-                .update_status(&format!("dl-v{version}"), DownloadStatus::Error)
-                .unwrap());
-            let migrated: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            assert_eq!(migrated["schema_version"], 3);
-            assert!(migrated["lifecycle_quarantines"]
-                .as_object()
-                .unwrap()
-                .is_empty());
-        }
-    }
-
-    #[test]
     fn ambient_quarantine_exclusively_owns_the_snapshot_and_rejects_stale_writers() {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
         let entry = persisted("dl-ambient-quarantine");
-        store.save(&entry).unwrap();
+        let attempt = store.admit_test_download(&entry).unwrap();
 
         store
             .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, true)
@@ -3177,17 +3019,10 @@ mod tests {
             entry.download_id
         );
         assert!(inventory.quarantines["dl-ambient-quarantine"].sticky_failure);
-        assert!(store.save(&entry).is_err());
+        assert!(store.admit_test_download(&entry).is_err());
         assert!(!store
-            .update_status("dl-ambient-quarantine", DownloadStatus::Paused)
+            .update_admitted_status("dl-ambient-quarantine", &attempt, DownloadStatus::Paused)
             .unwrap());
-        assert!(store
-            .begin_legacy_relocation(
-                &Uuid::new_v4().to_string(),
-                &entry,
-                &legacy_relocation_request(tmp.path().join("moved")),
-            )
-            .is_err());
 
         assert!(store
             .verify_lifecycle_quarantine("dl-ambient-quarantine")
@@ -3206,7 +3041,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
         let entry = persisted("dl-recovery-quarantine");
-        store.save(&entry).unwrap();
         store.revoke("dl-recovery-quarantine").unwrap();
 
         store
@@ -3234,7 +3068,9 @@ mod tests {
     fn quarantine_publication_ambiguity_never_authorizes_the_initiating_owner() {
         let tmp = TempDir::new().unwrap();
         let entry = persisted("dl-quarantine-unknown");
-        DownloadPersistence::new(tmp.path()).save(&entry).unwrap();
+        DownloadPersistence::new(tmp.path())
+            .admit_test_download(&entry)
+            .unwrap();
         let pending_publisher = Arc::new(ScriptedPublisher::new([
             ScriptedPublication::Durable,
             ScriptedPublication::PublishedDurabilityUnknown,
@@ -3270,7 +3106,9 @@ mod tests {
     fn failed_pending_intent_leaves_the_ordinary_row_owned_by_a_fresh_writer() {
         let tmp = TempDir::new().unwrap();
         let entry = persisted("dl-quarantine-not-published");
-        DownloadPersistence::new(tmp.path()).save(&entry).unwrap();
+        DownloadPersistence::new(tmp.path())
+            .admit_test_download(&entry)
+            .unwrap();
         let publisher = Arc::new(ScriptedPublisher::new([ScriptedPublication::NotPublished]));
         let store = DownloadPersistence::new(tmp.path()).with_test_publisher(publisher.clone());
 
@@ -3278,9 +3116,9 @@ mod tests {
             .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, false)
             .is_err());
         assert_eq!(publisher.calls(), 1);
-        let fresh = DownloadPersistence::new(tmp.path())
-            .load_lifecycle_inventory_strict()
-            .unwrap();
+        let reopened = DownloadPersistence::new(tmp.path());
+        reopened.reconcile_lifecycle_inventory_strict().unwrap();
+        let fresh = reopened.load_lifecycle_inventory_strict().unwrap();
         assert_eq!(fresh.downloads.len(), 1);
         assert!(fresh.quarantines.is_empty());
     }
@@ -3290,7 +3128,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
         let entry = persisted("dl-clean-cancel");
-        store.save(&entry).unwrap();
+        let attempt = store.admit_test_download(&entry).unwrap();
         store
             .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, false)
             .unwrap();
@@ -3298,7 +3136,7 @@ mod tests {
         assert!(!pending.quarantines["dl-clean-cancel"].sticky_failure);
 
         assert!(store
-            .remove_clean_lifecycle_quarantine("dl-clean-cancel")
+            .settle_queue_admission("dl-clean-cancel", &attempt)
             .unwrap());
         let fresh = DownloadPersistence::new(tmp.path())
             .load_lifecycle_inventory_strict()
@@ -3312,7 +3150,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path());
         let entry = persisted("dl-late-failure");
-        store.save(&entry).unwrap();
+        store.admit_test_download(&entry).unwrap();
         store
             .begin_lifecycle_quarantine(&entry, LifecycleQuarantineDomain::Ambient, false)
             .unwrap();
@@ -3343,255 +3181,6 @@ mod tests {
         }
     }
 
-    fn legacy_relocation_request(target_dir: PathBuf) -> LegacyRelocationRequest {
-        LegacyRelocationRequest {
-            source: admission_request("unused").destination,
-            target: PersistedDestinationIdentity {
-                library_root: "root-device-7-inode-11".into(),
-                relative_target: "llm/new/model".into(),
-            },
-            target_dir,
-            model_type: Some("llm".into()),
-            family: Some("new".into()),
-        }
-    }
-
-    #[test]
-    fn legacy_relocation_refuses_existing_foreign_source_or_target_owners() {
-        for at_target in [false, true] {
-            for quarantined in [false, true] {
-                let tmp = TempDir::new().unwrap();
-                let store = DownloadPersistence::new(tmp.path());
-                let source = persisted("source");
-                store.save(&source).unwrap();
-                let request = LegacyRelocationRequest {
-                    source: admission_request("unused").destination,
-                    target: PersistedDestinationIdentity {
-                        library_root: "root-device-7-inode-11".into(),
-                        relative_target: "llm/new/model".into(),
-                    },
-                    target_dir: tmp.path().join("new"),
-                    model_type: None,
-                    family: None,
-                };
-                let mut foreign = persisted("foreign");
-                foreign.dest_dir = if at_target {
-                    request.target_dir.clone()
-                } else {
-                    source.dest_dir.clone()
-                };
-                store.save(&foreign).unwrap();
-                if quarantined {
-                    store
-                        .begin_lifecycle_quarantine(
-                            &foreign,
-                            LifecycleQuarantineDomain::Ambient,
-                            true,
-                        )
-                        .unwrap();
-                }
-                assert!(store
-                    .begin_legacy_relocation(&Uuid::new_v4().to_string(), &source, &request)
-                    .is_err());
-                let inventory = store.load_lifecycle_inventory_strict().unwrap();
-                assert!(inventory.pending_relocations.is_empty());
-                assert!(inventory
-                    .downloads
-                    .iter()
-                    .any(|row| row.download_id == "source"));
-            }
-        }
-    }
-
-    #[test]
-    fn legacy_relocation_publication_uncertainty_preserves_valid_restart_state() {
-        for abort in [false, true] {
-            for after_effect in [false, true] {
-                let tmp = TempDir::new().unwrap();
-                let store = DownloadPersistence::new(tmp.path());
-                let source = persisted("relocation");
-                store.save(&source).unwrap();
-                let request = LegacyRelocationRequest {
-                    source: admission_request("unused").destination,
-                    target: PersistedDestinationIdentity {
-                        library_root: "root-device-7-inode-11".into(),
-                        relative_target: "llm/new/model".into(),
-                    },
-                    target_dir: tmp.path().join("new"),
-                    model_type: None,
-                    family: None,
-                };
-                let attempt = Uuid::new_v4().to_string();
-                store
-                    .begin_legacy_relocation(&attempt, &source, &request)
-                    .unwrap()
-                    .unwrap();
-                let publisher = ScriptedPublisher::new([if after_effect {
-                    ScriptedPublication::PublishedDurabilityUnknown
-                } else {
-                    ScriptedPublication::VisibilityUnknownBeforeEffect
-                }]);
-                let uncertain = store.with_test_publisher(Arc::new(publisher));
-                let outcome = if abort {
-                    uncertain.abort_legacy_relocation(&source.download_id, &attempt)
-                } else {
-                    uncertain.finish_legacy_relocation(&source.download_id, &attempt)
-                }
-                .unwrap()
-                .unwrap();
-                assert!(!matches!(outcome, AtomicPublication::Durable));
-                let fresh = DownloadPersistence::new(tmp.path());
-                let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
-                if after_effect {
-                    assert!(inventory.pending_relocations.is_empty());
-                    assert_eq!(
-                        inventory.downloads[0].dest_dir,
-                        if abort {
-                            source.dest_dir
-                        } else {
-                            request.target_dir
-                        }
-                    );
-                    assert!(fresh
-                        .finish_legacy_relocation("relocation", &attempt)
-                        .is_err());
-                } else {
-                    assert!(inventory.downloads.is_empty());
-                    assert!(inventory.pending_relocations.contains_key("relocation"));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn uncertain_relocation_intent_never_exposes_source_as_resumable() {
-        let tmp = TempDir::new().unwrap();
-        let store = DownloadPersistence::new(tmp.path());
-        let source = persisted("relocation");
-        store.save(&source).unwrap();
-        let request = LegacyRelocationRequest {
-            source: admission_request("unused").destination,
-            target: PersistedDestinationIdentity {
-                library_root: "root-device-7-inode-11".into(),
-                relative_target: "llm/new/model".into(),
-            },
-            target_dir: tmp.path().join("new"),
-            model_type: None,
-            family: None,
-        };
-        let attempt = Uuid::new_v4().to_string();
-        let uncertain = store.with_test_publisher(Arc::new(ScriptedPublisher::new([
-            ScriptedPublication::PublishedDurabilityUnknown,
-        ])));
-        assert!(matches!(
-            uncertain
-                .begin_legacy_relocation(&attempt, &source, &request)
-                .unwrap()
-                .unwrap(),
-            AtomicPublication::PublishedDurabilityUnknown { .. }
-        ));
-        let fresh = DownloadPersistence::new(tmp.path());
-        fresh.reconcile_lifecycle_inventory_strict().unwrap();
-        assert!(fresh.load_all_strict().unwrap().is_empty());
-        assert_eq!(
-            fresh
-                .load_lifecycle_inventory_strict()
-                .unwrap()
-                .pending_relocations["relocation"]
-                .request,
-            request
-        );
-        assert!(matches!(
-            fresh
-                .abort_legacy_relocation("relocation", &attempt)
-                .unwrap()
-                .unwrap(),
-            AtomicPublication::Durable
-        ));
-        assert_eq!(
-            fresh.load_all_strict().unwrap()[0].dest_dir,
-            source.dest_dir
-        );
-    }
-
-    #[test]
-    fn legacy_relocation_parks_both_destinations_and_publishes_only_exact_target() {
-        let tmp = TempDir::new().unwrap();
-        let store = DownloadPersistence::new(tmp.path());
-        let source = persisted("relocating");
-        store.save(&source).unwrap();
-        let request = LegacyRelocationRequest {
-            source: admission_request("unused").destination,
-            target: PersistedDestinationIdentity {
-                library_root: "root-device-7-inode-11".into(),
-                relative_target: "llm/new/model".into(),
-            },
-            target_dir: tmp.path().join("new"),
-            model_type: Some("llm".into()),
-            family: Some("new".into()),
-        };
-        let attempt = Uuid::new_v4().to_string();
-        let mut stale = source.clone();
-        stale.repo_id = "wrong/repo".into();
-        assert!(store
-            .begin_legacy_relocation(&attempt, &stale, &request)
-            .is_err());
-        assert!(matches!(
-            store
-                .begin_legacy_relocation(&attempt, &source, &request)
-                .unwrap()
-                .unwrap(),
-            AtomicPublication::Durable
-        ));
-        let fresh = DownloadPersistence::new(tmp.path());
-        assert!(fresh.load_all_strict().unwrap().is_empty());
-        let inventory = fresh.load_lifecycle_inventory_strict().unwrap();
-        assert_eq!(inventory.pending_relocations["relocating"].request, request);
-        assert_eq!(
-            inventory.pending_relocations["relocating"]
-                .snapshot
-                .dest_dir,
-            source.dest_dir
-        );
-        for identity in [&request.source, &request.target] {
-            let mut admission = admission_request("intruder");
-            admission.destination = identity.clone();
-            assert!(fresh
-                .admit_download(&Uuid::new_v4().to_string(), &admission)
-                .is_err());
-        }
-        assert!(fresh.save(&source).is_err());
-        assert!(fresh.remove(&source.download_id).is_err());
-        assert!(fresh
-            .update_status(&source.download_id, DownloadStatus::Error)
-            .is_err());
-        assert!(fresh.revoke(&source.download_id).is_err());
-        assert!(fresh
-            .begin_lifecycle_quarantine(&source, LifecycleQuarantineDomain::Ambient, false)
-            .is_err());
-        assert!(fresh
-            .finish_legacy_relocation(&source.download_id, &Uuid::new_v4().to_string())
-            .is_err());
-        assert!(matches!(
-            fresh
-                .finish_legacy_relocation(&source.download_id, &attempt)
-                .unwrap()
-                .unwrap(),
-            AtomicPublication::Durable
-        ));
-        let after = DownloadPersistence::new(tmp.path())
-            .load_all_strict()
-            .unwrap();
-        let mut expected = source;
-        expected.dest_dir = request.target_dir;
-        expected.download_request.model_type = request.model_type;
-        expected.download_request.family = request.family.unwrap();
-        assert!(persisted_download_matches(&after[0], &expected));
-        assert!(fresh
-            .finish_legacy_relocation(&expected.download_id, &attempt)
-            .is_err());
-    }
-
     #[test]
     fn admitted_status_update_requires_confirmed_exact_owner_and_preserves_request() {
         let tmp = TempDir::new().unwrap();
@@ -3610,9 +3199,6 @@ mod tests {
         let fresh = DownloadPersistence::new(tmp.path());
         assert!(!fresh
             .update_admitted_status("status", &attempt, DownloadStatus::Paused)
-            .unwrap());
-        assert!(!store
-            .update_status("status", DownloadStatus::Error)
             .unwrap());
         assert!(store
             .update_admitted_status("status", &attempt, DownloadStatus::Paused)
@@ -3748,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_save_is_rejected_before_overwriting_a_hidden_admission() {
+    fn conflicting_admission_is_rejected_before_overwriting_a_hidden_admission() {
         let tmp = TempDir::new().unwrap();
         let store = DownloadPersistence::new(tmp.path()).with_test_publisher(Arc::new(
             ScriptedPublisher::new([ScriptedPublication::PublishedDurabilityUnknown]),
@@ -3760,7 +3346,7 @@ mod tests {
                 .unwrap(),
             DownloadAdmissionTransition::PublishedDurabilityUnknown { .. }
         ));
-        assert!(store.save(&request.snapshot).is_err());
+        assert!(store.admit_test_download(&request.snapshot).is_err());
         let fresh = DownloadPersistence::new(tmp.path())
             .load_lifecycle_inventory_strict()
             .unwrap();
@@ -3846,15 +3432,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mutations_cannot_release_or_relocate_queue_owned_downloads() {
-        for operation in [
-            "quarantine_drift",
-            "save",
-            "remove",
-            "revoke",
-            "relocate",
-            "clean_quarantine",
-        ] {
+    fn conflicting_mutations_cannot_replace_or_release_queue_owned_downloads() {
+        for operation in ["quarantine_drift", "admit", "revoke", "clean_quarantine"] {
             let tmp = TempDir::new().unwrap();
             let store = DownloadPersistence::new(tmp.path());
             let request = admission_request("queued");
@@ -3873,20 +3452,12 @@ mod tests {
                         )
                         .is_err()
                 }
-                "save" => {
+                "admit" => {
                     let mut stale = request.snapshot.clone();
                     stale.dest_dir = tmp.path().join("other");
-                    store.save(&stale).is_err()
+                    store.admit_test_download(&stale).is_err()
                 }
-                "remove" => store.remove("queued").is_err(),
                 "revoke" => store.revoke("queued").is_err(),
-                "relocate" => store
-                    .begin_legacy_relocation(
-                        &Uuid::new_v4().to_string(),
-                        &request.snapshot,
-                        &legacy_relocation_request(tmp.path().join("other")),
-                    )
-                    .is_err(),
                 _ => {
                     store
                         .begin_lifecycle_quarantine(

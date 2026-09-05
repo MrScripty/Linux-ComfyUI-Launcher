@@ -27,7 +27,6 @@ type FallibleBlockingReceiver<T, E> =
 pub(super) enum TaskRole {
     AdmissionTransition,
     RecoveryTransition,
-    RelocationTransition,
     Worker,
     CancelFinalizer,
     TerminalProjection,
@@ -120,67 +119,11 @@ pub(super) struct DestinationExecutionOwner {
 }
 
 impl DestinationExecutionOwner {
-    /// A physical legacy-directory move owns both names. The target must have
-    /// no incumbent; the source may only be taken by its current first owner.
-    pub(super) fn reserve_relocation(
-        &self,
-        source: DestinationIdentity,
-        target: DestinationIdentity,
-        download_id: String,
-        generation: TaskGeneration,
-    ) -> bool {
-        if source == target {
-            return false;
-        }
-        let mut queues = self
-            .queues
-            .lock()
-            .expect("HF destination-execution owner lock poisoned");
-        if queues
-            .get(&target)
-            .is_some_and(|queue| !queue.claims.is_empty())
-        {
-            return false;
-        }
-        if queues.get(&source).is_some_and(|queue| {
-            queue.claims.front().is_some_and(|claim| {
-                claim.download_id != download_id || claim.domain != DestinationDomain::Ambient
-            }) || queue
-                .released
-                .contains(&(download_id.clone(), DestinationDomain::Ambient))
-        }) {
-            return false;
-        }
-        let queue = queues.entry(source).or_default();
-        if let Some(claim) = queue.claims.front_mut() {
-            claim.generation = Some(generation.clone());
-        } else {
-            queue.claims.push_back(DestinationClaim {
-                download_id: download_id.clone(),
-                domain: DestinationDomain::Ambient,
-                generation: Some(generation.clone()),
-                ready: Arc::new(Notify::new()),
-            });
-        }
-        let queue = queues.entry(target).or_default();
-        queue
-            .released
-            .remove(&(download_id.clone(), DestinationDomain::Ambient));
-        queue.claims.push_back(DestinationClaim {
-            download_id,
-            domain: DestinationDomain::Ambient,
-            generation: Some(generation),
-            ready: Arc::new(Notify::new()),
-        });
-        true
-    }
     pub(super) fn new() -> Self {
         Self::default()
     }
 
-    /// Reserves a destination position at the state/task commit point. A
-    /// repeated reservation for the same download transfers that position to
-    /// the successor lifecycle generation without reordering the queue.
+    /// Reserves or transfers a lifecycle generation without changing FIFO order.
     pub(super) fn reserve(
         &self,
         destination: DestinationIdentity,
@@ -319,41 +262,46 @@ impl DestinationExecutionOwner {
         domain: DestinationDomain,
         generation: &TaskGeneration,
     ) -> bool {
-        match self.release_deferred(destination, download_id, domain, generation) {
-            Some(release) => {
-                release.wake();
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Commits exact queue bookkeeping without signaling under a caller's guard.
-    pub(super) fn release_deferred(
-        &self,
-        destination: &DestinationIdentity,
-        download_id: &str,
-        domain: DestinationDomain,
-        generation: &TaskGeneration,
-    ) -> Option<DestinationRelease> {
         let next = {
             let mut queues = self
                 .queues
                 .lock()
                 .expect("HF destination-execution owner lock poisoned");
-            let queue = queues.get_mut(destination)?;
-            let index = queue
+            let Some(queue) = queues.get_mut(destination) else {
+                return false;
+            };
+            let Some(index) = queue
                 .claims
                 .iter()
-                .position(|claim| claim.matches(download_id, domain, generation))?;
+                .position(|claim| claim.matches(download_id, domain, generation))
+            else {
+                return false;
+            };
             queue.claims.remove(index);
             queue.released.insert((download_id.to_string(), domain));
-            let next = (index == 0)
+            (index == 0)
                 .then(|| queue.claims.front().map(|claim| claim.ready.clone()))
-                .flatten();
-            next
+                .flatten()
         };
-        Some(DestinationRelease { next })
+        if let Some(next) = next {
+            next.notify_waiters();
+        }
+        true
+    }
+
+    /// Eligibility check only; the installed generation must still acquire its turn.
+    pub(super) fn is_first(
+        &self,
+        destination: &DestinationIdentity,
+        download_id: &str,
+        domain: DestinationDomain,
+    ) -> bool {
+        self.queues
+            .lock()
+            .expect("HF destination-execution owner lock poisoned")
+            .get(destination)
+            .and_then(|queue| queue.claims.front())
+            .is_some_and(|claim| claim.download_id == download_id && claim.domain == domain)
     }
 
     #[cfg(test)]
@@ -384,18 +332,6 @@ impl DestinationExecutionOwner {
             .get(destination)
             .map(|queue| queue.claims.len())
             .unwrap_or(0)
-    }
-}
-
-pub(super) struct DestinationRelease {
-    next: Option<Arc<Notify>>,
-}
-
-impl DestinationRelease {
-    pub(super) fn wake(self) {
-        if let Some(next) = self.next {
-            next.notify_waiters();
-        }
     }
 }
 
@@ -652,7 +588,6 @@ struct RetiredTask {
 }
 
 struct TaskEntry {
-    relocation_completion: Option<tokio::sync::watch::Receiver<bool>>,
     admission: Option<(PendingAdmissionIdentity, tokio::sync::watch::Receiver<bool>)>,
     generation: TaskGeneration,
     role: TaskRole,
@@ -868,7 +803,6 @@ pub(super) enum ProjectionSettlement {
 
 #[derive(Debug)]
 pub(super) enum CancelTransition {
-    Relocating(tokio::sync::watch::Receiver<bool>),
     Started(InstalledTask),
     Existing(InstalledTask),
     AlreadyRunning,
@@ -1038,7 +972,6 @@ impl DownloadTaskOwner {
             download_id.clone(),
             TaskEntry {
                 admission: None,
-                relocation_completion: None,
                 generation: generation.clone(),
                 role: entry.role,
                 outer: entry.outer,
@@ -1210,35 +1143,6 @@ impl DownloadTaskOwner {
         }
     }
 
-    pub(super) fn bind_relocation_completion(
-        &self,
-        download_id: &str,
-        generation: &TaskGeneration,
-        completion: tokio::sync::watch::Receiver<bool>,
-    ) -> bool {
-        let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
-        let Some(entry) = tasks.get_mut(download_id) else {
-            return false;
-        };
-        if entry.role != TaskRole::RelocationTransition || !entry.generation.matches(generation) {
-            return false;
-        }
-        entry.relocation_completion = Some(completion);
-        true
-    }
-
-    pub(super) fn relocation_completion(
-        &self,
-        download_id: &str,
-    ) -> Option<tokio::sync::watch::Receiver<bool>> {
-        self.tasks
-            .lock()
-            .expect("HF task owner lock poisoned")
-            .get(download_id)
-            .filter(|entry| entry.role == TaskRole::RelocationTransition)
-            .and_then(|entry| entry.relocation_completion.clone())
-    }
-
     pub(super) fn pending_admission(
         &self,
         identity: &PendingAdmissionIdentity,
@@ -1313,13 +1217,6 @@ impl DownloadTaskOwner {
         }
         let mut tasks = self.tasks.lock().expect("HF task owner lock poisoned");
         if let Some(current) = tasks.get_mut(download_id) {
-            if current.role == TaskRole::RelocationTransition {
-                if let Some(completion) = current.relocation_completion.as_ref() {
-                    if !*completion.borrow() {
-                        return CancelTransition::Relocating(completion.clone());
-                    }
-                }
-            }
             if current.role == TaskRole::CancelFinalizer && !current.finished() {
                 return if TaskStartState::load(&current.start_state) == TaskStartState::Running {
                     CancelTransition::AlreadyRunning
@@ -1339,7 +1236,6 @@ impl DownloadTaskOwner {
             .is_some_and(|entry| entry.outer.is_finished());
         let abort_on_start = current
             .as_ref()
-            .filter(|entry| entry.role != TaskRole::RelocationTransition)
             .map(|entry| entry.outer.abort_handle())
             .into_iter()
             .collect();
@@ -1382,7 +1278,6 @@ impl DownloadTaskOwner {
             download_id.to_string(),
             TaskEntry {
                 admission: None,
-                relocation_completion: None,
                 generation: generation.clone(),
                 role: TaskRole::CancelFinalizer,
                 outer,
@@ -1589,7 +1484,6 @@ impl DownloadTaskOwner {
             download_id.to_string(),
             TaskEntry {
                 admission: None,
-                relocation_completion: None,
                 generation: generation.clone(),
                 role: TaskRole::TerminalProjection,
                 outer,
@@ -1859,6 +1753,7 @@ impl DownloadTaskOwner {
         self.retired_observations.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn register_blocking<T, F>(
         self: &Arc<Self>,
         download_id: &str,
@@ -2229,9 +2124,8 @@ impl TaskContext {
         Ok(())
     }
 
-    /// Tracks completion and panics when the caller classifies richer domain
-    /// outcomes itself (for example definite refusal versus uncertain move).
-    /// Such callers must retain custody for any unresolved outcome.
+    /// Exercises owned blocking success/panic observation without a domain error.
+    #[cfg(test)]
     pub(super) async fn run_blocking_named<T, F>(
         &self,
         operation: &'static str,
@@ -2507,7 +2401,6 @@ mod tests {
                 finalizer.start();
             }
             CancelTransition::AlreadyRunning => {}
-            CancelTransition::Relocating(_) => return false,
         }
         true
     }

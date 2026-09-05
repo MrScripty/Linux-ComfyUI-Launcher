@@ -3349,6 +3349,46 @@
   slice. Full C3/C4 and transport/UI acceptance remain pending. Unrelated
   drafts and the original staged UniFFI change remain separately owned.
 
+### 2026-09-04 — Queued-Pause Restart Scope Blocker
+
+- Same-session queued pause and resumed marker provenance have focused green
+  draft evidence. Stronger restart evidence exposes absent durable legacy FIFO
+  ownership: a successor can execute before the paused legacy head releases.
+- `RUST-I10` owns the required ownership/migration decision. Source is frozen,
+  uncommitted, and unaccepted pending user direction; the failing legacy
+  fixture remains intact. The focused Rust ledger records the causal evidence.
+
+### 2026-09-04 — Current-Only Cutover Authorized
+
+- The user selected a one-time update of the existing library and removal of
+  runtime legacy support. This supersedes the preceding scope blocker, not
+  the observed missing-FIFO evidence. Current records must carry durable
+  admission ownership; old formats must fail without mutation.
+- Two paused records in distinct local destinations were inspected. A
+  temporary offline converter is being verified separately from shipping
+  source. Live records and model files remain unchanged. Automatic finishing
+  remains required for current admitted downloads; explicit resume is not an
+  acceptable replacement. Tests, lint, publication, and acceptance are pending.
+
+### 2026-09-04 — Current-Only Cutover and Queued Pause Accepted
+
+- Runtime legacy tracking/relocation support is removed. The two local paused
+  records were updated once with a synced exact backup and durable publication;
+  all inspected file bytes and absent paths are unchanged. The converter is
+  retired and excluded from shipping source.
+- Current admissions preserve queued pause, restart ordering, marker selection,
+  and no-network automatic finishing. A deterministic completion-handoff race
+  was reproduced and fixed without consuming replacement state. Independent
+  review accepts the narrow boundary.
+- Both full core package configurations pass 1,166 tests each with 11 existing
+  ignores. Strict core lint passes in both feature configurations; strict
+  supported-workspace lint passes. The development backend builds; release
+  binaries require rebuilding, and GUI acceptance remains separate.
+- Accept RUST-I9/RUST-I10 incrementally. The focused Rust ledger owns exact
+  hashes, live-data proof, scope, and limits. Remaining current-format C3
+  unresolved-state restore precedes broader transport/UI integration; full
+  C3/C4 and Milestone 2 acceptance remain pending.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.

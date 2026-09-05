@@ -3,11 +3,9 @@
 use super::{reconcile_on_demand, ReconcileScope};
 use crate::error::{PumasError, Result};
 use crate::model_library;
-use crate::models;
 use crate::PumasApi;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
 
 const MIGRATION_REPORTS_DIR: &str = "migration-reports";
 
@@ -110,12 +108,7 @@ impl PumasApi {
             .model_library
             .execute_migration_with_checkpoint()
             .await?;
-        let mutated = relocate_skipped_partial_downloads(
-            &primary.model_library,
-            primary.hf_client.as_ref(),
-            &mut report,
-        )
-        .await?;
+        let mutated = mark_partial_download_moves_unsupported(&mut report);
         if mutated {
             recompute_execution_report_counts(&mut report);
             // Rewrite artifacts so UI/opened report JSON reflects post-move outcomes.
@@ -232,159 +225,23 @@ async fn reconcile_all_models_for_migration(
     Ok(())
 }
 
-pub(crate) fn split_model_id(model_id: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = model_id.splitn(3, '/');
-    let model_type = parts.next()?;
-    let family = parts.next()?;
-    let cleaned_name = parts.next()?;
-    Some((model_type, family, cleaned_name))
-}
-
-pub(crate) async fn wait_for_download_pause(
-    client: &model_library::HuggingFaceClient,
-    download_id: &str,
-) -> Result<()> {
-    for _ in 0..80 {
-        match client.get_download_status(download_id).await {
-            Some(models::DownloadStatus::Paused)
-            | Some(models::DownloadStatus::Error)
-            | Some(models::DownloadStatus::Cancelled)
-            | Some(models::DownloadStatus::Completed) => return Ok(()),
-            Some(models::DownloadStatus::Downloading)
-            | Some(models::DownloadStatus::Queued)
-            | Some(models::DownloadStatus::Pausing)
-            | Some(models::DownloadStatus::Cancelling) => {
-                sleep(Duration::from_millis(250)).await;
-            }
-            None => {
-                return Err(PumasError::NotFound {
-                    resource: format!("download_id {}", download_id),
-                });
-            }
-        }
-    }
-
-    Err(PumasError::Other(format!(
-        "Timed out waiting for download {} to pause before migration move",
-        download_id
-    )))
-}
-
-pub(crate) async fn relocate_skipped_partial_downloads(
-    library: &model_library::ModelLibrary,
-    hf_client: Option<&model_library::HuggingFaceClient>,
+/// Preserve partial downloads at their admitted destination. Directory migration
+/// cannot change that identity without an owned admission transition.
+pub(crate) fn mark_partial_download_moves_unsupported(
     report: &mut model_library::MigrationExecutionReport,
-) -> Result<bool> {
-    let mut mutated = false;
+) -> bool {
+    let mut changed = false;
     for row in &mut report.results {
-        if row.action != "skipped_partial_download" {
-            continue;
-        }
-        let Some((target_model_type, target_family, target_cleaned_name)) =
-            split_model_id(&row.target_model_id)
-        else {
-            row.action = "partial_move_error".into();
-            row.error = Some(format!("Invalid target model_id: {}", row.target_model_id));
-            mutated = true;
-            continue;
-        };
-        let Some(client) = hf_client else {
-            row.error =
-                Some("Partial download retained: download lifecycle owner unavailable".into());
-            mutated = true;
-            continue;
-        };
-        let source_dir = library.library_root().join(&row.model_id);
-        let target_dir =
-            library.build_model_path(target_model_type, target_family, target_cleaned_name);
-        let mut relocation_completed = false;
-        let move_result: Result<bool> = async {
-            let Some(download_id) = client.download_owner_for_move(&source_dir).await? else {
-                return Ok(false);
-            };
-            let metadata = library
-                .index()
-                .get(&row.model_id)?
-                .map(|record| {
-                    serde_json::from_value::<model_library::ModelMetadata>(record.metadata)
-                })
-                .transpose()?;
-            let status = client.get_download_status(&download_id).await;
-            let resume_after_move = matches!(
-                status,
-                Some(
-                    models::DownloadStatus::Queued
-                        | models::DownloadStatus::Downloading
-                        | models::DownloadStatus::Pausing
-                )
-            );
-            if resume_after_move {
-                if status != Some(models::DownloadStatus::Pausing)
-                    && !client.pause_download(&download_id).await?
-                {
-                    return Err(PumasError::Validation {
-                        field: "download_relocation".into(),
-                        message: "Download owner refused migration pause".into(),
-                    });
-                }
-                wait_for_download_pause(client, &download_id).await?;
-            }
-            if !client
-                .relocate_download_destination_from(
-                    &download_id,
-                    &source_dir,
-                    &target_dir,
-                    Some(target_model_type),
-                    Some(target_family),
-                )
-                .await?
-            {
-                return Err(PumasError::Validation {
-                    field: "download_relocation".into(),
-                    message: "Download owner refused relocation before movement".into(),
-                });
-            }
-            relocation_completed = true;
-            if let Some(mut metadata) = metadata {
-                metadata.model_id = Some(row.target_model_id.clone());
-                metadata.model_type = Some(target_model_type.to_string());
-                metadata.family = Some(target_family.to_string());
-                metadata.cleaned_name = Some(target_cleaned_name.to_string());
-                metadata.updated_date = Some(chrono::Utc::now().to_rfc3339());
-                library.upsert_index_from_metadata(&target_dir, &metadata)?;
-                library.index().delete(&row.model_id)?;
-            }
-            // A later index or resume failure cannot authorize a physical rollback.
-            if resume_after_move && !client.resume_download(&download_id).await? {
-                return Err(PumasError::Validation {
-                    field: "download_relocation".into(),
-                    message: "Download moved, but its owner refused resumption".into(),
-                });
-            }
-            Ok(true)
-        }
-        .await;
-        match move_result {
-            Ok(true) => {
-                row.action = "moved_partial".into();
-                row.error = None;
-            }
-            Ok(false) => {
-                row.error = Some("Partial download retained: no tracked download owner".into());
-            }
-            Err(error) => {
-                if relocation_completed {
-                    row.action = "moved_partial".into();
-                    row.error = Some(format!("Download moved; post-move update failed: {error}"));
-                } else {
-                    row.action = "partial_move_error".into();
-                    row.error = Some(error.to_string());
-                }
+        if row.action == "skipped_partial_download" {
+            let reason =
+                "Partial download retained: moving an admitted download destination is unsupported";
+            if row.error.as_deref() != Some(reason) {
+                row.error = Some(reason.into());
+                changed = true;
             }
         }
-        mutated = true;
     }
-    Ok(mutated)
+    changed
 }
 
 pub(crate) fn recompute_execution_report_counts(
@@ -415,114 +272,56 @@ mod tests {
     use super::normalize_migration_report_path;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn partial_migration_preserves_bytes_when_download_owner_refuses() {
+    #[test]
+    fn unsupported_partial_move_preserves_files_and_completed_results() {
         let temp = TempDir::new().unwrap();
-        let library = crate::model_library::ModelLibrary::new(temp.path().join("models"))
-            .await
-            .unwrap();
-        let source = library.library_root().join("llm/old/model");
-        let target = library.library_root().join("llm/new/model");
+        let source = temp.path().join("llm/old/model");
+        let target = temp.path().join("llm/new/model");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("weights.gguf.part"), b"partial bytes").unwrap();
-        let mut client = crate::model_library::HuggingFaceClient::new(temp.path()).unwrap();
-        client
-            .configure_download_destination_root(library.library_root())
-            .unwrap();
-        let persistence =
-            std::sync::Arc::new(crate::model_library::DownloadPersistence::new(temp.path()));
-        let snapshot: crate::model_library::download_store::PersistedDownload =
-            serde_json::from_value(serde_json::json!({
-                "download_id": "not-restored",
-                "repo_id": "owner/model",
-                "filename": "weights.gguf",
-                "filenames": ["weights.gguf"],
-                "dest_dir": source,
-                "total_bytes": 100,
-                "status": "paused",
-                "download_request": {
-                    "repo_id": "owner/model", "family": "old", "official_name": "Model"
-                },
-                "created_at": "2026-09-04T00:00:00Z"
-            }))
-            .unwrap();
-        persistence.save(&snapshot).unwrap();
-        client.set_persistence(persistence.clone());
-        // The persisted row exists, but no runtime owner has restored it.
-        // A refusal must not be treated as a successful filesystem move.
+        let marker = b"{\"repo_id\":\"owner/model\"}";
+        std::fs::write(source.join(".pumas_download"), marker).unwrap();
         let mut report = crate::model_library::MigrationExecutionReport {
-            results: vec![crate::model_library::MigrationExecutionItem {
-                model_id: "llm/old/model".into(),
-                target_model_id: "llm/new/model".into(),
-                action: "skipped_partial_download".into(),
-                error: None,
-            }],
+            referential_integrity_ok: true,
+            results: vec![
+                crate::model_library::MigrationExecutionItem {
+                    model_id: "llm/old/model".into(),
+                    target_model_id: "llm/new/model".into(),
+                    action: "skipped_partial_download".into(),
+                    error: None,
+                },
+                crate::model_library::MigrationExecutionItem {
+                    model_id: "llm/old/complete".into(),
+                    target_model_id: "llm/new/complete".into(),
+                    action: "moved".into(),
+                    error: None,
+                },
+            ],
             ..Default::default()
         };
-        super::relocate_skipped_partial_downloads(&library, Some(&client), &mut report)
-            .await
-            .unwrap();
-        assert_eq!(report.results[0].action, "partial_move_error");
+        assert!(super::mark_partial_download_moves_unsupported(&mut report));
+        super::recompute_execution_report_counts(&mut report);
+        assert_eq!(report.results[0].action, "skipped_partial_download");
         assert!(report.results[0]
             .error
             .as_deref()
             .unwrap()
-            .contains("refused"));
+            .contains("unsupported"));
+        assert_eq!(report.results[1].action, "moved");
+        assert!(report.results[1].error.is_none());
+        assert_eq!(report.completed_move_count, 1);
+        assert_eq!(report.skipped_move_count, 1);
+        assert_eq!(report.error_count, 0);
         assert_eq!(
             std::fs::read(source.join("weights.gguf.part")).unwrap(),
             b"partial bytes"
         );
+        assert_eq!(
+            std::fs::read(source.join(".pumas_download")).unwrap(),
+            marker
+        );
         assert!(!target.exists());
-        assert_eq!(persistence.load_all_strict().unwrap()[0].dest_dir, source);
-
-        let marker = serde_json::json!({
-            "repo_id": "owner/model", "family": "old", "model_type": "llm",
-            "selected_artifact": {"artifact_id": "selected-q4", "selected_quant": "q4_k_m"}
-        });
-        std::fs::write(
-            source.join(".pumas_download"),
-            serde_json::to_vec(&marker).unwrap(),
-        )
-        .unwrap();
-        library
-            .upsert_index_from_metadata(
-                &source,
-                &crate::model_library::ModelMetadata {
-                    model_id: Some("llm/old/model".into()),
-                    family: Some("old".into()),
-                    model_type: Some("llm".into()),
-                    official_name: Some("Model".into()),
-                    cleaned_name: Some("model".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        client.restore_persisted_downloads().await.unwrap();
-        report.results[0].action = "skipped_partial_download".into();
-        super::relocate_skipped_partial_downloads(&library, Some(&client), &mut report)
-            .await
-            .unwrap();
-        assert_eq!(
-            report.results[0].action, "moved_partial",
-            "{:?}",
-            report.results[0].error
-        );
-        assert!(report.results[0].error.is_none());
-        assert!(!source.exists());
-        assert_eq!(
-            std::fs::read(target.join("weights.gguf.part")).unwrap(),
-            b"partial bytes"
-        );
-        let actual: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(target.join(".pumas_download")).unwrap())
-                .unwrap();
-        assert_eq!(actual["family"], "new");
-        assert_eq!(actual["architecture_family"], "new");
-        assert_eq!(actual["selected_artifact"], marker["selected_artifact"]);
-        let reopened = crate::model_library::DownloadPersistence::new(temp.path());
-        assert_eq!(reopened.load_all_strict().unwrap()[0].dest_dir, target);
-        assert!(library.index().get("llm/old/model").unwrap().is_none());
-        assert!(library.index().get("llm/new/model").unwrap().is_some());
+        assert!(!super::mark_partial_download_moves_unsupported(&mut report));
     }
 
     #[test]
