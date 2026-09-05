@@ -21,6 +21,63 @@
 
 ## Slice Log
 
+### 2026-09-05 — Capability cleanup parent synchronization
+
+- Exact source: `download_recovery.rs` SHA-256
+  `c5a74139b549780d455fe9d0cd9f515fd335a3209d59d4b7df9530ba055afb0e`.
+  Partial and marker deletion share one private unlink/sync implementation;
+  callers retain the existing result Interface. Synchronize the exact held
+  parent after unlink or NotFound retry; other unlink failures return before
+  synchronization. Existing absent-parent behavior and path checks are unchanged.
+- RED: `cargo test --offline -p pumas-library --lib
+  cleanup_requires_exact_parent_sync_even_on_absent_retry` failed both actual-method tests because
+  deletion returned success without invoking the required barrier. Both pass
+  after the fix. A per-destination test-only sync Adapter proves real unlink
+  ordering, exact parent inode/device, EIO propagation, and absent-entry retry.
+  Removing injection also exercises successful real directory synchronization.
+- The invalid-target regression preserves directory contents and observes no
+  sync. Root tightened its diagnostic to match independent native unlink errno
+  for the same directory target, avoiding an incidental generic failure or
+  a Linux-only errno assumption. Production was unchanged by that tightening.
+- Independent source/caller review passes: sync errors feed cancellation's
+  filesystem-failure path, skip persistence settlement, retain failure and
+  destination ownership, and allow explicit retry. Existing retained-owner and
+  containment checks remain regression obligations. The 24 capability tests
+  passed before the diagnostic-only tightening; final package gates follow.
+- Focused logs: `/tmp/pumas-durable-unlink-{red,green,focused}.log`; root gates
+  `/tmp/pumas-durable-cleanup.2dOUZ8/`. Linux syscall/order/error evidence is not
+  a power-loss, Windows/macOS, or automatic Pending replay claim.
+- Final-source package evidence: `cargo test --offline -p pumas-library`,
+  default and `--no-default-features`, each 1,197 passing (1,094 unit plus 103
+  integration/doc), 11 existing ignores. Root reran the default suite after
+  diagnostic tightening; `core-default-final.log` and `core-no-default.log`
+  own final results. Real local socket/process tests use the permitted host
+  environment. Live download store SHA-256 remains
+  `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+- Supporting gates pass: `cargo clippy --offline -p pumas-library --all-targets
+  --all-features -- -D warnings`, the same command replacing `--all-features`
+  with `--no-default-features`, `cargo fmt --all -- --check`, diff whitespace,
+  and all five plan contracts at standards `aff5b867`. No suppression or hook
+  bypass. The unlink prerequisite is accepted; Pending replay and full C3/C4
+  remain open.
+
+### 2026-09-05 — Pending replay prerequisites and durable-unlink admission
+
+- Continued from `072a7bd4` against standards
+  `aff5b8673264a11785b65cf3e9bf04f6e0fb86ee`. Its changes since `1609c304` are
+  standards tooling/docs; applicable coding rules are unchanged.
+- Read-only lifecycle/store review found Pending is not replay authority:
+  public inventory combines PendingIntent, Pending, VerifiedIntent, and
+  unconfirmed Verified. Store transaction locks do not exclude another live
+  client's filesystem work; destination queues are client-local. The existing
+  held-cleanup/fresh-client test must keep refusing replay with retained bytes.
+- Capability `remove_part`/`remove_marker` also omit parent sync. Admit this
+  bounded prerequisite first: only `download_recovery.rs` and its tests, using
+  exact held-parent authority, sync after successful unlink or NotFound retry,
+  and propagated sync failure. Keep shared durability ordering inside its
+  private Module, not duplicated across callers. No Pending replay, new lease,
+  store phase transition, schema, dependency, or live data change is admitted.
+
 ### 2026-09-05 — Verified Recovery settlement admitted
 
 - Continued this plan from `2e79993c` against unchanged standards `1609c304`.

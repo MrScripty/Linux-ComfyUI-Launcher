@@ -31,13 +31,23 @@ preserved hidden history/tombstone, follower progress, and repeat restore
 without recreating execution authority. Pending and unquarantined Recovery
 still refuse with unchanged custody and payload.
 
-**Next slice:** Bound Pending cleanup restoration against its durable intent,
-exact admission, and held destination authority before admitting implementation.
-Require a deciding real-store/filesystem regression and retained cleanup owner;
-do not treat the snapshot alone as permission to delete or resume. Unquarantined
-Recovery and hidden/unknown admission remain separate. No live mutation,
-schema change, legacy support, or C4 importer change is admitted by this
-investigation; persisted-cutpoint tests do not prove hard-process recovery.
+Capability-relative partial-file and marker deletion now syncs the exact held
+parent before success, including an already-absent entry retry. The bounded
+`download_recovery.rs` correction is accepted after review, dual package tests,
+strict lint, and formatting. Callers retain their existing Interface.
+
+**Next slice:** Bound store-owned cleanup preparation that distinguishes
+persisted intent phases and returns exact-attempt evidence without authorizing
+filesystem replay. Record its failure/publication outcomes and deciding
+real-store regression before implementation. Cross-client/process exclusion
+through cleanup drain remains a separate prerequisite for actual Pending replay.
+
+Pending replay remains excluded. Investigation found three prerequisites:
+cross-client/process exclusion through cleanup drain; distinguishing persisted
+intent phases currently projected together as Pending; and parent-sync deletion
+durability. The current checkpoint addresses only the last. Preserve fresh-client
+refusal while an earlier cleanup is held. No snapshot-derived deletion/resume,
+live library mutation, legacy support, or C4 importer change is admitted.
 
 The current-only cutover and queued pause remain accepted. Full C3, admitted
 relocation, guard-free effects, C4 awaited importer integration, and hard-process
@@ -846,7 +856,9 @@ no required-real environment is represented by a lower-fidelity substitute.
 
 ## Blockers
 
-- None external for the admitted Verified Ambient settlement checkpoint.
+- The durable-unlink checkpoint is accepted on Linux. Pending replay still
+  requires phase-aware preparation and cross-client/process exclusion through
+  cleanup drain; it is not admitted by the unlink fix.
 - `RUST-I1` is resolved; Milestone 2 enforces the accepted loopback-only
   boundary.
 - `RUST-I2`'s product decision is resolved; Milestone 4 must still remove the

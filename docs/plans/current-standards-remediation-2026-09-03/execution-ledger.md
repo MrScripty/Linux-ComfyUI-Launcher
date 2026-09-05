@@ -20,6 +20,18 @@
 
 ## Slice Log
 
+### 2026-09-05 — Cleanup durability prerequisite
+
+- Pending replay investigation found missing cross-client/process exclusion
+  through effect drain and ambiguous projected intent phases. Replay remains
+  refused; no earlier worker's completion is inferred from persisted snapshots.
+- Admitted one concrete prerequisite instead: capability-relative partial-file
+  and marker deletion must sync the exact parent, including absent-file retries,
+  before success. No live library, schema, dependency, or consumer change.
+- The [Rust record](rust-library-and-rpc/execution-ledger.md#2026-09-05--capability-cleanup-parent-synchronization)
+  owns RED/GREEN, exact source, review, final gates, and the remaining replay
+  limitations. Standards `aff5b867` changes tooling rather than applicable rules.
+
 ### 2026-09-05 — Verified Recovery terminal settlement
 
 - Continued C3 from `2e79993c` with one implementation agent and an independent

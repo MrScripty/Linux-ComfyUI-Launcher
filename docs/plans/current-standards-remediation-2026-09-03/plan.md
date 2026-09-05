@@ -212,13 +212,15 @@ predecessors. Its existing test remains narrow unstarted-worker evidence.
 Verified Recovery terminal settlement is accepted after review and core gates,
 preserving revocation, hidden history, and the follower's exact queue position.
 
-**Next slice:** Bound Pending cleanup restoration against durable intent, exact
-admission, and held destination authority. The Rust owner must identify its
-retained cleanup owner and a deciding real-store/filesystem regression before
-admitting source. Snapshots alone cannot authorize deletion or resumption.
-Unquarantined Recovery, hidden/unknown admission, C4 importer changes,
-old-format support, live mutation, and schema changes remain excluded. Cargo
-and commits remain serialized.
+The capability cleanup parent-sync prerequisite is accepted after review, dual
+core suites, strict lint, and formatting on Linux.
+
+**Next slice:** Bound store-owned, exact-attempt preparation that distinguishes
+cleanup intent phases without authorizing filesystem replay. The Rust owner
+must record its publication/error contract and real-store regression before
+implementation. Actual Pending replay also requires cross-client/process
+exclusion through effect drain. No live mutation, schema change, old-format
+support, or C4 expansion. Cargo and commits remain serialized.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

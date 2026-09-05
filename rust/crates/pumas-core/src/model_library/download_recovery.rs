@@ -186,7 +186,12 @@ pub(crate) struct DownloadRecoveryDestination {
     held: Arc<OnceLock<HeldDestination>>,
     creation_anchor: Arc<CreationAnchor>,
     file_parents: Arc<Mutex<BTreeMap<PathBuf, Arc<HeldDestination>>>>,
+    #[cfg(test)]
+    cleanup_parent_sync: Option<Arc<CleanupParentSync>>,
 }
+
+#[cfg(test)]
+type CleanupParentSync = dyn Fn(&Dir) -> io::Result<()> + Send + Sync;
 
 impl super::partial_download::PartialDownloadFiles for DownloadRecoveryDestination {
     fn file_len(&self, filename: &str) -> Result<Option<u64>> {
@@ -293,6 +298,8 @@ impl DownloadDestinationRoot {
             model_relative: relative,
             held: Arc::new(OnceLock::new()),
             file_parents: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            cleanup_parent_sync: None,
         };
         match destination.directory(false) {
             Ok(_) => {}
@@ -367,6 +374,8 @@ impl RecoveryRoot {
             display_path,
             held: Arc::new(OnceLock::new()),
             file_parents: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            cleanup_parent_sync: None,
         })
     }
 
@@ -728,11 +737,7 @@ impl DownloadRecoveryDestination {
             "{name}{}",
             crate::config::NetworkConfig::DOWNLOAD_TEMP_SUFFIX
         );
-        match parent.remove_file(name) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.remove_file_durable(&parent, &name)
     }
 
     pub(crate) fn rename_part_to_file(&self, file: &str) -> io::Result<()> {
@@ -748,11 +753,22 @@ impl DownloadRecoveryDestination {
         let Some(directory) = self.directory_if_present(false)? else {
             return Ok(());
         };
-        match directory.remove_file(".pumas_download") {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        self.remove_file_durable(&directory, ".pumas_download")
+    }
+
+    fn remove_file_durable(&self, parent: &Dir, name: &str) -> io::Result<()> {
+        match parent.remove_file(name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+        // An earlier unlink may have succeeded before its directory sync failed.
+        // Absence alone is not durable cleanup proof, so retries sync again.
+        #[cfg(test)]
+        if let Some(sync) = &self.cleanup_parent_sync {
+            return sync(parent);
+        }
+        parent.open(".")?.sync_all()
     }
 
     fn regular_file_len(&self, relative: &Path) -> io::Result<Option<u64>> {
@@ -1419,6 +1435,116 @@ mod tests {
         std::fs::rename(temp.path().join("model"), temp.path().join("old-model")).unwrap();
         assert!(destination.file_len("weights.gguf").is_err());
         assert!(destination.part_len("weights.gguf").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_cleanup_requires_exact_parent_sync_even_on_absent_retry() {
+        assert_cleanup_parent_sync(Some("nested/weights.gguf"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_cleanup_requires_exact_parent_sync_even_on_absent_retry() {
+        assert_cleanup_parent_sync(None);
+    }
+
+    #[cfg(unix)]
+    fn assert_cleanup_parent_sync(partial: Option<&str>) {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = super::DownloadDestinationRoot::open(temp.path()).unwrap();
+        let mut destination = root.resolve(std::path::Path::new("model")).unwrap();
+        destination.prepare().unwrap();
+        let relative = match partial {
+            Some(filename) => {
+                destination.create_parent(filename).unwrap();
+                format!("{filename}.part")
+            }
+            None => ".pumas_download".into(),
+        };
+        let path = temp.path().join("model").join(&relative);
+        std::fs::write(&path, b"old download state").unwrap();
+        let expected_parent = std::fs::metadata(path.parent().unwrap()).unwrap();
+        let leaf = path.file_name().unwrap().to_owned();
+        let sync_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        destination.cleanup_parent_sync = Some(std::sync::Arc::new({
+            let sync_calls = sync_calls.clone();
+            move |parent| {
+                let actual = parent.open(".")?.into_std().metadata()?;
+                assert_eq!(
+                    (actual.dev(), actual.ino()),
+                    (expected_parent.dev(), expected_parent.ino())
+                );
+                assert!(matches!(parent.symlink_metadata(&leaf), Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound));
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            }
+        }));
+        let remove = |destination: &super::DownloadRecoveryDestination| match partial {
+            Some(filename) => destination.remove_part(filename),
+            None => destination.remove_marker(),
+        };
+        let error =
+            remove(&destination).expect_err("a real unlink must propagate parent sync failure");
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(!path.exists());
+        let retry = remove(&destination)
+            .expect_err("absent-file retry must still establish directory durability");
+        assert_eq!(retry.raw_os_error(), Some(libc::EIO));
+        assert_eq!(sync_calls.load(Ordering::SeqCst), 2);
+        destination.cleanup_parent_sync = None;
+        remove(&destination).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_cleanup_unlink_preserves_target_and_does_not_claim_parent_sync() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = super::DownloadDestinationRoot::open(temp.path()).unwrap();
+        let mut destination = root.resolve(std::path::Path::new("model")).unwrap();
+        destination.prepare().unwrap();
+        destination.create_parent("nested/weights.gguf").unwrap();
+        let partial = temp.path().join("model/nested/weights.gguf.part");
+        let marker = temp.path().join("model/.pumas_download");
+        for path in [&partial, &marker] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("retained"), b"not a download file").unwrap();
+        }
+        let sync_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        destination.cleanup_parent_sync = Some(std::sync::Arc::new({
+            let sync_calls = sync_calls.clone();
+            move |_| {
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }));
+        let partial_error = std::fs::remove_file(&partial).unwrap_err().raw_os_error();
+        let marker_error = std::fs::remove_file(&marker).unwrap_err().raw_os_error();
+        assert!(partial_error.is_some());
+        assert!(marker_error.is_some());
+        assert_eq!(
+            destination
+                .remove_part("nested/weights.gguf")
+                .unwrap_err()
+                .raw_os_error(),
+            partial_error
+        );
+        assert_eq!(
+            destination.remove_marker().unwrap_err().raw_os_error(),
+            marker_error
+        );
+        assert_eq!(sync_calls.load(Ordering::SeqCst), 0);
+        for path in [&partial, &marker] {
+            assert_eq!(
+                std::fs::read(path.join("retained")).unwrap(),
+                b"not a download file"
+            );
+        }
     }
 
     #[cfg(unix)]
