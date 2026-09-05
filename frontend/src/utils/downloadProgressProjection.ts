@@ -1,10 +1,11 @@
 import type { DownloadProgressOutcome } from '../generated/desktop-contract';
 import type { ModelDownloadSnapshotEntry } from '../types/api-models';
 
-/** RPC nullable absence maps to the existing pushed-snapshot presentation contract. */
+/** Canonical list and push progress share one nullable-to-presentation projection. */
 export function projectDownloadProgress(progress: DownloadProgressOutcome): ModelDownloadSnapshotEntry {
   return {
     downloadId: progress.downloadId,
+    libraryModelId: progress.libraryModelId,
     status: progress.status,
     repoId: progress.repoId ?? undefined,
     selectedArtifactId: progress.selectedArtifactId,

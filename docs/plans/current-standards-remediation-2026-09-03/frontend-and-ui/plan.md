@@ -20,6 +20,55 @@ Rust recovery work and does not reopen accepted catalog/startup implementation.
 
 **Acceptance status:** `partial`
 
+## Download Row Association Bug Admission
+
+Status: accepted after the bounded regression, cross-boundary, dual Rust and
+two-mode built GUI checks recorded in the
+[execution ledger](execution-ledger.md#2026-09-05--download-to-catalog-row-association-accepted).
+
+User-reported regression at `aa7c483a`: starting a catalog partial adds a second
+activity row. The exact-ID merge regression fails with two rows instead of one.
+Current progress omits library identity and the renderer deliberately refuses
+repo/name/quant guesses. Repair that missing producer-to-consumer relation.
+
+Core projects nullable `libraryModelId` from the already-bound destination
+capability's library-relative model path, not repository labels, ambient paths,
+filesystem scans or a new persisted mapping. No capability means no association.
+RPC list/status and pushed progress share the existing canonical progress DTO;
+preload decodes both before renderer use. Generated contracts migrate together.
+Recovery admission may immediately carry the exact selected catalog ID into
+local activity until canonical updates arrive. Merge only one uniquely associated
+activity into a current catalog row, retaining its ID/name/metadata and exact
+download controls. Unassociated, ambiguous, or cached-only activity stays separate;
+different repositories, artifacts and quants never merge by display similarity.
+
+Review refinement: preserve every distinct download ID through snapshot selection,
+optimistic starts and initial-list merging, even when artifact keys collide.
+Only repeated observations of the same download ID may coalesce; association
+must never transfer to another download ID through an artifact key. Retain the
+existing priority-selected primary artifact entry for remote-search consumers.
+
+Write ownership: Rust owner changes core `models/model.rs`,
+`model_library/{download_recovery.rs,hf/download.rs}`, RPC
+`{contract.rs,contract/export.rs,handlers/mod.rs}` and affected Rust fixtures.
+Frontend state owner changes `hooks/{modelDownloadState,useModelDownloads,useActiveModelDownload,
+useModelLibraryActions}.ts`, `types/api-models.ts`, `utils/downloadProgressProjection.ts`
+and their tests. Root integrates `components/ModelManagerUtils.ts`, `types/apps.ts`,
+affected row/manager tests, Electron preload and its existing event/conformance
+tests, six generated desktop-contract artifacts, and producer/preload/renderer
+conformance fixtures. Existing UI verification machinery and these active plans/
+ledgers may record evidence. No search semantics, model files, persistence schema,
+dependency, retry, root-exclusion or Pending replay changes.
+
+Evidence: exact association survives queued/downloading/paused/error updates and
+restart; one row retains live progress and pause/resume/cancel actions; absent or
+ambiguous association and distinct identities remain separate. Core capability
+projection, generated invalid-ID rejection, real producer/preload/renderer flow,
+frontend tests/types/lint, affected dual Rust gates, generator freshness, and a
+representative built GUI check are required. Do not download or delete user model
+payloads to verify presentation. The Rust plan owns canonical contract changes;
+root serializes generation, Cargo and commits. Full M4/M5 remain unaccepted.
+
 **Execution ledger:** [execution-ledger.md](execution-ledger.md)
 
 **Issues:** [issues.md](issues.md)

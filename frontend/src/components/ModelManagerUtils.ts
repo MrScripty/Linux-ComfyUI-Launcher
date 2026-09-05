@@ -28,6 +28,7 @@ export function buildDownloadingModels(
         downloadProgress: status.progress,
         downloadStatus: status.status as ModelInfo['downloadStatus'],
         downloadKey,
+        downloadLibraryModelId: status.libraryModelId,
         downloadRepoId: repoId,
         downloadSelectedArtifactId: status.selectedArtifactId,
         downloadArtifactId: status.artifactId,
@@ -44,12 +45,44 @@ export function mergeLocalModelGroups(
     return modelGroups;
   }
 
-  // The download contract has no library model ID. Repository and artifact
-  // labels do not authorize attaching activity to a catalog row.
+  // Only an exact, unambiguous producer association can overlay a current row.
+  // Labels and cached records cannot establish that relationship.
+  const catalogCounts = new Map<string, number>();
+  for (const group of modelGroups) {
+    for (const model of group.models) {
+      if (model.provenance === 'catalog') {
+        catalogCounts.set(model.id, (catalogCounts.get(model.id) ?? 0) + 1);
+      }
+    }
+  }
+  const associated = new Map<string, ModelInfo[]>();
+  for (const activity of downloadingModels) {
+    const id = activity.downloadLibraryModelId;
+    if (id) associated.set(id, [...(associated.get(id) ?? []), activity]);
+  }
+  const mergedActivities = new Set<ModelInfo>();
   const groupMap = new Map<string, ModelInfo[]>(
-    modelGroups.map((group) => [group.category, [...group.models]])
+    modelGroups.map((group) => [group.category, group.models.map((model) => {
+      const matches = associated.get(model.id);
+      const activity = matches?.length === 1 ? matches[0] : undefined;
+      if (model.provenance !== 'catalog' || catalogCounts.get(model.id) !== 1 || !activity) return model;
+      mergedActivities.add(activity);
+      return {
+        ...model,
+        isDownloading: activity.isDownloading,
+        downloadProgress: activity.downloadProgress,
+        downloadStatus: activity.downloadStatus,
+        downloadKey: activity.downloadKey,
+        downloadLibraryModelId: activity.downloadLibraryModelId,
+        downloadRepoId: activity.downloadRepoId,
+        downloadSelectedArtifactId: activity.downloadSelectedArtifactId,
+        downloadArtifactId: activity.downloadArtifactId,
+        downloadTotalBytes: activity.downloadTotalBytes,
+      };
+    })])
   );
   downloadingModels.forEach((model) => {
+    if (mergedActivities.has(model)) return;
     const existing = groupMap.get(model.category);
     if (existing) {
       groupMap.set(model.category, [model, ...existing]);
@@ -61,7 +94,7 @@ export function mergeLocalModelGroups(
   const orderedCategories = Array.from(
     new Set([
       ...modelGroups.map((group) => group.category),
-      ...downloadingModels.map((model) => model.category),
+      ...downloadingModels.filter((model) => !mergedActivities.has(model)).map((model) => model.category),
     ])
   );
 

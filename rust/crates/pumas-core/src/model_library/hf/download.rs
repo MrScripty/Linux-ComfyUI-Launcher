@@ -1503,6 +1503,10 @@ fn parse_download_update_cursor(cursor: &str) -> Option<u64> {
 fn progress_from_state(state: &DownloadState) -> ModelDownloadProgress {
     ModelDownloadProgress {
         download_id: state.download_id.clone(),
+        library_model_id: state
+            .destination
+            .as_ref()
+            .map(|destination| destination.capability().library_model_id()),
         repo_id: Some(state.repo_id.clone()),
         selected_artifact_id: selected_artifact_id_for_state(state),
         model_name: state
@@ -6909,6 +6913,40 @@ mod tests {
             known_sha256: None,
             huggingface_evidence: None,
         }
+    }
+
+    #[test]
+    fn progress_library_identity_comes_only_from_the_bound_destination() {
+        let temp = TempDir::new().unwrap();
+        let verified =
+            verified_recovery(temp.path(), "different-publisher/model", &["weights.gguf"]);
+        let mut state = recovery_test_state(
+            &verified,
+            "identity-download",
+            DownloadStatus::Paused,
+            false,
+        );
+        assert_eq!(
+            progress_from_state(&state).library_model_id.as_deref(),
+            Some("llm/acme/model")
+        );
+        state.make_managed_for_test();
+        assert_eq!(
+            progress_from_state(&state).library_model_id.as_deref(),
+            Some("llm/acme/model")
+        );
+        let snapshot = persisted_recovery_test_state(&state);
+        let restored =
+            DownloadState::from_persisted(&snapshot, 2, state.destination.clone().unwrap());
+        assert_eq!(
+            progress_from_state(&restored).library_model_id.as_deref(),
+            Some("llm/acme/model")
+        );
+        state.destination = None;
+        assert!(
+            progress_from_state(&state).library_model_id.is_none(),
+            "ambient path and repository labels cannot invent association"
+        );
     }
 
     fn persisted_recovery_test_state(state: &DownloadState) -> PersistedDownload {

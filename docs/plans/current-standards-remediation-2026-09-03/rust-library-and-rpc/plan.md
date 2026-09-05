@@ -76,6 +76,15 @@ durable authority and retained root custody before implementing replay. Shutdown
 managed importer and grant prerequisites are accepted. Pending replay, relocation,
 and whole-runtime teardown remain unaccepted; this is not C3/M4 completion.
 
+**User-prioritized interruption accepted:** the canonical nullable library-model
+association for download progress under the frontend plan's
+[bug admission](../frontend-and-ui/plan.md#download-row-association-bug-admission).
+The core destination capability owns this identity; RPC list/status/SSE project
+it through one progress DTO and generated consumers migrated atomically. The
+[execution ledger](execution-ledger.md#2026-09-05--exact-download-library-identity-projection-accepted)
+records verification. This adds no persisted authority and does not begin
+Pending cleanup replay.
+
 ## Physical-Root Execution Grant Admission
 
 **Outcome:** independent cooperating HF clients cannot overlap protected download

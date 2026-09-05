@@ -537,6 +537,15 @@ impl RecoveryRoot {
 }
 
 impl DownloadRecoveryDestination {
+    /// Observed catalog identity, not authority to perform filesystem effects.
+    pub(crate) fn library_model_id(&self) -> String {
+        self.model_relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     pub(crate) fn execution_root(&self) -> DownloadDestinationRoot {
         DownloadDestinationRoot(self.authority.clone())
     }
@@ -1783,6 +1792,8 @@ mod tests {
             .destination_for(&record)
             .unwrap();
         assert_eq!(ordinary.identity(), recovery.identity());
+        assert_eq!(ordinary.library_model_id(), record.id);
+        assert_eq!(recovery.library_model_id(), record.id);
         assert_eq!(
             ordinary.persisted_identity().unwrap(),
             recovery.persisted_identity().unwrap()

@@ -41,6 +41,7 @@ interface UseModelLibraryActionsOptions {
     downloadKey: string,
     downloadId: string,
     details?: {
+      libraryModelId?: string | null;
       modelName?: string;
       modelType?: string;
       repoId?: string;
@@ -211,6 +212,7 @@ export function useModelLibraryActions({
         downloadId: result.download_id,
       });
       startDownload(result.download_id, result.download_id, {
+        libraryModelId: modelId,
         repoId,
         selectedArtifactId: recovery.selectedArtifactId,
         modelName: model.name,

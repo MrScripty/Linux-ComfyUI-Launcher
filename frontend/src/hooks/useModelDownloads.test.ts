@@ -29,7 +29,18 @@ vi.mock('../api/adapter', () => ({
 }));
 
 import type { ModelDownloadUpdateNotification } from '../types/api';
+import type { DownloadProgressOutcome } from '../generated/desktop-contract';
 import { useModelDownloads } from './useModelDownloads';
+import { buildDownloadingModels, mergeLocalModelGroups } from '../components/ModelManagerUtils';
+
+function progressOutcome(overrides: Partial<DownloadProgressOutcome>): DownloadProgressOutcome {
+  return {
+    downloadId: 'dl-1', status: 'downloading', repoId: 'org/model', selectedArtifactId: 'artifact-1',
+    libraryModelId: null, progress: 40, downloadedBytes: 4, totalBytes: 10, speed: null,
+    etaSeconds: null, modelName: null, modelType: null, retryAttempt: null, retryLimit: null,
+    retrying: null, nextRetryDelaySeconds: null, error: null, ...overrides,
+  };
+}
 
 async function flushMicrotasks() {
   await act(async () => {
@@ -65,6 +76,121 @@ describe('useModelDownloads', () => {
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+  });
+
+  it('propagates authoritative catalog association from startup and canonical pushes', async () => {
+    listModelDownloadsMock.mockResolvedValueOnce({ success: true, downloads: [
+      progressOutcome({ libraryModelId: 'llm/org/model' }),
+    ] });
+    const { result } = renderHook(() => useModelDownloads());
+    await flushMicrotasks();
+    expect(result.current.downloadStatusByRepo['artifact-1']?.libraryModelId).toBe('llm/org/model');
+    act(() => downloadUpdateCallback?.({
+      cursor: 'download:2', snapshot: { cursor: 'download:2', revision: 2, downloads: [
+        progressOutcome({ libraryModelId: 'llm/org/model', downloadedBytes: null, progress: 55 }),
+      ] }, stale_cursor: false, snapshot_required: false,
+    }));
+    expect(result.current.downloadStatusByRepo['artifact-1']).toMatchObject({
+      libraryModelId: 'llm/org/model', progress: 55, downloadedBytes: undefined,
+    });
+  });
+
+  it('associates recovery immediately and reuses an exact pushed download ID on late start acknowledgement', async () => {
+    const { result } = renderHook(() => useModelDownloads());
+    await flushMicrotasks();
+    act(() => result.current.startDownload('recovery-request', 'dl-recovery', {
+      libraryModelId: 'llm/org/recovery', repoId: 'org/recovery',
+    }));
+    expect(result.current.downloadStatusByRepo['org/recovery']?.libraryModelId).toBe('llm/org/recovery');
+    act(() => downloadUpdateCallback?.({
+      cursor: 'download:3', snapshot: { cursor: 'download:3', revision: 3, downloads: [
+        progressOutcome({ downloadId: 'dl-recovery', libraryModelId: 'llm/org/recovery' }),
+      ] }, stale_cursor: false, snapshot_required: false,
+    }));
+    act(() => result.current.startDownload('late-ack-key', 'dl-recovery', {
+      libraryModelId: 'llm/org/recovery', repoId: 'org/recovery',
+    }));
+    expect(Object.keys(result.current.downloadStatusByRepo)).toEqual(['artifact-1']);
+    expect(result.current.downloadStatusByRepo['artifact-1']).toMatchObject({
+      downloadId: 'dl-recovery', libraryModelId: 'llm/org/recovery', status: 'downloading', progress: 40,
+    });
+    await act(async () => { await result.current.pauseDownload('artifact-1'); });
+    expect(pauseModelDownloadMock).toHaveBeenCalledWith('dl-recovery');
+    act(() => downloadUpdateCallback?.({
+      cursor: 'download:4', snapshot: { cursor: 'download:4', revision: 4, downloads: [
+        progressOutcome({ downloadId: 'dl-recovery', libraryModelId: 'llm/org/recovery', status: 'error', error: 'Disk full' }),
+      ] }, stale_cursor: false, snapshot_required: false,
+    }));
+    act(() => result.current.startDownload('late-ack-key', 'dl-recovery', { libraryModelId: 'llm/org/recovery' }));
+    expect(Object.keys(result.current.downloadStatusByRepo)).toEqual(['artifact-1']);
+    expect(result.current.downloadStatusByRepo['artifact-1']?.status).toBe('queued');
+    expect(result.current.downloadErrors).toEqual({});
+  });
+
+  it('merges a late startup snapshot by exact download ID without retaining an optimistic alias', async () => {
+    let resolveList!: (value: { success: true; downloads: DownloadProgressOutcome[] }) => void;
+    listModelDownloadsMock.mockReturnValueOnce(new Promise((resolve) => { resolveList = resolve; }));
+    const { result } = renderHook(() => useModelDownloads());
+    act(() => result.current.startDownload('org/model', 'dl-1', { libraryModelId: 'llm/org/model' }));
+    await act(async () => resolveList({ success: true, downloads: [
+      progressOutcome({ libraryModelId: 'llm/org/model' }),
+    ] }));
+    expect(Object.keys(result.current.downloadStatusByRepo)).toEqual(['artifact-1']);
+    expect(result.current.downloadStatusByRepo['artifact-1']).toMatchObject({
+      downloadId: 'dl-1', libraryModelId: 'llm/org/model',
+    });
+  });
+
+  it('does not inherit catalog association when a different download reuses an inactive artifact key', async () => {
+    listModelDownloadsMock.mockResolvedValueOnce({ success: true, downloads: [
+      progressOutcome({ downloadId: 'dl-old', status: 'error', libraryModelId: 'llm/org/old' }),
+    ] });
+    const { result } = renderHook(() => useModelDownloads());
+    await flushMicrotasks();
+    act(() => result.current.startDownload('artifact-1', 'dl-new', { selectedArtifactId: 'artifact-1' }));
+    expect(Object.values(result.current.downloadStatusByRepo).find(status => status.downloadId === 'dl-new')).toMatchObject({
+      downloadId: 'dl-new', libraryModelId: undefined, status: 'queued',
+    });
+  });
+
+  it('retains distinct optimistic IDs when an initial list arrives with the same artifact', async () => {
+    let resolveList: ((value: { success: boolean; downloads: DownloadProgressOutcome[] }) => void) | undefined;
+    listModelDownloadsMock.mockReturnValueOnce(new Promise(resolve => { resolveList = resolve; }));
+    const { result } = renderHook(() => useModelDownloads());
+    act(() => {
+      result.current.startDownload('artifact-1', 'dl-local', { selectedArtifactId: 'artifact-1', libraryModelId: 'local' });
+      result.current.startDownload('artifact-1', 'dl-other', { selectedArtifactId: 'artifact-1', libraryModelId: 'other' });
+    });
+    expect(Object.values(result.current.downloadStatusByRepo).map(status => status.downloadId).sort())
+      .toEqual(['dl-local', 'dl-other']);
+    await act(async () => { resolveList?.({ success: true, downloads: [
+      progressOutcome({ downloadId: 'dl-snapshot', libraryModelId: 'snapshot' }),
+    ] }); });
+    expect(Object.values(result.current.downloadStatusByRepo).map(status => [status.downloadId, status.libraryModelId]).sort())
+      .toEqual([['dl-local', 'local'], ['dl-other', 'other'], ['dl-snapshot', 'snapshot']]);
+    expect(result.current.downloadStatusByRepo['artifact-1']?.downloadId).toBe('dl-snapshot');
+  });
+
+  it('preserves ambiguous same-artifact activities through the hook and catalog merge', async () => {
+    listModelDownloadsMock.mockResolvedValueOnce({ success: true, downloads: [
+      progressOutcome({ downloadId: 'dl-first', libraryModelId: 'llm/org/model' }),
+      progressOutcome({ downloadId: 'dl-second', libraryModelId: 'llm/org/model', status: 'paused' }),
+    ] });
+    const { result } = renderHook(() => useModelDownloads());
+    await flushMicrotasks();
+    const activities = buildDownloadingModels(result.current.downloadStatusByRepo);
+    const merged = mergeLocalModelGroups([{ category: 'llm', models: [{
+      id: 'llm/org/model', provenance: 'catalog', name: 'Catalog model', category: 'llm',
+    }] }], activities);
+    expect(activities).toHaveLength(2);
+    expect(merged[0]?.models).toHaveLength(3);
+    expect(merged[0]?.models.find(model => model.provenance === 'catalog')?.isDownloading).toBeUndefined();
+    const secondKey = Object.entries(result.current.downloadStatusByRepo)
+      .find(([, status]) => status.downloadId === 'dl-second')?.[0];
+    expect(secondKey).toBeDefined();
+    if (secondKey === undefined) return;
+    await act(async () => { await result.current.resumeDownload(secondKey); });
+    expect(resumeModelDownloadMock).toHaveBeenCalledWith('dl-second');
   });
 
   it('restores tracked downloads and repo-level errors on startup', async () => {
@@ -178,9 +304,9 @@ describe('useModelDownloads', () => {
           cursor: 'download:2',
           revision: 2,
           downloads: [
-            {
+            progressOutcome({
               repoId: 'repo-a',
-              artifactId: 'repo-a::Q4',
+              selectedArtifactId: 'repo-a::Q4',
               downloadId: 'dl-1',
               status: 'downloading',
               progress: 55,
@@ -188,7 +314,7 @@ describe('useModelDownloads', () => {
               totalBytes: 1000,
               speed: 32,
               etaSeconds: 14,
-            },
+            }),
           ],
         },
         stale_cursor: false,
@@ -203,7 +329,7 @@ describe('useModelDownloads', () => {
         status: 'downloading',
         progress: 55,
         repoId: 'repo-a',
-        artifactId: 'repo-a::Q4',
+        selectedArtifactId: 'repo-a::Q4',
         downloadedBytes: 550,
         totalBytes: 1000,
         speed: 32,
@@ -226,7 +352,7 @@ describe('useModelDownloads', () => {
     setIntervalSpy.mockRestore();
   });
 
-  it('tracks same-repo artifact downloads independently and blocks duplicate same-artifact starts', async () => {
+  it('tracks same-repo artifact downloads independently and ignores duplicate same-ID starts', async () => {
     const { result } = renderHook(() => useModelDownloads());
 
     await flushMicrotasks();
@@ -266,7 +392,7 @@ describe('useModelDownloads', () => {
     });
 
     act(() => {
-      result.current.startDownload('org/model::Q4', 'dl-q4-duplicate', {
+      result.current.startDownload('org/model::Q4', 'dl-q4', {
         repoId: 'org/model',
         artifactId: 'org/model::Q4',
         modelName: 'Duplicate Q4',
@@ -316,7 +442,7 @@ describe('useModelDownloads', () => {
     });
 
     act(() => {
-      result.current.startDownload('repo-a', 'dl-2', {
+      result.current.startDownload('repo-a', 'dl-1', {
         modelName: 'Replacement Model',
       });
     });

@@ -20,6 +20,20 @@
 
 ## Slice Log
 
+### 2026-09-05 — Duplicate library download rows corrected
+
+- The admitted user bug now has an exact producer-to-current-catalog association,
+  with distinct download IDs preserved through state selection and controls.
+  Backend and frontend owners integrated one coordinated contract migration;
+  no repository/name matching, live model edits or recovery schema changes.
+- Dual Rust suites, strict lint, generated producer/preload/renderer conformance,
+  all 535 frontend tests, Electron tests/types/lint, release builds and both built
+  GUI entry workflows pass. The [frontend ledger](frontend-and-ui/execution-ledger.md#2026-09-05--download-to-catalog-row-association-accepted)
+  and [Rust ledger](rust-library-and-rpc/execution-ledger.md#2026-09-05--exact-download-library-identity-projection-accepted)
+  own detailed evidence and limits. The user's live app remains undisturbed.
+- This interruption does not change the next admitted standards-remediation
+  work or accept Pending cleanup replay, full C3/M4/M5 or overall completion.
+
 ### 2026-09-05 — Bounded physical-root exclusion accepted on Linux
 
 - Download mutation phases now share native exclusion within one HF client and

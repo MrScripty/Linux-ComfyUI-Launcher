@@ -1,5 +1,6 @@
 export interface DownloadStatus {
   downloadId: string;
+  libraryModelId?: string | null;
   status: 'queued' | 'downloading' | 'pausing' | 'paused' | 'cancelling' | 'completed' | 'cancelled' | 'error';
   progress: number;
   repoId?: string;
@@ -35,6 +36,7 @@ interface RepoDownloadSelection {
 }
 
 interface ModelDownloadStatusPayload {
+  libraryModelId?: string | null;
   repoId?: string;
   selectedArtifactId?: string | null;
   artifactId?: string | null;
@@ -66,6 +68,14 @@ export interface DownloadArtifactIdentity {
 
 export function getDownloadArtifactKey(identity: DownloadArtifactIdentity): string | null {
   return identity.selectedArtifactId ?? identity.artifactId ?? identity.repoId ?? null;
+}
+
+/** Allocate a presentation key without treating artifact identity as download identity. */
+export function getUnusedDownloadKey(downloadId: string, occupiedKeys: Iterable<string>): string {
+  const occupied = new Set(occupiedKeys);
+  let key = JSON.stringify(['download', downloadId]);
+  while (occupied.has(key)) key = `:${key}`;
+  return key;
 }
 
 function isTrackedStatus(status: string): status is DownloadStatus['status'] {
@@ -107,6 +117,7 @@ function toRepoDownloadCandidate(
     key,
     status: {
       downloadId: download.downloadId,
+      libraryModelId: download.libraryModelId,
       status,
       progress: typeof download.progress === 'number' ? download.progress : 0,
       repoId: download.repoId,
@@ -131,7 +142,7 @@ export function selectDownloadsByRepo(downloads: ModelDownloadStatusPayload[]): 
   statuses: Record<string, DownloadStatus>;
   errors: Record<string, string>;
 } {
-  const selected: Record<string, RepoDownloadSelection> = {};
+  const candidates = new Map<string, RepoDownloadCandidate>();
 
   for (const download of downloads) {
     const candidate = toRepoDownloadCandidate(download);
@@ -139,21 +150,33 @@ export function selectDownloadsByRepo(downloads: ModelDownloadStatusPayload[]): 
       continue;
     }
 
-    const current = selected[candidate.key]?.status;
-    if (!current || shouldReplaceSelection(current, candidate.status)) {
-      selected[candidate.key] = {
-        status: candidate.status,
-        error: candidate.error,
-      };
-    }
+    candidates.set(candidate.status.downloadId, candidate);
   }
 
+  const groups = new Map<string, RepoDownloadCandidate[]>();
+  for (const candidate of candidates.values()) {
+    const group = groups.get(candidate.key) ?? [];
+    if (group[0] && shouldReplaceSelection(group[0].status, candidate.status)) {
+      group.unshift(candidate);
+    } else {
+      group.push(candidate);
+    }
+    groups.set(candidate.key, group);
+  }
   const statuses: Record<string, DownloadStatus> = {};
   const errors: Record<string, string> = {};
-  for (const [key, selectedDownload] of Object.entries(selected)) {
-    statuses[key] = selectedDownload.status;
-    if (selectedDownload.status.status === 'error' && selectedDownload.error) {
-      errors[key] = selectedDownload.error;
+  const reservedKeys = new Set(groups.keys());
+  for (const [artifactKey, group] of groups) {
+    for (const [index, selectedDownload] of group.entries()) {
+      let key = artifactKey;
+      if (index > 0) {
+        key = getUnusedDownloadKey(selectedDownload.status.downloadId, reservedKeys);
+        reservedKeys.add(key);
+      }
+      statuses[key] = selectedDownload.status;
+      if (selectedDownload.status.status === 'error' && selectedDownload.error) {
+        errors[key] = selectedDownload.error;
+      }
     }
   }
 

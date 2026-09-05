@@ -935,6 +935,7 @@ pub(crate) struct DownloadStatusMissingOutcome {
 #[cfg_attr(feature = "export-contract", derive(schemars::JsonSchema))]
 struct DownloadProgressOutcome {
     download_id: String,
+    library_model_id: Option<String>,
     repo_id: Option<String>,
     selected_artifact_id: Option<String>,
     model_name: Option<String>,
@@ -956,6 +957,13 @@ impl TryFrom<ModelDownloadProgress> for DownloadProgressOutcome {
     type Error = PumasError;
 
     fn try_from(progress: ModelDownloadProgress) -> Result<Self, Self::Error> {
+        if progress
+            .library_model_id
+            .as_deref()
+            .is_some_and(|model_id| DownloadRecoveryModelId::parse(model_id).is_none())
+        {
+            return Err(invalid_domain_outcome("download library model ID"));
+        }
         if [progress.downloaded_bytes, progress.total_bytes]
             .into_iter()
             .flatten()
@@ -976,6 +984,7 @@ impl TryFrom<ModelDownloadProgress> for DownloadProgressOutcome {
         }
         Ok(Self {
             download_id: progress.download_id,
+            library_model_id: progress.library_model_id,
             repo_id: progress.repo_id,
             selected_artifact_id: progress.selected_artifact_id,
             model_name: progress.model_name,
@@ -1024,6 +1033,23 @@ impl DownloadMutationOutcome {
 pub(crate) struct DownloadListOutcome {
     success: bool,
     downloads: Vec<DownloadProgressOutcome>,
+}
+
+/// Push delivery uses the same validated and redacted progress as polling.
+pub(crate) fn project_download_notification(
+    notification: &pumas_library::models::ModelDownloadUpdateNotification,
+) -> Result<Value, PumasError> {
+    let downloads = DownloadListOutcome::new(notification.snapshot.downloads.clone())?;
+    Ok(serde_json::json!({
+        "cursor": notification.cursor,
+        "snapshot": {
+            "cursor": notification.snapshot.cursor,
+            "revision": notification.snapshot.revision,
+            "downloads": downloads.downloads,
+        },
+        "stale_cursor": notification.stale_cursor,
+        "snapshot_required": notification.snapshot_required,
+    }))
 }
 
 impl DownloadListOutcome {
@@ -3049,6 +3075,7 @@ mod tests {
 
         let progress = ModelDownloadProgress {
             download_id: "download-1".to_string(),
+            library_model_id: Some("llm/acme/model".to_string()),
             repo_id: Some("acme/model".to_string()),
             selected_artifact_id: None,
             model_name: Some("Model".to_string()),
@@ -3235,6 +3262,43 @@ mod tests {
         boundary.total_bytes = Some(MAX_JS_SAFE_INTEGER);
         boundary.progress = Some(1.0);
         assert!(DownloadProgressOutcome::try_from(boundary).is_ok());
+    }
+
+    #[test]
+    fn download_library_identity_is_exact_optional_and_validated_for_poll_and_push() {
+        let progress = |model_id: Option<&str>| {
+            serde_json::from_value::<ModelDownloadProgress>(json!({
+                "downloadId": "identity-fixture", "status": "downloading",
+                "libraryModelId": model_id, "error": "private diagnostic",
+            }))
+            .unwrap()
+        };
+        let notification = |progress| pumas_library::models::ModelDownloadUpdateNotification {
+            cursor: "download:1".into(),
+            snapshot: pumas_library::models::ModelDownloadSnapshot {
+                cursor: "download:1".into(),
+                revision: 1,
+                downloads: vec![progress],
+            },
+            stale_cursor: false,
+            snapshot_required: true,
+        };
+        for model_id in [None, Some("llm/acme/model-q4"), Some("llm/other/model-q8")] {
+            let item = progress(model_id);
+            let poll = serde_json::to_value(DownloadListOutcome::new(vec![item.clone()]).unwrap())
+                .unwrap();
+            let push = project_download_notification(&notification(item)).unwrap();
+            assert_eq!(poll["downloads"], push["snapshot"]["downloads"]);
+            assert_eq!(
+                push["snapshot"]["downloads"][0]["libraryModelId"],
+                json!(model_id)
+            );
+            assert!(!push.to_string().contains("private diagnostic"));
+        }
+        for invalid in ["", "../model", "/llm/model", "llm\\model", "llm/CON/model"] {
+            assert!(DownloadListOutcome::new(vec![progress(Some(invalid))]).is_err());
+            assert!(project_download_notification(&notification(progress(Some(invalid)))).is_err());
+        }
     }
 
     #[test]

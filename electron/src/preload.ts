@@ -22,6 +22,7 @@ import {
   decodePartialDownloadOutcome,
   decodeRecoverDownloadParams,
   type DecodeOutcome,
+  type DownloadListOutcome,
 } from './generated/desktop-contract';
 
 const launcherRootPresentationTimeoutListeners = new Set<() => void>();
@@ -251,7 +252,7 @@ type ModelDownloadUpdateNotificationPayload = {
   snapshot: {
     cursor: string;
     revision: number;
-    downloads?: unknown[];
+    downloads: DownloadListOutcome['downloads'];
   };
   stale_cursor: boolean;
   snapshot_required: boolean;
@@ -381,23 +382,28 @@ function isServingStatusErrorNotificationPayload(
   return isRecord(value) && typeof value['message'] === 'string';
 }
 
-function isModelDownloadUpdateNotificationPayload(
+function decodeModelDownloadUpdateNotificationPayload(
   value: unknown
-): value is ModelDownloadUpdateNotificationPayload {
+): ModelDownloadUpdateNotificationPayload | null {
   if (!isRecord(value) || !isRecord(value['snapshot'])) {
-    return false;
+    return null;
   }
 
   const snapshot = value['snapshot'];
-  const downloads = snapshot['downloads'];
-  return (
-    typeof value['cursor'] === 'string' &&
-    typeof value['stale_cursor'] === 'boolean' &&
-    typeof value['snapshot_required'] === 'boolean' &&
-    typeof snapshot['cursor'] === 'string' &&
-    typeof snapshot['revision'] === 'number' &&
-    (downloads === undefined || Array.isArray(downloads))
-  );
+  if (typeof value['cursor'] !== 'string' ||
+      typeof value['stale_cursor'] !== 'boolean' ||
+      typeof value['snapshot_required'] !== 'boolean' ||
+      typeof snapshot['cursor'] !== 'string' ||
+      typeof snapshot['revision'] !== 'number' ||
+      !Number.isSafeInteger(snapshot['revision']) || snapshot['revision'] < 0) return null;
+  const decoded = decodeDownloadListOutcome({ success: true, downloads: snapshot['downloads'] });
+  if (decoded.status !== 'valid') return null;
+  return {
+    cursor: value['cursor'],
+    stale_cursor: value['stale_cursor'],
+    snapshot_required: value['snapshot_required'],
+    snapshot: { cursor: snapshot['cursor'], revision: snapshot['revision'], downloads: decoded.value.downloads },
+  };
 }
 
 function isStatusTelemetryUpdateNotificationPayload(
@@ -961,8 +967,9 @@ const electronAPI = {
     callback: (notification: ModelDownloadUpdateNotificationPayload) => void
   ): (() => void) => {
     const listener = (_event: IpcRendererEvent, payload: unknown) => {
-      if (isModelDownloadUpdateNotificationPayload(payload)) {
-        callback(payload);
+      const decoded = decodeModelDownloadUpdateNotificationPayload(payload);
+      if (decoded) {
+        callback(decoded);
       }
     };
 

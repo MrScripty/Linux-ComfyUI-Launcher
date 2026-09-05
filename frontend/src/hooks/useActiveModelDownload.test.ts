@@ -20,7 +20,17 @@ vi.mock('../api/adapter', () => ({
 }));
 
 import type { ModelDownloadUpdateNotification } from '../types/api';
+import type { DownloadProgressOutcome } from '../generated/desktop-contract';
 import { useActiveModelDownload } from './useActiveModelDownload';
+
+function progressOutcome(overrides: Partial<DownloadProgressOutcome>): DownloadProgressOutcome {
+  return {
+    downloadId: 'dl-1', status: 'queued', repoId: null, selectedArtifactId: null,
+    libraryModelId: null, progress: null, downloadedBytes: null, totalBytes: null, speed: null,
+    etaSeconds: null, modelName: null, modelType: null, retryAttempt: null, retryLimit: null,
+    retrying: null, nextRetryDelaySeconds: null, error: null, ...overrides,
+  };
+}
 
 async function flushMicrotasks() {
   await act(async () => {
@@ -179,7 +189,7 @@ describe('useActiveModelDownload', () => {
           cursor: 'download:2',
           revision: 2,
           downloads: [
-            {
+            progressOutcome({
               repoId: 'repo-b',
               downloadId: 'dl-b',
               status: 'downloading',
@@ -188,13 +198,13 @@ describe('useActiveModelDownload', () => {
               totalBytes: 1000,
               speed: 128,
               etaSeconds: 5,
-            },
-            {
+            }),
+            progressOutcome({
               repoId: 'repo-a',
               downloadId: 'dl-a',
               status: 'queued',
               progress: 10,
-            },
+            }),
           ],
         },
         stale_cursor: false,
@@ -279,12 +289,12 @@ describe('useActiveModelDownload', () => {
           cursor: 'download:2',
           revision: 2,
           downloads: [
-            {
+            progressOutcome({
               repoId: 'repo-a',
               downloadId: 'dl-done',
               status: 'completed',
               progress: 100,
-            },
+            }),
           ],
         },
         stale_cursor: false,

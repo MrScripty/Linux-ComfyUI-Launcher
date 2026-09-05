@@ -2,11 +2,13 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { useState } from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LauncherRootRecoveryProvider } from '../src/hooks/useLauncherRootRecovery';
 import { useModels } from '../src/hooks/useModels';
 import { useModelLibraryActions } from '../src/hooks/useModelLibraryActions';
+import { useModelDownloads } from '../src/hooks/useModelDownloads';
+import { buildDownloadingModels, mergeLocalModelGroups } from '../src/components/ModelManagerUtils';
 import { LocalModelsList } from '../src/components/LocalModelsList';
 import { ValidationError } from '../src/errors';
 
@@ -25,7 +27,11 @@ function readFixture(path: string): Record<string, unknown> {
 const fixture = readFixture(fixturePath);
 const preload = readFileSync(resolve('../electron/dist/preload.js'), 'utf8');
 
-function installActualPreload(recoveryOutcome = 'recovery_outcome') {
+function installActualPreload(
+  recoveryOutcome = 'recovery_outcome',
+  listeners = new Map<string, (event: unknown, payload: unknown) => void>(),
+  initialDownloads: unknown = fixture['download_list'],
+) {
   const requests: Array<{ method: string; params: unknown }> = [];
   const module = { exports: {} };
   const electron = {
@@ -36,20 +42,23 @@ function installActualPreload(recoveryOutcome = 'recovery_outcome') {
       },
     },
     ipcRenderer: {
-      on: () => undefined,
-      removeListener: () => undefined,
+      on: (channel: string, listener: (event: unknown, payload: unknown) => void) => { listeners.set(channel, listener); },
+      removeListener: (channel: string) => { listeners.delete(channel); },
       sendSync: (channel: string) => {
         expect(channel).toBe('launcher:getRootBootstrap');
         return { status: 'ready', selectionAction: 'select-library', libraryScopeId: null };
       },
       invoke: async (channel: string, method: string, params: unknown) => {
         if (channel === 'launcher-root:presentation-committed') return undefined;
+        if (channel === 'model-download:subscribe' || channel === 'model-download:unsubscribe') return undefined;
         expect(channel).toBe('api:call');
         const requestParams: unknown = JSON.parse(JSON.stringify(params));
         requests.push({ method, params: requestParams });
         if (method === 'get_models') return fixture['models'];
         if (method === 'search_models_fts') return fixture['search'];
         if (method === 'resume_partial_download') return fixture[recoveryOutcome];
+        if (method === 'list_model_downloads') return initialDownloads;
+        if (method === 'resume_model_download' || method === 'pause_model_download' || method === 'cancel_model_download') return fixture['download_mutation'];
         throw new ValidationError(`Unprovided fixture operation: ${method}`, 'producer-fixtures');
       },
     },
@@ -67,6 +76,25 @@ function installActualPreload(recoveryOutcome = 'recovery_outcome') {
 }
 
 type StartDownload = Parameters<typeof useModelLibraryActions>[0]['startDownload'];
+
+function LiveDownloadLibrary() {
+  const { modelGroups, libraryLoadStatus } = useModels();
+  const downloads = useModelDownloads();
+  const actions = useModelLibraryActions({ setDownloadErrors: downloads.setDownloadErrors, startDownload: downloads.startDownload });
+  const merged = mergeLocalModelGroups(modelGroups, buildDownloadingModels(downloads.downloadStatusByRepo));
+  return <>
+    <div role="status">{libraryLoadStatus}</div>
+    <LocalModelsList modelGroups={merged} totalModels={modelGroups.flatMap(group => group.models).length}
+      starredModels={new Set()} excludedModels={new Set()} selectedAppId={null} hasFilters={false}
+      onToggleStar={() => undefined} onToggleLink={() => undefined}
+      relatedModelsById={actions.relatedModelsById} expandedRelated={actions.expandedRelated}
+      onToggleRelated={actions.handleToggleRelated} onOpenRelatedUrl={actions.openRemoteUrl}
+      onRecoverPartialDownload={actions.handleRecoverPartialDownload}
+      onPauseDownload={downloads.pauseDownload} onResumeDownload={downloads.resumeDownload}
+      onCancelDownload={downloads.cancelDownload} downloadErrors={downloads.downloadErrors}
+    />
+  </>;
+}
 
 function Library({ onStarted }: { onStarted: StartDownload }) {
   const { modelGroups, libraryLoadStatus } = useModels();
@@ -107,8 +135,43 @@ describe('actual Rust catalog through bundled preload and renderer', () => {
     expect(requests.find((request) => request.method === 'resume_partial_download')?.params)
       .toEqual(fixture['recovery_request']);
     expect(onStarted).toHaveBeenCalledWith('fixture-download', 'fixture-download', {
-      modelName: 'partial', modelType: 'llm', repoId: 'example/model', selectedArtifactId: 'example/model::Q4',
+      libraryModelId: 'llm/example/partial', modelName: 'partial', modelType: 'llm', repoId: 'example/model', selectedArtifactId: 'example/model::Q4',
     });
+  });
+
+  it('keeps one catalog row from recovery admission through decoded paused updates and exact controls', async () => {
+    const listeners = new Map<string, (event: unknown, payload: unknown) => void>();
+    const requests = installActualPreload('recovery_outcome', listeners, { success: true, downloads: [] });
+    render(<LauncherRootRecoveryProvider><LiveDownloadLibrary /></LauncherRootRecoveryProvider>);
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('ready'));
+    expect(screen.getAllByText('partial', { exact: true })).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Resume partial download (50%)' }));
+    await waitFor(() => expect(screen.getByTitle('Pause download')).toBeVisible());
+    expect(screen.getAllByText('partial', { exact: true })).toHaveLength(1);
+    await act(async () => { listeners.get('model-download:update')?.({}, fixture['download_push']); });
+    expect(screen.getAllByText('partial', { exact: true })).toHaveLength(1);
+    expect(screen.getByText('PARTIAL 50%')).toBeVisible();
+    expect(screen.queryByText('Download activity · paused')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle('Resume download'));
+    await waitFor(() => expect(requests.find(request => request.method === 'resume_model_download')?.params)
+      .toEqual({ download_id: 'fixture-download' }));
+  });
+
+  it('restores associated activity as one row and rejects an invalid pushed library identity', async () => {
+    const listeners = new Map<string, (event: unknown, payload: unknown) => void>();
+    installActualPreload('recovery_outcome', listeners);
+    render(<LauncherRootRecoveryProvider><LiveDownloadLibrary /></LauncherRootRecoveryProvider>);
+    await waitFor(() => expect(screen.getByTitle('Resume download')).toBeVisible());
+    expect(screen.getAllByText('partial', { exact: true })).toHaveLength(1);
+    const invalid = structuredClone(fixture['download_push']);
+    if (!isFixtureRecord(invalid) || !isFixtureRecord(invalid['snapshot']) || !Array.isArray(invalid['snapshot']['downloads'])) throw new ValidationError('Invalid producer fixture', 'producer-fixtures');
+    const entry: unknown = invalid['snapshot']['downloads'][0];
+    if (!isFixtureRecord(entry)) throw new ValidationError('Invalid producer download', 'producer-fixtures');
+    entry['libraryModelId'] = '../outside';
+    entry['progress'] = 0.9;
+    await act(async () => { listeners.get('model-download:update')?.({}, invalid); });
+    expect(screen.getAllByText('partial', { exact: true })).toHaveLength(1);
+    expect(screen.getByText('PARTIAL 50%')).toBeVisible();
   });
 
   it('shows the bounded busy outcome without starting a download', async () => {

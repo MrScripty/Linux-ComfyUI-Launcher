@@ -1,6 +1,6 @@
 import type { BaseResponse } from './api-common';
 import type {
-  DownloadListOutcome, DownloadStartedOutcome, DownloadStatusOutcome, ModelsOutcome, PartialDownloadOutcome,
+  DownloadListOutcome, DownloadProgressOutcome, DownloadStartedOutcome, DownloadStatusOutcome, ModelsOutcome, PartialDownloadOutcome,
 } from '../generated/desktop-contract';
 
 // ============================================================================
@@ -153,10 +153,11 @@ export type ModelDownloadResponse = DownloadStartedOutcome;
 export type ModelDownloadStatusResponse = DownloadStatusOutcome;
 export type ListModelDownloadsResponse = DownloadListOutcome;
 
-/** Existing core push-event payload; distinct from the RPC status/list outcomes. */
+/** Local presentation projection of canonical download progress. */
 export interface ModelDownloadSnapshotEntry {
   success?: boolean;
   downloadId?: string;
+  libraryModelId?: string | null;
   repoId?: string;
   selectedArtifactId?: string | null;
   artifactId?: string | null;
@@ -178,7 +179,7 @@ export interface ModelDownloadSnapshotEntry {
 export interface ModelDownloadSnapshot {
   cursor: string;
   revision: number;
-  downloads: ModelDownloadSnapshotEntry[];
+  downloads: DownloadProgressOutcome[];
 }
 
 export interface ModelDownloadUpdateNotification {

@@ -282,6 +282,7 @@ describe('useModelLibraryActions', () => {
     });
 
     expect(startDownload).toHaveBeenCalledWith('dl-123', 'dl-123', {
+      libraryModelId: 'llm/org-model',
       repoId: 'org/model',
       modelName: 'Org Model',
       modelType: 'llm',

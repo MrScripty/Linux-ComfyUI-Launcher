@@ -709,6 +709,10 @@ pub enum DownloadStatus {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ModelDownloadProgress {
     pub download_id: String,
+    /// Exact root-relative catalog ID from the bound download destination.
+    /// Absent when this activity has no retained library association.
+    #[serde(default)]
+    pub library_model_id: Option<String>,
     #[serde(default)]
     pub repo_id: Option<String>,
     #[serde(default)]
@@ -1074,6 +1078,7 @@ mod tests {
                 revision: 1,
                 downloads: vec![ModelDownloadProgress {
                     download_id: "dl-1".to_string(),
+                    library_model_id: Some("llm/owner/model".to_string()),
                     repo_id: Some("owner/model".to_string()),
                     selected_artifact_id: None,
                     model_name: None,
@@ -1101,6 +1106,10 @@ mod tests {
         assert!(value.get("staleCursor").is_none());
         assert!(value.get("snapshotRequired").is_none());
         assert_eq!(value["snapshot"]["downloads"][0]["downloadId"], "dl-1");
+        assert_eq!(
+            value["snapshot"]["downloads"][0]["libraryModelId"],
+            "llm/owner/model"
+        );
         assert_eq!(value["snapshot"]["downloads"][0]["downloadedBytes"], 512);
     }
 

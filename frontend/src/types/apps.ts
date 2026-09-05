@@ -42,6 +42,7 @@ export interface ModelInfo {
   downloadProgress?: number;
   downloadStatus?: 'queued' | 'downloading' | 'pausing' | 'paused' | 'cancelling' | 'error';
   downloadKey?: string;
+  downloadLibraryModelId?: string | null;
   downloadRepoId?: string;
   downloadSelectedArtifactId?: string | null;
   downloadArtifactId?: string | null;

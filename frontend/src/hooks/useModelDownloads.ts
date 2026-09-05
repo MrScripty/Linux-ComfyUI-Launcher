@@ -14,6 +14,7 @@ import { projectDownloadProgress } from '../utils/downloadProgressProjection';
 import {
   getDownloadArtifactKey,
   selectDownloadsByRepo,
+  getUnusedDownloadKey,
   type DownloadStatus,
   type DownloadArtifactIdentity,
 } from './modelDownloadState';
@@ -42,9 +43,21 @@ export function useModelDownloads() {
     options: { preserveExisting?: boolean } = {}
   ) => {
     const { statuses, errors } = selectDownloadsByRepo(downloads);
-    setDownloadStatusByRepo((prev) => (
-      options.preserveExisting ? { ...statuses, ...prev } : statuses
-    ));
+    setDownloadStatusByRepo((prev) => {
+      if (!options.preserveExisting) return statuses;
+      const merged = { ...statuses };
+      const snapshotKeys = new Map(Object.entries(statuses).map(([key, status]) => [status.downloadId, key]));
+      for (const [key, status] of Object.entries(prev)) {
+        const snapshotKey = snapshotKeys.get(status.downloadId);
+        const targetKey = snapshotKey ?? (merged[key] && merged[key].downloadId !== status.downloadId
+          ? getUnusedDownloadKey(status.downloadId, Object.keys(merged)) : key);
+        merged[targetKey] = {
+          ...statuses[targetKey], ...status,
+          libraryModelId: snapshotKey ? statuses[snapshotKey]?.libraryModelId : status.libraryModelId,
+        };
+      }
+      return merged;
+    });
     setDownloadErrors(errors);
   }, []);
 
@@ -67,7 +80,7 @@ export function useModelDownloads() {
     void restoreDownloads();
 
     const unsubscribe = getElectronAPI()?.onModelDownloadUpdate((notification) => {
-      applyDownloadSnapshot(notification.snapshot.downloads);
+      applyDownloadSnapshot(notification.snapshot.downloads.map(projectDownloadProgress));
     });
 
     return () => {
@@ -79,7 +92,7 @@ export function useModelDownloads() {
   const startDownload = useCallback((
     downloadKey: string,
     downloadId: string,
-    details?: { modelName?: string; modelType?: string } & DownloadArtifactIdentity
+    details?: { libraryModelId?: string | null; modelName?: string; modelType?: string } & DownloadArtifactIdentity
   ) => {
     const artifactKey = getDownloadArtifactKey({
       selectedArtifactId: details?.selectedArtifactId,
@@ -88,14 +101,23 @@ export function useModelDownloads() {
     }) ?? downloadKey;
 
     setDownloadStatusByRepo((prev) => {
-      const existing = prev[artifactKey];
+      const existingEntry = Object.entries(prev).find(([, status]) => status.downloadId === downloadId);
+      const targetKey = existingEntry?.[0] ?? (prev[artifactKey]
+        ? getUnusedDownloadKey(downloadId, Object.keys(prev)) : artifactKey);
+      const existing = prev[targetKey];
       if (existing && isActiveStatus(existing.status)) {
+        if (existing.downloadId === downloadId && details?.libraryModelId != null
+          && existing.libraryModelId !== details.libraryModelId) {
+          return { ...prev, [targetKey]: { ...existing, libraryModelId: details.libraryModelId } };
+        }
         return prev;
       }
       return {
         ...prev,
-        [artifactKey]: {
+        [targetKey]: {
           downloadId,
+          libraryModelId: details?.libraryModelId
+            ?? (existing?.downloadId === downloadId ? existing.libraryModelId : undefined),
           status: 'queued',
           progress: 0,
           repoId: details?.repoId ?? downloadKey,
@@ -107,9 +129,11 @@ export function useModelDownloads() {
       };
     });
     setDownloadErrors((prev) => {
-      if (!prev[artifactKey]) return prev;
+      const keys = Object.keys(prev).filter((key) => downloadStatusRef.current[key]?.downloadId === downloadId
+        || (key === artifactKey && !downloadStatusRef.current[key]));
+      if (keys.length === 0) return prev;
       const next = { ...prev };
-      delete next[artifactKey];
+      for (const key of keys) delete next[key];
       return next;
     });
   }, []);

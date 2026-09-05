@@ -134,6 +134,7 @@ pub(crate) fn desktop_contract_fixtures() -> anyhow::Result<Value> {
     .collect::<Vec<_>>();
     let progress = ModelDownloadProgress {
         download_id: "fixture-download".into(),
+        library_model_id: Some("llm/example/partial".into()),
         repo_id: Some("example/model".into()),
         selected_artifact_id: Some("example/model::Q4".into()),
         model_name: Some("partial".into()),
@@ -150,6 +151,17 @@ pub(crate) fn desktop_contract_fixtures() -> anyhow::Result<Value> {
         next_retry_delay_seconds: None,
         error: None,
     };
+    let download_push =
+        project_download_notification(&pumas_library::models::ModelDownloadUpdateNotification {
+            cursor: "download:1".into(),
+            snapshot: pumas_library::models::ModelDownloadSnapshot {
+                cursor: "download:1".into(),
+                revision: 1,
+                downloads: vec![progress.clone()],
+            },
+            stale_cursor: false,
+            snapshot_required: true,
+        })?;
     Ok(serde_json::json!({
         "models":models, "search":search, "recovery_request":recovery_request,
         "recovery_outcome":recovery_outcome,
@@ -157,6 +169,7 @@ pub(crate) fn desktop_contract_fixtures() -> anyhow::Result<Value> {
         "recovery_request_probes":recovery_request_probes,
         "catalog_text_probes":catalog_text_probes,
         "download_status":DownloadStatusOutcome::new(Some(progress.clone()))?,
+        "download_push":download_push,
         "download_list":DownloadListOutcome::new(vec![progress])?,
         "download_started":DownloadStartedOutcome::started("fixture-download".into(),Some("example/model::Q4".into())),
         "download_mutation":DownloadMutationOutcome::completed(true),
@@ -291,6 +304,8 @@ fn refine_named(name: &str, schema: &mut Value) {
                 properties["download_id"]["minLength"] = 1.into();
             }
             "DownloadProgressOutcome" | "DownloadStatusFoundOutcome" => {
+                properties["libraryModelId"]["pumasPortablePath"] = true.into();
+                properties["libraryModelId"]["pumasUtf8Max"] = MAX_IDENTIFIER_BYTES.into();
                 for field in ["progress", "speed", "etaSeconds", "nextRetryDelaySeconds"] {
                     properties[field]["minimum"] = 0.into();
                 }

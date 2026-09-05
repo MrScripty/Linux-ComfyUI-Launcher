@@ -239,6 +239,23 @@ describe('ModelManager integrity refresh acceptance', () => {
     expect(resumeDownloadMock).toHaveBeenCalledExactlyOnceWith('download-exact-id');
   });
 
+  it('renders an associated paused download once with the catalog name and exact resume control', async () => {
+    getModelsMock.mockResolvedValue({ success: true, models: { qwen: makeRecord('qwen', true) } });
+    downloadActivities['download-exact-id'] = {
+      downloadId: 'download-exact-id', libraryModelId: 'qwen',
+      status: 'paused', repoId: 'publisher/Qwen', modelName: 'Qwen Test',
+      progress: 0.25,
+    };
+    render(<Harness />);
+    await flushMicrotasks();
+
+    expect(screen.getByPlaceholderText('Search 1 models')).toBeInTheDocument();
+    expect(screen.getAllByText('Qwen Test')).toHaveLength(1);
+    expect(screen.queryByText('Download activity · paused')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle('Resume download'));
+    expect(resumeDownloadMock).toHaveBeenCalledExactlyOnceWith('download-exact-id');
+  });
+
   it('shows loading rather than an empty library or a zero count before the first response', () => {
     getModelsMock.mockReturnValue(new Promise(() => {}));
     render(<Harness />);

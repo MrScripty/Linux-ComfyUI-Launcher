@@ -21,6 +21,26 @@
 
 ## Slice Log
 
+### 2026-09-05 — Exact download library identity projection accepted
+
+- Core projects optional library identity only from the verified destination
+  capability's existing relative model path. Live and restored destinations
+  retain it; absent capability emits no association. This observation introduces
+  no new filesystem effect authority, persistence schema, scan or mapping.
+- Canonical progress validates the same portable model ID for status/list and
+  SSE delivery. Push now shares polling's bounded diagnostic projection, and
+  both generated desktop consumers migrate together. Invalid identity is refused
+  before renderer use. Producer fixtures cover real push and catalog association.
+- Both complete core feature configurations pass 1,253 tests each (12 existing
+  ignores each); RPC default/minimal pass 117/77 (10 existing ignores each).
+  Strict all-target/all-feature core/RPC/UniFFI lint, no-default core/RPC lint,
+  formatting and contract freshness pass. Optimized RPC build passes in 4m27s.
+  Evidence: `/tmp/pumas-row-{core,rpc}-{default,minimal}.log`,
+  `/tmp/pumas-row-clippy{,-minimal}.log`, `/tmp/pumas-row-release-rust.log`.
+- The [frontend ledger](../frontend-and-ui/execution-ledger.md#2026-09-05--download-to-catalog-row-association-accepted)
+  owns exact row/control and real built two-mode GUI evidence. This bounded
+  user-prioritized fix does not admit Pending cleanup replay or close full C3/M4.
+
 ### 2026-09-05 — Physical-root grant integration
 
 - Continue the admitted slice at `d3679f40`, standards

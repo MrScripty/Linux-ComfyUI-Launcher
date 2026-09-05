@@ -12,6 +12,38 @@
   earlier dated entries preserve the evidence and rejected alternatives at
   their historical boundaries.
 
+## 2026-09-05 — Download-to-catalog row association accepted
+
+- The user-visible two-row regression failed before the fix (`shows one catalog
+  row`: expected one, received two). Download progress now carries the exact
+  destination-derived library ID through canonical list/status/push DTOs and
+  the real preload. Recovery admission supplies the selected current catalog ID
+  immediately. One uniquely associated activity overlays that catalog row;
+  absent, cached-only or ambiguous associations remain separate.
+- Review caught artifact-key association inheritance and activity collapse
+  before the ambiguity guard. Both are corrected: distinct download IDs survive
+  snapshot selection, optimistic admission and initial restore; same-ID updates
+  retain exact controls. Repository/name/quant similarity grants no association.
+- `pnpm --dir frontend test:run`: 113 files, 535 tests pass. Frontend types/lint,
+  Electron build/tests (10), lint, producer/preload conformance (5), renderer
+  conformance (5), and generated desktop-contract freshness pass. The renderer
+  conformance uses actual Rust fixtures and bundled preload, including invalid
+  pushed identity rejection and exact resume parameters.
+- Both real Vite entry modes pass an isolated Electron 39.8.6/Chromium workflow:
+  initial partial, recovery admission, paused push and reload each retain one
+  catalog row without a separate activity label; resumed IPC names the exact
+  producer download ID. A 50% partial is visible after push and restore. Native
+  mouse input and captured pixels supplement DOM assertions. No renderer
+  warnings/errors remained after correcting ancillary test fixtures.
+- Temporary fixture window/profile and scripts are isolated under
+  `/tmp/pumas-row-gui.L9RInV`; logs are `/tmp/pumas-row-gui{,-default}.log` and
+  `/tmp/pumas-row-*.log`. No backend or user model files participate in that GUI
+  test. The running operator app was not restarted. Permanent regression owners
+  are the existing component/hook and producer/preload suites, not a new runner.
+- Optimized backend and default frontend/Electron builds pass. This accepts
+  only the admitted duplicate-row correction, not full M4/M5, packaged-platform
+  claims, or the complete remediation program.
+
 ## Reports
 
 - `reports/frontend-async-owner-inventory.md` — completed for M0-S1.

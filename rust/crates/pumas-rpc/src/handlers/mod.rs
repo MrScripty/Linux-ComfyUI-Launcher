@@ -845,7 +845,9 @@ async fn next_model_download_update_event(
 }
 
 fn model_download_update_sse_event(notification: &ModelDownloadUpdateNotification) -> Event {
-    match serde_json::to_string(notification) {
+    match crate::contract::project_download_notification(notification)
+        .and_then(|value| serde_json::to_string(&value).map_err(Into::into))
+    {
         Ok(payload) => Event::default()
             .event("model-download-update")
             .data(payload),
@@ -1272,6 +1274,38 @@ async fn dispatch_method(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn download_push_validates_library_identity_and_redacts_diagnostics() {
+        for (model_id, event_name) in [
+            ("llm/acme/model", "model-download-update"),
+            ("../outside", "model-download-error"),
+        ] {
+            let notification: ModelDownloadUpdateNotification = serde_json::from_value(json!({
+                "cursor": "download:1",
+                "snapshot": {"cursor": "download:1", "revision": 1, "downloads": [{
+                    "downloadId": "push-fixture", "libraryModelId": model_id,
+                    "status": "downloading", "error": "private diagnostic",
+                }]},
+                "stale_cursor": false, "snapshot_required": true,
+            }))
+            .unwrap();
+            let event = model_download_update_sse_event(&notification);
+            let response = Sse::new(stream::iter([Ok::<_, Infallible>(event)])).into_response();
+            let body = axum::body::to_bytes(response.into_body(), 16_384)
+                .await
+                .unwrap();
+            let wire = std::str::from_utf8(&body).unwrap();
+            assert!(wire.contains(event_name));
+            assert!(!wire.contains("private diagnostic"));
+            if event_name == "model-download-update" {
+                assert!(wire.contains("\"libraryModelId\":\"llm/acme/model\""));
+            } else {
+                assert!(!wire.contains("../outside"));
+                assert!(!wire.contains("model-download-update"));
+            }
+        }
+    }
 
     #[test]
     fn test_json_rpc_response_success() {

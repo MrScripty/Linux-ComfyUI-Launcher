@@ -48,6 +48,51 @@ function createRemoteModel(overrides: Partial<RemoteModelInfo> = {}): RemoteMode
 }
 
 describe('ModelManagerUtils', () => {
+  it.each(['queued', 'downloading', 'pausing', 'paused', 'cancelling', 'error'] as const)(
+    'shows one catalog row when its exact model starts downloading (%s)', (downloadStatus) => {
+    const model = createLocalModel({ provenance: 'catalog', isPartialDownload: true });
+    const status = {
+      ...createDownloadStatus({ repoId: 'Org/Alpha', progress: 0.7, status: downloadStatus, modelType: 'unknown' }),
+      libraryModelId: model.id,
+    };
+    const groups = [{ category: 'llm', models: [model] }];
+    expect(mergeLocalModelGroups(groups, [])).toEqual(groups);
+
+    const merged = mergeLocalModelGroups(groups, buildDownloadingModels({ 'download-1': status }));
+    expect(merged[0]?.models).toHaveLength(1);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.models[0]).toMatchObject({
+      id: model.id, name: model.name, provenance: 'catalog',
+      isDownloading: true, downloadKey: 'download-1', downloadProgress: 0.7,
+    });
+    });
+
+  it('keeps cached and ambiguous model associations separate', () => {
+    for (const provenance of ['catalog', 'cached'] as const) {
+      const model = createLocalModel({ provenance, isPartialDownload: true });
+      const first = { ...createDownloadStatus(), libraryModelId: model.id };
+      const second = { ...first, downloadId: 'download-2' };
+      const activities: Record<string, DownloadStatus> = provenance === 'catalog'
+        ? { first, second } : { first };
+      const merged = mergeLocalModelGroups([{ category: 'llm', models: [model] }], buildDownloadingModels(activities));
+      expect(merged[0]?.models).toHaveLength(provenance === 'catalog' ? 3 : 2);
+      expect(merged[0]?.models.at(-1)).toEqual(model);
+    }
+  });
+
+  it('associates exact IDs without merging distinct quants or publishers', () => {
+    const models = [
+      createLocalModel({ provenance: 'catalog', id: 'llm/org/q4', quant: 'Q4', isPartialDownload: true }),
+      createLocalModel({ provenance: 'catalog', id: 'llm/org/q8', quant: 'Q8' }),
+      createLocalModel({ provenance: 'catalog', id: 'llm/other/q4', quant: 'Q4', repoId: 'Other/Alpha' }),
+    ];
+    const status = { ...createDownloadStatus(), libraryModelId: 'llm/org/q4' };
+    const merged = mergeLocalModelGroups([{ category: 'llm', models }], buildDownloadingModels({ exact: status }));
+    expect(merged[0]?.models).toHaveLength(3);
+    expect(merged[0]?.models[0]?.downloadKey).toBe('exact');
+    expect(merged[0]?.models.slice(1)).toEqual(models.slice(1));
+  });
+
   it('detects authentication-required download errors by HTTP status code', () => {
     expect(isAuthRequiredError('Request failed with HTTP 401 Unauthorized')).toBe(true);
     expect(isAuthRequiredError('Request failed with HTTP 403 Forbidden')).toBe(false);
