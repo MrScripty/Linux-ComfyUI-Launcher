@@ -20,6 +20,17 @@
 
 ## Slice Log
 
+### 2026-09-05 — Verified Ambient restart settlement checkpoint
+
+- Continued after plan reconciliation `14b53c74`. A real current-format store
+  regression reproduced startup refusal after durably Verified cleanup but
+  before exact queue settlement. The fix settles under retained task ownership
+  and validates both initial and returned inventory without replaying cleanup.
+- The [Rust ledger](rust-library-and-rpc/execution-ledger.md#2026-09-05--verified-ambient-pre-settlement-restore-corrected)
+  owns the exact source, RED/GREEN, cancellation/Pending evidence, independent
+  review correction, full dual-configuration core gates, and unchanged live
+  store hash. This checkpoint does not complete C3/C4 or platform acceptance.
+
 ### 2026-09-05 — Reconcile accepted checkpoints and resume bounded C3 work
 
 - Continued the canonical parent and focused plans against standards

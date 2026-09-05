@@ -21,6 +21,44 @@
 
 ## Slice Log
 
+### 2026-09-05 — Verified Ambient pre-settlement restore corrected
+
+- Exact source: `hf/download.rs`, SHA-256
+  `fb6a783526023f6080c7b2c5135fb78cf5027673530bf5ef472768d51df6c4c4`.
+  Reuses the existing retained recovery task, blocking-operation owner, and
+  exact-attempt queue settlement; no store schema or public API change.
+- RED: `cargo test --offline -p pumas-library --lib
+  restore_settles_verified_ambient_cleanup_before_restoring_follower` rejected
+  the real current-format persisted cutpoint with the existing unresolved
+  quarantine error. GREEN restores read-only Error history, settles only the
+  verified head, preserves follower ordinal/predecessor, allows its completion,
+  and reopens with only terminal history. Fixture bytes do not claim a network
+  transfer or process-kill test.
+- Added exact-diagnostic Pending refusal with unchanged queue/payload evidence,
+  and a blocked real store transition proving caller cancellation does not
+  discard settlement ownership. The initial test's Completed-task retirement
+  wait was corrected to use the existing observation method; production
+  completion was already reached and no lifecycle contract was weakened.
+- Independent review found that the returned inventory also needed validation.
+  Both snapshots now reject unresolved custody; the final one additionally
+  rejects any quarantine still holding an active admission. Revised production
+  review passes. This does not claim general concurrent restore or client Drop.
+- Focused `--lib restore_`: 6/6 pass. Full
+  `cargo test --offline -p pumas-library`, default and `--no-default-features`:
+  each 1,191 pass (1,088 unit plus 103 integration/doc), 11 existing ignores.
+  Evidence: `/tmp/pumas-verified-ambient-restore-focused.log` and
+  `/tmp/pumas-verified-restore.dc87Q6/`. Runs use Linux and isolated fixtures;
+  full package tests use the permitted real local socket/process environment.
+- Final supporting gates pass: `cargo clippy --offline -p pumas-library
+  --all-targets --all-features -- -D warnings`, the same command with
+  `--no-default-features` instead of `--all-features`, `cargo fmt --all --
+  --check`, diff whitespace, and all five plan contracts. No suppression or
+  hook bypass. The checkpoint is accepted; whole C3 remains unaccepted.
+- Live `launcher-data/downloads.json` SHA-256 remains
+  `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+  No live download, file migration, GUI rerun, or cross-target proof is claimed.
+  Remaining Pending/Recovery/hidden restore and C4 importer ownership stay open.
+
 ### 2026-09-05 — Current authority reconciled; Verified Ambient restore admitted
 
 - Source `2b9553a0`, standards `1609c304`. Continued the canonical focused plan;

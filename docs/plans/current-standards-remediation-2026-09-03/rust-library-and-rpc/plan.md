@@ -17,16 +17,19 @@ core/UniFFI ambient adapters do not reintroduce the removed desktop methods.
 HF-unavailable regressions now pass, but complete M2J and all-route contract
 acceptance remain open. RUST-I12 is resolved on Linux, not pending source work.
 
-**Next slice:** Restore current-format Verified Ambient quarantine with its
-exact queue admission still active after cleanup. Only
-`rust/crates/pumas-core/src/model_library/hf/download.rs` and colocated tests
-are admitted for this checkpoint. Use the existing exact settlement operation
-under retained restore-task ownership and reload reconciled strict inventory;
-do not replay filesystem cleanup or derive new authority from snapshots.
-The deterministic persisted-cutpoint regression must first fail, then prove
-successful restore, read-only Error history, and successor FIFO progress.
-Pending cleanup, unresolved Recovery custody, and hidden admission remain
-fail-closed. No live library mutation, schema change, or legacy support.
+The Verified Ambient pre-settlement restore checkpoint is accepted in
+`hf/download.rs` after focused review, dual core suites, and strict lint. Its regression
+failed before the fix and now proves successful restore, read-only Error
+history, successor progress, and retained settlement after caller cancellation.
+Initial and returned inventory both reject unresolved custody; no filesystem
+cleanup replay or new admission is inferred.
+
+**Next slice:** Bound the remaining C3 unresolved-state restore case. Identify
+exact durable proof and lifecycle
+ownership before admitting source and a deciding regression. Pending cleanup,
+unresolved Recovery custody, and hidden admission still fail closed; snapshots
+cannot grant new execution authority. No live mutation, schema change, legacy
+support, or C4 importer change is admitted by this investigation.
 
 The current-only cutover and queued pause remain accepted. Full C3, admitted
 relocation, guard-free effects, C4 awaited importer integration, and hard-process
@@ -107,9 +110,9 @@ is not hard-process-crash or live Hugging Face evidence. Marker-failure and
 seeded-file tests retain their narrower meaning. Held identities, network and
 queued pause, and removal of old partial relocation are integrated. Unknown
 admissions, Pending cleanup, and unresolved active Recovery custody still fail
-closed without a complete recovery path. Verified cleanup currently restores
-only after queue settlement; the admitted checkpoint addresses that specific
-restart gap. Runtime release facts remain retained until owner drop. Physical
+closed without a complete recovery path. Verified Ambient cleanup now settles
+its exact remaining admission before restore; the focused checkpoint is accepted. Runtime
+release facts remain retained until owner drop. Physical
 destination locking, admitted relocation, and C4 real awaited importer/callback
 ordering remain unfinished. Selected producer/consumer GUI integration is
 accepted separately, not evidence of full C3 or client-drop completion.
@@ -198,8 +201,9 @@ accepted separately, not evidence of full C3 or client-drop completion.
   refuses partial-directory moves without effects; complete-model migration is
   unchanged. Admitted relocation remains separate C3 work. Do not reintroduce
   compatibility, infer historical FIFO, or rerun conversion during startup.
-- **Held boundaries:** the next checkpoint changes only the source named in
-  Next slice. The broader write set above records C3/C4 ownership, not permission
+- **Held boundaries:** the next investigation admits no source changes until
+  its exact write set and deciding regression are recorded. The broader write
+  set above records C3/C4 ownership, not permission
   to expand this checkpoint. Selected RPC/frontend/Electron/generated/CI changes
   are already accepted at `2b081fba`; no new wire or consumer change is needed.
   The metadata files expose only the existing atomic writer

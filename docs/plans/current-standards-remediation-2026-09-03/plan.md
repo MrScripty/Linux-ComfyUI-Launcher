@@ -17,8 +17,9 @@ restore/lifecycle and C4 awaited importer ownership remain open; hard-process
 crash recovery is not proved. Slices A/B, governance, frontend milestones 0–3,
 and recorded incremental launcher/Torch work retain their evidence limits.
 
-The current checkpoint is the bounded Verified Ambient restore settlement
-described below, followed by C4 only after a separate exact admission. The
+The bounded Verified Ambient restore settlement is accepted after focused
+review, dual core suites, and strict lint. Remaining C3 and C4 require separate
+exact admission. The
 [execution ledger](execution-ledger.md) retains dated findings and verification;
 the contracts below remain binding. Current blockers are listed in
 [Blockers](#blockers).
@@ -208,16 +209,14 @@ requests or aborts the currently owned async handles; it has no Slice B drain
 or completion claim for running blocking work or finalizer-captured
 predecessors. Its existing test remains narrow unstarted-worker evidence.
 
-**Next slice:** Reconcile current-format Verified Ambient quarantine whose
-exact queue admission remains unsettled after completed cleanup. The Rust
-owner admits only `hf/download.rs` and colocated regressions: settle through
-the retained task owner and existing exact store operation, then reload strict
-inventory. Prove restored read-only Error history and follower progress at the
-persisted cutpoint; Pending cleanup, unresolved Recovery custody, and hidden
-admissions remain fail-closed. No cleanup replay, fresh snapshot-derived
-authority, old-format support, live download mutation, or schema change is
-admitted. The focused Rust plan owns the exact boundary and evidence. Other
-agents reconcile disjoint plan records; Cargo and commits remain serialized.
+**Next slice:** Bound the remaining C3 unresolved-state restore contract before
+implementation, preserving the accepted Verified Ambient settlement checkpoint.
+Pending cleanup, unresolved Recovery custody, and hidden admission still fail
+closed; their snapshots cannot grant fresh execution authority. Identify the
+exact durable proof and lifecycle owner needed for the next supported case,
+then record its source set and deciding regression. C4 importer ownership
+remains separate. No old-format support, live mutation, or schema change is
+admitted by this investigation. Cargo and commits remain serialized.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

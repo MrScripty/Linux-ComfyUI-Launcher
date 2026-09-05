@@ -17,7 +17,7 @@ use crate::error::{PumasError, Result};
 use crate::model_library::download_store::{
     DownloadAdmissionDomain, DownloadAdmissionRequest, DownloadAdmissionTransition,
     DownloadPersistence, LifecycleCleanupDisposition, LifecycleQuarantine,
-    LifecycleQuarantineDomain, PersistedDownload,
+    LifecycleQuarantineDomain, PersistedDownload, PersistedDownloadInventory,
 };
 use crate::model_library::partial_download::{
     finalize_download_artifact_with_files, infer_expected_sizes_with_files,
@@ -335,6 +335,31 @@ struct CancellationPersistence {
     domain: LifecycleQuarantineDomain,
     admission_attempt: Option<String>,
     revoked_snapshot: Option<PersistedDownload>,
+}
+
+fn validate_restore_inventory(inventory: &PersistedDownloadInventory) -> Result<()> {
+    if inventory
+        .queue_admissions
+        .values()
+        .any(|admission| admission.domain == DownloadAdmissionDomain::Recovery)
+    {
+        return Err(PumasError::Validation {
+            field: "download_recovery".into(),
+            message: "Active recovery custody requires explicit reconciliation before restore"
+                .into(),
+        });
+    }
+    if !inventory.hidden_admissions.is_empty()
+        || inventory
+            .quarantines
+            .values()
+            .any(|quarantine| quarantine.disposition != LifecycleCleanupDisposition::Verified)
+    {
+        return Err(PumasError::Other(
+            "Download restore requires unresolved admission or quarantine reconciliation".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl CancellationPersistence {
@@ -1866,37 +1891,45 @@ impl HuggingFaceClient {
             None => return Ok(Vec::new()),
         };
 
-        let inventory = tokio::task::spawn_blocking({
-            let persistence = persistence.clone();
-            move || {
-                persistence.reconcile_lifecycle_inventory_strict()?;
-                persistence.load_lifecycle_inventory_strict()
-            }
-        })
-        .await
-        .map_err(|error| PumasError::Other(format!("Download restore owner failed: {error}")))??;
-        if inventory
-            .queue_admissions
-            .values()
-            .any(|admission| admission.domain == DownloadAdmissionDomain::Recovery)
-        {
-            return Err(PumasError::Validation {
-                field: "download_recovery".into(),
-                message: "Active recovery custody requires explicit reconciliation before restore"
-                    .into(),
-            });
-        }
-        if !inventory.hidden_admissions.is_empty()
-            || inventory.quarantines.iter().any(|(id, quarantine)| {
-                quarantine.disposition != LifecycleCleanupDisposition::Verified
-                    || inventory.queue_admissions.contains_key(id)
+        let inventory = self
+            .run_recovery_transition(move |context| async move {
+                context
+                    .run_fallible_blocking_named("reconcile download restore inventory", move || {
+                        persistence.reconcile_lifecycle_inventory_strict()?;
+                        let inventory = persistence.load_lifecycle_inventory_strict()?;
+                        validate_restore_inventory(&inventory)?;
+                        // A crash can leave durable Verified cleanup immediately
+                        // before its exact queue settlement. No filesystem replay
+                        // or new admission is authorized by this terminal proof.
+                        for (id, quarantine) in &inventory.quarantines {
+                            if quarantine.domain != LifecycleQuarantineDomain::Ambient {
+                                continue;
+                            }
+                            if let Some(admission) = inventory.queue_admissions.get(id) {
+                                if !persistence.settle_queue_admission(id, &admission.attempt_id)? {
+                                    return Err(PumasError::Validation {
+                                        field: "download_cleanup".into(),
+                                        message: "Verified cleanup queue settlement was not confirmed".into(),
+                                    });
+                                }
+                            }
+                        }
+                        let inventory = persistence.load_lifecycle_inventory_strict()?;
+                        validate_restore_inventory(&inventory)?;
+                        if inventory.quarantines.keys().any(|id| inventory.queue_admissions.contains_key(id)) {
+                            return Err(PumasError::Validation {
+                                field: "download_cleanup".into(),
+                                message: "Cleanup queue custody remains active after reconciliation".into(),
+                            });
+                        }
+                        Ok(inventory)
+                    })
+                    .await
+                    .map_err(|error| {
+                        PumasError::Other(format!("Download restore owner failed: {error}"))
+                    })?
             })
-        {
-            return Err(PumasError::Other(
-                "Download restore requires unresolved admission or quarantine reconciliation"
-                    .into(),
-            ));
-        }
+            .await?;
         let verified_failures = inventory
             .quarantines
             .values()
@@ -13387,6 +13420,225 @@ mod tests {
         client.set_persistence(persistence);
         client.restore_persisted_downloads().await.unwrap();
         (Arc::new(client), source)
+    }
+
+    #[tokio::test]
+    async fn restore_settles_verified_ambient_cleanup_before_restoring_follower() {
+        let temp = TempDir::new().unwrap();
+        let (head, follower) = ambient_cleanup_cutpoint(temp.path(), true);
+        let store = Arc::new(DownloadPersistence::new(temp.path()));
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        client.set_persistence(store.clone());
+
+        assert!(client
+            .restore_persisted_downloads()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            client.get_download_status(&head.download_id).await,
+            Some(DownloadStatus::Error)
+        );
+        assert_eq!(
+            client.get_download_status(&follower.download_id).await,
+            Some(DownloadStatus::Paused)
+        );
+        assert!(!client.resume_download(&head.download_id).await.unwrap());
+        assert!(client.cancel_download(&head.download_id).await.is_err());
+        let inventory = store.load_lifecycle_inventory_strict().unwrap();
+        assert!(!inventory.queue_admissions.contains_key(&head.download_id));
+        let admission = &inventory.queue_admissions[&follower.download_id];
+        assert_eq!(admission.position.ordinal, 1);
+        assert_eq!(
+            admission.position.predecessor.as_ref().unwrap().download_id,
+            head.download_id
+        );
+        let quarantine = &inventory.quarantines[&head.download_id];
+        assert_eq!(
+            quarantine.disposition,
+            LifecycleCleanupDisposition::Verified
+        );
+        assert!(quarantine.sticky_failure);
+        let mut expected = serde_json::to_value(&head).unwrap();
+        expected["status"] = serde_json::to_value(DownloadStatus::Error).unwrap();
+        assert_eq!(
+            serde_json::to_value(&quarantine.snapshot).unwrap(),
+            expected
+        );
+
+        // Fixture bytes prove queue progress without a network transfer claim.
+        std::fs::write(follower.dest_dir.join(&follower.filename), b"complete").unwrap();
+        assert!(client.resume_download(&follower.download_id).await.unwrap());
+        let settled = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                client.observe_finished_download_tasks().await;
+                if client.get_download_status(&follower.download_id).await
+                    == Some(DownloadStatus::Completed)
+                    && !client.download_tasks.contains(&follower.download_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "verified predecessor cleanup must not strand its follower: {:?}",
+            client.get_download_progress(&follower.download_id).await
+        );
+        let mut fresh = HuggingFaceClient::new(temp.path().join("fresh-cache")).unwrap();
+        fresh
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        fresh.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
+        assert!(fresh
+            .restore_persisted_downloads()
+            .await
+            .unwrap()
+            .is_empty());
+        let history = fresh.list_downloads().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].download_id, head.download_id);
+        assert_eq!(history[0].status, DownloadStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_pending_ambient_cleanup_and_follower_fail_closed() {
+        let temp = TempDir::new().unwrap();
+        let (head, follower) = ambient_cleanup_cutpoint(temp.path(), false);
+        let store = Arc::new(DownloadPersistence::new(temp.path()));
+        store.reconcile_lifecycle_inventory_strict().unwrap();
+        let before = store.load_lifecycle_inventory_strict().unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        client.set_persistence(store.clone());
+        assert!(matches!(client.restore_persisted_downloads().await,
+            Err(PumasError::Other(message))
+                if message == "Download restore requires unresolved admission or quarantine reconciliation"));
+        assert!(client.list_downloads().await.is_empty());
+        assert_eq!(
+            std::fs::read(head.dest_dir.join("head.gguf.part")).unwrap(),
+            b"old"
+        );
+        let after = store.load_lifecycle_inventory_strict().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.queue_admissions).unwrap(),
+            serde_json::to_value(&before.queue_admissions).unwrap()
+        );
+        assert!(after.queue_admissions.contains_key(&follower.download_id));
+        assert_eq!(
+            after.quarantines[&head.download_id].disposition,
+            LifecycleCleanupDisposition::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_verified_settlement_remains_owned_after_caller_cancellation() {
+        let temp = TempDir::new().unwrap();
+        let (head, _) = ambient_cleanup_cutpoint(temp.path(), true);
+        let store = Arc::new(DownloadPersistence::new(temp.path()));
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client
+            .configure_download_destination_root(temp.path())
+            .unwrap();
+        client.set_persistence(store.clone());
+        let client = Arc::new(client);
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocked = std::sync::Mutex::new(blocked);
+        client
+            .download_tasks
+            .set_blocking_observer(Some(Arc::new(move |operation| {
+                if operation == "reconcile download restore inventory" {
+                    if let Some(entered) = entered.lock().unwrap().take() {
+                        let _ = entered.send(());
+                        blocked.lock().unwrap().recv().unwrap();
+                    }
+                }
+            })));
+        let restore = tokio::spawn({
+            let client = client.clone();
+            async move { client.restore_persisted_downloads().await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        restore.abort();
+        assert!(restore.await.unwrap_err().is_cancelled());
+        assert!(!client.download_tasks.is_empty());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !client.download_tasks.is_empty() {
+                client.observe_finished_download_tasks().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retained restore operation must settle after its caller leaves");
+        client.download_tasks.set_blocking_observer(None);
+        let inventory = store.load_lifecycle_inventory_strict().unwrap();
+        assert!(!inventory.queue_admissions.contains_key(&head.download_id));
+        assert_eq!(
+            inventory.quarantines[&head.download_id].disposition,
+            LifecycleCleanupDisposition::Verified
+        );
+        assert!(client
+            .restore_persisted_downloads()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    fn ambient_cleanup_cutpoint(
+        root: &Path,
+        verified: bool,
+    ) -> (PersistedDownload, PersistedDownload) {
+        let destination = root.join("model");
+        std::fs::create_dir(&destination).unwrap();
+        let store = DownloadPersistence::new(root);
+        let request = recovery_test_request("owner/head", &["head.gguf".into()]);
+        let head = PersistedDownload {
+            download_id: "verified-cleanup-head".into(),
+            repo_id: request.repo_id.clone(),
+            filename: "head.gguf".into(),
+            filenames: vec!["head.gguf".into()],
+            dest_dir: destination.clone(),
+            total_bytes: Some(8),
+            status: DownloadStatus::Paused,
+            download_request: request,
+            created_at: "2026-09-03T00:00:00Z".into(),
+            known_sha256: None,
+            huggingface_evidence: None,
+        };
+        let mut follower = head.clone();
+        follower.download_id = "verified-cleanup-follower".into();
+        follower.repo_id = "owner/follower".into();
+        follower.filename = "follower.gguf".into();
+        follower.filenames = vec![follower.filename.clone()];
+        follower.download_request = recovery_test_request(&follower.repo_id, &follower.filenames);
+        admit_snapshot_at_root(&store, &head, root);
+        admit_snapshot_at_root(&store, &follower, root);
+        std::fs::write(destination.join("head.gguf.part"), b"old").unwrap();
+        store
+            .begin_lifecycle_quarantine(&head, LifecycleQuarantineDomain::Ambient, true)
+            .unwrap();
+        if verified {
+            // Persisted cutpoint after successful cleanup/verification, before
+            // exact queue settlement; this is not a process-kill fixture.
+            std::fs::remove_file(destination.join("head.gguf.part")).unwrap();
+            assert!(store
+                .verify_lifecycle_quarantine(&head.download_id)
+                .unwrap());
+        }
+        (head, follower)
     }
 
     #[tokio::test]
