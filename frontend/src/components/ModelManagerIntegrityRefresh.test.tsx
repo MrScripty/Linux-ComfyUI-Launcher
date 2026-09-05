@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ModelLibraryUpdateNotification, ModelRecord } from '../types/api';
 import { useModels } from '../hooks/useModels';
 import { ModelManager } from './ModelManager';
+import { writeModelLibrarySnapshot } from '../utils/modelLibrarySnapshot';
 
 const {
   getElectronAPIMock,
@@ -173,16 +174,18 @@ function makeRecord(id: string, hasIntegrityIssue: boolean): ModelRecord {
 }
 
 function Harness() {
-  const { modelGroups } = useModels();
+  const { modelGroups, libraryLoadStatus } = useModels();
 
   return (
     <ModelManager
       modelGroups={modelGroups}
+      libraryLoadStatus={libraryLoadStatus}
       starredModels={new Set()}
       excludedModels={new Set()}
       onToggleStar={vi.fn()}
       onToggleLink={vi.fn()}
       selectedAppId="ollama"
+      onChooseExistingLibrary={vi.fn()}
     />
   );
 }
@@ -198,11 +201,65 @@ describe('ModelManager integrity refresh acceptance', () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     isApiAvailableMock.mockReturnValue(true);
+    localStorage.clear();
+    getElectronAPIMock.mockReturnValue(null);
   });
 
   afterEach(() => {
     vi.clearAllTimers();
     vi.useRealTimers();
+  });
+
+  it('shows loading rather than an empty library or a zero count before the first response', () => {
+    getModelsMock.mockReturnValue(new Promise(() => {}));
+    render(<Harness />);
+
+    expect(screen.getByRole('status')).toHaveTextContent('Loading library');
+    expect(screen.queryByText('No library models found')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('Search 0 models')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Search library models')).toBeInTheDocument();
+  });
+
+  it.each(['rejected', 'unsuccessful', 'unavailable'] as const)(
+    'does not claim an empty library when the backend is %s',
+    async (failure) => {
+      if (failure === 'rejected') getModelsMock.mockRejectedValue(new Error('Backend startup failed'));
+      if (failure === 'unsuccessful') getModelsMock.mockResolvedValue({ success: false, models: {} });
+      if (failure === 'unavailable') isApiAvailableMock.mockReturnValue(false);
+      render(<Harness />);
+      await flushMicrotasks();
+
+      expect(screen.getByRole('alert')).toHaveTextContent('Library unavailable');
+      expect(screen.queryByText('No library models found')).not.toBeInTheDocument();
+      expect(screen.queryByPlaceholderText('Search 0 models')).not.toBeInTheDocument();
+    },
+  );
+
+  it('still displays the genuine empty-library state after a successful empty response', async () => {
+    getModelsMock.mockResolvedValue({ success: true, models: {} });
+    render(<Harness />);
+    await flushMicrotasks();
+
+    expect(screen.getByText('No library models found')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Search 0 models')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('keeps saved partial models visible while clearly identifying a failed refresh', async () => {
+    writeModelLibrarySnapshot([{
+      category: 'llm',
+      models: [{ id: 'saved-partial', name: 'Saved partial model', category: 'llm', isPartialDownload: true }],
+    }]);
+    getModelsMock.mockRejectedValue(new Error('Backend startup failed'));
+    render(<Harness />);
+    expect(screen.getByText('Saved partial model')).toBeInTheDocument();
+    await flushMicrotasks();
+
+    expect(screen.getByText('Saved partial model')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Showing previously loaded models');
+    expect(screen.getByText('PARTIAL')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Search library models')).toBeInTheDocument();
+    expect(screen.queryByText('No library models found')).not.toBeInTheDocument();
   });
 
   it('clears the integrity header and ISSUE badge after backend-pushed refresh returns clean model data', async () => {

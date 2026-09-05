@@ -131,6 +131,24 @@ describe('useModels', () => {
     });
   });
 
+  it('recovers loading status after a failed fetch without accepting an older failure', async () => {
+    const older = createDeferred<{ success: boolean; models: Record<string, ModelRecord> }>();
+    getModelsMock.mockReturnValueOnce(older.promise);
+    const { result } = renderHook(() => useModels());
+    expect(result.current.libraryLoadStatus).toBe('loading');
+    await act(async () => { await result.current.fetchModels(); });
+    expect(result.current.libraryLoadStatus).toBe('ready');
+    await act(async () => { older.reject(new Error('Older request failed')); });
+    expect(result.current.libraryLoadStatus).toBe('ready');
+
+    getModelsMock.mockRejectedValueOnce(new Error('Current request failed'));
+    await act(async () => { await result.current.fetchModels(); });
+    expect(result.current.libraryLoadStatus).toBe('unavailable');
+    expect(result.current.modelGroups).toEqual(grouped(['alpha']));
+    await act(async () => { await result.current.fetchModels(); });
+    expect(result.current.libraryLoadStatus).toBe('ready');
+  });
+
   it('shows the last model snapshot immediately while startup revalidation is pending', () => {
     const pendingModels = createDeferred<{
       success: boolean;

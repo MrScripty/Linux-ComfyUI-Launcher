@@ -46,6 +46,7 @@ describe('DEFAULT_APPS', () => {
     expect(decorated.find((app) => app.id === onnxPlugin.id)?.iconState).toBe('offline');
 
     const modelManagerProps: ModelManagerProps = {
+      libraryLoadStatus: 'ready',
       excludedModels: new Set(),
       modelGroups: [],
       onToggleLink: () => {},

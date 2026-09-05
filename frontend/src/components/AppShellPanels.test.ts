@@ -12,6 +12,7 @@ const modelGroups: ModelCategory[] = [
 ];
 
 const modelManagerProps: ModelManagerProps = {
+  libraryLoadStatus: 'ready',
   excludedModels: new Set(),
   modelGroups,
   onToggleLink: vi.fn(),

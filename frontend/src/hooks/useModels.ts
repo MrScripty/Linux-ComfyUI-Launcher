@@ -28,6 +28,8 @@ const SEARCH_DEBOUNCE_MS = 300;
 /** Cache TTL for SWR pattern (ms) - show cached results for up to 30 seconds */
 const CACHE_TTL_MS = 30000;
 
+export type ModelLibraryLoadStatus = 'loading' | 'ready' | 'unavailable';
+
 /** Cache entry for SWR pattern */
 interface CacheEntry {
   query: string;
@@ -40,6 +42,7 @@ interface CacheEntry {
 
 export function useModels() {
   const [modelGroups, setModelGroups] = useState<ModelCategory[]>(readModelLibrarySnapshot);
+  const [libraryLoadStatus, setLibraryLoadStatus] = useState<ModelLibraryLoadStatus>('loading');
   const [isSearching, setIsSearching] = useState(false);
   const [isRevalidating, setIsRevalidating] = useState(false);
   const [searchQueryTime, setSearchQueryTime] = useState<number | null>(null);
@@ -55,16 +58,21 @@ export function useModels() {
   } | null>(null);
 
   const fetchModels = useCallback(async () => {
+    const currentSequence = ++fetchSequenceRef.current;
     // Check API availability before fetching
     if (!isAPIAvailable()) {
       logger.debug('API not available yet, skipping fetch');
+      setLibraryLoadStatus('unavailable');
       return;
     }
 
-    const currentSequence = ++fetchSequenceRef.current;
+    setLibraryLoadStatus('loading');
 
     try {
       const result = await modelsAPI.getModels();
+      if (currentSequence === fetchSequenceRef.current) {
+        setLibraryLoadStatus(result.success ? 'ready' : 'unavailable');
+      }
       if (currentSequence !== fetchSequenceRef.current || activeSearchRef.current) {
         logger.debug('Discarding stale model list response', {
           currentSequence,
@@ -82,6 +90,9 @@ export function useModels() {
         }
       }
     } catch (error) {
+      if (currentSequence === fetchSequenceRef.current) {
+        setLibraryLoadStatus('unavailable');
+      }
       if (error instanceof APIError) {
         logger.error('API error fetching models', { error: error.message, endpoint: error.endpoint });
       } else if (error instanceof Error) {
@@ -284,6 +295,7 @@ export function useModels() {
 
   return {
     modelGroups,
+    libraryLoadStatus,
     fetchModels,
     scanModels,
     searchModelsFTS,

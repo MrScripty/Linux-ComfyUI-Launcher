@@ -21,6 +21,7 @@ vi.mock('./sections/RuntimeProfileSettingsSection', () => ({
 describe('OnnxRuntimePanel', () => {
   it('renders ONNX profile settings and delegates model groups to the ONNX library section', () => {
     const modelManagerProps: ModelManagerProps = {
+      libraryLoadStatus: 'ready',
       excludedModels: new Set(),
       modelGroups: [
         {

@@ -17,6 +17,7 @@ import { useModelImportPicker } from '../hooks/useModelImportPicker';
 import { useModelLibraryActions } from '../hooks/useModelLibraryActions';
 import { useModelManagerFilters } from '../hooks/useModelManagerFilters';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
+import type { ModelLibraryLoadStatus } from '../hooks/useModels';
 import { ModelSearchBar } from './ModelSearchBar';
 import { LocalModelsList } from './LocalModelsList';
 import { RemoteModelsList } from './RemoteModelsList';
@@ -36,6 +37,7 @@ import { startRemoteModelDownload } from './ModelManagerRemoteDownload';
 
 export interface ModelManagerProps {
   modelGroups: ModelCategory[];
+  libraryLoadStatus: ModelLibraryLoadStatus;
   starredModels: Set<string>;
   excludedModels: Set<string>;
   onToggleStar: (modelId: string) => void;
@@ -55,6 +57,7 @@ export interface ModelManagerProps {
 
 export const ModelManager: React.FC<ModelManagerProps> = ({
   modelGroups,
+  libraryLoadStatus,
   starredModels,
   excludedModels,
   onToggleStar,
@@ -227,7 +230,7 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
         onToggleMode={handleToggleMode}
         isCategoryFiltered={isCategoryFiltered}
         onFilterClick={toggleFilterMenu}
-        totalModels={totalModels}
+        totalModels={libraryLoadStatus === 'ready' ? totalModels : null}
         hasActiveDownloads={hasActiveDownloads}
         showCategoryMenu={showCategoryMenu}
         filterList={filterList}
@@ -264,38 +267,51 @@ export const ModelManager: React.FC<ModelManagerProps> = ({
             />
           ) : (
             <>
+              {libraryLoadStatus !== 'ready' && (
+                <div
+                  role={libraryLoadStatus === 'unavailable' ? 'alert' : 'status'}
+                  className="rounded border border-[hsl(var(--launcher-border))] px-3 py-2 text-sm text-[hsl(var(--text-secondary))]"
+                >
+                  {libraryLoadStatus === 'loading'
+                    ? 'Loading library…'
+                    : 'Library unavailable. Could not load models.'}
+                  {modelGroups.length > 0 && ' Showing previously loaded models.'}
+                </div>
+              )}
               {integrityIssueCount > 0 && (
                 <div className="rounded border border-[hsl(var(--accent-warning)/0.35)] bg-[hsl(var(--accent-warning)/0.12)] px-3 py-2 text-xs text-[hsl(var(--accent-warning))]">
                   Library integrity warning: {integrityIssueCount} model entr{integrityIssueCount === 1 ? 'y' : 'ies'} have duplicate artifact records for the same repository. Reconciliation will keep one visible entry and mark the issue.
                 </div>
               )}
-              <LocalModelsList
-                modelGroups={filteredGroups}
-                starredModels={starredModels}
-                excludedModels={excludedModels}
-                onToggleStar={onToggleStar}
-                onToggleLink={onToggleLink}
-                selectedAppId={selectedAppId}
-                servedModels={servedModels}
-                totalModels={totalModels}
-                hasFilters={hasLocalFilters}
-                onClearFilters={handleClearLocalFilters}
-                relatedModelsById={relatedModelsById}
-                expandedRelated={expandedRelated}
-                onToggleRelated={handleToggleRelated}
-                onOpenRelatedUrl={openRemoteUrl}
-                onPauseDownload={pauseDownload}
-                onResumeDownload={resumeDownload}
-                onCancelDownload={cancelDownload}
-                onRecoverPartialDownload={handleRecoverPartialDownload}
-                recoveringPartialRepoIds={recoveringPartialRepoIds}
-                downloadErrors={downloadErrors}
-                onDeleteModel={handleDeleteModel}
-                onConvertModel={handleConvertModel}
-                onServeModel={onServeModel}
-                onChooseExistingLibrary={onChooseExistingLibrary ? chooseExistingLibrary : undefined}
-                isChoosingExistingLibrary={isChoosingExistingLibrary}
-              />
+              {(libraryLoadStatus === 'ready' || localModelGroups.length > 0) && (
+                <LocalModelsList
+                  modelGroups={filteredGroups}
+                  starredModels={starredModels}
+                  excludedModels={excludedModels}
+                  onToggleStar={onToggleStar}
+                  onToggleLink={onToggleLink}
+                  selectedAppId={selectedAppId}
+                  servedModels={servedModels}
+                  totalModels={totalModels}
+                  hasFilters={hasLocalFilters}
+                  onClearFilters={handleClearLocalFilters}
+                  relatedModelsById={relatedModelsById}
+                  expandedRelated={expandedRelated}
+                  onToggleRelated={handleToggleRelated}
+                  onOpenRelatedUrl={openRemoteUrl}
+                  onPauseDownload={pauseDownload}
+                  onResumeDownload={resumeDownload}
+                  onCancelDownload={cancelDownload}
+                  onRecoverPartialDownload={handleRecoverPartialDownload}
+                  recoveringPartialRepoIds={recoveringPartialRepoIds}
+                  downloadErrors={downloadErrors}
+                  onDeleteModel={handleDeleteModel}
+                  onConvertModel={handleConvertModel}
+                  onServeModel={onServeModel}
+                  onChooseExistingLibrary={onChooseExistingLibrary ? chooseExistingLibrary : undefined}
+                  isChoosingExistingLibrary={isChoosingExistingLibrary}
+                />
+              )}
               {/* Link Health Status */}
               <div className="mt-4">
                 <LinkHealthStatus activeVersion={activeVersion} />

@@ -40,6 +40,7 @@ interface BuildManagedAppsStateOptions {
 }
 
 interface BuildModelManagerPropsOptions {
+  libraryLoadStatus: ModelManagerProps['libraryLoadStatus'];
   activeVersion: string | null;
   excludedModels: Set<string>;
   modelGroups: ModelCategory[];
@@ -137,6 +138,7 @@ export function buildManagedAppsState({
 }
 
 export function buildModelManagerProps({
+  libraryLoadStatus,
   activeVersion,
   excludedModels,
   modelGroups,
@@ -154,6 +156,7 @@ export function buildModelManagerProps({
 }: BuildModelManagerPropsOptions): ModelManagerProps {
   return {
     modelGroups,
+    libraryLoadStatus,
     starredModels,
     excludedModels,
     onToggleStar,

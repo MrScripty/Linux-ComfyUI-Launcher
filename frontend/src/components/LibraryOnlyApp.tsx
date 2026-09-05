@@ -22,7 +22,7 @@ export default function LibraryOnlyApp() {
     refetch: refetchStatus,
   } = useStatus();
   const { fetchDiskSpace } = useDiskSpace();
-  const { modelGroups, scanModels, fetchModels } = useModels();
+  const { modelGroups, libraryLoadStatus, scanModels, fetchModels } = useModels();
   const { activeDownload, activeDownloadCount } = useActiveModelDownload();
   const {
     checkLauncherUpdates,
@@ -81,6 +81,7 @@ export default function LibraryOnlyApp() {
       <main className="relative z-10 flex flex-1 flex-col overflow-hidden p-6">
         <ModelManager
           modelGroups={modelGroups}
+          libraryLoadStatus={libraryLoadStatus}
           starredModels={starredModels}
           excludedModels={excludedModels}
           onToggleStar={toggleStar}

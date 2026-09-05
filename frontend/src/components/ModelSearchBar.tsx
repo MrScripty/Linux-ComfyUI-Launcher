@@ -16,7 +16,7 @@ interface ModelSearchBarProps {
   onToggleMode: () => void;
   isCategoryFiltered: boolean;
   onFilterClick: () => void;
-  totalModels: number;
+  totalModels: number | null;
   hasActiveDownloads?: boolean;
   showCategoryMenu: boolean;
   filterList: string[];
@@ -109,7 +109,7 @@ export function ModelSearchBar({
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[hsl(var(--launcher-text-muted))]" />
             <input
               type="text"
-              placeholder={isDownloadMode ? 'Search Hugging Face models' : `Search ${totalModels} models`}
+              placeholder={isDownloadMode ? 'Search Hugging Face models' : totalModels === null ? 'Search library models' : `Search ${totalModels} models`}
               value={searchQuery}
               onChange={(e) => onSearchChange(e.target.value)}
               className="w-full pl-9 pr-16 py-2 text-sm bg-[hsl(var(--launcher-bg-primary))] border border-[hsl(var(--launcher-border))] rounded text-[hsl(var(--launcher-text-primary))] placeholder:text-[hsl(var(--launcher-text-muted))] focus:outline-none focus:border-[hsl(var(--launcher-accent-primary))] transition-colors"
