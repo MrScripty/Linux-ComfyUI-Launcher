@@ -21,6 +21,64 @@
 
 ## Slice Log
 
+### 2026-09-05 — Cancellation predecessor custody accepted
+
+- Accepted the bounded admission below after independent consumer review and
+  root gates. The codebase-design skill kept predecessor observation inside the
+  existing task owner instead of adding an unused shutdown Interface.
+- Actual RED: `/tmp/pumas-finalizer-predecessor-red.log` reports terminal
+  completion while a real predecessor blocking effect is held. Three new inline
+  tests now cover finalizer interruption across success/error/panic, inherited
+  failure after receipt delivery without failing new cleanup, and observer
+  bookkeeping failure after effect drain without fabricated absence.
+- Focused GREEN: 25 lifecycle tests and 8 HF cancellation tests in
+  `/tmp/pumas-finalizer-predecessor-lifecycle-final.log` and
+  `/tmp/pumas-finalizer-predecessor-cancellation-final.log`. The cancellation
+  suite required local socket fixture permission; its earlier sandbox refusal
+  is superseded by the successful permitted run.
+- Root verified the final assertion-order adjustment: both full core suites
+  pass 1,212 tests each, with 11 existing ignores; strict all-targets Clippy
+  passes with all features and without default features; workspace formatting
+  passes. Logs: `/tmp/pumas-cancel-custody.T9wZ9l/`. All five plan contracts pass.
+- Final `hf/lifecycle.rs` SHA-256:
+  `4cb725eda17b108f881e7424e0973380499917ce4e0511bf1411932fef467a49`.
+  Live `launcher-data/downloads.json` remains unchanged at
+  `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+- No client Drop/abort_all drainage, general poison recovery, RPC shutdown,
+  root lease, importer ownership, or Pending replay acceptance. Next admit
+  explicit HF shutdown with atomic admission closure, retained gated/in-transit
+  custody, and the identified RPC supervisor consuming a cancellation-safe result.
+
+### 2026-09-05 — Cancellation predecessor custody admitted
+
+- Continue from `9e8e9bea` at standards `aff5b867`. The RPC supervisor in
+  `server.rs` already survives shutdown-waiter cancellation and observes catalog
+  drain; it is the selected future consumer of explicit HF shutdown. Existing
+  RuntimeTasks/PumasApi Drop is not an adequate substitute.
+- Shutdown inspection exposed an independently correctable prerequisite:
+  `begin_cancel` captures the predecessor TaskEntry inside the abortable finalizer
+  future. Aborting that outer task can make existing terminal observation report
+  completion while predecessor blocking work continues and its outcome is lost.
+- Exact source: `hf/lifecycle.rs` and inline tests. Retain predecessor observation
+  as a registered NestedTask, following the existing finished-projection pattern;
+  deliver the actual observation to the finalizer. Missing delivery must not be
+  fabricated as an absent predecessor. Preserve start gates, projection transfer,
+  normal cancellation ordering, and failure observation without a new Interface.
+- Preserve inherited failure separately from current finalizer effect failures:
+  drain waits for both, but only current effects can prevent otherwise successful
+  cleanup verification. Terminal observation retains both. Clearing inherited
+  failure on delivery would lose evidence if the finalizer subsequently aborts.
+- Deciding RED: hold real predecessor blocking work, start cancellation, abort
+  only the finalizer outer, and require snapshot/terminal observation to remain
+  incomplete. Release success/error/panic and prove terminal observation consumes
+  the outcome without running cleanup. Check existing cancellation/projection
+  gates, both full core configurations, strict lint, formatting, and plan checks.
+- This corrects existing terminal-observation semantics; it does not fix client
+  Drop/abort_all or satisfy the later weak-reference shutdown regression.
+  Full shutdown still needs retained prepared/retired/in-flight custody, separate
+  custody start gates, atomic admission closure, and an observed shared receipt.
+  No RPC/API implementation, root lock, importer change, or Pending replay yet.
+
 ### 2026-09-05 — Execution ownership prerequisites reconciled
 
 - Continue from `4ab3910b`, standards `aff5b867`. Two independent read-only

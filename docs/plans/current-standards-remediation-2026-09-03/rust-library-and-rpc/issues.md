@@ -32,18 +32,26 @@
   eligibility under the grant; stale runtime snapshots are not authority.
   Importer effects need an awaited or explicitly transferred owner before this
   grant can justify Pending replay. Do not claim general library-wide exclusion.
-- **Next admission:** choose the real runtime consumer of HF shutdown completion
-  and failure. Center the initial slice on `hf/lifecycle.rs`, `hf/mod.rs`, tests,
-  and that consumer only where required. A detached drain spawned by Drop or
-  the existing outcome-discarding retired-task reaper is not sufficient.
+- **Teardown consumer identified:** the existing RPC server supervisor can await
+  explicit HF shutdown and catalog drain even after its caller leaves. Future
+  wiring goes through core/HF forwarding, not the abort-only RuntimeTasks owner.
+  A detached drain spawned by Drop or the existing outcome-discarding retired-
+  task reaper is not sufficient.
+- **Accepted prerequisite:** cancellation now retains predecessor observation in
+  the existing nested-task owner (`hf/lifecycle.rs` only). The started-finalizer
+  interruption regression proves terminal observation cannot finish while
+  predecessor effects remain, and failures survive delivery. Full shutdown must close
+  admission atomically and retain in-transit prepared/retired custody; start gates
+  cannot discard a custody observer merely because finalizer execution is aborted.
 - **Deciding regression:** hold a real blocking write, retain only a weak test
   reference to its task owner, and drop the client. Production ownership must
   survive until the effect and its success/error/panic outcome are observed by
   teardown. A test-owned strong reference must not manufacture retention.
   Later lease gates include independent-process contention/release, same-client
   concurrency, idle handoff, root replacement refusal, and last-effect release.
-- **Disposition:** sequencing re-planned; no runtime edits or lease acceptance.
-  Revisit on teardown-consumer selection, a demonstrated ownership gap, or a
+- **Disposition:** bounded predecessor-custody checkpoint accepted; explicit
+  shutdown, client Drop drainage, and lease acceptance remain open.
+  Revisit on shutdown admission, a demonstrated ownership gap, or a
   requirement for concurrent independent mutation engines.
 
 ## Open Decision Dependencies

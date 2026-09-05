@@ -589,6 +589,12 @@ impl fmt::Display for BlockingTaskError {
 struct NestedTask {
     handle: JoinHandle<()>,
     completion: Arc<NestedCompletion>,
+    failure_kind: NestedFailureKind,
+}
+
+enum NestedFailureKind {
+    Effect,
+    Predecessor,
 }
 
 struct NestedCompletion {
@@ -608,6 +614,7 @@ struct TaskEntry {
     outer: JoinHandle<()>,
     nested: Vec<NestedTask>,
     nested_failures_archived: usize,
+    predecessor_failures_archived: usize,
     projection: Option<Arc<ProjectionCell>>,
     starts: Vec<oneshot::Sender<()>>,
     superseded_projection: Option<Arc<ProjectionCell>>,
@@ -646,9 +653,15 @@ impl TaskEntry {
                 None
             };
             if let Some(result) = observed {
-                self.nested_failures_archived += usize::from(
+                let failures = usize::from(
                     result.is_err() || nested.completion.failed.load(Ordering::Acquire),
                 );
+                match nested.failure_kind {
+                    NestedFailureKind::Effect => self.nested_failures_archived += failures,
+                    NestedFailureKind::Predecessor => {
+                        self.predecessor_failures_archived += failures
+                    }
+                }
             } else {
                 retained.push(nested);
             }
@@ -991,6 +1004,7 @@ impl DownloadTaskOwner {
                 outer: entry.outer,
                 nested: Vec::new(),
                 nested_failures_archived: 0,
+                predecessor_failures_archived: 0,
                 projection: entry.projection,
                 starts: vec![entry.start],
                 superseded_projection: None,
@@ -1226,8 +1240,8 @@ impl DownloadTaskOwner {
     }
 
     /// Starts a caller-independent finalizer after synchronously replacing and
-    /// aborting the current generation. The finalizer observes the outer task
-    /// and all registered blocking work before it runs `finish`.
+    /// aborting the current generation. A separately retained observer drains
+    /// predecessor custody even if the finalizer is aborted before `finish`.
     pub(super) fn begin_cancel<F, Fut>(
         self: &Arc<Self>,
         download_id: &str,
@@ -1291,19 +1305,29 @@ impl DownloadTaskOwner {
             projection_failure: superseded_projection.clone(),
         };
         let (start, started) = oneshot::channel();
+        let (predecessor_start, predecessor_started) = oneshot::channel();
+        let (predecessor_sender, predecessor_receiver) = oneshot::channel();
+        let predecessor_completion = Arc::new(NestedCompletion {
+            finished: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
+        let predecessor_observer = tokio::spawn(observe_cancellation_predecessor(
+            current,
+            outer_finished_before_replacement,
+            predecessor_started,
+            predecessor_completion.clone(),
+            predecessor_sender,
+        ));
         let start_state = Arc::new(AtomicU8::new(TaskStartState::Gated as u8));
         let outer = tokio::spawn(async move {
             if started.await.is_err() {
                 return;
             }
-            let predecessor = match current {
-                Some(current) => {
-                    let role = current.role;
-                    CancelPredecessor::Observed(
-                        observe_entry(current, role, outer_finished_before_replacement).await,
-                    )
-                }
-                None => CancelPredecessor::Absent,
+            let Ok(predecessor) = predecessor_receiver.await else {
+                // Observer failure remains owned by the nested task; it must
+                // never authorize cleanup as an absent predecessor.
+                return;
             };
             finish(context, predecessor).await;
         });
@@ -1314,11 +1338,17 @@ impl DownloadTaskOwner {
                 generation: generation.clone(),
                 role: TaskRole::CancelFinalizer,
                 outer,
-                nested: Vec::new(),
+                nested: vec![NestedTask {
+                    handle: predecessor_observer,
+                    completion: predecessor_completion,
+                    failure_kind: NestedFailureKind::Predecessor,
+                }],
                 nested_failures_archived: 0,
+                predecessor_failures_archived: 0,
                 projection: None,
                 starts: predecessor_starts
                     .into_iter()
+                    .chain(std::iter::once(predecessor_start))
                     .chain(std::iter::once(start))
                     .collect(),
                 superseded_projection,
@@ -1523,8 +1553,10 @@ impl DownloadTaskOwner {
                 nested: vec![NestedTask {
                     handle: predecessor_observer,
                     completion: predecessor_completion,
+                    failure_kind: NestedFailureKind::Effect,
                 }],
                 nested_failures_archived: 0,
+                predecessor_failures_archived: 0,
                 projection: Some(cell.clone()),
                 starts: vec![predecessor_start, project_start],
                 superseded_projection: None,
@@ -1899,6 +1931,7 @@ impl DownloadTaskOwner {
         entry.nested.push(NestedTask {
             handle: observer,
             completion,
+            failure_kind: NestedFailureKind::Effect,
         });
         drop(tasks);
         let _ = start_sender.send(());
@@ -2062,6 +2095,8 @@ impl DownloadTaskOwner {
                 }
                 entry.reap_completed_nested();
                 if entry.nested.is_empty() {
+                    // Predecessor failures remain terminal provenance, not a
+                    // new failure of this generation's cleanup effects.
                     Some(entry.nested_failures_archived)
                 } else {
                     None
@@ -2332,6 +2367,57 @@ impl ProjectionTicket {
     }
 }
 
+async fn observe_cancellation_predecessor(
+    current: Option<TaskEntry>,
+    outer_finished_before_replacement: bool,
+    started: oneshot::Receiver<()>,
+    completion: Arc<NestedCompletion>,
+    receipt: oneshot::Sender<CancelPredecessor>,
+) {
+    let started = started.await.is_ok();
+    let predecessor = match current {
+        Some(current) => {
+            if !started {
+                current.outer.abort();
+            }
+            let role = current.role;
+            match AssertUnwindSafe(observe_entry(
+                current,
+                role,
+                outer_finished_before_replacement,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(observation) => {
+                    completion.failed.store(
+                        !started
+                            || observation.terminal == TaskTerminal::Panicked
+                            || observation.nested_failures > 0,
+                        Ordering::Release,
+                    );
+                    Some(CancelPredecessor::Observed(observation))
+                }
+                Err(_) => {
+                    completion.failed.store(true, Ordering::Release);
+                    None
+                }
+            }
+        }
+        None => {
+            completion.failed.store(!started, Ordering::Release);
+            Some(CancelPredecessor::Absent)
+        }
+    };
+    completion.finished.store(true, Ordering::Release);
+    completion.notify.notify_waiters();
+    if started {
+        if let Some(predecessor) = predecessor {
+            let _ = receipt.send(predecessor);
+        }
+    }
+}
+
 async fn observe_entry(
     mut entry: TaskEntry,
     role: TaskRole,
@@ -2343,14 +2429,17 @@ async fn observe_entry(
         Err(error) if error.is_cancelled() => TaskTerminal::Cancelled,
         Err(_) => TaskTerminal::Panicked,
     };
+    let nested_failures = entry.nested_failures_archived
+        + entry.predecessor_failures_archived
+        + observe_nested(entry.nested.drain(..).collect()).await;
+    // Drain owned effects before reading failure provenance, whose poisoned
+    // bookkeeping must not cause an observer to detach unfinished work.
     let projection_failed = entry.projection.as_ref().is_some_and(|cell| cell.failed())
         || entry
             .superseded_projection
             .as_ref()
             .is_some_and(|cell| cell.failed());
-    let nested_failures = entry.nested_failures_archived
-        + observe_nested(entry.nested.drain(..).collect()).await
-        + usize::from(projection_failed);
+    let nested_failures = nested_failures + usize::from(projection_failed);
     TaskObservation {
         generation,
         role,
@@ -3015,6 +3104,241 @@ mod tests {
         finish_sender.send(()).unwrap();
         tokio::task::yield_now().await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_finalizer_retains_predecessor_drain_and_failure() {
+        for outcome in ["success", "error", "panic"] {
+            let owner = Arc::new(DownloadTaskOwner::new());
+            let (entered_sender, entered) = oneshot::channel();
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let prepared = owner.prepare(
+                "download".into(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let _ = context
+                        .run_fallible_blocking_named(
+                            "held cancellation predecessor",
+                            move || -> Result<(), &'static str> {
+                                entered_sender.send(()).unwrap();
+                                release.recv().unwrap();
+                                match outcome {
+                                    "success" => Ok(()),
+                                    "error" => Err("predecessor failure"),
+                                    _ => panic!("predecessor panic"),
+                                }
+                            },
+                        )
+                        .await;
+                },
+            );
+            owner.install_gated(prepared).unwrap().start();
+            entered.await.unwrap();
+            let finished = Arc::new(AtomicBool::new(false));
+            let finished_in_finalizer = finished.clone();
+            let CancelTransition::Started(finalizer) =
+                owner.begin_cancel("download", move |_, _| async move {
+                    finished_in_finalizer.store(true, Ordering::Release);
+                })
+            else {
+                panic!("worker must receive a finalizer")
+            };
+            let generation = finalizer.generation().clone();
+            finalizer.start();
+            owner.tasks.lock().unwrap()["download"].outer.abort();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !owner.outer_finished_for_test("download") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("finalizer outer must observe cancellation");
+            let prematurely_finished = owner.snapshot("download").unwrap().finished;
+            let premature_observation = owner
+                .observe_finished_generation("download", &generation)
+                .await;
+            release_sender.send(()).unwrap();
+            assert!(!prematurely_finished, "predecessor still held: {outcome}");
+            assert!(premature_observation.is_none());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !owner
+                    .snapshot("download")
+                    .is_some_and(|snapshot| snapshot.finished)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("predecessor observation must drain after release");
+            let observation = owner
+                .observe_finished_generation("download", &generation)
+                .await
+                .unwrap();
+            assert_eq!(observation.terminal, TaskTerminal::Cancelled);
+            assert_eq!(
+                observation.nested_failures,
+                usize::from(outcome != "success")
+            );
+            assert!(!finished.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn predecessor_failure_is_retained_without_failing_new_cleanup_effects() {
+        for abort_after_delivery in [false, true] {
+            let owner = Arc::new(DownloadTaskOwner::new());
+            let (entered_sender, entered) = oneshot::channel();
+            let (release_sender, release) = std::sync::mpsc::channel();
+            let prepared = owner.prepare(
+                "download".into(),
+                TaskRole::Worker,
+                move |context| async move {
+                    let _ = context
+                        .run_fallible_blocking_named(
+                            "failed predecessor",
+                            move || -> Result<(), &'static str> {
+                                entered_sender.send(()).unwrap();
+                                release.recv().unwrap();
+                                Err("predecessor failed")
+                            },
+                        )
+                        .await;
+                },
+            );
+            owner.install_gated(prepared).unwrap().start();
+            entered.await.unwrap();
+            let (delivered_sender, delivered) = oneshot::channel();
+            let (finish_sender, finish) = oneshot::channel();
+            let CancelTransition::Started(finalizer) =
+                owner.begin_cancel("download", move |context, predecessor| async move {
+                    let CancelPredecessor::Observed(observation) = predecessor else {
+                        panic!("predecessor must be observed")
+                    };
+                    assert_eq!(observation.nested_failures, 1);
+                    context
+                        .run_fallible_blocking_named("successful cleanup", || {
+                            Ok::<_, &'static str>(())
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(context.drain_blocking().await, Ok(0));
+                    delivered_sender.send(()).unwrap();
+                    let _ = finish.await;
+                })
+            else {
+                panic!("worker must receive a finalizer")
+            };
+            let generation = finalizer.generation().clone();
+            finalizer.start();
+            release_sender.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), delivered)
+                .await
+                .expect("predecessor failure must not prevent cleanup drain")
+                .unwrap();
+            if abort_after_delivery {
+                owner.tasks.lock().unwrap()["download"].outer.abort();
+            } else {
+                finish_sender.send(()).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !owner
+                    .snapshot("download")
+                    .is_some_and(|snapshot| snapshot.finished)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("finalizer must become observable");
+            let observation = owner
+                .observe_finished_generation("download", &generation)
+                .await
+                .unwrap();
+            assert_eq!(observation.nested_failures, 1);
+            assert_eq!(
+                observation.terminal,
+                if abort_after_delivery {
+                    TaskTerminal::Cancelled
+                } else {
+                    TaskTerminal::Completed
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_predecessor_observation_closes_receipt_only_after_effect_drain() {
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let (entered_sender, entered) = oneshot::channel();
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let prepared = owner.prepare(
+            "download".into(),
+            TaskRole::Worker,
+            move |context| async move {
+                let _ = context
+                    .run_blocking(move || {
+                        entered_sender.send(()).unwrap();
+                        release.recv().unwrap();
+                    })
+                    .await;
+            },
+        );
+        owner.install_gated(prepared).unwrap().start();
+        entered.await.unwrap();
+        let mut predecessor = owner.tasks.lock().unwrap().remove("download").unwrap();
+        let outer_abort = predecessor.outer.abort_handle();
+        outer_abort.abort();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !outer_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("predecessor outer must finish before observing its nested work");
+        let poisoned = Arc::new(ProjectionCell::new(false));
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = poisoned.state.lock().unwrap();
+            panic!("poison predecessor provenance");
+        }))
+        .is_err());
+        // Exercise the observer's own bookkeeping-failure path without placing
+        // a poisoned cell in a live successor's unrelated projection state.
+        predecessor.projection = Some(poisoned);
+        let completion = Arc::new(NestedCompletion {
+            finished: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
+        let (start, started) = oneshot::channel();
+        let (receipt_sender, mut receipt) = oneshot::channel();
+        let mut observer = Box::pin(observe_cancellation_predecessor(
+            Some(predecessor),
+            false,
+            started,
+            completion.clone(),
+            receipt_sender,
+        ));
+        start.send(()).unwrap();
+        let observation_while_held = futures::poll!(&mut observer);
+        let finished_while_held = completion.finished.load(Ordering::Acquire);
+        let receipt_while_held = receipt.try_recv();
+        release_sender.send(()).unwrap();
+        assert!(observation_while_held.is_pending());
+        tokio::time::timeout(Duration::from_secs(1), observer)
+            .await
+            .expect("failed observer must drain before completing");
+        assert!(!finished_while_held);
+        assert!(matches!(
+            receipt_while_held,
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(completion.finished.load(Ordering::Acquire));
+        assert!(completion.failed.load(Ordering::Acquire));
+        assert!(
+            receipt.await.is_err(),
+            "failed observation must not synthesize Absent"
+        );
     }
 
     #[tokio::test]

@@ -222,12 +222,16 @@ deletion authority from a stale Pending projection or missing admitted snapshot.
 Terminal intent restart confirmation is accepted after review and dual core
 gates: existing restore can settle completed cleanup without repeating deletion.
 
-**Next slice:** Bound retained HF shutdown/effect ownership and name its actual
-runtime completion/failure consumer before source admission. RUST-I13 records
-why a root lock alone is insufficient: running writes can outlive client Drop,
-and importer work escapes download drain. Pending replay now depends on bounded
-M4 ownership and separately admitted C4 coordination. No live mutation, schema,
-old-format support, or broader source change is admitted. Cargo/commits stay serial.
+Cancellation predecessor custody is accepted after independent review and dual
+core gates. Interrupting a started finalizer cannot hide unfinished predecessor
+effects or their failures. This does not establish client Drop drainage.
+
+**Next slice:** Bound explicit HF shutdown ownership and integration with the
+identified RPC supervisor, including atomic admission closure and retained
+gated/in-transit custody, before source implementation. The Rust ledger owns
+the exact prerequisite evidence; no shutdown or lease Interface is added yet.
+Pending replay still depends on bounded M4 ownership and C4 coordination. No live
+mutation, schema, or old-format support. Cargo/commits stay serial.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

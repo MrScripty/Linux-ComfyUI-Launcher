@@ -52,12 +52,17 @@ HF client's active lifecycles, not a configured-root lifetime lock. Idle/search
 clients must not pin it. RUST-I13 records the design and the newly identified
 shutdown/importer dependencies; no lease implementation is accepted.
 
-**Next slice:** Bound retained HF shutdown/effect ownership with an actual
-production consumer of completion and failure. Trace the runtime teardown path,
-record the exact write set and deciding held-write/client-drop regression using
-only weak test observation, then admit implementation. Do not substitute a
-detached drain or unused lease Interface. Pending replay stays refused; importer
-handoff needs a separately admitted C4 contract before replay can be accepted.
+Cancellation predecessor custody is accepted after independent review and dual
+core gates. A retained observer keeps terminal observation incomplete until
+predecessor effects drain; inherited failures remain observable without failing
+successful new cleanup. Failed observation cannot synthesize absence.
+
+**Next slice:** Bound explicit HF shutdown ownership and integration with the
+identified RPC supervisor, including atomic admission closure and retained
+gated/in-transit custody, before source implementation. Its shared result must
+survive waiter cancellation. Client Drop proof remains separate from the accepted
+started-finalizer interruption regression. No unused shutdown/lease Interface
+or Pending replay.
 
 Pending replay remains excluded. Investigation found three prerequisites:
 cross-client/process exclusion through cleanup drain; distinguishing persisted

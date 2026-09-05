@@ -20,6 +20,28 @@
 
 ## Slice Log
 
+### 2026-09-05 — Cancellation custody checkpoint accepted
+
+- The existing task owner now retains predecessor observation independently of
+  an interrupted finalizer. Inherited failures remain observable without failing
+  successful cleanup, and observer failure cannot authorize cleanup as absence.
+- Independent review, actual RED-to-GREEN regressions, both full core suites
+  (1,212 passing each; 11 existing ignores), strict dual-feature lint, formatting,
+  and five plan contracts pass. The Rust ledger owns exact hashes and log paths.
+  Live download data is unchanged.
+- Next bound explicit HF shutdown with the identified RPC consumer and atomic
+  admission/gated custody. Full shutdown, client Drop, root exclusion, importer
+  ownership, and Pending replay remain open; this is not milestone closure.
+
+### 2026-09-05 — Cancellation custody prerequisite
+
+- Identified the existing RPC server supervisor as the later HF shutdown result
+  consumer. Before wiring shutdown, correct predecessor custody captured inside
+  the abortable cancellation finalizer. The Rust admission owns the single-source
+  implementation and actual terminal-observation regression.
+- Full shutdown, client Drop, root exclusion, and importer ownership remain open;
+  this prerequisite must not be presented as their acceptance.
+
 ### 2026-09-05 — Ownership dependency correction
 
 - Read-only investigation found that client/root lifetime does not cover every
