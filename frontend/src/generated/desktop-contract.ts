@@ -1,4 +1,4 @@
-// Generated from pumas-rpc contract.rs; SHA256 8e49c9f5a553a700912c4032d46b83b73385d8b0928b490ba47ec5440d4c6ae2. DO NOT EDIT.
+// Generated from pumas-rpc contract.rs; SHA256 cf647412743240d05022ab3823a5925a26646a42043d25c2fd63288d780adb55. DO NOT EDIT.
 import { validateCatalogSearchOutcome, validateDownloadIdParams, validateDownloadListOutcome, validateDownloadMutationOutcome, validateDownloadStartedOutcome, validateDownloadStatusOutcome, validateModelIndexRefreshOutcome, validateModelsOutcome, validatePartialDownloadOutcome, validatePublicError, validateRecoverDownloadParams, validateSearchCatalogParams } from './desktop-contract.validators.js';
 export type CatalogArtifactState = ({ "state": "complete" }) | ({ "downloadProgressFraction"?: number; "reasons": ReadonlyArray<CatalogPartialReason>; "recovery"?: CatalogRecoveryIdentity; "state": "partial" });
 export type CatalogIntegrityState = ({ "state": "clean" }) | ({ "count": number; "otherModelIds": ReadonlyArray<string>; "state": "duplicate" });
@@ -21,7 +21,7 @@ export type ModelIndexRefreshOutcome = { "indexed_count": number; "success": tru
 export type ModelsOutcome = { "models": Readonly<Record<string, CatalogModel>>; "success": true };
 export type PartialDownloadActionName = "resume" | "recover" | "attach" | "none";
 export type PartialDownloadOutcome = { "action": PartialDownloadActionName; "download_id": string | null; "error": string | null; "reason_code": (PartialDownloadReason) | (null); "status": (DownloadStatus) | (null); "success": boolean };
-export type PartialDownloadReason = "hf_client_unavailable" | "model_not_found" | "model_not_partial" | "recovery_unavailable" | "recovery_context_stale" | "resume_rejected" | "already_completed" | "already_cancelled" | "invalid_repo_id" | "repo_not_found" | "rate_limited" | "permission_denied" | "network_error" | "recover_failed";
+export type PartialDownloadReason = "hf_client_unavailable" | "download_root_busy" | "model_not_found" | "model_not_partial" | "recovery_unavailable" | "recovery_context_stale" | "resume_rejected" | "already_completed" | "already_cancelled" | "invalid_repo_id" | "repo_not_found" | "rate_limited" | "permission_denied" | "network_error" | "recover_failed";
 export type PublicError = { "class": PublicErrorClass; "code": number; "message": string };
 export type PublicErrorClass = "invalid_request" | "not_found" | "conflict" | "cancelled" | "unavailable" | "operation_failed" | "internal";
 export type RecoverDownloadParams = { "modelId": string; "recoveryToken": string };

@@ -65,6 +65,8 @@ pub use dependencies::{
     ModelDependencyRequirementsResolution, DEPENDENCY_CONTRACT_VERSION,
 };
 pub use directory_import::classify_import_path;
+#[cfg(test)]
+pub(crate) use download_recovery::DownloadDestinationRoot;
 pub(crate) use download_recovery::{
     canonical_managed_model_dir, verify_download_recovery_ticket, DownloadRecoveryDestination,
     DownloadRecoveryVerification, RecoveryDownloadAdmission, VerifiedDownloadRecovery,

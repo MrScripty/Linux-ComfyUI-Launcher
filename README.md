@@ -100,6 +100,14 @@ The crate is currently consumed from this workspace:
 pumas-library = { path = "rust/crates/pumas-core" }
 ```
 
+Download mutations also acquire advisory exclusion on the physical model-library
+root. Independent HF clients contend even when using different destinations;
+one client's active downloads share the grant. Idle and paused clients release
+it. Contention returns `DownloadRootBusy` without automatic retry, including when
+startup requires download restoration. Read-only runtime progress remains
+available but may be stale. This does not lock unrelated imports or external
+writers; native root-exclusion behavior is verified on Linux only.
+
 ## Verification
 
 ```bash

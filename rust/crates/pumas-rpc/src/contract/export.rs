@@ -105,6 +105,13 @@ pub(crate) fn desktop_contract_fixtures() -> anyhow::Result<Value> {
         reason_code: None,
         message: None,
     })?;
+    let recovery_busy_outcome = PartialDownloadOutcome::try_from(PartialDownloadAction {
+        action: "none".into(),
+        download_id: None,
+        status: None,
+        reason_code: Some("download_root_busy".into()),
+        message: Some("Download library root is busy".into()),
+    })?;
     let recovery_request_probes = [
         "llm/example/model".to_string(),
         String::new(),
@@ -146,6 +153,7 @@ pub(crate) fn desktop_contract_fixtures() -> anyhow::Result<Value> {
     Ok(serde_json::json!({
         "models":models, "search":search, "recovery_request":recovery_request,
         "recovery_outcome":recovery_outcome,
+        "recovery_busy_outcome":recovery_busy_outcome,
         "recovery_request_probes":recovery_request_probes,
         "catalog_text_probes":catalog_text_probes,
         "download_status":DownloadStatusOutcome::new(Some(progress.clone()))?,

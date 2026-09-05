@@ -20,6 +20,21 @@
 
 ## Slice Log
 
+### 2026-09-05 — Bounded physical-root exclusion accepted on Linux
+
+- Download mutation phases now share native exclusion within one HF client and
+  refuse independent contenders. Idle/paused queue waits release it; reacquisition
+  checks canonical durable authority. Real preparation, import and cleanup retain
+  custody through observation, including client and shutdown-waiter drop.
+- G-1 through G-4 and independent reviews pass. Both core suites pass 1,252 tests;
+  RPC suites pass 115/75. Binding conversion, strict Rust lint, generated desktop
+  contracts, Electron/renderer conformance, types/lint/build and five plan contracts
+  pass. The [Rust ledger](rust-library-and-rpc/execution-ledger.md) owns exact logs,
+  test refinements and the correction that local IPC has no download mutation route.
+- No live data, persistence schema, authored UI behavior, old-format support or
+  platform claims changed. Next admit exact Pending cleanup replay authority;
+  this checkpoint does not accept replay, full C3/M4 or the overall program.
+
 ### 2026-09-05 — Physical-root exclusion design admitted
 
 - Two bounded subagent traces and root review define phase-scoped exclusion for

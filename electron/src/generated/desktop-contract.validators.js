@@ -1,12 +1,12 @@
-// Generated from pumas-rpc contract.rs; SHA256 8e49c9f5a553a700912c4032d46b83b73385d8b0928b490ba47ec5440d4c6ae2. DO NOT EDIT.
+// Generated from pumas-rpc contract.rs; SHA256 cf647412743240d05022ab3823a5925a26646a42043d25c2fd63288d780adb55. DO NOT EDIT.
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 
-// ../node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/ucs2length.js
+// node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/ucs2length.js
 var require_ucs2length = __commonJS({
-  "../node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/ucs2length.js"(exports) {
+  "node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/ucs2length.js"(exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     function ucs2length(str) {
@@ -30,9 +30,9 @@ var require_ucs2length = __commonJS({
   }
 });
 
-// ../node_modules/.pnpm/fast-deep-equal@3.1.3/node_modules/fast-deep-equal/index.js
+// node_modules/.pnpm/fast-deep-equal@3.1.3/node_modules/fast-deep-equal/index.js
 var require_fast_deep_equal = __commonJS({
-  "../node_modules/.pnpm/fast-deep-equal@3.1.3/node_modules/fast-deep-equal/index.js"(exports, module) {
+  "node_modules/.pnpm/fast-deep-equal@3.1.3/node_modules/fast-deep-equal/index.js"(exports, module) {
     "use strict";
     module.exports = function equal(a, b) {
       if (a === b) return true;
@@ -65,9 +65,9 @@ var require_fast_deep_equal = __commonJS({
   }
 });
 
-// ../node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/equal.js
+// node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/equal.js
 var require_equal = __commonJS({
-  "../node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/equal.js"(exports) {
+  "node_modules/.pnpm/ajv@8.20.0/node_modules/ajv/dist/runtime/equal.js"(exports) {
     "use strict";
     Object.defineProperty(exports, "__esModule", { value: true });
     var equal = require_fast_deep_equal();
@@ -76,7 +76,7 @@ var require_equal = __commonJS({
   }
 });
 
-// desktop-contract.validators.js
+// electron/desktop-contract.validators.js
 var validateCatalogSearchOutcome = validate10;
 var schema12 = { "additionalProperties": false, "properties": { "artifact": { "$ref": "#/definitions/CatalogArtifactState" }, "dependencyCount": { "maximum": 512, "minimum": 0, "type": "integer" }, "displayDate": { "minLength": 1, "pumasCanonicalText": true, "pumasUtf8Max": 4096, "type": "string" }, "displayName": { "minLength": 1, "pumasCanonicalText": true, "pumasUtf8Max": 4096, "type": "string" }, "format": { "minLength": 1, "pumasCanonicalText": true, "pumasUtf8Max": 4096, "type": "string" }, "id": { "minLength": 1, "pumasCanonicalText": true, "pumasUtf8Max": 4096, "type": "string" }, "integrity": { "$ref": "#/definitions/CatalogIntegrityState" }, "modelDir": { "minLength": 1, "pumasCanonicalText": true, "pumasUtf8Max": 4096, "type": "string" }, "modelType": { "minLength": 1, "pumasCanonicalText": true, "pumasUtf8Max": 4096, "type": "string" }, "quantization": { "minLength": 1, "pumasCanonicalText": true, "pumasUtf8Max": 4096, "type": "string" }, "relatedAvailable": { "type": "boolean" }, "sizeBytes": { "maximum": 9007199254740991, "minimum": 0, "type": "integer" } }, "pumasCatalogRow": true, "required": ["id", "modelDir", "displayName", "modelType", "dependencyCount", "relatedAvailable", "artifact", "integrity"], "type": "object" };
 var func2 = Object.prototype.hasOwnProperty;
@@ -4070,9 +4070,9 @@ function validate25(data, { instancePath = "", parentData, parentDataProperty, r
   return errors === 0;
 }
 var validatePartialDownloadOutcome = validate30;
-var schema36 = { "$schema": "http://json-schema.org/draft-07/schema#", "additionalProperties": false, "definitions": { "DownloadStatus": { "description": "Model download status.", "enum": ["queued", "downloading", "pausing", "paused", "cancelling", "completed", "cancelled", "error"], "type": "string" }, "PartialDownloadActionName": { "enum": ["resume", "recover", "attach", "none"], "type": "string" }, "PartialDownloadReason": { "enum": ["hf_client_unavailable", "model_not_found", "model_not_partial", "recovery_unavailable", "recovery_context_stale", "resume_rejected", "already_completed", "already_cancelled", "invalid_repo_id", "repo_not_found", "rate_limited", "permission_denied", "network_error", "recover_failed"], "type": "string" } }, "properties": { "action": { "$ref": "#/definitions/PartialDownloadActionName" }, "download_id": { "type": ["string", "null"] }, "error": { "type": ["string", "null"] }, "reason_code": { "anyOf": [{ "$ref": "#/definitions/PartialDownloadReason" }, { "type": "null" }] }, "status": { "anyOf": [{ "$ref": "#/definitions/DownloadStatus" }, { "type": "null" }] }, "success": { "type": "boolean" } }, "pumasPartialOutcome": true, "required": ["success", "action", "download_id", "status", "reason_code", "error"], "title": "PartialDownloadOutcome", "type": "object" };
+var schema36 = { "$schema": "http://json-schema.org/draft-07/schema#", "additionalProperties": false, "definitions": { "DownloadStatus": { "description": "Model download status.", "enum": ["queued", "downloading", "pausing", "paused", "cancelling", "completed", "cancelled", "error"], "type": "string" }, "PartialDownloadActionName": { "enum": ["resume", "recover", "attach", "none"], "type": "string" }, "PartialDownloadReason": { "enum": ["hf_client_unavailable", "download_root_busy", "model_not_found", "model_not_partial", "recovery_unavailable", "recovery_context_stale", "resume_rejected", "already_completed", "already_cancelled", "invalid_repo_id", "repo_not_found", "rate_limited", "permission_denied", "network_error", "recover_failed"], "type": "string" } }, "properties": { "action": { "$ref": "#/definitions/PartialDownloadActionName" }, "download_id": { "type": ["string", "null"] }, "error": { "type": ["string", "null"] }, "reason_code": { "anyOf": [{ "$ref": "#/definitions/PartialDownloadReason" }, { "type": "null" }] }, "status": { "anyOf": [{ "$ref": "#/definitions/DownloadStatus" }, { "type": "null" }] }, "success": { "type": "boolean" } }, "pumasPartialOutcome": true, "required": ["success", "action", "download_id", "status", "reason_code", "error"], "title": "PartialDownloadOutcome", "type": "object" };
 var schema37 = { "enum": ["resume", "recover", "attach", "none"], "type": "string" };
-var schema38 = { "enum": ["hf_client_unavailable", "model_not_found", "model_not_partial", "recovery_unavailable", "recovery_context_stale", "resume_rejected", "already_completed", "already_cancelled", "invalid_repo_id", "repo_not_found", "rate_limited", "permission_denied", "network_error", "recover_failed"], "type": "string" };
+var schema38 = { "enum": ["hf_client_unavailable", "download_root_busy", "model_not_found", "model_not_partial", "recovery_unavailable", "recovery_context_stale", "resume_rejected", "already_completed", "already_cancelled", "invalid_repo_id", "repo_not_found", "rate_limited", "permission_denied", "network_error", "recover_failed"], "type": "string" };
 var schema39 = { "description": "Model download status.", "enum": ["queued", "downloading", "pausing", "paused", "cancelling", "completed", "cancelled", "error"], "type": "string" };
 function validate30(data, { instancePath = "", parentData, parentDataProperty, rootData = data } = {}) {
   let vErrors = null;
@@ -4148,7 +4148,7 @@ function validate30(data, { instancePath = "", parentData, parentDataProperty, r
                     }
                     errors++;
                   }
-                  if (!(data3 === "hf_client_unavailable" || data3 === "model_not_found" || data3 === "model_not_partial" || data3 === "recovery_unavailable" || data3 === "recovery_context_stale" || data3 === "resume_rejected" || data3 === "already_completed" || data3 === "already_cancelled" || data3 === "invalid_repo_id" || data3 === "repo_not_found" || data3 === "rate_limited" || data3 === "permission_denied" || data3 === "network_error" || data3 === "recover_failed")) {
+                  if (!(data3 === "hf_client_unavailable" || data3 === "download_root_busy" || data3 === "model_not_found" || data3 === "model_not_partial" || data3 === "recovery_unavailable" || data3 === "recovery_context_stale" || data3 === "resume_rejected" || data3 === "already_completed" || data3 === "already_cancelled" || data3 === "invalid_repo_id" || data3 === "repo_not_found" || data3 === "rate_limited" || data3 === "permission_denied" || data3 === "network_error" || data3 === "recover_failed")) {
                     const err1 = { instancePath: instancePath + "/reason_code", schemaPath: "#/definitions/PartialDownloadReason/enum", keyword: "enum", params: { allowedValues: schema38.enum }, message: "must be equal to one of the allowed values" };
                     if (vErrors === null) {
                       vErrors = [err1];

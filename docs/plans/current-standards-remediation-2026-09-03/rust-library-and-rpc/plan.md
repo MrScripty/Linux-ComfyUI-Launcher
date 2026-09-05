@@ -47,10 +47,9 @@ only VerifiedIntent through its durable barrier; existing restore settles the
 exact queue entry without file deletion. Pending and publication-failure refusal
 remain verified. Production HF and supported store format are unchanged.
 
-Ownership investigation selects a physical-root execution grant shared by one
-HF client's active lifecycles, not a configured-root lifetime lock. Idle/search
-clients must not pin it. RUST-I13 records the design and the newly identified
-shutdown/importer dependencies; no lease implementation is accepted.
+Physical-root exclusion is accepted for the bounded Linux download population.
+Active mutation phases share a grant; idle/search clients and queued waits do
+not pin it. RUST-I13 retains the broader teardown and Pending replay limits.
 
 Cancellation predecessor custody is accepted after independent review and dual
 core gates. A retained observer keeps terminal observation incomplete until
@@ -68,9 +67,13 @@ C4 awaited managed-download importer finalization is now accepted under the
 success precedes settlement, failures retain retry custody, and notifications
 follow logical release. C4-1 through C4-4 and dual core/RPC and lint gates pass.
 
-**Next slice:** Implement the physical-root execution grant under the
-[bounded grant admission](#physical-root-execution-grant-admission). Shutdown
-and managed importer prerequisites are accepted. Pending replay, relocation,
+The [bounded grant](#physical-root-execution-grant-admission) passes G-1 through
+G-4, independent reviews, dual core/RPC suites, strict lint and desktop diagnostic
+conformance. The execution ledger records consumer corrections and exact limits.
+
+**Next slice:** Admit the exact Pending cleanup replay contract against current
+durable authority and retained root custody before implementing replay. Shutdown,
+managed importer and grant prerequisites are accepted. Pending replay, relocation,
 and whole-runtime teardown remain unaccepted; this is not C3/M4 completion.
 
 ## Physical-Root Execution Grant Admission
@@ -118,7 +121,7 @@ as well as destination release, while shutdown still observes the notification.
 
 | Entry/owner | Required disposition |
 | --- | --- |
-| Shared core `api/hf.rs` start and ticket recovery, reached by public Rust and IPC | Acquire before artifact destination preparation or index refresh; retain into immediate mutation work. |
+| Shared core `api/hf.rs` start and ticket recovery, reached by public Rust and desktop RPC | Acquire before artifact destination preparation or index refresh; retain into immediate mutation work. Current local IPC exposes no download mutation route. |
 | Direct HF start, resume, pause, cancellation and recovery admission | Protect durable admission/status/quarantine and destination effects, including operations without a worker; preserve existing recovery authority. |
 | Restore and byte-complete finalization | Protect strict inventory reconciliation, Verified settlement, importer and terminal settlement even when no worker remains. Pending replay stays refused. |
 | Worker/cancellation/projection phases | Retain through real file/metadata/index/store effects and observation; active handoffs cannot create a gap. |
@@ -149,6 +152,10 @@ when busy; they promise neither fresh durable inventory nor successful repair.
 Preserve existing no-root read behavior and non-busy failure handling. IPC already
 preserves the wire conflict category but converts it back to `PumasError::Other`;
 do not claim a new typed round-trip or introduce a protocol discriminator here.
+The closed desktop partial-action reason enum must admit `download_root_busy`
+and its generated Electron/frontend validators must migrate together; otherwise
+the core outcome becomes an invalid-domain error at the RPC adapter. This is an
+additive diagnostic contract change, not a new operation or persistence schema.
 The existing UniFFI exhaustive conversion maps this busy outcome to Config,
 consistent with its current busy errors; no FFI schema or public lock handle.
 
@@ -161,13 +168,20 @@ operation in `src/model_library/download_store.rs` if current operations cannot
 express the existing policy without duplication. Root owns `src/error.rs`,
 `src/tests.rs`, `src/ipc/protocol.rs`, `rust/crates/pumas-rpc/src/contract.rs`, and
 `rust/crates/pumas-uniffi/src/bindings.rs` for diagnostic/consumer integration.
+`src/model_library/mod.rs` may re-export the root capability under `cfg(test)`
+for core consumer tests without expanding its production visibility.
 Tests stay in these existing owners; README/Rustdoc and parent/Rust plan, issue,
-and ledger records are allowed. No Cargo/dependency, schema, live data, UI,
+and ledger records are allowed. Diagnostic integration also owns the existing
+RPC contract export fixtures and all six `desktop-contract` generated artifacts
+in `electron/src/generated` and `frontend/src/generated`, plus their existing
+Electron/frontend conformance consumers to exercise the new busy fixture; regenerate through
+`electron/scripts/generate-desktop-contract.mjs`, never hand-edit them. No
+Cargo/dependency, persistence schema, live data, UI controls,
 relocation, general importer, or Pending replay changes. Interface coordination,
 Cargo gates, staged review and commits remain serial; workers escalate ownership
 or contract conflicts rather than edit shared authority independently.
 
-**Evidence** (pending; automated Linux representative filesystem, real child
+**Evidence** (accepted for the bounded slice; automated Linux representative filesystem, real child
 processes for G-1; current source supports Unix root capabilities only):
 
 - `G-1`, system: independent clients/processes using the actual root adapter
@@ -181,15 +195,21 @@ processes for G-1; current source supports Unix root capabilities only):
   importer and cancellation cleanup; caller/client drop, shutdown and active
   cancellation transfer cannot let an independent contender acquire early.
   Include abandoned prepared work and success/error/panic observation.
-- `G-4`, contract/integration: public Rust and IPC shared preparation refuse busy
-  before effects; restore and read reconciliation follow their distinct contracts;
+- `G-4`, contract/integration: public Rust ticket recovery refuses busy before
+  effects; ordinary start's pre-mutation acquisition ordering receives source
+  review plus direct HF coverage (its public producer first requires remote HF
+  metadata; no new offline seam is admitted). Restore and read reconciliation follow their distinct contracts;
   busy, unsupported/I/O and stale identity remain distinguishable. RPC/IPC wire
-  conflict and existing UniFFI conversion are tested, without a new protocol.
+  conflict and existing UniFFI conversion are tested. Local IPC evidence covers
+  its error adapter only, not an unexposed download operation. The partial-action
+  busy reason must pass RPC projection and generated consumer conformance.
 
 Reuse the existing store subprocess fixture pattern (current test executable,
 exact ignored helper, pipe handshake), not a new test framework. Final gates:
 both core/RPC configurations, focused binding conversion, affected strict
-all-target Clippy, formatting and five plan contracts. Linux proves only its
+all-target Clippy, formatting and five plan contracts. The diagnostic contract
+also requires generation freshness, both desktop conformance consumers, and
+Electron/frontend TypeScript checks. Linux proves only its
 tested filesystem semantics; Windows/macOS runtime and hard-process Pending
 recovery remain unaccepted.
 

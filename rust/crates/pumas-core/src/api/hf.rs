@@ -363,6 +363,7 @@ impl PumasApi {
             );
             resolved_request.model_type = Some(model_type.clone());
             let destination_type = model_type.clone();
+            let context = client.protect_download_mutation(&context).await?;
             let dest_dir = context.run_fallible_blocking_named(
                 "prepare HF artifact destination",
                 move || library.prepare_artifact_download_destination(
@@ -630,6 +631,10 @@ impl PumasApi {
                 {
                     Ok(Some(model_dir)) => model_dir,
                     Ok(None) => return Ok(partial_download_unavailable("recovery_unavailable")),
+                    Err(error) => return Ok(partial_download_error(&error)),
+                };
+                let context = match client.protect_download_mutation(&context).await {
+                    Ok(context) => context,
                     Err(error) => return Ok(partial_download_error(&error)),
                 };
                 let library = primary.model_library.clone();
@@ -1525,6 +1530,7 @@ pub(crate) fn partial_download_reason_code(err: &PumasError) -> &'static str {
         PumasError::NotFound { .. } => "dest_dir_missing",
         PumasError::ModelNotFound { .. } => "repo_not_found",
         PumasError::RateLimited { .. } => "rate_limited",
+        PumasError::DownloadRootBusy => "download_root_busy",
         PumasError::PermissionDenied(_) => "permission_denied",
         PumasError::Network { message, .. } if message.contains("404 Not Found") => {
             "repo_not_found"
@@ -1895,6 +1901,14 @@ pub(super) mod tests {
     }
     use crate::models::HuggingFaceModel;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_partial_download_reason_code_preserves_root_contention() {
+        assert_eq!(
+            partial_download_reason_code(&PumasError::DownloadRootBusy),
+            "download_root_busy"
+        );
+    }
 
     #[test]
     fn test_partial_download_reason_code_maps_invalid_repo_id() {

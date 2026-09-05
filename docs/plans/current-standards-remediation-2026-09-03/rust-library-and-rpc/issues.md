@@ -10,14 +10,14 @@
   captured raw file wrapper, not the root capability. Recovery capabilities also
   open independent roots. Builder completion callbacks launch importer work
   outside HF drain. A configured-root lock can therefore release too early.
-- **Selected design, not implementation acceptance:** one physical-root grant
+- **Accepted bounded grant on Linux:** one physical-root grant
   shared across a single HF client's active mutation lifecycles, weakly cached
   by that client's execution owner. Keep same-client concurrency; independent
   clients contend, even for different destinations. Idle, inspection, and search
   clients must not retain the grant. The existing builder already rejects a
   second primary for one launcher root, but that registry claim is not proof of
   physical-root exclusion or last-effect completion.
-- **Mechanism selected, implementation pending:** nonblocking `fs2` exclusion on
+- **Mechanism implemented and verified:** nonblocking `fs2` exclusion on
   a fresh readable capability-relative root open. A Linux dependency probe found
   `open_dir(".")` yields EBADF; `root.open(".")` passes independent-open and
   child-process contention/release. Duplicated descriptors share custody and
@@ -79,7 +79,8 @@
   and restored completion await strict metadata/index success, retained failures
   remain retryable, and notifications follow destination release. Builder's
   enqueue/post-settlement import paths are removed. Whole-runtime teardown, general client
-  Drop drainage, physical-root execution grants, and Pending replay remain open.
+  Drop drainage outside the admitted download effects, and Pending replay remain
+  open. Physical-root grants now pass bounded Linux acceptance below.
   Revisit on an effect outside admitted custody, a demonstrated ownership gap, or a
   requirement for concurrent independent mutation engines.
 - **Admission refinement at `099adaf0`:** core pre-worker destination preparation,
@@ -88,8 +89,15 @@
   followers can wait behind a paused head indefinitely: neither is authority to
   pin an otherwise idle root. Active handoff retains custody continuously; idle
   reacquisition revalidates exact durable authority before effects. Public
-  notifications follow this task's grant release. Implement the bounded grant
-  next; no new Pending replay or general library-exclusion claim is accepted.
+  notifications follow this task's grant release.
+- **Grant acceptance:** G-1 through G-4, independent reviews, dual core/RPC suites,
+  strict lint and generated desktop conformance pass. Actual preparation/import/
+  cleanup retains custody through observation and client/waiter drop; paused
+  followers permit handoff, and stale execution refuses without durable rewrite.
+  Local IPC has no download mutation route: current IPC evidence covers only its
+  error adapter, correcting the earlier inferred consumer description. Public
+  ticket recovery and separate desktop RPC are covered. Next admit exact Pending
+  replay authority; no replay or general library-exclusion claim is accepted.
 
 ## Open Decision Dependencies
 

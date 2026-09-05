@@ -6,6 +6,261 @@ use tempfile::TempDir;
 static REGISTRY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[tokio::test]
+async fn pre_worker_preparation_retains_root_after_caller_and_client_drop() {
+    use crate::model_library::{DownloadDestinationRoot, HuggingFaceClient};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let temp = TempDir::new().unwrap();
+    let library = Arc::new(
+        ModelLibrary::new(temp.path().join("library"))
+            .await
+            .unwrap(),
+    );
+    let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+    client
+        .configure_download_destination_root(library.library_root())
+        .unwrap();
+    let client = Arc::new(client);
+    let artifact = "owner--repo__q4";
+    let source = library.build_artifact_model_path("unknown", "owner", artifact);
+    let target = library.build_artifact_model_path("llm", "owner", artifact);
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("weights.gguf.part"), b"retained partial").unwrap();
+    library
+        .save_metadata(
+            &source,
+            &ModelMetadata {
+                model_type: Some("unknown".into()),
+                family: Some("owner".into()),
+                cleaned_name: Some(artifact.into()),
+                selected_artifact_id: Some(artifact.into()),
+                match_source: Some("download_partial".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let root = DownloadDestinationRoot::open(library.library_root()).unwrap();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, held) = std::sync::mpsc::channel();
+    let held = Mutex::new(held);
+    library.set_metadata_write_notifier(Some(Arc::new(move |_| {
+        if let Some(entered) = entered.lock().unwrap().take() {
+            let _ = entered.send(());
+            held.lock().unwrap().recv().unwrap();
+        }
+    })));
+    let caller = tokio::spawn({
+        let client = client.clone();
+        let library = library.clone();
+        async move {
+            let preparing_client = client.clone();
+            // Exercise the same real preparation and retained-effect Interface
+            // used by core start, without its preceding remote metadata producer.
+            client
+                .run_download_invocation(move |context| async move {
+                    let context = preparing_client.protect_download_mutation(&context).await?;
+                    drop(preparing_client);
+                    context
+                        .run_fallible_blocking_named("prepare HF artifact destination", move || {
+                            library.prepare_artifact_download_destination("llm", "owner", artifact)
+                        })
+                        .await
+                        .map_err(|error| PumasError::Other(error.to_string()))?
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), ready)
+        .await
+        .unwrap()
+        .unwrap();
+    let effect_started = !source.exists() && target.join("weights.gguf.part").exists();
+    caller.abort();
+    let _ = caller.await;
+    drop(client);
+    let contention = root.try_acquire_execution_grant();
+    // Release before assertions so a failed oracle cannot strand the real writer.
+    release.send(()).unwrap();
+    assert!(effect_started);
+    assert!(matches!(contention, Err(PumasError::DownloadRootBusy)));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match root.try_acquire_execution_grant() {
+                Ok(grant) => break grant,
+                Err(PumasError::DownloadRootBusy) => tokio::task::yield_now().await,
+                Err(error) => panic!("root acquisition failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("dropped client must retain then release observed preparation");
+    assert_eq!(
+        std::fs::read(target.join("weights.gguf.part")).unwrap(),
+        b"retained partial"
+    );
+    assert_eq!(
+        library
+            .load_metadata(&target)
+            .unwrap()
+            .unwrap()
+            .model_type
+            .as_deref(),
+        Some("llm")
+    );
+    assert!(library
+        .index()
+        .get(&library.build_artifact_model_id("llm", "owner", artifact))
+        .unwrap()
+        .is_some());
+    library.set_metadata_write_notifier(None);
+}
+
+#[tokio::test]
+async fn builder_requires_download_restore_grant_but_no_client_reads_do_not() {
+    use crate::model_library::DownloadDestinationRoot;
+
+    let temp = TempDir::new().unwrap();
+    let _registry = RegistryTestGuard::new(temp.path());
+    let initial = PumasApi::builder(temp.path())
+        .auto_create_dirs(true)
+        .with_process_manager(false)
+        .build()
+        .await
+        .unwrap();
+    let library_root = initial.model_library().library_root().to_path_buf();
+    initial.shutdown_downloads().await.unwrap();
+    drop(initial);
+
+    let root = DownloadDestinationRoot::open(&library_root).unwrap();
+    let grant = root.try_acquire_execution_grant().unwrap();
+    let store_path = temp.path().join("launcher-data/downloads.json");
+    let store_before = std::fs::read(&store_path).ok();
+    let busy = PumasApi::builder(temp.path())
+        .auto_create_dirs(true)
+        .with_process_manager(false)
+        .build()
+        .await;
+    assert!(matches!(busy, Err(PumasError::DownloadRootBusy)));
+    assert_eq!(std::fs::read(&store_path).ok(), store_before);
+
+    let without_client = PumasApi::builder(temp.path())
+        .auto_create_dirs(true)
+        .with_hf_client(false)
+        .with_process_manager(false)
+        .build()
+        .await
+        .unwrap();
+    assert!(without_client.list_models().await.unwrap().is_empty());
+    without_client.shutdown_downloads().await.unwrap();
+    assert_eq!(std::fs::read(&store_path).ok(), store_before);
+    drop(without_client);
+    drop(grant);
+
+    let restored = PumasApi::builder(temp.path())
+        .auto_create_dirs(true)
+        .with_process_manager(false)
+        .build()
+        .await
+        .expect("startup must retry required restore after contention ends");
+    assert!(restored.list_hf_downloads().await.unwrap().is_empty());
+    restored.shutdown_downloads().await.unwrap();
+}
+
+#[tokio::test]
+async fn ticket_recovery_refuses_busy_before_index_or_download_mutation() {
+    use crate::model_library::DownloadDestinationRoot;
+    use crate::model_library::{
+        issue_download_recovery_ticket, DownloadRecoveryModelId, DownloadRecoveryToken,
+    };
+
+    let temp = TempDir::new().unwrap();
+    let _registry = RegistryTestGuard::new(temp.path());
+    let api = PumasApi::builder(temp.path())
+        .auto_create_dirs(true)
+        .with_process_manager(false)
+        .build()
+        .await
+        .unwrap();
+    let library = api.model_library();
+    let root = DownloadDestinationRoot::open(library.library_root()).unwrap();
+    // Wait only for the empty startup's retained observations to release.
+    // Acquire before creating partial files so background orphan discovery
+    // cannot admit the fixture as real download work while it is being seeded.
+    let grant = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match root.try_acquire_execution_grant() {
+                Ok(grant) => break grant,
+                Err(PumasError::DownloadRootBusy) => tokio::task::yield_now().await,
+                Err(error) => panic!("empty startup root acquisition failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("empty startup must release download mutation custody");
+    let model_id = "llm/acme/model";
+    let destination = library.library_root().join(model_id);
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::write(destination.join("weights.gguf.part"), b"partial").unwrap();
+    let metadata = ModelMetadata {
+        model_id: Some(model_id.into()),
+        family: Some("acme".into()),
+        model_type: Some("llm".into()),
+        cleaned_name: Some("model".into()),
+        official_name: Some("Model".into()),
+        repo_id: Some("acme/model".into()),
+        selected_artifact_id: Some("acme/model::Q4_K_M".into()),
+        selected_artifact_quant: Some("Q4_K_M".into()),
+        selected_artifact_files: Some(vec!["weights.gguf".into()]),
+        expected_files: Some(vec!["weights.gguf".into()]),
+        ..Default::default()
+    };
+    library
+        .save_metadata(&destination, &metadata)
+        .await
+        .unwrap();
+    library.index_model_dir(&destination).await.unwrap();
+    let record = api.get_model(model_id).await.unwrap().unwrap();
+    let ticket = issue_download_recovery_ticket(library.library_root(), &record)
+        .unwrap()
+        .unwrap();
+    let metadata_before = std::fs::read(destination.join("metadata.json")).unwrap();
+    let store_path = temp.path().join("launcher-data/downloads.json");
+    let store_before = std::fs::read(&store_path).ok();
+    let index_before = serde_json::to_value(library.index().get(model_id).unwrap()).unwrap();
+    let action = api
+        .resume_partial_download_with_ticket(
+            &DownloadRecoveryModelId::parse(model_id).unwrap(),
+            &DownloadRecoveryToken::parse(ticket.token()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(action.action, "none");
+    assert_eq!(action.reason_code.as_deref(), Some("download_root_busy"));
+    assert!(action.download_id.is_none());
+    assert_eq!(std::fs::read(&store_path).ok(), store_before);
+    assert_eq!(
+        serde_json::to_value(library.index().get(model_id).unwrap()).unwrap(),
+        index_before
+    );
+    assert_eq!(
+        std::fs::read(destination.join("metadata.json")).unwrap(),
+        metadata_before
+    );
+    assert_eq!(
+        std::fs::read(destination.join("weights.gguf.part")).unwrap(),
+        b"partial"
+    );
+    assert!(!destination.join(".pumas_download").exists());
+    assert!(api.list_hf_downloads().await.unwrap().is_empty());
+    drop(grant);
+    api.shutdown_downloads().await.unwrap();
+}
+
+#[tokio::test]
 async fn builder_retains_failed_download_import_and_retries_before_completion() {
     use crate::model_library::download_store::{
         DownloadAdmissionDomain, DownloadAdmissionRequest, DownloadPersistence,

@@ -257,7 +257,55 @@ pub(crate) struct DestinationIdentity {
 #[derive(Clone)]
 pub(crate) struct DownloadDestinationRoot(Arc<RecoveryRoot>);
 
+/// Native exclusion retained by active download mutation, not configured roots.
+pub(crate) struct RootExecutionGrant {
+    file: std::fs::File,
+    authority: DownloadDestinationRoot,
+}
+
+impl RootExecutionGrant {
+    pub(crate) fn validate_root(&self, root: &DownloadDestinationRoot) -> Result<()> {
+        self.authority.0.require_current()?;
+        root.0.require_current()?;
+        if !self.authority.same_physical_root(root)
+            || filesystem_identity(&self.file.metadata()?) != Some(root.0.root_identity)
+            || self.authority.0.library_id != root.0.library_id
+        {
+            return Err(invalid_capability_path().into());
+        }
+        Ok(())
+    }
+}
+
 impl DownloadDestinationRoot {
+    pub(crate) fn same_physical_root(&self, other: &Self) -> bool {
+        self.0.root_identity == other.0.root_identity
+    }
+
+    pub(crate) fn try_acquire_execution_grant(&self) -> Result<RootExecutionGrant> {
+        self.0.require_current()?;
+        // A fresh readable open has independent lock ownership. A cloned handle
+        // shares ownership; an open_dir handle may not support native locking.
+        let file = self.0.root.open(".")?.into_std();
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || filesystem_identity(&metadata) != Some(self.0.root_identity) {
+            return Err(invalid_capability_path().into());
+        }
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                PumasError::DownloadRootBusy
+            } else {
+                error.into()
+            }
+        })?;
+        let grant = RootExecutionGrant {
+            file,
+            authority: self.clone(),
+        };
+        grant.validate_root(self)?;
+        Ok(grant)
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         #[cfg(not(unix))]
         return Err(io::Error::new(
@@ -489,6 +537,10 @@ impl RecoveryRoot {
 }
 
 impl DownloadRecoveryDestination {
+    pub(crate) fn execution_root(&self) -> DownloadDestinationRoot {
+        DownloadDestinationRoot(self.authority.clone())
+    }
+
     /// Logical library identity survives remounts and clones; it grants no
     /// filesystem authority. Physical identity still governs every effect.
     pub(crate) fn persisted_identity(
@@ -1206,6 +1258,138 @@ fn invalid_capability_path() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn root_execution_grants_contend_across_aliases_and_release_on_close() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("library root");
+        std::fs::create_dir(&path).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let root = super::DownloadDestinationRoot::open(&path).unwrap();
+        let contender = super::DownloadDestinationRoot::open(&alias).unwrap();
+        let grant = root.try_acquire_execution_grant().unwrap();
+        grant.validate_root(&contender).unwrap();
+        let copied_path = temp.path().join("copied library");
+        std::fs::create_dir(&copied_path).unwrap();
+        std::fs::copy(
+            path.join(super::LIBRARY_ID_MARKER),
+            copied_path.join(super::LIBRARY_ID_MARKER),
+        )
+        .unwrap();
+        let copied_root = super::DownloadDestinationRoot::open(&copied_path).unwrap();
+        assert!(matches!(grant.validate_root(&copied_root),
+            Err(crate::PumasError::Io { source: Some(ref error), .. })
+                if error.kind() == std::io::ErrorKind::PermissionDenied));
+        copied_root.try_acquire_execution_grant().unwrap();
+        assert!(matches!(
+            contender.try_acquire_execution_grant(),
+            Err(crate::PumasError::DownloadRootBusy)
+        ));
+        drop(grant);
+        contender.try_acquire_execution_grant().unwrap();
+        assert_eq!(
+            std::fs::read_dir(&path).unwrap().count(),
+            2,
+            "execution must not add a sidecar beyond existing identity files"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_execution_grants_reject_replaced_root_and_changed_uuid() {
+        for replace_root in [false, true] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("library");
+            std::fs::create_dir(&path).unwrap();
+            let root = super::DownloadDestinationRoot::open(&path).unwrap();
+            let grant = root.try_acquire_execution_grant().unwrap();
+            if replace_root {
+                std::fs::rename(&path, temp.path().join("old")).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(
+                    path.join(super::LIBRARY_ID_MARKER),
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema_version": 1, "library_id": uuid::Uuid::new_v4().to_string()
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let current = super::DownloadDestinationRoot::open(&path).unwrap();
+            for result in [
+                grant.validate_root(&root),
+                grant.validate_root(&current),
+                root.try_acquire_execution_grant().map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(crate::PumasError::Io { source: Some(ref error), .. })
+                    if error.kind() == if replace_root { std::io::ErrorKind::PermissionDenied }
+                        else { std::io::ErrorKind::InvalidData })
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess helper invoked by root_execution_grant_releases_after_process_death"]
+    fn root_execution_grant_child_holder() {
+        use std::io::Write;
+        let Some(path) = std::env::var_os("PUMAS_ROOT_GRANT_CHILD_DIR") else {
+            return;
+        };
+        let root = super::DownloadDestinationRoot::open(std::path::Path::new(&path)).unwrap();
+        let _grant = root.try_acquire_execution_grant().unwrap();
+        println!("PUMAS_ROOT_GRANT_ACQUIRED");
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_line(&mut String::new()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_execution_grant_releases_after_process_death() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = super::DownloadDestinationRoot::open(temp.path()).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "model_library::download_recovery::tests::root_execution_grant_child_holder",
+                "--nocapture",
+            ])
+            .env("PUMAS_ROOT_GRANT_CHILD_DIR", temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(output).lines() {
+                if line.unwrap().contains("PUMAS_ROOT_GRANT_ACQUIRED") {
+                    let _ = ready_tx.send(());
+                    break;
+                }
+            }
+        });
+        let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let contended = ready.is_ok()
+            && matches!(
+                root.try_acquire_execution_grant(),
+                Err(crate::PumasError::DownloadRootBusy)
+            );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        reader.join().unwrap();
+        ready.unwrap();
+        assert!(contended, "independent process must hold native exclusion");
+        root.try_acquire_execution_grant().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn readonly_recovery_inspection_does_not_initialize_library_identity() {

@@ -138,6 +138,19 @@ impl HuggingFaceClient {
         self.download_tasks.run_invocation(operation).await
     }
 
+    /// Protect one download mutation phase without retaining exclusion in idle clients.
+    pub(crate) async fn protect_download_mutation(
+        &self,
+        context: &DownloadInvocationContext,
+    ) -> Result<DownloadInvocationContext> {
+        match self.destination_root.clone() {
+            Some(root) => context.with_root_grant(root).await,
+            None => Err(crate::PumasError::Config {
+                message: "Download mutation requires a configured library root".into(),
+            }),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_test_download_base_url(&mut self, base_url: String) {
         self.download_base_url = Some(base_url);

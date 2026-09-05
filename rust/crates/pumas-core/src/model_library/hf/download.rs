@@ -486,6 +486,7 @@ struct PreparedDownloadTask {
     repo_id: String,
     files: Vec<FileToDownload>,
     destination: DownloadDestination,
+    configured_root: Option<crate::model_library::download_recovery::DownloadDestinationRoot>,
     cancel_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
     completion_callback: Option<DownloadCompletionCallback>,
@@ -690,30 +691,78 @@ impl PreparedDownloadTask {
         self,
         owner: &Arc<DownloadTaskOwner>,
         role: TaskRole,
+        protected_context: Option<TaskContext>,
     ) -> Result<OwnedPreparedTask> {
         let download_id = self.download_id.clone();
         owner.prepare(download_id, role, move |task_context| async move {
+            let task_context = protected_context.as_ref().map_or_else(
+                || task_context.clone(),
+                |source| task_context.inherit_root_grant(source),
+            );
+            drop(protected_context);
             // This worker owns and projects its failures; ordinary starts do
             // not have a second consumer for the settled internal outcome.
             let _ = self.run_owned(task_context).await;
         })
     }
 
-    async fn run_owned(self, task_context: TaskContext) -> Result<bool> {
+    async fn run_owned(self, mut task_context: TaskContext) -> Result<bool> {
         use futures::FutureExt;
 
         let destination_path = self.destination.identity();
         let destination_domain = self.destination.domain();
-        let acquired = tokio::select! {
-            biased;
-            _ = task_context.pause_requested(&self.pause_flag) => None,
-            acquired = self.destination_executions.wait_for_turn(
-                &destination_path,
-                task_context.download_id(),
-                destination_domain,
-                task_context.generation(),
-            ) => Some(acquired),
+        let waiting_context = task_context.without_root_grant();
+        let acquired = {
+            let wait = async {
+                tokio::select! {
+                    biased;
+                    _ = waiting_context.pause_requested(&self.pause_flag) => None,
+                    acquired = self.destination_executions.wait_for_turn(
+                        &destination_path,
+                        waiting_context.download_id(),
+                        destination_domain,
+                        waiting_context.generation(),
+                    ) => Some(acquired),
+                }
+            };
+            tokio::pin!(wait);
+            match futures::poll!(&mut wait) {
+                std::task::Poll::Ready(acquired) => acquired,
+                std::task::Poll::Pending => {
+                    // Only an actual queue wait relinquishes admission custody.
+                    task_context = task_context.without_root_grant();
+                    wait.await
+                }
+            }
         };
+        if acquired == Some(false) {
+            return Ok(false);
+        }
+        let protected = async {
+            if let Some(root) = self.configured_root.clone() {
+                task_context = task_context.with_root_grant(root).await?;
+            }
+            task_context = task_context
+                .with_root_grant(self.destination.capability().execution_root())
+                .await?;
+            if acquired == Some(true) {
+                self.validate_execution(&task_context).await?;
+            }
+            Ok::<_, PumasError>(())
+        }
+        .await;
+        if let Err(error) = protected {
+            HuggingFaceClient::project_execution_refusal(
+                &self.downloads,
+                &self.download_publications,
+                &self.download_id,
+                &task_context,
+                TaskRole::Worker,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
         let mut restore_import_failed = false;
         let outcome =
             if let (Some(true), Some(initial_status)) = (acquired, self.restore_finalization) {
@@ -807,6 +856,7 @@ impl PreparedDownloadTask {
                 destination_domain,
                 task_context.generation(),
             );
+            task_context = task_context.without_root_grant();
             if let (Some(callback), Some(info)) =
                 (self.completion_callback.clone(), completion_info)
             {
@@ -915,6 +965,58 @@ impl PreparedDownloadTask {
             return Ok(false);
         }
         result.map(|()| true)
+    }
+
+    async fn validate_execution(&self, context: &TaskContext) -> Result<()> {
+        let Some(store) = self.terminal_cleanup_persistence.clone() else {
+            return Ok(());
+        };
+        let attempt = self
+            .downloads
+            .read()
+            .await
+            .get(&self.download_id)
+            .and_then(|state| {
+                state
+                    .admission
+                    .as_ref()
+                    .map(|entry| entry.attempt_id.clone())
+            });
+        // Newly ticket-authorized recovery never acquired an ordinary durable
+        // admission. Its bound destination capability remains its authority.
+        if attempt.is_none() && self.destination.is_recovery() {
+            return Ok(());
+        }
+        let attempt = attempt.ok_or_else(|| PumasError::Config {
+            message: "Download execution requires its retained admission attempt".into(),
+        })?;
+        let destination = self.destination.clone();
+        let download_id = self.download_id.clone();
+        let files = self
+            .files
+            .iter()
+            .map(|file| file.filename.clone())
+            .collect::<Vec<_>>();
+        context
+            .run_fallible_blocking_named("validate current download execution", move || {
+                store.validate_queue_execution(
+                    &download_id,
+                    &attempt,
+                    if destination.is_recovery() {
+                        DownloadAdmissionDomain::Recovery
+                    } else {
+                        DownloadAdmissionDomain::Ambient
+                    },
+                    &destination.persisted_identity()?,
+                    &files,
+                )
+            })
+            .await
+            .map_err(|error| {
+                PumasError::Other(format!(
+                    "Download execution validation observation failed: {error}"
+                ))
+            })?
     }
 }
 
@@ -1571,6 +1673,41 @@ pub(super) async fn project_download_shutdown(
 }
 
 impl HuggingFaceClient {
+    async fn project_execution_refusal(
+        downloads: &Arc<RwLock<HashMap<String, DownloadState>>>,
+        publications: &Arc<DownloadPublicationOwner>,
+        download_id: &str,
+        context: &TaskContext,
+        role: TaskRole,
+        error: &PumasError,
+    ) {
+        let _ = context.drain_blocking().await;
+        let changed = {
+            let mut states = downloads.write().await;
+            if !context.is_current_role(role) {
+                return;
+            }
+            states.get_mut(download_id).is_some_and(|state| {
+                if matches!(
+                    state.status,
+                    DownloadStatus::Completed | DownloadStatus::Cancelled
+                ) {
+                    return false;
+                }
+                // Refusal establishes no durable mutation or settlement authority.
+                state.status = DownloadStatus::Error;
+                state.error = Some(error.to_string());
+                state.task_registered = false;
+                state.lifecycle_failure_unverified = true;
+                true
+            })
+        };
+        if changed {
+            publish_download_snapshot_from_parts(publications).await;
+            let _ = context.complete_transferred_projection(true);
+        }
+    }
+
     /// Permanently close download admission and observe owned work to completion.
     /// Cancelling one waiter does not cancel the shared drain or its result.
     pub async fn shutdown_downloads(&self) -> Result<()> {
@@ -1582,15 +1719,22 @@ impl HuggingFaceClient {
     }
 
     async fn reconcile_download_reads(&self) {
+        if self.destination_root.is_none() {
+            return;
+        }
         let client = self.clone_for_invocation();
         let result = self
-            .run_download_invocation(move |_| async move {
-                client.reconcile_inactive_active_downloads().await;
+            .run_download_invocation(move |context| async move {
+                let context = client.protect_download_mutation(&context).await?;
+                client.reconcile_inactive_active_downloads(&context).await;
                 Ok(())
             })
             .await;
         if let Err(error) = result {
-            if !matches!(error, PumasError::DownloadLifecycleClosed) {
+            if !matches!(
+                error,
+                PumasError::DownloadLifecycleClosed | PumasError::DownloadRootBusy
+            ) {
                 warn!("Download read reconciliation owner failed: {error}");
             }
         }
@@ -1904,7 +2048,7 @@ impl HuggingFaceClient {
         }
     }
 
-    async fn reconcile_inactive_active_downloads(&self) {
+    async fn reconcile_inactive_active_downloads(&self, context: &TaskContext) {
         self.observe_finished_download_tasks().await;
 
         let missing_registered_tasks = {
@@ -1966,9 +2110,12 @@ impl HuggingFaceClient {
                         let fallback_states = self.downloads.clone();
                         let fallback_publications = self.download_publications.clone();
                         let fallback_id = download_id.clone();
+                        let protected_context = context.clone();
                         let prepared = self.download_tasks.prepare_projection(
                             download_id.clone(),
                             move |task_context, _| async move {
+                                let task_context =
+                                    task_context.inherit_root_grant(&protected_context);
                                 Self::project_inactive_download(
                                     states,
                                     publications,
@@ -2031,6 +2178,7 @@ impl HuggingFaceClient {
     pub async fn restore_persisted_downloads(&self) -> Result<Vec<DownloadCompletionInfo>> {
         let client = self.clone_for_invocation();
         self.run_download_invocation(move |context| async move {
+            let context = client.protect_download_mutation(&context).await?;
             client.restore_persisted_downloads_admitted(&context).await
         })
         .await
@@ -2045,8 +2193,11 @@ impl HuggingFaceClient {
             None => return Ok(Vec::new()),
         };
 
+        let protected_context = context.clone();
         let inventory = self
             .run_download_invocation(move |context| async move {
+                let context = context.inherit_root_grant(&protected_context);
+                drop(protected_context);
                 context
                     .run_fallible_blocking_named("reconcile download restore inventory", move || {
                         persistence.reconcile_lifecycle_inventory_strict()?;
@@ -2220,7 +2371,7 @@ impl HuggingFaceClient {
         self.publish_download_snapshot().await;
         let mut completed = Vec::new();
         for id in restored_ids {
-            if let Some(info) = self.finalize_restored_download(&id).await? {
+            if let Some(info) = self.finalize_restored_download(context, &id).await? {
                 completed.push(info);
             }
         }
@@ -2229,6 +2380,7 @@ impl HuggingFaceClient {
 
     async fn finalize_restored_download(
         &self,
+        protected_context: &TaskContext,
         download_id: &str,
     ) -> Result<Option<DownloadCompletionInfo>> {
         let (info, files, destination, admission, initial_status) = {
@@ -2296,10 +2448,13 @@ impl HuggingFaceClient {
         prepared_download.restore_finalization = Some(initial_status);
         let (finished_sender, finished) = tokio::sync::oneshot::channel();
         let result_states = self.downloads.clone();
+        let protected_context = protected_context.clone();
         let prepared = self.download_tasks.prepare(
             download_id.into(),
             TaskRole::Worker,
             move |context| async move {
+                let context = context.inherit_root_grant(&protected_context);
+                drop(protected_context);
                 let result = prepared_download.run_owned(context.clone()).await;
                 if result.as_ref().is_ok_and(|complete| *complete) {
                     let mut states = result_states.write().await;
@@ -2407,6 +2562,8 @@ impl HuggingFaceClient {
         dest_dir: &Path,
         remote_evidence: Option<crate::models::HuggingFaceEvidence>,
     ) -> Result<String> {
+        let protected_context = self.protect_download_mutation(context).await?;
+        let context = &protected_context;
         let root = self
             .destination_root
             .clone()
@@ -2718,6 +2875,7 @@ impl HuggingFaceClient {
                 completion_callback: self.completion_callback.clone(),
                 aux_complete_callback: self.aux_complete_callback.clone(),
                 download_importer: self.download_importer.clone(),
+                configured_root: self.destination_root.clone(),
                 persistence: self.persistence.clone(),
                 terminal_cleanup_persistence: self.persistence.clone(),
                 auth_header,
@@ -2760,10 +2918,13 @@ impl HuggingFaceClient {
             let executions = self.destination_executions.clone();
             let held_destination = destination.clone();
             let attempt_id = uuid::Uuid::new_v4().to_string();
+            let protected_context = context.clone();
             let prepared = self.download_tasks.prepare(
                 download_id.clone(),
                 TaskRole::AdmissionTransition,
                 move |task_context| async move {
+                    let task_context = task_context.inherit_root_grant(&protected_context);
+                    drop(protected_context);
                     let attempt = attempt_id.clone();
                     let admission_destination = held_destination.clone();
                     #[cfg(test)]
@@ -2959,6 +3120,7 @@ impl HuggingFaceClient {
             repo_id,
             files,
             destination,
+            configured_root: self.destination_root.clone(),
             cancel_flag,
             pause_flag,
             completion_callback,
@@ -3005,7 +3167,7 @@ impl HuggingFaceClient {
             )
             .await;
         let prepared = prepared
-            .prepare_owned(&self.download_tasks, TaskRole::Worker)
+            .prepare_owned(&self.download_tasks, TaskRole::Worker, None)
             .unwrap();
         let installed = {
             let mut downloads = self.downloads.write().await;
@@ -4194,13 +4356,20 @@ impl HuggingFaceClient {
     pub async fn cancel_download(&self, download_id: &str) -> Result<bool> {
         let client = self.clone_for_invocation();
         let download_id = download_id.to_string();
-        self.run_download_invocation(move |_| async move {
-            client.cancel_download_admitted(&download_id).await
+        self.run_download_invocation(move |context| async move {
+            let context = client.protect_download_mutation(&context).await?;
+            client
+                .cancel_download_admitted(&context, &download_id)
+                .await
         })
         .await
     }
 
-    async fn cancel_download_admitted(&self, download_id: &str) -> Result<bool> {
+    async fn cancel_download_admitted(
+        &self,
+        context: &TaskContext,
+        download_id: &str,
+    ) -> Result<bool> {
         let finalizer = {
             let mut download_states = self.downloads.write().await;
             let Some(state) = download_states.get_mut(download_id) else {
@@ -4262,22 +4431,53 @@ impl HuggingFaceClient {
                 admission_attempt,
                 revoked_snapshot: state.revoked_snapshot.clone(),
             });
+            let protected_context = context.clone();
+            let configured_root = self.destination_root.clone();
             let transition = self.download_tasks.begin_cancel(
                 download_id,
                 move |task_context, predecessor| async move {
                     use futures::FutureExt;
+                    let mut task_context = task_context.inherit_root_grant(&protected_context);
+                    drop(protected_context);
 
-                    if !destination_executions
+                    let waiting_identity = cleanup_destination.identity();
+                    let waiting_generation = task_context.generation().clone();
+                    let turn = destination_executions
                         .wait_for_turn(
-                            &cleanup_destination.identity(),
+                            &waiting_identity,
                             &finalizer_id,
                             cleanup_domain,
-                            task_context.generation(),
-                        )
-                        .await
-                    {
+                            &waiting_generation,
+                        );
+                    tokio::pin!(turn);
+                    let acquired = match futures::poll!(&mut turn) {
+                        std::task::Poll::Ready(acquired) => acquired,
+                        std::task::Poll::Pending => {
+                            // The predecessor has already drained before this
+                            // finalizer runs. A queued destination owns no effects.
+                            task_context = task_context.without_root_grant();
+                            turn.await
+                        }
+                    };
+                    if !acquired {
                         return;
                     }
+                    let protected = async {
+                        if let Some(root) = configured_root {
+                            task_context = task_context.with_root_grant(root).await?;
+                        }
+                        task_context.with_root_grant(cleanup_destination.capability().execution_root()).await
+                    }.await;
+                    let task_context = match protected {
+                        Ok(context) => context,
+                        Err(error) => {
+                            Self::project_execution_refusal(
+                                &downloads, &download_publications, &finalizer_id,
+                                &task_context, TaskRole::CancelFinalizer, &error,
+                            ).await;
+                            return;
+                        }
+                    };
                     let destination_identity = cleanup_destination.identity();
                     let finalizer_generation = task_context.generation().clone();
                     let finalizer_outcome = std::panic::AssertUnwindSafe(async {
@@ -4549,13 +4749,21 @@ impl HuggingFaceClient {
         verified: &VerifiedDownloadRecovery,
         model_type: Option<String>,
     ) -> Result<RecoveryDownloadAdmission> {
+        let protected_context = self.protect_download_mutation(context).await?;
+        let protected_context = protected_context
+            .with_root_grant(verified.destination.execution_root())
+            .await?;
+        let context = &protected_context;
         self.observe_finished_download_tasks().await;
         let dest_dir = verified.destination.display_path();
 
         let destination = verified.destination.clone();
         let bound_files = verified.files.clone();
+        let protected_context = context.clone();
         if self
             .run_download_invocation(move |task_context| async move {
+                let task_context = task_context.inherit_root_grant(&protected_context);
+                drop(protected_context);
                 recovery_filesystem_operation(
                     &task_context,
                     "recovery admission preflight",
@@ -4691,10 +4899,13 @@ impl HuggingFaceClient {
             let destination_executions = self.destination_executions.clone();
             let persistence = self.persistence.clone();
             let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+            let protected_context = context.clone();
             let prepared_transition = self.download_tasks.prepare(
                 download_id.clone(),
                 TaskRole::RecoveryTransition,
                 move |task_context| async move {
+                    let task_context = task_context.inherit_root_grant(&protected_context);
+                    drop(protected_context);
                     let result = async {
                         if let Some(persistence) = persistence {
                             let persisted_id = transition_download_id.clone();
@@ -4993,7 +5204,11 @@ impl HuggingFaceClient {
         let RecoveryLaunchPlan::New { download_id } = launch_plan else {
             unreachable!("existing recovery returned from its transition owner")
         };
-        let prepared = prepared_download.prepare_owned(&self.download_tasks, TaskRole::Worker)?;
+        let prepared = prepared_download.prepare_owned(
+            &self.download_tasks,
+            TaskRole::Worker,
+            Some(context.clone()),
+        )?;
         let installed = {
             let mut downloads = self.downloads.write().await;
             if matches!(
@@ -5078,7 +5293,8 @@ impl HuggingFaceClient {
     pub async fn pause_download(&self, download_id: &str) -> Result<bool> {
         let client = self.clone_for_invocation();
         let download_id = download_id.to_string();
-        self.run_download_invocation(move |_| async move {
+        self.run_download_invocation(move |context| async move {
+            let _context = client.protect_download_mutation(&context).await?;
             client.pause_download_admitted(&download_id).await
         })
         .await
@@ -5126,6 +5342,8 @@ impl HuggingFaceClient {
         context: &TaskContext,
         download_id: &str,
     ) -> Result<bool> {
+        let protected_context = self.protect_download_mutation(context).await?;
+        let context = &protected_context;
         self.observe_finished_download_tasks().await;
         if self
             .download_tasks
@@ -5183,8 +5401,11 @@ impl HuggingFaceClient {
                         && same_recovery
                         && !self.download_tasks.contains(download_id)
                     {
-                        let prepared = prepared_download
-                            .prepare_owned(&self.download_tasks, TaskRole::Worker)?;
+                        let prepared = prepared_download.prepare_owned(
+                            &self.download_tasks,
+                            TaskRole::Worker,
+                            Some(context.clone()),
+                        )?;
                         if let Ok(installed) = self.download_tasks.install_gated(prepared) {
                             if !self.destination_executions.reserve(
                                 recovery_destination.identity(),
@@ -5304,8 +5525,11 @@ impl HuggingFaceClient {
                 && same_context
                 && !self.download_tasks.contains(download_id)
             {
-                let prepared =
-                    prepared_download.prepare_owned(&self.download_tasks, TaskRole::Worker)?;
+                let prepared = prepared_download.prepare_owned(
+                    &self.download_tasks,
+                    TaskRole::Worker,
+                    Some(context.clone()),
+                )?;
                 match self.download_tasks.install_gated(prepared) {
                     Ok(installed) => {
                         if !self.destination_executions.reserve(
@@ -6406,6 +6630,9 @@ mod tests {
         let path = temp.path().join("downloads.json");
         std::fs::write(&path, b"not-json").unwrap();
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        client
+            .configure_download_destination_root(temp.path())
+            .unwrap();
         client.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
         assert!(matches!(
             client.restore_persisted_downloads().await,
@@ -6443,6 +6670,15 @@ mod tests {
                 b"marker"
             );
         }
+    }
+
+    fn recovery_test_client(cache_dir: PathBuf, library_root: &Path) -> HuggingFaceClient {
+        std::fs::create_dir_all(library_root).unwrap();
+        let mut client = HuggingFaceClient::new(cache_dir).unwrap();
+        client
+            .configure_download_destination_root(library_root)
+            .unwrap();
+        client
     }
 
     fn configured_download_client(cache_dir: impl Into<PathBuf>) -> Result<HuggingFaceClient> {
@@ -7623,10 +7859,14 @@ mod tests {
     async fn missing_resume_row_fails_closed_without_late_queued_persistence() {
         let temp = TempDir::new().unwrap();
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let library_root = temp.path().join("library");
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
-        let library_root = temp.path().join("library");
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "ambient-resume-missing-row";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
@@ -7849,7 +8089,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let cache = temp.path().join("cache");
-        let client = HuggingFaceClient::new(&cache).unwrap();
+        let mut client = HuggingFaceClient::new(&cache).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let verified = verified_recovery(
             &library_root,
             "acme/model",
@@ -7892,7 +8136,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let cache = temp.path().join("cache");
-        let client = HuggingFaceClient::new(&cache).unwrap();
+        let mut client = HuggingFaceClient::new(&cache).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let verified = verified_recovery(
             &library_root,
             "acme/model",
@@ -7941,7 +8189,12 @@ mod tests {
     async fn concurrent_unrelated_recovery_context_cannot_attach_or_filter() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
+        let client = Arc::new(client);
         let first = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let second = verified_recovery(&library_root, "other/model", &["other.gguf"]);
         cache_repo_tree(
@@ -8003,7 +8256,11 @@ mod tests {
     async fn recovery_admission_atomically_registers_task_with_held_capability() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         cache_repo_tree(
             &client,
@@ -8090,6 +8347,9 @@ mod tests {
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         cache_repo_tree(
             &client,
             "acme/model",
@@ -8214,7 +8474,12 @@ mod tests {
     async fn cancelling_recovery_admission_before_commit_leaves_no_state_or_task() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
+        let client = Arc::new(client);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         cache_repo_tree(
             &client,
@@ -8258,7 +8523,12 @@ mod tests {
     async fn cancelling_recovery_admission_after_commit_keeps_registered_owner() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
+        let client = Arc::new(client);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         cache_repo_tree(
             &client,
@@ -8330,7 +8600,11 @@ mod tests {
     async fn recovery_attach_requires_registered_capability_backed_owner() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         cache_repo_tree(
             &client,
@@ -8401,6 +8675,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -8453,6 +8731,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
@@ -8534,6 +8816,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
@@ -8586,6 +8872,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
@@ -8697,6 +8987,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
@@ -8786,6 +9080,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
@@ -8866,6 +9164,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -8940,6 +9242,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -8986,6 +9292,9 @@ mod tests {
         }));
 
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         cache_repo_tree(
             &client,
             "acme/model",
@@ -9067,6 +9376,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -9165,6 +9478,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -9446,6 +9763,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -9602,6 +9923,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_root_refuses_mutation_but_preserves_idle_runtime_reads() {
+        let temp = TempDir::new().unwrap();
+        let (library, client, destination, request) = imported_download_fixture(temp.path()).await;
+        let root = crate::model_library::download_recovery::DownloadDestinationRoot::open(
+            library.library_root(),
+        )
+        .unwrap();
+        // Configuring an idle client must not acquire exclusion.
+        let grant = root.try_acquire_execution_grant().unwrap();
+        assert!(matches!(
+            client.start_download(&request, &destination, None).await,
+            Err(PumasError::DownloadRootBusy)
+        ));
+        assert!(matches!(
+            client.restore_persisted_downloads().await,
+            Err(PumasError::DownloadRootBusy)
+        ));
+        assert!(matches!(
+            client.pause_download("absent").await,
+            Err(PumasError::DownloadRootBusy)
+        ));
+        assert!(matches!(
+            client.resume_download("absent").await,
+            Err(PumasError::DownloadRootBusy)
+        ));
+        assert!(matches!(
+            client.cancel_download("absent").await,
+            Err(PumasError::DownloadRootBusy)
+        ));
+        assert!(client.list_downloads().await.is_empty());
+        assert!(client.get_download_progress("absent").await.is_none());
+        assert!(!destination.join(".pumas_download").exists());
+        assert!(library.load_metadata(&destination).unwrap().is_none());
+        assert!(client
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_lifecycle_inventory_strict()
+            .unwrap()
+            .queue_admissions
+            .is_empty());
+        assert_eq!(
+            std::fs::read(destination.join("model.onnx")).unwrap(),
+            b"data"
+        );
+        drop(grant);
+        assert!(client
+            .restore_persisted_downloads()
+            .await
+            .unwrap()
+            .is_empty());
+        client.shutdown_downloads().await.unwrap();
+        assert!(root.try_acquire_execution_grant().is_ok());
+    }
+
+    #[tokio::test]
     async fn real_import_precedes_completion_and_holds_destination_successor() {
         let temp = TempDir::new().unwrap();
         let (library, client, destination, request) = imported_download_fixture(temp.path()).await;
@@ -9614,7 +9991,8 @@ mod tests {
             if import_destination.join(".pumas_download").exists() {
                 return;
             }
-            if let Some(entered) = entered.lock().unwrap().take() {
+            let entered = entered.lock().unwrap().take();
+            if let Some(entered) = entered {
                 let _ = entered.send(());
                 let _ = held.lock().unwrap().recv();
             }
@@ -9640,6 +10018,37 @@ mod tests {
             .unwrap();
         let metadata_while_held = library.load_metadata(&destination).unwrap();
         let marker_while_held = destination.join(".pumas_download").exists();
+        let competing_root =
+            crate::model_library::download_recovery::DownloadDestinationRoot::open(
+                library.library_root(),
+            )
+            .unwrap();
+        let contender_blocked = matches!(
+            competing_root.try_acquire_execution_grant(),
+            Err(PumasError::DownloadRootBusy)
+        );
+        let independent_destination = library.build_model_path("vision", "acme", "independent");
+        std::fs::create_dir_all(&independent_destination).unwrap();
+        std::fs::write(independent_destination.join("model.onnx.part"), b"data").unwrap();
+        let independent = client
+            .start_download(&request, &independent_destination, None)
+            .await
+            .unwrap();
+        // Auxiliary metadata and final import share the existing metadata writer.
+        // Root exclusion must still allow this destination's preceding marker write.
+        let independent_progressed = tokio::time::timeout(Duration::from_secs(3), async {
+            while !independent_destination.join(".pumas_download").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let independent_state = client
+            .downloads
+            .read()
+            .await
+            .get(&independent)
+            .map(|state| (state.status, state.error.clone()));
         std::fs::write(destination.join("successor.onnx"), b"next").unwrap();
         let mut successor_request = request.clone();
         successor_request.repo_id = "acme/successor".into();
@@ -9686,6 +10095,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status_while_held, Some(DownloadStatus::Downloading));
+        assert!(
+            contender_blocked,
+            "real final import must retain physical exclusion"
+        );
+        assert!(
+            independent_progressed,
+            "same-client different destinations must overlap: {independent_state:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status(&independent).await != Some(DownloadStatus::Completed)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second import must finish after metadata writer release");
         assert!(inventory.queue_admissions.contains_key(&first));
         assert!(index_while_held.is_none());
         assert!(metadata_while_held.is_none());
@@ -9746,6 +10171,12 @@ mod tests {
             .unwrap()
             .load_lifecycle_inventory_strict()
             .unwrap();
+        let competing_root =
+            crate::model_library::download_recovery::DownloadDestinationRoot::open(
+                library.library_root(),
+            )
+            .unwrap();
+        let notification_released_root = competing_root.try_acquire_execution_grant().is_ok();
         std::fs::write(destination.join("successor.onnx"), b"next").unwrap();
         let mut successor_request = request.clone();
         successor_request.repo_id = "acme/successor".into();
@@ -9786,6 +10217,10 @@ mod tests {
             Some("acme/model")
         );
         assert!(indexed_before_successor.is_some());
+        assert!(
+            notification_released_root,
+            "notification must not retain physical exclusion"
+        );
         assert!(!inventory_before_successor
             .queue_admissions
             .contains_key(&first));
@@ -9860,6 +10295,15 @@ mod tests {
                 let waiting = waiter.as_ref().is_none_or(|waiter| !waiter.is_finished());
                 let status = client.get_download_status(&download_id).await;
                 let marker_while_held = destination.join(".pumas_download").exists();
+                let competing_root =
+                    crate::model_library::download_recovery::DownloadDestinationRoot::open(
+                        library.library_root(),
+                    )
+                    .unwrap();
+                let contender_blocked = matches!(
+                    competing_root.try_acquire_execution_grant(),
+                    Err(PumasError::DownloadRootBusy)
+                );
                 release.send(()).unwrap();
                 if let Some(waiter) = waiter {
                     let outcome = tokio::time::timeout(Duration::from_secs(3), waiter)
@@ -9879,6 +10323,10 @@ mod tests {
                     .unwrap();
                 }
                 assert!(waiting);
+                assert!(
+                    contender_blocked,
+                    "cancellation and shutdown must retain importer exclusion"
+                );
                 assert_eq!(marker_while_held, !final_import);
                 assert!(before.queue_admissions.contains_key(&download_id));
                 assert!(!before.quarantines.contains_key(&download_id));
@@ -9918,7 +10366,10 @@ mod tests {
     async fn auxiliary_callback_runs_without_destination_lease_and_cancel_stops_continuation() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(
             &library_root,
             "acme/model",
@@ -10027,7 +10478,10 @@ mod tests {
     async fn auxiliary_callback_panic_survives_cancelled_waiter_and_fails_closed() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(
             &library_root,
             "acme/model",
@@ -10165,7 +10619,7 @@ mod tests {
     async fn completion_callback_panic_is_observed_without_rolling_back_completed() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "completion-callback-panic";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
@@ -10241,6 +10695,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -10337,6 +10795,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -10414,6 +10876,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -10541,6 +11007,9 @@ mod tests {
             aux_observer.store(true, Ordering::SeqCst);
         }));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let download_id = "ordinary-resume";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
         state.make_managed_for_test();
@@ -10602,6 +11071,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
@@ -10658,16 +11131,18 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_resume_caller_after_commit_keeps_started_owner_in_both_modes() {
-        let temp = TempDir::new().unwrap();
-        let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
-        let persistence = Arc::new(DownloadPersistence::new(temp.path()));
-        client.set_persistence(persistence.clone());
-        let client = Arc::new(client);
-
         for recovery in [false, true] {
+            let temp = TempDir::new().unwrap();
             let mode = if recovery { "recovery" } else { "ambient" };
             let library_root = temp.path().join(mode).join("library");
             let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+            let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            client
+                .configure_download_destination_root(&library_root)
+                .unwrap();
+            let persistence = Arc::new(DownloadPersistence::new(temp.path()));
+            client.set_persistence(persistence.clone());
+            let client = Arc::new(client);
             let download_id = format!("cancelled-{mode}-resume-after-commit");
             let mut state =
                 recovery_test_state(&verified, &download_id, DownloadStatus::Paused, false);
@@ -10741,7 +11216,10 @@ mod tests {
     async fn pause_cannot_overwrite_concurrent_completion() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "pause-complete";
         let mut state =
@@ -10773,10 +11251,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_before_destination_work_fails_closed_when_the_row_is_absent() {
+    async fn missing_admission_refuses_destination_work_even_when_pause_races() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -10821,11 +11303,14 @@ mod tests {
                 )
                 .await
         );
-        assert!(client.pause_download(download_id).await.unwrap());
-        assert_eq!(
-            client.get_download_status(download_id).await,
-            Some(DownloadStatus::Pausing)
-        );
+        // Admission validation precedes the destination mutex. It may reject
+        // before the pause request can attach; neither order may authorize work.
+        if !client.pause_download(download_id).await.unwrap() {
+            assert_eq!(
+                client.get_download_status(download_id).await,
+                Some(DownloadStatus::Error)
+            );
+        }
         drop(destination_guard);
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -10849,6 +11334,22 @@ mod tests {
         drop(downloads);
         assert_eq!(destination_work.load(Ordering::SeqCst), 0);
         assert!(persistence.load_all().is_empty());
+        assert!(!temp.path().join("downloads.json").exists());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join(".pumas_download")
+            .exists());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join("weights.gguf.part")
+            .exists());
+        assert!(!verified
+            .destination
+            .display_path()
+            .join("weights.gguf")
+            .exists());
         client.download_tasks.set_blocking_observer(None);
     }
 
@@ -10857,6 +11358,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
@@ -10929,7 +11434,7 @@ mod tests {
     async fn pause_rejects_absent_gated_finished_and_non_worker_owners() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         assert!(!client.pause_download("absent").await.unwrap());
 
@@ -11233,7 +11738,10 @@ mod tests {
     async fn recovery_resume_and_cancel_overlap_ends_cancelled_without_registered_task() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "resume-cancel";
         client.downloads.write().await.insert(
@@ -11287,7 +11795,10 @@ mod tests {
     async fn cancelling_cancel_future_cannot_detach_recovery_finalizer() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancel-finalizer";
         client.downloads.write().await.insert(
@@ -11398,7 +11909,10 @@ mod tests {
         {
             let temp = TempDir::new().unwrap();
             let library_root = temp.path().join("library");
-            let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+            let client = Arc::new(recovery_test_client(
+                temp.path().join("cache"),
+                &library_root,
+            ));
             let verified = verified_recovery(&library_root, "acme/model", &["nested/weights.gguf"]);
             let destination = DownloadDestination::Recovery(verified.destination.clone());
             let filename = "nested/weights.gguf";
@@ -11559,7 +12073,10 @@ mod tests {
     async fn ambient_finalizer_drains_inflight_write_before_cleanup_and_terminal() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "ambient-held-write-cancel";
         let mut state =
@@ -11645,7 +12162,7 @@ mod tests {
     async fn recovery_worker_panic_cannot_publish_cancelled_or_release_capability() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "worker-panic-cancel";
         client.downloads.write().await.insert(
@@ -11698,7 +12215,7 @@ mod tests {
     async fn recovery_nested_panic_cannot_publish_cancelled_or_release_capability() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "nested-panic-cancel";
         client.downloads.write().await.insert(
@@ -11756,6 +12273,9 @@ mod tests {
         let download_id = "cleanup-failure-cancel";
         let library_root = temp.path().join("library");
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let mut state =
             recovery_test_state(&verified, download_id, DownloadStatus::Downloading, true);
         state.make_managed_for_test();
@@ -11798,7 +12318,7 @@ mod tests {
     async fn panicked_cancel_finalizer_is_reconciled_to_error() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "panicked-finalizer";
         client.downloads.write().await.insert(
@@ -11843,7 +12363,7 @@ mod tests {
         for panicked in [false, true] {
             let temp = TempDir::new().unwrap();
             let library_root = temp.path().join("library");
-            let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            let client = recovery_test_client(temp.path().join("cache"), &library_root);
             let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
             let download_id = if panicked {
                 "repeat-panicked-finalizer"
@@ -11907,7 +12427,10 @@ mod tests {
     async fn direct_cancel_preserves_finished_active_worker_obligation() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancel-finished-active-worker";
         client.downloads.write().await.insert(
@@ -12019,7 +12542,7 @@ mod tests {
     async fn cancel_drains_held_nested_work_after_outer_finished_and_preserves_obligation() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancel-outer-finished-nested-held";
         client.downloads.write().await.insert(
@@ -12098,7 +12621,7 @@ mod tests {
     async fn finished_active_worker_is_projected_to_sticky_error_without_cancel() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "project-finished-active-worker";
         client.downloads.write().await.insert(
@@ -12152,7 +12675,10 @@ mod tests {
         ] {
             let temp = TempDir::new().unwrap();
             let library_root = temp.path().join("library");
-            let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+            let client = Arc::new(recovery_test_client(
+                temp.path().join("cache"),
+                &library_root,
+            ));
             let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
             client.downloads.write().await.insert(
                 download_id.to_string(),
@@ -12261,7 +12787,10 @@ mod tests {
     async fn public_cancel_acknowledges_transferred_failure_after_error_projection() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancel-acknowledges-transferred-projection";
         client.downloads.write().await.insert(
@@ -12375,7 +12904,10 @@ mod tests {
     async fn panicked_terminal_projection_projects_once_settles_and_stays_fail_closed() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "panicked-terminal-projector";
         let mut state = recovery_test_state(&verified, download_id, DownloadStatus::Paused, false);
@@ -12455,7 +12987,10 @@ mod tests {
     async fn cancelled_finished_observer_keeps_owner_until_atomic_state_projection() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "stale-failed-observation";
         client.downloads.write().await.insert(
@@ -12574,7 +13109,10 @@ mod tests {
     async fn concurrent_finished_observers_cannot_apply_predecessor_to_successor() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "concurrent-finished-observers";
         client.downloads.write().await.insert(
@@ -12686,7 +13224,7 @@ mod tests {
     async fn public_cancel_without_predecessor_owner_settles_truthfully() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        let client = recovery_test_client(temp.path().join("cache"), &library_root);
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancel-without-predecessor";
         client.downloads.write().await.insert(
@@ -12728,6 +13266,10 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let library_root = temp.path().join("library");
             let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            std::fs::create_dir_all(&library_root).unwrap();
+            client
+                .configure_download_destination_root(&library_root)
+                .unwrap();
             let persistence = Arc::new(DownloadPersistence::new(temp.path()));
             client.set_persistence(persistence.clone());
             let verified = verified_recovery(
@@ -12808,6 +13350,15 @@ mod tests {
                 .await
                 .expect("the finalizer must own partial cleanup")
                 .unwrap();
+            let competing_root =
+                crate::model_library::download_recovery::DownloadDestinationRoot::open(
+                    &library_root,
+                )
+                .unwrap();
+            let cleanup_excluded_contender = matches!(
+                competing_root.try_acquire_execution_grant(),
+                Err(PumasError::DownloadRootBusy)
+            );
             {
                 let downloads = client.downloads.read().await;
                 let state = downloads.get(download_id).unwrap();
@@ -12825,6 +13376,10 @@ mod tests {
             })
             .await
             .expect("terminal cancellation must wait for all cleanup");
+            assert!(
+                cleanup_excluded_contender,
+                "actual partial removal must retain root exclusion"
+            );
 
             let downloads = client.downloads.read().await;
             let state = downloads.get(download_id).unwrap();
@@ -12846,6 +13401,82 @@ mod tests {
             assert!(persistence.load_all().is_empty());
             assert_eq!(persistence.is_revoked(download_id).unwrap(), recovery);
             client.download_tasks.set_blocking_observer(None);
+            client.shutdown_downloads().await.unwrap();
+            assert!(competing_root.try_acquire_execution_grant().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_client_and_shutdown_waiter_retain_root_through_actual_cleanup() {
+        for explicit_shutdown in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let (client, destination) = admitted_download_fixture(temp.path()).await;
+            let competing_root =
+                crate::model_library::download_recovery::DownloadDestinationRoot::open(temp.path())
+                    .unwrap();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let entered = std::sync::Mutex::new(Some(entered));
+            let (release, held) = std::sync::mpsc::channel();
+            let held = std::sync::Mutex::new(held);
+            client
+                .download_tasks
+                .set_blocking_observer(Some(Arc::new(move |operation| {
+                    if operation == "remove ambient partial download file" {
+                        let entered = entered.lock().unwrap().take();
+                        if let Some(entered) = entered {
+                            let _ = entered.send(());
+                            let _ = held.lock().unwrap().recv();
+                        }
+                    }
+                })));
+            assert!(client.cancel_download("admitted-cleanup").await.unwrap());
+            tokio::time::timeout(Duration::from_secs(3), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            let weak_client = Arc::downgrade(&client);
+            let weak_owner = Arc::downgrade(&client.download_tasks);
+            if explicit_shutdown {
+                let shutdown_client = client.clone();
+                let shutdown =
+                    tokio::spawn(async move { shutdown_client.shutdown_downloads().await });
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !client.download_tasks.is_closed() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                shutdown.abort();
+                assert!(shutdown.await.unwrap_err().is_cancelled());
+            }
+            drop(client);
+            // Only production shutdown/effect observers may retain ownership now.
+            let client_released = weak_client.strong_count() == 0;
+            let held_payload = std::fs::read(destination.join("weights.gguf.part")).unwrap();
+            let excluded = matches!(
+                competing_root.try_acquire_execution_grant(),
+                Err(PumasError::DownloadRootBusy)
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while weak_owner.strong_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("production observers must drain after the actual cleanup closure exits");
+            assert!(
+                client_released,
+                "the test must not keep a strong client alive"
+            );
+            assert!(
+                excluded,
+                "client/waiter drop must not unlock a running remove closure"
+            );
+            assert_eq!(held_payload, b"abc");
+            assert!(!destination.join("weights.gguf.part").exists());
+            assert!(competing_root.try_acquire_execution_grant().is_ok());
         }
     }
 
@@ -12855,6 +13486,10 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let library_root = temp.path().join("library");
             let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+            std::fs::create_dir_all(&library_root).unwrap();
+            client
+                .configure_download_destination_root(&library_root)
+                .unwrap();
             let persistence = Arc::new(DownloadPersistence::new(temp.path()));
             client.set_persistence(persistence.clone());
             let verified = verified_recovery(
@@ -13074,7 +13709,10 @@ mod tests {
     async fn replaced_worker_cannot_publish_cancelled_before_its_finalizer() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancel-ready-worker";
         let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
@@ -13183,7 +13821,10 @@ mod tests {
     async fn replaced_worker_cannot_publish_paused_after_its_finalizer() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancel-ready-pause-worker";
         let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
@@ -13297,7 +13938,10 @@ mod tests {
     async fn semantic_recovery_failure_survives_cancel_before_receiver_consumes_result() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["nested/weights.gguf"]);
         let download_id = "cancel-semantic-failure";
         let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
@@ -13477,7 +14121,10 @@ mod tests {
     async fn retry_reset_projection_cannot_overwrite_replacement_finalizer() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "retry-reset-replacement";
         client.downloads.write().await.insert(
@@ -13593,7 +14240,10 @@ mod tests {
     async fn recovery_pause_during_blocking_preflight_retains_owner_and_capability() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "pause-blocking-preflight";
         let state = recovery_test_state(&verified, download_id, DownloadStatus::Queued, false);
@@ -13679,7 +14329,10 @@ mod tests {
     async fn cancelling_recovery_resume_before_commit_preserves_paused_state() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "cancelled-resume";
         client.downloads.write().await.insert(
@@ -13718,7 +14371,10 @@ mod tests {
     async fn cancelling_recovery_resume_after_commit_keeps_registered_owner() {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "post-commit-resume";
         client.downloads.write().await.insert(
@@ -14316,6 +14972,103 @@ mod tests {
         client.set_persistence(persistence);
         client.restore_persisted_downloads().await.unwrap();
         (Arc::new(client), source)
+    }
+
+    #[tokio::test]
+    async fn paused_head_and_queued_follower_release_root_and_refuse_stale_resume() {
+        let temp = TempDir::new().unwrap();
+        let (client, source) = admitted_download_fixture(temp.path()).await;
+        let request = recovery_test_request("owner/follower", &["next.gguf".into()]);
+        cache_repo_tree(
+            &client,
+            &request.repo_id,
+            vec![LfsFileInfo {
+                filename: "next.gguf".into(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let follower = client
+            .start_download(&request, &source, None)
+            .await
+            .unwrap();
+        let root =
+            crate::model_library::download_recovery::DownloadDestinationRoot::open(temp.path())
+                .unwrap();
+        let grant = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match root.try_acquire_execution_grant() {
+                    Ok(grant) => break grant,
+                    Err(PumasError::DownloadRootBusy) => tokio::task::yield_now().await,
+                    Err(error) => panic!("independent root acquisition failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("paused head with queued follower must permit idle handoff");
+        assert_eq!(
+            client.get_download_status(&follower).await,
+            Some(DownloadStatus::Queued)
+        );
+        let before_wake = std::fs::read(temp.path().join("downloads.json")).unwrap();
+        {
+            // Schedule an already accepted pause notification after idle handoff.
+            // This uses the worker's existing wake seam, not a filesystem authority.
+            let mut states = client.downloads.write().await;
+            let state = states.get_mut(&follower).unwrap();
+            state.pause_flag.store(true, Ordering::Release);
+            state.status = DownloadStatus::Pausing;
+        }
+        client
+            .download_tasks
+            .active_worker_generation(&follower)
+            .unwrap()
+            .wake_pause();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status(&follower).await != Some(DownloadStatus::Error) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("busy idle worker must publish its runtime-only refusal");
+        assert_eq!(
+            client.downloads.read().await[&follower].error.as_deref(),
+            Some("Download library root is busy")
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("downloads.json")).unwrap(),
+            before_wake
+        );
+        let competing_store = DownloadPersistence::new(temp.path());
+        competing_store
+            .reconcile_lifecycle_inventory_strict()
+            .unwrap();
+        let inventory = competing_store.load_lifecycle_inventory_strict().unwrap();
+        let admission = &inventory.queue_admissions["admitted-cleanup"];
+        let snapshot = inventory
+            .downloads
+            .iter()
+            .find(|entry| entry.download_id == "admitted-cleanup")
+            .unwrap();
+        competing_store
+            .revoke_admitted_for_recovery("admitted-cleanup", &admission.attempt_id, snapshot)
+            .unwrap();
+        let persisted = std::fs::read(temp.path().join("downloads.json")).unwrap();
+        drop(grant);
+        assert!(!client.resume_download("admitted-cleanup").await.unwrap());
+        assert_eq!(
+            std::fs::read(temp.path().join("downloads.json")).unwrap(),
+            persisted
+        );
+        assert_eq!(
+            std::fs::read(source.join("weights.gguf.part")).unwrap(),
+            b"abc"
+        );
+        assert!(!source.join("next.gguf.part").exists());
+        assert!(!source.join(".pumas_download").exists());
+        client.shutdown_downloads().await.unwrap();
+        assert!(root.try_acquire_execution_grant().is_ok());
     }
 
     #[tokio::test]
@@ -15372,6 +16125,9 @@ mod tests {
     async fn test_list_downloads_pauses_registered_active_state_without_task() {
         let tmp = TempDir::new().unwrap();
         let mut client = HuggingFaceClient::new(tmp.path()).unwrap();
+        client
+            .configure_download_destination_root(tmp.path())
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(tmp.path()));
         client.set_persistence(persistence.clone());
 
@@ -15477,6 +16233,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         client.set_persistence(Arc::new(DownloadPersistence::new(temp.path())));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "reconcile-missing-durable-row";
@@ -15521,8 +16281,11 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_rechecks_owner_installed_after_its_initial_snapshot() {
         let temp = TempDir::new().unwrap();
-        let client = Arc::new(HuggingFaceClient::new(temp.path().join("cache")).unwrap());
         let library_root = temp.path().join("library");
+        let client = Arc::new(recovery_test_client(
+            temp.path().join("cache"),
+            &library_root,
+        ));
         let verified = verified_recovery(&library_root, "acme/model", &["weights.gguf"]);
         let download_id = "reconcile-install-race";
         let mut downloads_guard = client.downloads.write().await;
@@ -15582,6 +16345,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let library_root = temp.path().join("library");
         let mut client = HuggingFaceClient::new(temp.path().join("cache")).unwrap();
+        std::fs::create_dir_all(&library_root).unwrap();
+        client
+            .configure_download_destination_root(&library_root)
+            .unwrap();
         let persistence = Arc::new(DownloadPersistence::new(temp.path()));
         client.set_persistence(persistence.clone());
         let client = Arc::new(client);
@@ -15973,7 +16740,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_download_aborts_tracked_task() {
         let tmp = TempDir::new().unwrap();
-        let client = HuggingFaceClient::new(tmp.path()).unwrap();
+        let client = recovery_test_client(tmp.path().to_path_buf(), tmp.path());
         let destination =
             crate::model_library::download_recovery::DownloadDestinationRoot::open(tmp.path())
                 .unwrap()

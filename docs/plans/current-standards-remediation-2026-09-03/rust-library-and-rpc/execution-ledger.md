@@ -21,6 +21,87 @@
 
 ## Slice Log
 
+### 2026-09-05 — Physical-root grant integration
+
+- Continue the admitted slice at `d3679f40`, standards
+  `c99773d8ace3fb6471ed55e9ab3adbf80ee322da`. Its changes since the admission's
+  `ada38327` add standards-navigation authoring machinery, not changes to the
+  routed normative policies. Capability, store, HF integration, and diagnostic
+  subagents own separate files; root owns lifecycle, integration, serial gates,
+  and the commit. No additional worktree or external mutation.
+- Fresh native root opens establish independent advisory exclusion; the existing
+  task owner weakly shares active grants. Actual closures and retained observers
+  hold custody. Waiting followers release it; reacquisition validates the current
+  root and exact canonical durable admission before effects. Busy/stale worker
+  refusal projects runtime Error without rewriting or releasing durable custody.
+  Required restore refuses busy; no-root/busy reads retain runtime projections.
+- Review corrected two production gaps before acceptance: early worker/cancel
+  refusal previously skipped runtime failure projection, and queued cancellation
+  needed configured-root revalidation as well as its cleanup capability. Inherited
+  projection custody is acknowledged after refusal publication. Shutdown still
+  forbids new effects after closing; it drains already-registered effects rather
+  than granting new cancellation authority.
+- Consumer tracing corrected the admission: actual local IPC exposes only six
+  read/resolve/subscription operations (`LocalIpcOperation`, with unknown methods
+  refused by `process_request`), not a download mutation route. Desktop recovery
+  uses the separate RPC command/handler. IPC evidence is error-adapter evidence,
+  not a claimed end-to-end download route. Public ordinary core start still does
+  remote HF metadata work before its protected preparation; source-order review
+  and actual private preparation coverage do not claim an offline public producer.
+- The closed RPC partial-action reason enum initially rejected the new core busy
+  outcome. The bounded write set was amended before coordinated enum/parser,
+  export-fixture, generated Electron/frontend contract, and conformance changes.
+  No authored UI behavior, protocol envelope, persistence schema, dependencies,
+  automatic retry, or Pending replay was added.
+- `G-1`: actual capability tests cover aliases, independent opens, copied UUID on
+  a different root, root replacement/UUID mutation, and a real child process
+  killed before a fresh acquisition. The ignored child helper is invoked by its
+  parent test, not silently skipped as evidence.
+- `G-2`: real different-destination preparation proceeds while another import is
+  held; both complete after release. Existing library metadata serialization is
+  preserved, so simultaneous metadata completion is deliberately not the oracle.
+  Idle reads, paused heads with queued followers, and held completion notifications
+  permit independent acquisition. A stale resumed owner refuses durable revocation
+  with unchanged store/payload; an idle worker reports busy without durable writes.
+- `G-3`: actual pre-worker preparation retains exclusion after caller/client drop
+  through metadata/index completion; this exercises the existing private invocation
+  Interface and existing preparation behavior, not new relocation authority. Real
+  auxiliary/final imports, Ambient/Recovery cancellation removal, client drop and
+  abandoned shutdown waiters retain exclusion. Cleanup tests retain only weak
+  client/owner references. Prepared abandonment and success/error/panic observation
+  are covered by the lifecycle owner; native release follows observed work.
+- `G-4`: real builder restore refusal and public ticket recovery prove unchanged
+  store/index/payload on contention. Ticket setup acquires exclusion before creating
+  a partial, avoiding the real startup orphan scan. RPC conflict and partial-action
+  projection, IPC error conversion, UniFFI Config conversion, generated decoders,
+  and the actual bundled-preload renderer path preserve the bounded busy outcome.
+- Diagnosis used narrow failing HF tests before corrections: synthetic mutation
+  fixtures needed configured roots, and missing admission can fail before Pausing
+  becomes observable. Terminal Error/no-effect assertions remain strict; no fixed
+  sleeps or production fallback were introduced. Independent capability/lifecycle,
+  canonical store/HF, and final effect-evidence reviews found no remaining blocker.
+- Both full core configurations pass 1,252 tests each (12 ignores, including the
+  parent-invoked native helper); RPC configurations pass 115/75 (10 existing
+  ignores each). Focused UniFFI conversion passes. Logs are
+  `/tmp/pumas-root-core-{default,minimal}-final.log`,
+  `/tmp/pumas-root-rpc-{default,minimal}.log`, and `/tmp/pumas-root-uniffi.log`.
+  Generation freshness, generator tests (5), Electron decoder conformance (5),
+  renderer/preload conformance (3), both TypeScript/lint checks, and Electron build
+  pass; logs are `/tmp/pumas-root-{contract-check,generator-tests,electron-conformance,frontend-conformance,frontend-types,electron-types,frontend-lint,electron-lint,electron-build}.log`.
+- Strict all-target all-feature lint for core/RPC/UniFFI and minimal-feature
+  core/RPC lint pass (`/tmp/pumas-root-clippy-{all,minimal}-final.log`). The initial
+  lint run requested an equivalent `is_none_or` expression; all three canonical
+  execution tests pass afterward (`/tmp/pumas-root-store-postlint.log`). The final
+  preparation test also passes after explicitly dropping its setup client before
+  awaiting retained work (`/tmp/pumas-root-preparation-final.log`). Formatting,
+  five plan contracts, generated-copy equality and whitespace checks pass.
+- Accept G-1 through G-4 for this bounded slice. Live `launcher-data/downloads.json`
+  remains SHA256 `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`;
+  both private cutover/identity-repair directories remain untouched and unstaged.
+  Next admit exact Pending cleanup replay authority; full C3/M4 remain open. Linux filesystem
+  semantics only: no GUI, Windows/macOS runtime, unrelated importer exclusion,
+  general teardown, or hard-process Pending replay acceptance.
+
 ### 2026-09-05 — Physical-root grant implementation admission
 
 - Continue `docs/plans/current-standards-remediation-2026-09-03/rust-library-and-rpc/plan.md`

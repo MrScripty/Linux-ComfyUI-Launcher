@@ -657,6 +657,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn download_root_busy_preserves_existing_ipc_conflict_projection() {
+        let error = IpcError::from_pumas(&PumasError::DownloadRootBusy);
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "code": -32011,
+                "message": "Local IPC operation conflicted with current state",
+                "data": { "class": "conflict" },
+            })
+        );
+        let decoded: IpcError = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.code, -32011);
+        assert_eq!(
+            decoded.data,
+            Some(serde_json::json!({ "class": "conflict" }))
+        );
+        let response = IpcResponse::error(Some(serde_json::json!(1)), decoded);
+        assert!(matches!(
+            response.into_result(1),
+            Err(PumasError::Other(message))
+                if message == "Local IPC operation conflicted with current state"
+        ));
+    }
+
+    #[test]
     fn test_ipc_request_serialization_roundtrip() {
         let req = IpcRequest::new(
             LocalIpcOperation::ModelLibrarySelectorSnapshot,

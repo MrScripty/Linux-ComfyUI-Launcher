@@ -1677,6 +1677,7 @@ enum PartialDownloadActionName {
 #[cfg_attr(feature = "export-contract", derive(schemars::JsonSchema))]
 enum PartialDownloadReason {
     HfClientUnavailable,
+    DownloadRootBusy,
     ModelNotFound,
     ModelNotPartial,
     RecoveryUnavailable,
@@ -1697,6 +1698,7 @@ impl PartialDownloadReason {
         matches!(
             self,
             Self::HfClientUnavailable
+                | Self::DownloadRootBusy
                 | Self::ModelNotFound
                 | Self::ModelNotPartial
                 | Self::RecoveryUnavailable
@@ -1713,6 +1715,7 @@ impl PartialDownloadReason {
     fn parse(value: &str) -> Result<Self, PumasError> {
         match value {
             "hf_client_unavailable" => Ok(Self::HfClientUnavailable),
+            "download_root_busy" => Ok(Self::DownloadRootBusy),
             "model_not_found" => Ok(Self::ModelNotFound),
             "model_not_partial" => Ok(Self::ModelNotPartial),
             "recovery_unavailable" => Ok(Self::RecoveryUnavailable),
@@ -2353,6 +2356,22 @@ mod tests {
         let in_progress = PublicError::from(&PumasError::ModelIndexRefreshInProgress);
         assert_eq!(in_progress.code, -32011);
         assert_eq!(in_progress.class, PublicErrorClass::Conflict);
+
+        let root_busy = PublicError::from(&PumasError::DownloadRootBusy);
+        assert_eq!(root_busy.code, -32011);
+        assert_eq!(root_busy.class, PublicErrorClass::Conflict);
+        assert_eq!(
+            root_busy.message,
+            "The request conflicts with the current library state."
+        );
+        assert_eq!(
+            serde_json::to_value(root_busy).unwrap(),
+            json!({
+                "code": -32011,
+                "class": "conflict",
+                "message": "The request conflicts with the current library state.",
+            })
+        );
     }
 
     fn request(method: &str, params: Option<Value>) -> Vec<u8> {
@@ -2828,6 +2847,37 @@ mod tests {
                 "error": "The requested operation failed.",
             })
         );
+    }
+
+    #[test]
+    fn download_root_busy_partial_outcome_preserves_untracked_failure() {
+        let action = PartialDownloadAction {
+            action: "none".into(),
+            download_id: None,
+            status: None,
+            reason_code: Some("download_root_busy".into()),
+            message: Some(format!("private root {PRIVATE_PATH}")),
+        };
+        let outcome = RpcOutcome::PartialDownload(Box::new(action.clone().try_into().unwrap()))
+            .into_value()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            json!({
+                "success": false,
+                "action": "none",
+                "download_id": null,
+                "status": null,
+                "reason_code": "download_root_busy",
+                "error": "The partial download could not be resumed.",
+            })
+        );
+        let tracked = PartialDownloadAction {
+            download_id: Some("unexpected-admission".into()),
+            status: Some(DownloadStatus::Queued),
+            ..action
+        };
+        assert!(PartialDownloadOutcome::try_from(tracked).is_err());
     }
 
     #[test]

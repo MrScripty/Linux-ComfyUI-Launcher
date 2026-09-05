@@ -556,6 +556,89 @@ impl DownloadPersistence {
         Ok(())
     }
 
+    /// Recheck a retained worker admission after reacquiring root execution
+    /// custody. This reads current durable authority without renewing it. The
+    /// caller must retain root custody from this check through its effects;
+    /// cancellation instead uses the separate quarantine/cleanup authority.
+    pub(crate) fn validate_queue_execution(
+        &self,
+        download_id: &str,
+        attempt_id: &str,
+        domain: DownloadAdmissionDomain,
+        destination: &PersistedDestinationIdentity,
+        execution_files: &[String],
+    ) -> Result<()> {
+        let transaction = self.transaction(StoreOperation::Load)?;
+        let data = self.load_data_strict(&transaction)?;
+        let invalid = |message: &str| crate::PumasError::Validation {
+            field: "downloads.queue_admissions".into(),
+            message: message.into(),
+        };
+        let admission = data
+            .queue_admissions
+            .get(download_id)
+            .ok_or_else(|| invalid("Download execution requires an active retained admission"))?;
+        if admission.attempt_id != attempt_id
+            || !self.confirmed_admission_ids()?.contains(attempt_id)
+            || admission.domain != domain
+            || &admission.destination != destination
+            || admission.execution_files != execution_files
+        {
+            return Err(invalid("Download execution admission identity mismatch"));
+        }
+        if data.lifecycle_quarantines.contains_key(download_id) {
+            return Err(invalid(
+                "Download execution custody has been revoked or quarantined",
+            ));
+        }
+        match domain {
+            DownloadAdmissionDomain::Ambient => {
+                if data.recovery_revocations.contains_key(download_id) {
+                    return Err(invalid(
+                        "Download execution custody has been revoked or quarantined",
+                    ));
+                }
+                if !data
+                    .downloads
+                    .iter()
+                    .any(|snapshot| snapshot.download_id == download_id)
+                {
+                    return Err(invalid("Download execution requires its retained snapshot"));
+                }
+            }
+            DownloadAdmissionDomain::Recovery => {
+                // Ticket handoff revokes ambient authority but preserves this
+                // exact admission for capability-bound recovery execution.
+                if !data
+                    .recovery_revocations
+                    .get(download_id)
+                    .is_some_and(|revocation| {
+                        revocation.disposition == PersistedRevocationDisposition::Durable
+                            && matches!(&revocation.origin,
+                            PersistedRecoveryOrigin::Admitted { admission_attempt_id, .. }
+                                if admission_attempt_id == attempt_id)
+                    })
+                {
+                    return Err(invalid(
+                        "Recovery execution requires its durable admitted handoff",
+                    ));
+                }
+            }
+        }
+        if let Some(predecessor) = &admission.position.predecessor {
+            if data
+                .released_queue_admissions
+                .get(&predecessor.download_id)
+                .is_none_or(|released| released.attempt_id != predecessor.admission_attempt_id)
+            {
+                return Err(invalid(
+                    "Download execution requires its predecessor's durable release",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Settle exactly one admission after its runtime owner has completed all
     /// destination effects. Retain the immutable queue record as predecessor
     /// proof; absence is never proof of a successful earlier release.
@@ -3322,6 +3405,154 @@ mod tests {
             },
             requested_payload_files: vec!["model.gguf".to_string()],
             execution_files: vec!["README.md".to_string(), "model.gguf".to_string()],
+        }
+    }
+
+    fn execution_check(
+        store: &DownloadPersistence,
+        attempt: &str,
+        request: &DownloadAdmissionRequest,
+    ) -> Result<()> {
+        store.validate_queue_execution(
+            &request.snapshot.download_id,
+            attempt,
+            request.domain,
+            &request.destination,
+            &request.execution_files,
+        )
+    }
+
+    fn assert_execution_rejected(result: Result<()>, expected: &str) {
+        match result.unwrap_err() {
+            crate::PumasError::Validation { field, message } => {
+                assert_eq!(field, "downloads.queue_admissions");
+                assert_eq!(message, expected);
+            }
+            error => panic!("unexpected execution diagnostic: {error}"),
+        }
+    }
+
+    #[test]
+    fn execution_rechecks_exact_binding_without_mutating_the_store() {
+        let tmp = TempDir::new().unwrap();
+        let store = DownloadPersistence::new(tmp.path());
+        let attempt = Uuid::new_v4().to_string();
+        let request = admission_request("execution");
+        store
+            .admit_download(&attempt, &request)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        execution_check(&store, &attempt, &request).unwrap();
+        let bytes = std::fs::read(&store.path).unwrap();
+        let mismatch = "Download execution admission identity mismatch";
+        assert_execution_rejected(
+            execution_check(&store, &Uuid::new_v4().to_string(), &request),
+            mismatch,
+        );
+        for change in ["domain", "root", "destination", "files"] {
+            let mut changed = request.clone();
+            match change {
+                "domain" => changed.domain = DownloadAdmissionDomain::Recovery,
+                "root" => changed.destination.library_root.push_str("-other"),
+                "destination" => changed.destination.relative_target.push_str("-other"),
+                "files" => {
+                    changed.execution_files.pop().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_execution_rejected(execution_check(&store, &attempt, &changed), mismatch);
+        }
+        let fresh = DownloadPersistence::new(tmp.path());
+        assert_execution_rejected(execution_check(&fresh, &attempt, &request), mismatch);
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        fresh.reconcile_lifecycle_inventory_strict().unwrap();
+        execution_check(&fresh, &attempt, &request).unwrap();
+    }
+
+    #[test]
+    fn execution_requires_durable_predecessor_release_and_refuses_settled_custody() {
+        let tmp = TempDir::new().unwrap();
+        let store = DownloadPersistence::new(tmp.path());
+        let first = admission_request("first");
+        let second = admission_request("second");
+        let first_attempt = Uuid::new_v4().to_string();
+        let second_attempt = Uuid::new_v4().to_string();
+        store
+            .admit_download(&first_attempt, &first)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        store
+            .admit_download(&second_attempt, &second)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let bytes = std::fs::read(&store.path).unwrap();
+        assert_execution_rejected(
+            execution_check(&store, &second_attempt, &second),
+            "Download execution requires its predecessor's durable release",
+        );
+        assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
+        let other = DownloadPersistence::new(tmp.path());
+        other
+            .settle_queue_admission("first", &first_attempt)
+            .unwrap();
+        assert_execution_rejected(
+            execution_check(&store, &first_attempt, &first),
+            "Download execution requires an active retained admission",
+        );
+        execution_check(&store, &second_attempt, &second).unwrap();
+    }
+
+    #[test]
+    fn execution_refuses_custody_revoked_by_another_owner() {
+        for recovery in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let store = DownloadPersistence::new(tmp.path());
+            let attempt = Uuid::new_v4().to_string();
+            let mut request = admission_request("revoked");
+            store
+                .admit_download(&attempt, &request)
+                .unwrap()
+                .into_result()
+                .unwrap();
+            let other = DownloadPersistence::new(tmp.path());
+            if recovery {
+                other.reconcile_lifecycle_inventory_strict().unwrap();
+                other
+                    .revoke_admitted_for_recovery("revoked", &attempt, &request.snapshot)
+                    .unwrap();
+                assert_execution_rejected(
+                    execution_check(&store, &attempt, &request),
+                    "Download execution admission identity mismatch",
+                );
+                request.domain = DownloadAdmissionDomain::Recovery;
+                execution_check(&store, &attempt, &request).unwrap();
+                other
+                    .begin_lifecycle_quarantine(
+                        &request.snapshot,
+                        LifecycleQuarantineDomain::Recovery,
+                        false,
+                        Some(&attempt),
+                    )
+                    .unwrap();
+            } else {
+                other
+                    .begin_lifecycle_quarantine(
+                        &request.snapshot,
+                        LifecycleQuarantineDomain::Ambient,
+                        false,
+                        Some(&attempt),
+                    )
+                    .unwrap();
+            }
+            let bytes = std::fs::read(&store.path).unwrap();
+            assert_execution_rejected(
+                execution_check(&store, &attempt, &request),
+                "Download execution custody has been revoked or quarantined",
+            );
+            assert_eq!(std::fs::read(&store.path).unwrap(), bytes);
         }
     }
 

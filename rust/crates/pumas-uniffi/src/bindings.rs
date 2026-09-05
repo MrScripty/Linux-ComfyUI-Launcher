@@ -165,6 +165,9 @@ impl From<pumas_library::PumasError> for FfiError {
             PumasError::DownloadLifecycleClosed => FfiError::Config {
                 message: "Download lifecycle is closed".to_string(),
             },
+            PumasError::DownloadRootBusy => FfiError::Config {
+                message: "Download library root is busy".to_string(),
+            },
             PumasError::DownloadShutdownFailed { failures } => {
                 FfiError::Other(format!("Download shutdown observed {failures} failure(s)"))
             }
@@ -364,6 +367,14 @@ mod tests {
     use pumas_library::{ModelRecord, PumasError, SearchResult};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn download_root_busy_uses_existing_host_config_error() {
+        assert!(matches!(
+            FfiError::from(PumasError::DownloadRootBusy),
+            FfiError::Config { message } if message == "Download library root is busy"
+        ));
+    }
 
     #[test]
     fn download_shutdown_errors_use_existing_host_error_shapes() {

@@ -60,11 +60,17 @@ test('actual download and recovery outcomes preserve nulls, numeric bounds and a
     ['DownloadStatusOutcome',fixtures.download_status], ['DownloadListOutcome',fixtures.download_list],
     ['DownloadStartedOutcome',fixtures.download_started], ['DownloadMutationOutcome',fixtures.download_mutation],
     ['PartialDownloadOutcome',fixtures.recovery_outcome], ['RecoverDownloadParams',fixtures.recovery_request],
+    ['PartialDownloadOutcome',fixtures.recovery_busy_outcome],
   ]) assert.equal(contract[`decode${name}`](value).status, 'valid', name);
   for (const [key, value] of [['progress',1.01], ['downloadedBytes',9007199254740992], ['speed',-1], ['etaSeconds',Number.POSITIVE_INFINITY]]) {
     assert.equal(contract.decodeDownloadStatusOutcome({...fixtures.download_status,[key]:value}).status, 'invalid');
   }
   assert.equal(contract.decodePartialDownloadOutcome({...fixtures.recovery_outcome,status:'paused'}).status, 'invalid');
+  const busy = contract.decodePartialDownloadOutcome(fixtures.recovery_busy_outcome);
+  assert.equal(busy.value.reason_code, 'download_root_busy');
+  assert.equal(busy.value.success, false);
+  assert.equal(busy.value.download_id, null);
+  assert.equal(contract.decodePartialDownloadOutcome({...fixtures.recovery_busy_outcome,download_id:'unexpected-admission',status:'queued'}).status, 'invalid');
   assert.equal(contract.decodeDownloadMutationOutcome({success:false}).status, 'invalid');
   assert.equal(contract.decodeRecoverDownloadParams({...fixtures.recovery_request,modelId:'../escape'}).status, 'invalid');
   assert.equal(contract.decodeSearchCatalogParams({query:'',offset:4294967296}).status, 'invalid');

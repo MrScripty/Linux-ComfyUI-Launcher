@@ -138,6 +138,10 @@ pub enum PumasError {
     #[error("Download lifecycle is closed")]
     DownloadLifecycleClosed,
 
+    /// Another cooperating download client owns mutation of this library root.
+    #[error("Download library root is busy")]
+    DownloadRootBusy,
+
     /// Owned work drained, but one or more terminal observations failed.
     #[error("Download shutdown observed {failures} failure(s)")]
     DownloadShutdownFailed { failures: usize },
@@ -322,9 +326,9 @@ impl PumasError {
             PumasError::TorchInference { .. } => -32008,
             PumasError::SlotNotFound { .. } => -32009,
             PumasError::DeviceNotAvailable { .. } => -32010,
-            PumasError::PrimaryInstanceBusy { .. } | PumasError::ModelIndexRefreshInProgress => {
-                -32011
-            }
+            PumasError::PrimaryInstanceBusy { .. }
+            | PumasError::ModelIndexRefreshInProgress
+            | PumasError::DownloadRootBusy => -32011,
             PumasError::PrimaryInstanceStartupTimeout { .. } => -32012,
 
             // All other errors are internal errors
@@ -416,6 +420,14 @@ macro_rules! io_err {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_root_busy_is_a_conflict_without_automatic_retry() {
+        let error = PumasError::DownloadRootBusy;
+        assert_eq!(error.to_rpc_error_code(), -32011);
+        assert!(!error.is_retryable());
+        assert_eq!(error.to_string(), "Download library root is busy");
+    }
 
     #[test]
     fn download_shutdown_errors_preserve_terminal_classification() {

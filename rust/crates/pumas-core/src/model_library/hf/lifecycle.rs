@@ -18,7 +18,9 @@ use futures::FutureExt;
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
-use crate::model_library::download_recovery::DestinationIdentity;
+use crate::model_library::download_recovery::{
+    DestinationIdentity, DownloadDestinationRoot, RootExecutionGrant,
+};
 
 type FallibleBlockingReceiver<T, E> =
     oneshot::Receiver<std::result::Result<std::result::Result<T, E>, String>>;
@@ -729,6 +731,7 @@ type ProjectionObserver = Arc<dyn Fn(&'static str) + Send + Sync>;
 #[derive(Default)]
 pub(super) struct DownloadTaskOwner {
     state: Mutex<OwnerState>,
+    root_grant_changed: Notify,
     retired_observations: AtomicUsize,
     #[cfg(test)]
     blocking_observer: Mutex<Option<BlockingObserver>>,
@@ -759,6 +762,8 @@ struct OwnerState {
     // Admission, ownership transfers, and shutdown capture share this mutex.
     // Entries leave these populations only for another registered observer.
     closed: bool,
+    root_grant: Weak<RootExecutionGrant>,
+    root_grant_acquiring: bool,
     tasks: HashMap<String, TaskEntry>,
     prepared: HashMap<usize, PreparedEntry>,
     retired: Vec<RetiredTask>,
@@ -771,6 +776,12 @@ struct InvocationWaiter {
     owner: Arc<DownloadTaskOwner>,
     id: String,
     generation: TaskGeneration,
+}
+
+enum GrantAcquisition {
+    Reuse(Arc<RootExecutionGrant>),
+    Open,
+    Wait,
 }
 
 impl Drop for InvocationWaiter {
@@ -887,6 +898,7 @@ pub(crate) struct TaskContext {
     download_id: String,
     generation: TaskGeneration,
     projection_failure: Option<Arc<ProjectionCell>>,
+    root_grant: Option<Arc<RootExecutionGrant>>,
 }
 
 impl Clone for TaskContext {
@@ -896,6 +908,7 @@ impl Clone for TaskContext {
             download_id: self.download_id.clone(),
             generation: self.generation.clone(),
             projection_failure: self.projection_failure.clone(),
+            root_grant: self.root_grant.clone(),
         }
     }
 }
@@ -976,6 +989,73 @@ pub(super) enum CancelPredecessor {
 }
 
 impl DownloadTaskOwner {
+    async fn acquire_root_grant(
+        self: &Arc<Self>,
+        context: &TaskContext,
+        root: DownloadDestinationRoot,
+    ) -> crate::Result<Arc<RootExecutionGrant>> {
+        loop {
+            let changed = self.root_grant_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let acquisition = {
+                let mut state = self.state.lock().expect("HF task owner lock poisoned");
+                if state.closed {
+                    return Err(crate::PumasError::DownloadLifecycleClosed);
+                }
+                if let Some(grant) = state.root_grant.upgrade() {
+                    GrantAcquisition::Reuse(grant)
+                } else if state.root_grant_acquiring {
+                    GrantAcquisition::Wait
+                } else {
+                    state.root_grant_acquiring = true;
+                    GrantAcquisition::Open
+                }
+            };
+            match acquisition {
+                GrantAcquisition::Wait => changed.await,
+                GrantAcquisition::Reuse(grant) => {
+                    return context
+                        .run_blocking_named("validate download root grant", move || {
+                            grant.validate_root(&root)?;
+                            Ok(grant)
+                        })
+                        .await
+                        .map_err(|error| {
+                            crate::PumasError::Other(format!(
+                                "Download root validation observation failed: {error}"
+                            ))
+                        })?;
+                }
+                GrantAcquisition::Open => {
+                    // No owner guard crosses capability I/O. The retained async
+                    // envelope always clears this slot, even if its caller leaves
+                    // or the blocking opener panics and returns a join failure.
+                    let result = context
+                        .run_blocking_named("open download root grant", move || {
+                            root.try_acquire_execution_grant().map(Arc::new)
+                        })
+                        .await
+                        .map_err(|error| {
+                            crate::PumasError::Other(format!(
+                                "Download root acquisition observation failed: {error}"
+                            ))
+                        })
+                        .and_then(|result| result);
+                    {
+                        let mut state = self.state.lock().expect("HF task owner lock poisoned");
+                        if let Ok(grant) = &result {
+                            state.root_grant = Arc::downgrade(grant);
+                        }
+                        state.root_grant_acquiring = false;
+                    }
+                    self.root_grant_changed.notify_waiters();
+                    return result;
+                }
+            }
+        }
+    }
+
     pub(super) fn is_closed(&self) -> bool {
         self.state
             .lock()
@@ -1167,6 +1247,7 @@ impl DownloadTaskOwner {
             download_id: download_id.clone(),
             generation: generation.clone(),
             projection_failure: None,
+            root_grant: None,
         };
         let (start, started) = oneshot::channel();
         let outer = tokio::spawn(async move {
@@ -1613,6 +1694,7 @@ impl DownloadTaskOwner {
             download_id: download_id.to_string(),
             generation: generation.clone(),
             projection_failure: superseded_projection.clone(),
+            root_grant: None,
         };
         let (start, started) = oneshot::channel();
         let (predecessor_start, predecessor_started) = oneshot::channel();
@@ -1794,6 +1876,7 @@ impl DownloadTaskOwner {
             download_id: download_id.to_string(),
             generation: generation.clone(),
             projection_failure: Some(cell.clone()),
+            root_grant: None,
         };
         let start_state = Arc::new(AtomicU8::new(TaskStartState::Gated as u8));
 
@@ -2105,7 +2188,14 @@ impl DownloadTaskOwner {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.register_blocking_with_failure(download_id, generation, operation, function, |_| false)
+        self.register_blocking_with_failure(
+            download_id,
+            generation,
+            operation,
+            function,
+            |_| false,
+            None,
+        )
     }
 
     fn register_fallible_blocking<T, E, F>(
@@ -2114,6 +2204,7 @@ impl DownloadTaskOwner {
         generation: &TaskGeneration,
         operation: &'static str,
         function: F,
+        root_grant: Option<Arc<RootExecutionGrant>>,
     ) -> std::result::Result<FallibleBlockingReceiver<T, E>, BlockingTaskError>
     where
         T: Send + 'static,
@@ -2126,6 +2217,7 @@ impl DownloadTaskOwner {
             operation,
             function,
             std::result::Result::is_err,
+            root_grant,
         )
     }
 
@@ -2136,6 +2228,7 @@ impl DownloadTaskOwner {
         operation: &'static str,
         function: F,
         failed: C,
+        root_grant: Option<Arc<RootExecutionGrant>>,
     ) -> std::result::Result<oneshot::Receiver<std::result::Result<T, String>>, BlockingTaskError>
     where
         T: Send + 'static,
@@ -2178,8 +2271,10 @@ impl DownloadTaskOwner {
             .expect("HF blocking-result observer lock poisoned")
             .clone();
         let observer = tokio::spawn(async move {
+            let closure_grant = root_grant.clone();
             let result = if start_receiver.await.is_ok() {
                 tokio::task::spawn_blocking(move || {
+                    let _grant = closure_grant;
                     #[cfg(test)]
                     if let Some(observer) = blocking_observer {
                         observer(operation);
@@ -2206,6 +2301,7 @@ impl DownloadTaskOwner {
                 .finished
                 .store(true, Ordering::Release);
             completion_in_observer.notify.notify_waiters();
+            drop(root_grant);
         });
         entry.nested.push(NestedTask {
             handle: observer,
@@ -2392,6 +2488,51 @@ impl DownloadTaskOwner {
 }
 
 impl TaskContext {
+    /// Scope physical exclusion to mutation, not to historical task entries.
+    /// Acquisition itself is retained work: a cancelled waiter cannot strand
+    /// the in-progress slot or detach a newly opened native lock.
+    pub(crate) async fn with_root_grant(
+        &self,
+        root: DownloadDestinationRoot,
+    ) -> crate::Result<Self> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or(crate::PumasError::DownloadLifecycleClosed)?;
+        let context = self.clone();
+        let grant = self
+            .run_fallible_async_named("acquire download root grant", move || async move {
+                // A refused acquisition has no protected effects and must not poison
+                // shutdown as a failed effect. Panics and observation failures still do.
+                Ok::<_, std::convert::Infallible>(owner.acquire_root_grant(&context, root).await)
+            })
+            .await
+            .map_err(|error| {
+                crate::PumasError::Other(format!("Download root grant observation failed: {error}"))
+            })?
+            .expect("infallible acquisition envelope")?;
+        let mut scoped = self.clone();
+        scoped.root_grant = Some(grant);
+        Ok(scoped)
+    }
+
+    pub(crate) fn without_root_grant(&self) -> Self {
+        let mut context = self.clone();
+        context.root_grant = None;
+        context
+    }
+
+    /// Preserve the receiving generation while transferring protected custody.
+    pub(crate) fn inherit_root_grant(&self, source: &Self) -> Self {
+        assert!(
+            Weak::ptr_eq(&self.owner, &source.owner),
+            "root grant transfer requires the same task owner"
+        );
+        let mut context = self.clone();
+        context.root_grant = source.root_grant.clone();
+        context
+    }
+
     /// Registers an async effect whose internal work must survive cancellation
     /// of the invoking future. Like blocking effects, this observer is joined,
     /// never aborted, by lifecycle shutdown.
@@ -2429,6 +2570,7 @@ impl TaskContext {
                 notify: Notify::new(),
             });
             let observed = completion.clone();
+            let root_grant = self.root_grant.clone();
             let handle = tokio::spawn(async move {
                 let _ = started.await;
                 let result = AssertUnwindSafe(async move { function().await })
@@ -2441,6 +2583,7 @@ impl TaskContext {
                 let _ = sender.send(result);
                 observed.finished.store(true, Ordering::Release);
                 observed.notify.notify_waiters();
+                drop(root_grant);
             });
             entry.nested.push(NestedTask {
                 handle,
@@ -2539,7 +2682,6 @@ impl TaskContext {
     }
 
     /// Exercises owned blocking success/panic observation without a domain error.
-    #[cfg(test)]
     pub(super) async fn run_blocking_named<T, F>(
         &self,
         operation: &'static str,
@@ -2553,8 +2695,14 @@ impl TaskContext {
             .owner
             .upgrade()
             .ok_or(BlockingTaskError::StaleGeneration)?;
-        let receiver =
-            owner.register_blocking(&self.download_id, &self.generation, operation, function)?;
+        let receiver = owner.register_blocking_with_failure(
+            &self.download_id,
+            &self.generation,
+            operation,
+            function,
+            |_| false,
+            self.root_grant.clone(),
+        )?;
         receiver
             .await
             .map_err(|_| BlockingTaskError::ResultChannelClosed)?
@@ -2580,6 +2728,7 @@ impl TaskContext {
             &self.generation,
             operation,
             function,
+            self.root_grant.clone(),
         )?;
         receiver
             .await
@@ -2824,6 +2973,232 @@ async fn wait_for_nested(completions: &[Arc<NestedCompletion>]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn abandoned_prepared_mutation_retains_root_until_owned_drain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = DownloadDestinationRoot::open(temp.path()).unwrap();
+        let phase_root = root.clone();
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let preparing_owner = owner.clone();
+        let ran = Arc::new(AtomicBool::new(false));
+        let work_ran = ran.clone();
+        let prepared = owner
+            .run_invocation(move |context| async move {
+                let protected = context.with_root_grant(phase_root).await?;
+                preparing_owner.prepare(
+                    "protected-prepared".into(),
+                    TaskRole::Worker,
+                    move |context| async move {
+                        let _context = context.inherit_root_grant(&protected);
+                        work_ran.store(true, Ordering::Release);
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            root.try_acquire_execution_grant(),
+            Err(crate::PumasError::DownloadRootBusy)
+        ));
+        drop(prepared);
+        owner.shutdown(|| async { Ok(()) }).await.unwrap();
+        assert!(!ran.load(Ordering::Acquire));
+        root.try_acquire_execution_grant().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_grant_outlives_completed_blocking_work_until_result_observation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = DownloadDestinationRoot::open(temp.path()).unwrap();
+        let phase_root = root.clone();
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let (entered, ready) = oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, held) = std::sync::mpsc::channel();
+        let held = Mutex::new(held);
+        owner.set_blocking_result_observer(Some(Arc::new(move |operation| {
+            if operation == "protected completed write" {
+                let sender = entered.lock().unwrap().take();
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                    held.lock().unwrap().recv().unwrap();
+                }
+            }
+        })));
+        let caller_owner = owner.clone();
+        let caller = tokio::spawn(async move {
+            caller_owner
+                .run_invocation(move |context| async move {
+                    let context = context.with_root_grant(phase_root).await?;
+                    context
+                        .run_fallible_blocking_named(
+                            "protected completed write",
+                            || Ok::<_, ()>(()),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        let receipt = owner.request_shutdown(|| async { Ok(()) });
+        let mut shutdown = Box::pin(receipt.wait());
+        let pending = futures::poll!(&mut shutdown).is_pending();
+        let contention = root.try_acquire_execution_grant();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending);
+        assert!(matches!(
+            contention,
+            Err(crate::PumasError::DownloadRootBusy)
+        ));
+        owner.set_blocking_result_observer(None);
+        root.try_acquire_execution_grant().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scoped_root_grants_share_and_release_without_retiring_the_invocation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = DownloadDestinationRoot::open(temp.path()).unwrap();
+        let owner = Arc::new(DownloadTaskOwner::new());
+        owner
+            .run_invocation(move |context| async move {
+                let (first, second) = tokio::join!(
+                    context.with_root_grant(root.clone()),
+                    context.with_root_grant(root.clone()),
+                );
+                let first = first?;
+                let second = second?;
+                assert!(Arc::ptr_eq(
+                    first.root_grant.as_ref().unwrap(),
+                    second.root_grant.as_ref().unwrap()
+                ));
+                assert!(matches!(
+                    root.try_acquire_execution_grant(),
+                    Err(crate::PumasError::DownloadRootBusy)
+                ));
+                drop(first);
+                drop(second);
+                context.drain_blocking().await.unwrap();
+                // This invocation is still registered and running: only its mutation
+                // scope, not its registry membership, determines native custody.
+                root.try_acquire_execution_grant()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        owner.shutdown(|| async { Ok(()) }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_root_grant_does_not_poison_shutdown() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = DownloadDestinationRoot::open(temp.path()).unwrap();
+        let held = root.try_acquire_execution_grant().unwrap();
+        let owner = Arc::new(DownloadTaskOwner::new());
+        let outcome = owner
+            .run_invocation(move |context| async move {
+                context.with_root_grant(root).await.map(|_| ())
+            })
+            .await;
+        assert!(matches!(outcome, Err(crate::PumasError::DownloadRootBusy)));
+        owner.shutdown(|| async { Ok(()) }).await.unwrap();
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn root_grant_retains_cancelled_blocking_and_async_effects_until_observed() {
+        for asynchronous in [false, true] {
+            for failure in 0..3 {
+                let temp = tempfile::TempDir::new().unwrap();
+                let root = DownloadDestinationRoot::open(temp.path()).unwrap();
+                let effect_root = root.clone();
+                let owner = Arc::new(DownloadTaskOwner::new());
+                let caller_owner = owner.clone();
+                let (entered, ready) = oneshot::channel();
+                let (release, released) = oneshot::channel();
+                let caller = tokio::spawn(async move {
+                    caller_owner
+                        .run_invocation(move |context| async move {
+                            let context = context.with_root_grant(effect_root).await?;
+                            if asynchronous {
+                                let _ = context
+                                    .run_fallible_async_named(
+                                        "held protected async effect",
+                                        move || async move {
+                                            let _ = entered.send(());
+                                            released.await.unwrap();
+                                            assert_ne!(
+                                                failure, 2,
+                                                "injected protected async panic"
+                                            );
+                                            if failure == 1 {
+                                                Err("protected async failure")
+                                            } else {
+                                                Ok(())
+                                            }
+                                        },
+                                    )
+                                    .await;
+                            } else {
+                                let _ = context
+                                    .run_fallible_blocking_named(
+                                        "held protected blocking effect",
+                                        move || {
+                                            let _ = entered.send(());
+                                            released.blocking_recv().unwrap();
+                                            assert_ne!(
+                                                failure, 2,
+                                                "injected protected blocking panic"
+                                            );
+                                            if failure == 1 {
+                                                Err("protected blocking failure")
+                                            } else {
+                                                Ok(())
+                                            }
+                                        },
+                                    )
+                                    .await;
+                            }
+                            Ok(())
+                        })
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(3), ready)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                caller.abort();
+                let _ = caller.await;
+                let receipt = owner.request_shutdown(|| async { Ok(()) });
+                let mut shutdown = Box::pin(receipt.wait());
+                let pending = futures::poll!(&mut shutdown).is_pending();
+                let contention = root.try_acquire_execution_grant();
+                release.send(()).unwrap();
+                let outcome = tokio::time::timeout(Duration::from_secs(3), shutdown)
+                    .await
+                    .unwrap();
+                assert!(pending);
+                assert!(matches!(
+                    contention,
+                    Err(crate::PumasError::DownloadRootBusy)
+                ));
+                assert_eq!(outcome.is_err(), failure != 0);
+                root.try_acquire_execution_grant().unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_rejects_work_whose_start_gate_was_already_extracted() {
         let owner = Arc::new(DownloadTaskOwner::new());

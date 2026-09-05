@@ -241,12 +241,15 @@ Metadata/index success precedes settlement; retained failures remain retryable;
 notifications follow release. C4-1 through C4-4, dual core/RPC suites, and strict
 affected lint pass on Linux.
 
-**Next slice:** Implement the physical-root execution grant under the Rust plan's
+Physical-root execution exclusion is accepted under the Rust plan's
 [bounded grant admission](rust-library-and-rpc/plan.md#physical-root-execution-grant-admission).
-It binds phase-scoped custody, idle handoff, current durable authority, and busy
-consumer behavior. The shutdown/importer prerequisites and grant design are
-accepted; grant runtime behavior and Pending replay are not. No live mutation,
-schema, or old-format support.
+Phase custody, idle handoff, canonical admission validation, and busy consumer
+behavior pass Linux gates. The existing desktop diagnostic enum and generated
+validators migrated together; no persistence schema or live data changed.
+
+**Next slice:** Admit the exact Pending cleanup replay contract against current
+durable authority and retained root custody. The shutdown/importer/grant
+prerequisites are accepted, not Pending replay itself. No old-format support.
 Cargo/commits stay serial; full C3/M4 and program acceptance remain open.
 
 The following checkpoints refine Slice C's integration order; they preserve its

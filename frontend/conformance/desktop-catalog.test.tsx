@@ -25,7 +25,7 @@ function readFixture(path: string): Record<string, unknown> {
 const fixture = readFixture(fixturePath);
 const preload = readFileSync(resolve('../electron/dist/preload.js'), 'utf8');
 
-function installActualPreload() {
+function installActualPreload(recoveryOutcome = 'recovery_outcome') {
   const requests: Array<{ method: string; params: unknown }> = [];
   const module = { exports: {} };
   const electron = {
@@ -49,7 +49,7 @@ function installActualPreload() {
         requests.push({ method, params: requestParams });
         if (method === 'get_models') return fixture['models'];
         if (method === 'search_models_fts') return fixture['search'];
-        if (method === 'resume_partial_download') return fixture['recovery_outcome'];
+        if (method === 'resume_partial_download') return fixture[recoveryOutcome];
         throw new ValidationError(`Unprovided fixture operation: ${method}`, 'producer-fixtures');
       },
     },
@@ -109,6 +109,18 @@ describe('actual Rust catalog through bundled preload and renderer', () => {
     expect(onStarted).toHaveBeenCalledWith('fixture-download', 'fixture-download', {
       modelName: 'partial', modelType: 'llm', repoId: 'example/model', selectedArtifactId: 'example/model::Q4',
     });
+  });
+
+  it('shows the bounded busy outcome without starting a download', async () => {
+    const requests = installActualPreload('recovery_busy_outcome');
+    const onStarted = vi.fn<StartDownload>();
+    render(<LauncherRootRecoveryProvider><Library onStarted={onStarted} /></LauncherRootRecoveryProvider>);
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('ready'));
+    fireEvent.click(screen.getByRole('button', { name: 'Resume partial download (50%)' }));
+    await waitFor(() => expect(screen.getByText('The partial download could not be resumed.')).toBeVisible());
+    expect(onStarted).not.toHaveBeenCalled();
+    expect(requests.find((request) => request.method === 'resume_partial_download')?.params)
+      .toEqual(fixture['recovery_request']);
   });
 
   it('accepts the same typed catalog projection from the actual search producer', async () => {
