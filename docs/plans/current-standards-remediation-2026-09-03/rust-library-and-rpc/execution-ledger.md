@@ -1523,6 +1523,71 @@
   C3 remains active; this source cannot be committed independently of its
   still-uncommitted lifecycle dependencies and compatible consumer integration.
 
+### 2026-09-04 — Queue Identity Draft and Relocation Scope Blocker
+
+- Operation: continue C3. TDD at the admitted public restore/start/cancel seam
+  exposed a legacy paused row restored through a root symlink alias bypassed by
+  a canonical-path successor. The original code reached destination preparation;
+  the new regression reported that bypass explicitly.
+- The unaccepted draft replaces path-keyed queues and physical-lock lookup with
+  held `DestinationIdentity`, consolidates state capability into explicit
+  Managed/Recovery provenance, and reuses capability-relative operations during
+  legacy restoration. The alias test is green and also proves successor progress
+  after the incumbent is cancelled. The design skill guided removal of duplicate
+  capability storage and reuse of the existing finalization policy owner.
+- Supporting scope correction: `partial_download.rs` joins the existing C3
+  source set solely for a shared filesystem Interface. This replaces the prior
+  nine-file count restriction, without changing the held consumer, public wire,
+  manifest, or migration-caller boundary. Its independent exact candidate over
+  `acbc726c` passed `cargo test --offline -p pumas-library --lib
+  model_library::library::tests` (131 tests) in default and no-default modes,
+  default `cargo clippy --offline -p pumas-library --lib --tests -- -D warnings`,
+  scoped Rustfmt, source review, staged review, message validation, and enabled
+  hooks. Committed as `09fd0777`; SHA-256
+  `2fe574ac496e426f3ddbb396a1406020b98e6b705c10f2f4a5551abff22d0af9`.
+- The queue draft is **not accepted**. Final default `cargo test --offline -p
+  pumas-library --lib model_library::hf::` reports 163 passed and one failed:
+  `test_relocate_download_destination_updates_state_and_persistence`. The
+  original post-relocation lookup assertion remains intact and the fixture now
+  supplies a real configured root/held old destination. A no-default run before
+  that fixture/configuration and formatting cleanup likewise reported 163/1;
+  it is not final-hash acceptance. Production checks and scoped formatting pass,
+  but do not override the failed behavioral gate.
+- RUST-I8/PRG-I24 blocks further queue integration. The existing relocation
+  path changes display/persisted metadata without transferring retained
+  capability and queue ownership. The actual migration caller moves files
+  first, ignores `false`, and attempts rollback on `Err`; the store does not
+  retain expected-old/publication-outcome proof. A generic task wrapper, raw-path
+  lookup fallback, silently disabled legacy move, or weaker assertion is not a
+  repair. The user was asked to admit coordinated migration/preflight/owned
+  relocation work; no caller modification or guessed rollback was made.
+- Queue-checkpoint draft SHA-256 (before the probe safety correction below): `hf/download.rs`
+  `18b42552372c80759f3c7117e8b9763f089b361497281cc551e2286b7751c953`;
+  `hf/types.rs`
+  `6e154a28bba03ea0c08528ae529ab586b4b561564d452ba8e8506cf79fc7db45`;
+  `hf/mod.rs`
+  `2ea1946f13ae34eccdc6e3247b1e3706dc4cd30f9ef5aa0c5eb46f07579a5e02`;
+  `download_recovery.rs`
+  `73083c3c011dc711ff0b0444f26bb9eacc49079d132262438c653855eda38087`.
+  These are uncommitted draft subjects, not accepted integration hashes. Do not
+  use this draft for model migration. The original staged UniFFI change remains
+  separately owned and unchanged.
+- Independent review then found that file-size probes converted lost held-parent
+  authority into ordinary absence, allowing restore to discard its persisted
+  record as empty. The new `file_probes_distinguish_uncreated_paths_from_lost_authority`
+  regression failed at the lost nested-parent assertion before the fix.
+  `regular_file_len` now uses the existing `file_parent_if_present` distinction:
+  never-created paths are absent; lost authority propagates an error. Both final
+  and partial probes are covered for nested-parent and model-directory loss.
+  `cargo test --offline -p pumas-library --lib
+  model_library::download_recovery::tests` passes all 17 tests, also with
+  `--no-default-features`; six existing unused-integration warnings remain.
+  Scoped Rustfmt and independent narrow source review pass. The corrected
+  `download_recovery.rs` SHA-256 is
+  `2652a7e5eb89039e48200cc0a465a97d61a63e9dac636e5e17ec55b20f35ab96`.
+  This safety correction remains in the uncommitted draft; the HF results above
+  precede it, and no relocation or full-C3 acceptance is claimed.
+
 ## Reports
 
 - [RPC diagnostic disclosure evidence](reports/rpc-disclosure-evidence.md):

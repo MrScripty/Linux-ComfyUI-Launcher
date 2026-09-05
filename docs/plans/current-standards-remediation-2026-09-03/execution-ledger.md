@@ -3279,6 +3279,29 @@
 - C3 remains active for runtime queue identity, complete restore, pause, and
   relocation; C4 importer ownership and later consumer/GUI gates do not advance.
 
+### 2026-09-04 — Shared Finalization Policy; Queue Draft Blocked
+
+- Continued C3 using the TDD and design skills. A legacy root-alias queue bypass
+  was reproduced, then corrected in the uncommitted capability/identity draft.
+  Its test includes incumbent cancellation and subsequent successor progress.
+- Committed the independently verified shared finalization policy as `09fd0777`
+  with hooks enabled; both 131-test library configurations and strict Clippy
+  passed against the actual isolated candidate. The focused Rust ledger owns
+  exact commands, hashes, source-scope correction, and review evidence.
+- The larger draft is not accepted: the final default HF suite has 163 passes
+  and one existing relocation regression failure. PRG-I24/RUST-I8 records the
+  migration caller's move-before-relocate/ignored-result behavior and missing
+  coordinated cancellation/publication contract. The user was asked for scope
+  authority; caller changes remain held. Rust C3 is Blocked pending that decision.
+- No queue/relocation source was committed, no failed assertion was weakened,
+  no UI/release acceptance advanced, and the original staged UniFFI blob was
+  preserved. The draft must not be used for model migration.
+- Review also found and corrected a lost-directory-as-absent-file safety bug in
+  the draft. Its new regression was red before the correction; all 17 recovery
+  tests pass in both feature configurations afterward. Narrow source review and
+  formatting pass. This does not resolve the relocation blocker; the focused
+  ledger records the exact evidence and corrected source hash.
+
 ## Reports
 
 - Focused investigation and evidence reports are indexed by each focused plan.

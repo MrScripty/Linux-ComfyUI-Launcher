@@ -1,13 +1,18 @@
 # Plan: Rust Library and RPC Standards Remediation
 
-**Plan status:** `Active`
+**Plan status:** `Blocked`
 
-**Current phase:** Milestone 1 is accepted. Milestone 2 is active for producer
+**Current phase:** Milestone 1 is accepted. Milestone 2's C3 queue candidate is
+blocked on the relocation/migration composition decision in RUST-I8. The shared
+finalization-policy extraction is independently verified; the queue draft is
+not accepted. Milestone 2 otherwise remains producer
 contract work that is valid for loopback desktop RPC and local core IPC.
 `RUST-I1` is resolved: desktop RPC is loopback-only and LAN support is removed.
 
-**Next slice:** Continue PRG-I19 C3 with runtime destination-queue identity and
-the remaining restore/lifecycle integration. The real transferred-byte interrupted
+**Next slice:** Obtain the C3 scope decision for the model-migration caller and
+owned relocation transition before further queue integration. Do not preserve
+stale destination capability or bypass the relocation regression to accept the
+current draft. The real transferred-byte interrupted
 response → settled Error → fresh-owner restore → cancel path is now verified;
 hard process-crash recovery remains unproved. C1 store repairs and C2 destination
 authority passed independent source review and targeted regressions in both
@@ -42,7 +47,7 @@ with only its isolated red HF-unavailable oracle recorded.
 | --- | --- | --- |
 | C1 (internally verified) | Durable admission, restart reconciliation, quarantine, and exact queue settlement behind the store Interface | 38 store tests and atomic/HF regressions pass in both feature configurations; independent source review accepted |
 | C2 (internally verified) | Held configured-root destination authority and marker publisher ready for runtime integration | Independent source review accepted; root reproduced 14 recovery, 22 atomic-publication, 38 store, and 155 HF tests in both feature configurations |
-| C3 (active; admission and interrupted-transfer checkpoints verified) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Setup-failure and real interrupted-response → fresh-owner restore → cancel paths pass; complete queue/restore, hard-crash, stalled-pause, and relocation claims remain pending |
+| C3 (blocked; queue draft unaccepted) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Earlier admission/interrupted-transfer checkpoints remain verified. The new legacy-alias regression passes, but the existing relocation regression fails; RUST-I8 blocks this draft |
 | C4 | Importer mutations are awaited before settlement; notifications follow release | Real async importer held during cancellation/completion; successor progress and terminal-state tests |
 
 The complete producer/consumer boundary still requires the existing later
@@ -91,8 +96,10 @@ full builder-startup test.
 **Current C3 limits:** the new transfer path uses a real loopback HTTP response
 and real partial-file writes, then an orderly Error before reopening; it is not
 a process-crash or live Hugging Face service claim. The earlier marker-failure
-and seeded-final-file regressions retain their narrower meaning. Runtime queue keys and the
-physical destination mutex remain to be replaced; comprehensive restore still
+and seeded-final-file regressions retain their narrower meaning. The unaccepted
+queue draft uses held identities and one retained capability per state, but
+relocation still leaves path and authority inconsistent. The physical
+destination mutex remains; comprehensive restore still
 needs task ownership, legacy migration, and hidden/quarantined/recovery-state
 reconciliation. Stalled pause and relocation remain pending. Unknown admissions
 fail closed but do not yet have the complete recovery path. Runtime release
@@ -109,6 +116,7 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   the existing untracked
   `rust/crates/pumas-core/src/model_library/download_recovery.rs`,
   `rust/crates/pumas-core/src/api/builder.rs`,
+  `rust/crates/pumas-core/src/model_library/partial_download.rs`,
   `rust/crates/pumas-core/src/metadata/atomic.rs`, and
   `rust/crates/pumas-core/src/metadata/mod.rs`.
 - **Exact record set:** this plan, `execution-ledger.md`, `issues.md`, and
@@ -154,7 +162,7 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   is held; importer failure preserves resumable finalization state. Completion releases
   logical destination custody after durable/published terminal state and drain,
   before an owned callback-only phase whose panic cannot roll back Completed.
-- **Current red evidence:** a cached public ordinary start against a path
+- **Earlier regression evidence:** a cached public ordinary start against a path
   occupied by a regular file returned setup `Err` after leaving a published
   ownerless `Queued` entry. A public ambient resume cancelled while awaiting
   authentication similarly left its prior `Paused` state as ownerless Queued.
@@ -163,7 +171,14 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   Destination identity, durable FIFO admission/restore, capability marker,
   stalled pause, relocation, terminal rescue, and callback ordering remain
   red-first work before freeze.
-- **Held boundaries:** no tenth source file, public constructor/wire outcome,
+- **Supporting finalization seam:** the queue-identity regression also reaches
+  legacy restore's shared size-inference and finalization policy. The existing
+  `partial_download.rs` owner is added to this slice solely to share that policy
+  between its existing path adapter and the held-capability adapter. Existing
+  library callers retain their behavior; HF restoration must not regain ambient
+  filesystem authority or duplicate the policy. This replaces the prior
+  nine-file count limit, not the product, consumer, or dependency boundaries.
+- **Held boundaries:** no further source expansion, public constructor/wire outcome,
   manifest, RPC/IPC/UniFFI, frontend/Electron, package/generated/CI, or shared-
   document mutation. The metadata files expose only the existing atomic writer
   to a held capability-relative marker target. Builder changes inject the
@@ -830,4 +845,4 @@ no required-real environment is represented by a lower-fidelity substitute.
   tests, real binding-host cohorts, generators, packaged artifacts, and release
   evidence remain with the desktop/platform plan; frontend presentation remains
   with the frontend/UI plan.
-- Final status: `Active`
+- Final status: `Blocked`
