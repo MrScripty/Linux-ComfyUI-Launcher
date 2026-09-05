@@ -6,10 +6,11 @@
 - Planning code baseline: `d84e2b3520ce3da3f39cc3df953301fa9d6d3d50`.
 - Planning standards baseline: `7bf74bb5a8cb0ffccaff3ec86550051f900fb4bb`.
 - Milestones 0 through 3 are accepted; FE-A3, FE-A4, and FE-A5 are satisfied.
-  XR-S1 launcher-root recovery is `Verifying`: its renderer semantic handshake
-  is implemented, while the main-owned in-frame compositor challenge and
-  composed platform/runtime evidence remain pending. M4
-  renderer source remains catalog/search-provider-gated.
+  The selected desktop consumer checkpoint is accepted; M4 remains `Active`
+  for remaining operations and complete claim evidence. XR-S1 remains
+  `Verifying` for its full composed matrix. See the current checkpoint below;
+  earlier dated entries preserve the evidence and rejected alternatives at
+  their historical boundaries.
 
 ## Reports
 
@@ -34,7 +35,48 @@
 | M3-S2 | `accepted` | [focused verification record](#2026-09-03--m3-s2-central-reduced-motion-policy-accepted) | One composition-root and CSS reduced-motion policy covers both variants. |
 | M3-S3a | `accepted` | [repair evidence](#2026-09-03--m3-s3a-status-reachability-terminal-retention-and-admission-order-accepted) | Red→green manager/state/dialog public seams plus requested-install admission order accepted. |
 | M3-S3b | `accepted` | [repair and runtime evidence](#2026-09-03--m3-s3b-popover-motion-and-terminal-semantics-accepted) | Exact Popover entry/exit repair, stale M2 caller correction, both real entries, full suite, and behavior docs accepted. |
-| XR-S1 | `verifying` | [launcher-root recovery evidence](reports/launcher-root-recovery-consumer-evidence.md) | Renderer semantic handshake is focused-green; full composed conformance and first-visible-frame evidence await the main-owned compositor gate. |
+| XR-S1 | `verifying` | [selected checkpoint](#2026-09-05--selected-desktop-consumer-checkpoint-accepted) and [historical recovery evidence](reports/launcher-root-recovery-consumer-evidence.md) | Source and Linux cold/warm GUI accepted; full startup/selection and two-entry first-visible matrix remains pending. |
+| M4 selected consumers | `accepted` | [selected checkpoint](#2026-09-05--selected-desktop-consumer-checkpoint-accepted) | Catalog/FTS, ticket recovery, scoped display cache, and exact activity presentation; not all desktop consumers. |
+
+## 2026-09-05 — Selected Desktop Consumer Checkpoint Accepted
+
+- Reconciliation operation: `continue` this focused plan at Standards
+  `1609c304`. Commit `2b081fba` integrates the selected desktop contracts and
+  consumers; `2b9553a0` independently corrects backend artifact reclassification.
+  This entry supersedes current provider/preload/uncommitted-source holds,
+  not earlier dated observations or remaining milestone gates.
+- Accepted boundary: generated Rust-owned catalog and FTS projections, exact
+  ticket recovery, selected download responses, bundled sandbox preload,
+  synchronous decoded startup bootstrap, and version-2 root-scoped display
+  cache. Retired version-1 entries are discarded. Cached rows grant no model
+  action or recovery authority; fresh related-model controls are retained.
+  Scan/import records remain a distinct unmigrated contract.
+- Activity presentation preserves unassociated download rows and their exact
+  IDs; no repo/name/quant join is inferred. The deciding regression reproduced
+  an inflated model count, then proved catalog-only counting and explicit
+  download-activity status while retaining exact-ID resume controls.
+- Accepted automated evidence: frontend 520 tests, types, lint, both builds;
+  real-producer renderer conformance 2/2; producer-decoder conformance 5/5;
+  generator 5/5; Electron 129 tests plus the separately enabled real sandbox
+  preload oracle. The mandatory fixture-wrapper command is
+  `pnpm --dir frontend run test:desktop-contract`; it uses actual Rust
+  constructor output rather than consumer-authored authority.
+- Deciding Linux/X11 built-app evidence: 83 catalog models, two labelled paused
+  activities, nine partial badges with percentages, no Ready-to-finish state,
+  no renderer errors, scrolling, and normal shutdown. Warm native window
+  capture shows cached rows during refresh without stale controls. The
+  collision correction retains 83 models and clean repeat startup.
+- The [program verification record](../execution-ledger.md#2026-09-05--coordinated-desktop-contract-verification)
+  owns the combined commands, results, private capture location, and data
+  preservation evidence. The [collision record](../execution-ledger.md#2026-09-05--collision-correction-accepted-on-linux)
+  owns the later backend-only correction; neither is a whole M4/XR-S1/M5
+  acceptance claim.
+- Remaining next frontend slice: classify and coordinate link-health,
+  import-picker, and conversion consumers with canonical providers; preserve
+  raw import records and extend existing generation rather than handwritten
+  mirrors. Whole FE-A1, full cache degradation/retry runtime evidence, and
+  complete startup/two-entry matrices stay pending. Windows/macOS runtime
+  evidence is platform-owned and does not block independent Linux source work.
 
 ## 2026-09-03 — M0-S1 Installation Progress Owner Accepted
 

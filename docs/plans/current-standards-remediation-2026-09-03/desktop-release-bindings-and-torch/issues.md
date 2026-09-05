@@ -7,6 +7,11 @@
 - The product/release owner accepted the Milestone 0 decision bundle. Its
   former unavailable issues are resolved and implementation/evidence work is
   routed to the named downstream milestones.
+- `2b081fba` accepts the selected generated desktop contract, bundled preload,
+  and coordinated root/bootstrap renderer integration. Historical integration
+  holds below are superseded by the current dispositions, not extended into
+  all-route, stream, Torch, or release acceptance. `2b9553a0` separately accepts
+  the Rust-owned classification correction on Linux.
 
 ## Active Issues
 
@@ -42,30 +47,20 @@
   namespace replacement, and parent synchronization with explicit pre/post-
   publication failure states. Local Linux old-or-new evidence cannot stand in
   for power-loss or required-real Windows/macOS filesystem evidence.
-- Recovery projection status: the initial producer boundary was rejected for
-  collapsed explicit-authority policy and absent selection-attempt ownership.
-  The corrected producer below replaces the generic IPC collapse; the renderer
-  consumer and composed presentation remain open and block integration.
-- Renderer-recovery producer status: corrected focused boundary green pending
-  renewed review. Ready state preserves a path-free selection action, so
-  resolved environment/argument authority cannot open a persisted chooser that
-  will lose on relaunch. One main-owned single-flight handler observes dialog,
-  persistence, and synchronous relaunch-request outcomes; retries only while
-  authority is proven unchanged; and locks ambiguous, published, or restarting
-  terminals. Preload runtime-decodes every correlated IPC value. Integration
-  remains blocked until the separately owned renderer gate is accepted
-  atomically.
-- Sandboxed-preload status: Critical composed-runtime blocker corrected pending
-  renewed review. The initial compiled preload required a local helper module
-  that Electron's sandboxed preload could not load. Runtime decoding now lives
-  only in the standalone preload Adapter with a type-only producer import; the
-  built file requires only Electron. A real pinned-Electron hidden BrowserWindow
-  with exact production security preferences exposes the bridge, accepts all
-  closed values, rejects malformed values, emits no preload/load/render failure,
-  and exits within its bound. This is representative Linux loader evidence, not
-  packaged or cross-target acceptance.
-- Revisit trigger: coordinated renderer recovery acceptance, then required-real
-  target evidence or stream ownership under a separately admitted write set.
+- Recovery/bootstrap integration status: accepted in `2b081fba`. The corrected
+  single-flight selection owner preserves explicit-authority policy and locks
+  ambiguous/published terminals. The renderer consumes decoded outcomes;
+  root-scoped cached rows carry no action authority. The synchronous bootstrap
+  returns precomputed state, and presentation retains the accepted causal
+  marker barrier. Earlier uncommitted/absent-consumer holds are superseded.
+- Sandboxed-preload status: accepted for the selected integration. The build
+  bundles generated standalone validators and the preload, retaining Electron
+  as the external runtime dependency without weakening sandbox preferences.
+  Current-source freshness, actual-producer conformance, the enabled real
+  sandbox oracle, and built-app Linux verification are recorded in the parent
+  ledger. No Windows/macOS or packaged-runtime acceptance is inferred.
+- Revisit trigger: required-real target filesystem/runtime evidence for
+  DRBT-A3; independent stream ownership proceeds under DRBT-I11.
 
 ### DRBT-I11 — Desktop stream transitions lack one terminal owner
 
@@ -81,15 +76,17 @@
   or a false-clean terminal result.
 - Owner/boundary: Milestone 2 main-process stream Module and preload Interface;
   Milestone 1 remains the event-decoder authority.
-- Disposition: inventory complete, implementation held. Define per-renderer
-  subscribe/delivery/unsubscribe/close/shutdown outcomes without re-owning the
-  still-changing Rust event schema.
+- Disposition: next bounded Linux-capable investigation is the model-library
+  stream's per-renderer custody and terminal outcomes. Revalidate the recorded
+  inventory against current source, then admit its exact implementation write
+  set and real Electron oracle. Do not re-own Rust event semantics or infer
+  that the selected generated RPC contract closes streamed-event decoding.
 - Verification: Electron lifecycle harness with duplicate subscribe/unsubscribe,
   renderer destruction, late transport callbacks, delivery failure, backend
   restart, and shutdown oracles; required-real Electron evidence remains
   pending.
-- Revisit trigger: accepted persisted-authority slice and an admitted exact
-  stream-ownership write set.
+- Revisit trigger: persisted-authority integration is accepted; proceed with
+  the plan's single next investigation, then the admitted stream write set.
 
 ### DRBT-I7 — No accepted Torch runtime/model/device tuple
 

@@ -164,8 +164,8 @@
   This disposition is limited to the desktop RPC Interface. Public core/local-
   IPC and UniFFI `recover_download(repo_id, dest_dir)` remain transitional
   ambient-authority surfaces pending the accepted zero-`Legacy` and Milestone
-  6 removals; the current Electron/frontend repo/path caller also requires a
-  coordinated consumer migration before this producer boundary is shippable.
+  6 removals. The selected Electron/frontend ticket consumer migration is
+  accepted at `2b081fba`; its former repo/path mismatch is no longer a hold.
 - **Required verification:** exact request/token grammar; token stability under
   file reorder/duplication and refusal after semantic change; managed-root,
   symlink, alias, missing-path, and provenance cases; existing nested and part

@@ -2,36 +2,23 @@
 
 **Plan status:** `Active`
 
-**Current phase:** PRG-I19 Slice C remains unaccepted as a whole. Its core
-recovery, legacy relocation, cancellation-quarantine, and network-wait pause
-checkpoints are verified for incremental integration, with dual full-package
-tests and strict lint green.
-This supersedes PRG-I24's legacy composition gate, not the remaining C3 claims.
-C1's store repair is internally verified: compilation succeeds, independent
-source review accepted the repair, and store, atomic-publication, and HF
-regressions pass in both feature configurations. The September 4 audit's build
-failure is resolved. Production lifecycle integration remains incomplete;
-the integrated core checkpoint passes strict lint without suppression. C2's held
-destination and marker-publication source is also internally verified:
-independent review and root regression checks passed in both feature
-configurations. C3's narrower admission/resume checkpoint has passed independent
-review and targeted regressions; full production lifecycle integration remains
-active. Real interrupted-response bytes now survive fresh-owner restoration
-and cancellation; hard process-crash recovery is not yet proved.
+**Current phase:** The coordinated reconciliation, selected desktop contract,
+and artifact-collision checkpoints are committed and accepted within their
+recorded Linux evidence boundaries (`f77f4bed`, `2b081fba`, `2b9553a0`). The
+selected catalog/download/ticket producer, generated validators, bundled
+preload, renderer consumers, and root-scoped display-only startup cache now
+integrate together. They are not completion of the all-route contract, full
+frontend M4/M5, or general shutdown work.
 
-Slices A and B are internally accepted regression boundaries, with their
-platform and shutdown proof limits preserved below. Governance is accepted;
-frontend milestones 0–3 and the recorded incremental launcher/Torch work remain
-accepted within their existing evidence limits. Rust M2H/M2I acceptance and M2J
-remain pending, as do the complete producer/desktop contract and frontend M4.
-The UI work depends on that contract stabilizing.
+PRG-I19 C1/C2 and the incremental C3 admission, pause, cancellation, recovery,
+and current-only cutover checkpoints remain verified. Old download formats and
+partial relocation are retired, not compatibility obligations. C3 production
+restore/lifecycle and C4 awaited importer ownership remain open; hard-process
+crash recovery is not proved. Slices A/B, governance, frontend milestones 0–3,
+and recorded incremental launcher/Torch work retain their evidence limits.
 
-The next checkpoint is the user-approved 2026-09-05 coordinated draft
-integration and verification, followed by standards-aligned commits and the
-RUST-I12 collision fix. General C3/C4 completion remains separate. C3 and C4 cover
-production lifecycle integration and real importer ownership respectively.
-Their acceptance
-does not imply full PRG-I19 or user-workflow acceptance. The
+The current checkpoint is the bounded Verified Ambient restore settlement
+described below, followed by C4 only after a separate exact admission. The
 [execution ledger](execution-ledger.md) retains dated findings and verification;
 the contracts below remain binding. Current blockers are listed in
 [Blockers](#blockers).
@@ -221,25 +208,16 @@ requests or aborts the currently owned async handles; it has no Slice B drain
 or completion claim for running blocking work or finalizer-captured
 predecessors. Its existing test remains narrow unstarted-worker evidence.
 
-**Next slice:** Complete the remaining C3 current-format unresolved-state restore
-contract before broader transport/UI integration. The current-only cutover
-(`RUST-I10`) and queued pause (`RUST-I9`) are accepted incremental checkpoints:
-the two local records were converted once with verified backup and unchanged
-files. Schema 4 requires current queue ownership; no historical FIFO is guessed.
-The focused Rust plan owns exact evidence and remaining lifecycle boundaries.
-Preserve the verified network-wait pause, recovery, and cancellation
-regressions. Retire obsolete partial-relocation tests with that unsupported
-runtime path; completed-model migration remains supported. Ticket recovery is
-additive; existing transport callers retain
-their old method until explicitly migrated. RPC, bindings, and UI remain held.
-The interrupted-response → fresh-owner restore → cancel path now
-transfers real bytes through loopback HTTP. The narrow admission checkpoint
-now rejects unconfigured starts, retains admitted resume authority, and tests
-setup-failure restart/cancellation. C1's restart and settlement contracts
-remain binding: restore requires explicit reconciliation, generic queued
-mutations fail closed pending dedicated C3 transitions, and runtime effects
-must finish before settlement. Release proofs are retained; no garbage
-collection is claimed.
+**Next slice:** Reconcile current-format Verified Ambient quarantine whose
+exact queue admission remains unsettled after completed cleanup. The Rust
+owner admits only `hf/download.rs` and colocated regressions: settle through
+the retained task owner and existing exact store operation, then reload strict
+inventory. Prove restored read-only Error history and follower progress at the
+persisted cutpoint; Pending cleanup, unresolved Recovery custody, and hidden
+admissions remain fail-closed. No cleanup replay, fresh snapshot-derived
+authority, old-format support, live download mutation, or schema change is
+admitted. The focused Rust plan owns the exact boundary and evidence. Other
+agents reconcile disjoint plan records; Cargo and commits remain serialized.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.
@@ -737,8 +715,8 @@ integration admits the required frontend/platform source, canonical generated
 contract, and root-scoped display-only bootstrap; it does not admit unrelated
 release or Torch work. PRG-I21 retains the representative startup workload and
 approved marker barrier, with no universal compositor-causality or arbitrary
-one-sample threshold claim. Verify and commit coherent drafts before starting
-RUST-I12 collision remediation; preserve distinct repositories and quants.
+one-sample threshold claim. This coordinated checkpoint and subsequent RUST-I12
+Linux collision remediation are complete; their ledger entries own verification.
 
 Platform may also continue
 independent Torch request-contract narrowing, but PRG-I17 requires a serialized
@@ -1113,12 +1091,9 @@ links, and their already-declared final documentation/report write sets.
   mutations through production paths. Historical A/B acceptance remains a
   regression obligation; it does not accept the expanded C implementation.
   The focused Rust owner retains the exact write set and detailed evidence.
-  M2H/M2I counts, M2J, and downstream adoption remain held until their gates.
-- The candidate desktop producer cannot integrate while reachable
-  Electron/frontend callers still use the removed repo/path recovery request.
-  Generated contracts and consumers must migrate together. Core/UniFFI ambient
-  recovery is a transitional removal surface, not evidence for the closed
-  desktop contract.
+  Complete M2H/M2I/M2J acceptance remains pending; selected downstream adoption
+  is accepted at `2b081fba`, not held by the former repo/path consumer mismatch.
+  Core/UniFFI ambient recovery remains a separate transitional removal surface.
 - PRG-I21: current evidence has not satisfied both immediate model-list reveal
   and a truthful first framebuffer. The causal marker path adds roughly one
   second; terminal-bootstrap and hidden-capture alternatives did not prove the
@@ -1126,18 +1101,20 @@ links, and their already-declared final documentation/report write sets.
   representative startup claim and workload. The user accepted the existing
   roughly one-second barrier on 2026-09-05; no unproved reveal replaces it.
   The no-bridge and immediate/delayed/never-terminal composed checks remain
-  required before integration.
+  required for complete startup acceptance, not a hold on the accepted checkpoint.
 - PRG-I17 blocks managed Torch deployment, DRBT-A5 required-real runtime work,
   and any installed/ready product claim. Fake-backed request-decoder narrowing
   may continue independently, but no Rust/plugin/manifest/frontend deployment
   write set is admitted until the current producer boundary is stable and the
   program serializes the selected removal/disabled or repaired disposition.
-- Platform Milestone 1 generation and frontend Milestone 4 consumption are
-  admitted only for the approved bounded coordinated draft integration above;
-  the complete milestones remain pending. The FE-I10/FE-I11/FE-I14 consumer
-  classifications and producer/preload/renderer proof remain required.
+- Platform Milestone 1 generation and frontend Milestone 4 consumption have an
+  accepted selected-contract checkpoint; complete milestones remain pending.
+  FE-I10/FE-I11/FE-I14 still require their own remaining contract/consumer proof.
 - Platform DRBT-A6 remains unavailable for Windows x64 and macOS arm64 until
-  accepted required-real runners execute the launcher suite.
+  accepted required-real runners execute the launcher suite. No local hosts are
+  available; independent Linux implementation continues. GitHub Actions results
+  must be observed, not presumed to fail or treated as runtime acceptance merely
+  because a target compiles.
 - Later target, binding, release, persistence, and lifecycle claims remain
   gated by their focused milestone evidence; compile/static substitutes cannot
   close required-real rows.

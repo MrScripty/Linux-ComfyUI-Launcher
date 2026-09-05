@@ -10,39 +10,33 @@ Full C3 remains active and unaccepted. Milestone 2 remains producer
 contract work that is valid for loopback desktop RPC and local core IPC.
 `RUST-I1` is resolved: desktop RPC is loopback-only and LAN support is removed.
 
-**Next slice:** Complete the remaining C3 current-format unresolved-state restore
-contract, preserving exact queue, revocation, quarantine, and ticket custody.
-Unresolved Recovery admission currently fails closed; do not omit that owner
-or infer fresh recovery authority from a persisted snapshot. The current-only
-cutover (`RUST-I10`) and queued pause (`RUST-I9`) are accepted incrementally.
-Runtime schema 4 requires ordinary durable admission and rejects old formats
-without mutation. The two distinct local paused records were converted once
-with a verified backup and unchanged files; the operator converter is retired,
-not shipped. Automatic finishing preserves FIFO and original-task completion
-handoff. The additive
-`resume_partial_download_with_ticket` is available to core callers; existing
-repo/path consumers retain their prior contract until explicitly migrated.
-No fresh ticket is synthesized for existing repo/path calls. Unrelated Result-shape,
-reconciliation, RPC, and UI work remains held. Hard-process-crash recovery,
-comprehensive unresolved-state restore, admitted relocation, guard-free effects,
-and C4 importer ownership remain open. Exact evidence is in the ledger:
-the current cutover passed full core package tests in both feature
-configurations and strict core/supported-workspace Clippy without warning
-suppression. The development RPC backend was rebuilt. A scoped Linux GUI check
-now shows 83 models and clean shutdown with the current working-tree
-renderer/main, including held drafts; this does not accept their wider
-consumer migration. Release/package and other-platform acceptance remain
-separate. `RUST-I11` records the backed-up two-field identity repair; the
-non-blocking reclassification collision in `RUST-I12` remains open.
-C3 lifecycle integration and C4 importer integration proceed in
-that order; they are reviewable checkpoints, not independently shippable claims.
-The accepted Slice B
-generation, terminal-projection, cancellation, cleanup, tombstone, and sticky
-failure semantics remain invariants. General client-drop draining remains
-Milestone 4/RUST-A6, Slices D-E remain held, and Milestone 2J remains queued
-with only its isolated red HF-unavailable oracle recorded.
+Selected reconciliation ownership, desktop catalog/download/ticket contracts,
+and Linux artifact-preserving collision remediation are accepted at `f77f4bed`,
+`2b081fba`, and `2b9553a0`. Desktop callers have migrated together; remaining
+core/UniFFI ambient adapters do not reintroduce the removed desktop methods.
+HF-unavailable regressions now pass, but complete M2J and all-route contract
+acceptance remain open. RUST-I12 is resolved on Linux, not pending source work.
 
-**Acceptance status:** `pending`
+**Next slice:** Restore current-format Verified Ambient quarantine with its
+exact queue admission still active after cleanup. Only
+`rust/crates/pumas-core/src/model_library/hf/download.rs` and colocated tests
+are admitted for this checkpoint. Use the existing exact settlement operation
+under retained restore-task ownership and reload reconciled strict inventory;
+do not replay filesystem cleanup or derive new authority from snapshots.
+The deterministic persisted-cutpoint regression must first fail, then prove
+successful restore, read-only Error history, and successor FIFO progress.
+Pending cleanup, unresolved Recovery custody, and hidden admission remain
+fail-closed. No live library mutation, schema change, or legacy support.
+
+The current-only cutover and queued pause remain accepted. Full C3, admitted
+relocation, guard-free effects, C4 awaited importer integration, and hard-process
+crash evidence remain open. Slice B generation, terminal, cleanup, tombstone,
+and sticky-failure semantics remain invariants. General client-drop draining
+remains M4/RUST-A6; Slices D-E and wider source changes require their own admission.
+Unavailable Windows/macOS runtime evidence does not block this Linux-capable
+checkpoint or imply a failed GitHub Actions result.
+
+**Acceptance status:** `partial`
 
 **Execution ledger:** [execution-ledger.md](execution-ledger.md)
 
@@ -61,7 +55,7 @@ with only its isolated red HF-unavailable oracle recorded.
 | --- | --- | --- |
 | C1 (internally verified) | Durable admission, restart reconciliation, quarantine, and exact queue settlement behind the store Interface | 38 store tests and atomic/HF regressions pass in both feature configurations; independent source review accepted |
 | C2 (internally verified) | Held configured-root destination authority and marker publisher ready for runtime integration | Independent source review accepted; root reproduced 14 recovery, 22 atomic-publication, 38 store, and 155 HF tests in both feature configurations |
-| C3 (active; incremental core checkpoint verified) | Start, pause, resume, cancellation, restore, and relocation consume the store and destination Interfaces | Core ticket recovery, legacy relocation, cancellation quarantine, and network-wait pause pass independent review, dual full-package tests, and strict lint. Full C3 remains open; ledger owns exact boundaries |
+| C3 (active; incremental core checkpoint verified) | Start, pause, resume, cancellation, restore, and admitted relocation consume the store and destination Interfaces | Ticket recovery, cancellation quarantine, network/queued pause, and current-only cutover pass recorded review, dual package tests, and strict lint. Old partial relocation is retired. Full C3 remains open; ledger owns exact boundaries |
 | C4 | Importer mutations are awaited before settlement; notifications follow release | Real async importer held during cancellation/completion; successor progress and terminal-state tests |
 
 The complete producer/consumer boundary still requires the existing later
@@ -108,22 +102,17 @@ remaining lifecycle effects still need completion.
 Only Linux execution is evidenced; this is not cross-platform acceptance or a
 full builder-startup test.
 
-**Current C3 limits:** the new transfer path uses a real loopback HTTP response
-and real partial-file writes, then an orderly Error before reopening; it is not
-a process-crash or live Hugging Face service claim. The earlier marker-failure
-and seeded-final-file regressions retain their narrower meaning. The unaccepted
-queue draft uses held identities and one retained capability per state. The
-user no longer requires old-record relocation; its previously verified execution
-path and pending-intent machinery are being removed. The physical
-destination mutex remains; comprehensive restore still needs task ownership
-and hidden/Pending-state reconciliation. Verified cleanup history now restores
-without mutation authority; Pending state and active quarantine queues still
-refuse restoration. Network-wait pause now passes focused and dual package
-regressions; queued-pause ownership and admitted relocation remain pending. Unknown admissions
-fail closed but do not yet have the complete recovery path. Runtime release
-facts are retained until owner drop to prevent stale-inventory resurrection.
-The real asynchronous importer and callback ordering remain C4. This admission
-checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
+**Current C3 limits:** real loopback transfer and orderly Error/reopen evidence
+is not hard-process-crash or live Hugging Face evidence. Marker-failure and
+seeded-file tests retain their narrower meaning. Held identities, network and
+queued pause, and removal of old partial relocation are integrated. Unknown
+admissions, Pending cleanup, and unresolved active Recovery custody still fail
+closed without a complete recovery path. Verified cleanup currently restores
+only after queue settlement; the admitted checkpoint addresses that specific
+restart gap. Runtime release facts remain retained until owner drop. Physical
+destination locking, admitted relocation, and C4 real awaited importer/callback
+ordering remain unfinished. Selected producer/consumer GUI integration is
+accepted separately, not evidence of full C3 or client-drop completion.
 
 - **Exact source write set:**
   `rust/crates/pumas-core/src/model_library/hf/download.rs`,
@@ -201,43 +190,26 @@ checkpoint is neither full C3 acceptance nor a producer/consumer or GUI handoff.
   library callers retain their behavior; HF restoration must not regain ambient
   filesystem authority or duplicate the policy. This replaces the prior
   nine-file count limit, not the product, consumer, or dependency boundaries.
-- **Current-only cutover scope approved:** the user superseded ongoing
-  old-download compatibility with a one-time local conversion. Root owns the
-  exact `api/state.rs` caller hunk, records, live-data preflight and publication;
-  store_checkpoint owns the schema and store tests; destination_checkpoint owns
-  HF production lifecycle/types; audit_standards owns the HF test region,
-  capability pruning, and migration-caller pruning. plan_cleanup owns only a
-  throwaway offline converter, never normal
-  runtime source or live data. Cargo runs serialize; workers do not commit.
-  Remove old-record relocation execution and its unused unsafe move machinery.
-  `api/migration.rs` truthfully reports partial-directory moves as unsupported
-  without effects; complete-model migration remains unchanged. Admitted
-  relocation is still C3 work and is not implicitly implemented here.
-  The converter accepts the inspected unversioned paused-record shape only,
-  rejects ambiguous shared destinations or unresolved histories, binds current
-  held-root identities, preserves payload/marker bytes and complete snapshots,
-  and gives distinct destinations independent fresh admissions. Backup and
-  candidate durability precede guarded replacement. Unknown publication retains
-  recovery artifacts and never triggers automatic rollback. After successful
-  local cutover the converter is retired from execution, not embedded in startup.
-  Acceptance: real temporary-file conversion/failure/refusal and fresh runtime
-  restore; live exact-backup and identity/selection/byte preservation; current
-  queued pause/resume/marker/cancellation and automatic finishing with
-  original-task completion handoff; unchanged full-model migration; then
-  dual package and strict lint gates on the isolated source. No live download,
-  GUI, cross-platform or hard-process-crash claim follows. Composed ownership
-  stays in the existing store, task, queue, and capability owners; no generic
-  migration framework or permanent compatibility registry is added.
-- **Held boundaries:** no further source expansion, public constructor/wire outcome,
-  manifest, RPC/IPC/UniFFI, frontend/Electron, package/generated/CI, or shared-
-  document mutation. The metadata files expose only the existing atomic writer
+- **Current-only cutover accepted:** schema 4 and exact ordinary admission are
+  the only shipped runtime format. The two local paused records were converted
+  once with durable backup and unchanged payload/marker bytes; the operator
+  converter is retired. The ledger owns those commands and evidence. Old-record
+  relocation and its unused move machinery are removed. `api/migration.rs`
+  refuses partial-directory moves without effects; complete-model migration is
+  unchanged. Admitted relocation remains separate C3 work. Do not reintroduce
+  compatibility, infer historical FIFO, or rerun conversion during startup.
+- **Held boundaries:** the next checkpoint changes only the source named in
+  Next slice. The broader write set above records C3/C4 ownership, not permission
+  to expand this checkpoint. Selected RPC/frontend/Electron/generated/CI changes
+  are already accepted at `2b081fba`; no new wire or consumer change is needed.
+  The metadata files expose only the existing atomic writer
   to a held capability-relative marker target. Builder changes inject the
   selected root in C2, propagate strict restore failure in C3, and wire owned
   asynchronous importer hooks in C4. The Rust restore method returns
   `Result<Vec<DownloadCompletionInfo>>`; its builder and test callers migrate
   together. Corrupt or uncertain authoritative download inventory prevents
   successful API initialization rather than being reported as empty restore.
-  Slices D-E, M2J, full aggregate verification,
+  Slices D-E, further M2J work, full aggregate acceptance,
   general client Drop, consumer implementation, and standalone-shippable
   claims remain excluded. The [root incremental-commit decision](../plan.md#binding-decisions)
   permits coherent verified candidates with compatible reachable contracts;
@@ -861,10 +833,11 @@ no required-real environment is represented by a lower-fidelity substitute.
 
 ## Blockers
 
-- None for the admitted Milestone 1 slice.
+- None external for the admitted Verified Ambient settlement checkpoint.
 - `RUST-I1` is resolved; Milestone 2 enforces the accepted loopback-only
   boundary.
-- `RUST-I2` is resolved; Milestone 4 must prove the accepted startup behavior.
+- `RUST-I2`'s product decision is resolved; Milestone 4 must still remove the
+  configured plugin initialization fallback and prove the accepted behavior.
 - `RUST-I3` is resolved; Milestone 6 owns Rust source/manifests removal while
   the platform plan owns binding scripts, docs, and release projection.
 
@@ -890,7 +863,7 @@ no required-real environment is represented by a lower-fidelity substitute.
 
 ## Final Acceptance
 
-- Acceptance status: `pending`
+- Acceptance status: `partial`
 - Deferred follow-ups: Electron/TypeScript projections and negative consumer
   tests, real binding-host cohorts, generators, packaged artifacts, and release
   evidence remain with the desktop/platform plan; frontend presentation remains

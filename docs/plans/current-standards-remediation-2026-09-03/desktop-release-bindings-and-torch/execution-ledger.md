@@ -15,17 +15,20 @@
   from `Planned` to `Active`.
 - Milestone 0 is `Accepted`; the report and two canonical matrices agree and are
   visible versioned inputs.
-- Milestone 1 is `Blocked`: Rust's credential-disclosure prerequisite is
-  accepted, but the canonical producer projection still contains legacy
-  operations and handler-owned event shapes.
+- Milestone 1 is `Active`: selected catalog/FTS/download/ticket-recovery
+  generation and consumption are accepted in `2b081fba`; unselected Legacy
+  operations, transport, and streamed-event gates remain pending.
 - Milestone 4 is locally green but remains `Active`/pending until required-real
   Windows x64 and macOS arm64 launcher evidence exists.
 - Milestone 3 has one accepted request-contract slice but remains
   `Active`/pending; runtime scheduling and deployment are blocked on a real
   tuple and fixture.
-- Current slice: Milestone 2 sandbox-compatible renderer-recovery Electron
-  producer tranche at focused real-Electron review boundary. Frontend consumer
-  and streams remain held.
+- Milestone 2's selected bundled preload, root bootstrap, renderer recovery,
+  and Linux presentation integration is accepted in `2b081fba`. Stream
+  lifecycle and required-real cross-target evidence remain pending.
+- Next slice: DRBT-I11 model-library stream ownership investigation on Linux,
+  with exact implementation admission and terminal-outcome oracle before
+  source changes. No whole milestone is accepted by the selected checkpoint.
 
 ## Entries
 
@@ -786,6 +789,34 @@
   no-preload, fatal, reload, and 9+9 producer-to-renderer conformance remain
   held rather than inferred from the completed ready matrix. DRBT-A3 and
   Milestone 2 remain active.
+
+### 2026-09-05 — Reconcile committed desktop integration
+
+- Operation: `continue` on this canonical plan; standards `1609c304`.
+  Documentation-only ownership is this plan, issues, and ledger. Existing
+  historical entries remain evidence of their earlier states.
+- `2b081fba` accepted the coordinated selected Rust-to-desktop contract,
+  bundled sandbox preload, root-scoped display bootstrap, and renderer
+  integration. It supersedes the active generation-unavailable and
+  uncommitted/absent-consumer holds, not all-route or stream acceptance.
+- Deciding evidence is the parent ledger's
+  [Coordinated Desktop Contract Verification](../execution-ledger.md#2026-09-05--coordinated-desktop-contract-verification):
+  generator 5/5, actual-producer decoder 5/5 and renderer 2/2, Electron 129
+  tests with one explicit runtime skip plus the separately enabled real
+  sandbox oracle, frontend 520 tests and builds/types/lint, and built Linux
+  GUI with 83 catalog models, two labelled paused activities, nine partial
+  percentages, no Ready-to-finish state, zero renderer errors, and clean
+  shutdown. Warm cache painting is display-only; it grants no stale actions.
+- `2b9553a0` separately accepted RUST-I12's classification correction on Linux.
+  Its source, no-loss evidence, and non-Linux runtime limits remain owned by
+  the Rust plan. It does not close a desktop release or lifecycle claim.
+- DRBT-A1 through A9 retain their complete gates. Windows/macOS runtime
+  evidence is pending, not presumed failed; CI/build availability alone is
+  not execution proof. Torch runtime/deployment, binding/release, broader
+  transport, and stream ownership remain outside this acceptance.
+- Next independent slice is DRBT-I11's model-library stream custody
+  investigation on Linux. Preserve the accepted barrier and generated
+  contract; admit the exact source set and real terminal oracle before edits.
 
 ## Reports
 

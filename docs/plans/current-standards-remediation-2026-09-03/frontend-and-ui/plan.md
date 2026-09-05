@@ -2,19 +2,21 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Milestones 0 through 3 are accepted. The user's 2026-09-05
-decision accepts the main-owned causal marker barrier's roughly one-second
-cost and admits bounded XR-S1/M4 integration with the candidate catalog/search
-producer and generated platform decoder. Renderer-frame timing and hidden
-capture remain rejected reveal authorities. This is source admission, not
-acceptance of the unfinished M4 milestone.
+**Current phase:** Complete the remaining M4 consumer migration. Milestones 0
+through 3 and the selected catalog/search, ticket-recovery, display-cache, and
+startup source checkpoint are accepted. Commit `2b081fba` includes generated
+producer/preload/renderer conformance and Linux cold/warm GUI evidence;
+`2b9553a0` preserves that UI after the backend collision correction. Neither
+checkpoint closes all M4, XR-S1, or M5 claims. The approved approximately
+one-second main-owned marker barrier remains the reveal authority.
 
-**Next slice:** Complete the coordinated producer/preload/renderer conformance
-matrix, retaining the approved marker barrier. Preserve FE-I10/FE-I11/FE-I14
-consumer classifications: catalog/search use the closed projection, scan/import
-keep their distinct raw record contract, cached rows are root-scoped and
-display-only, and downloads without exact association remain orphan rows.
-No cached path, ticket, activity, or action authority is admitted.
+**Next slice:** Bound and migrate the remaining M4 link-health, import-picker,
+and conversion outcome consumers (FE-I10/FE-I11/FE-I14) with their canonical
+Rust/platform providers. Record exact consumer dispositions and the write set
+before implementation; preserve scan/import's distinct raw record contract.
+Extend the existing generated contract and consumer evidence, not handwritten
+wire mirrors. This frontend slice is sequenced after the program's current
+Rust recovery work and does not reopen accepted catalog/startup implementation.
 
 **Acceptance status:** `partial`
 
@@ -48,21 +50,23 @@ changes only owners whose current behavior cannot support the audited claims.
   31 candidates; the sibling governance plan owns that mechanism. No
   representative browser/Electron workflow or production build was run in the
   audit, so neither is baseline acceptance evidence.
-- The uncommitted `docs/plans/**` tree is shared program-planning work. This
-  plan owns only its `frontend-and-ui/` directory.
+- Current reconciliation standards: `1609c304`; source checkpoints:
+  `2b081fba` and `2b9553a0`. Historical baselines above remain historical.
+- This plan owns only its `frontend-and-ui/` directory; the program owner
+  serializes shared planning changes.
 
 ## Objective Acceptance
 
 | ID | Observable criterion | Kind | Environment | Mode | Status | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
-| FE-A1 | Every desktop RPC response or event used by renderer code arrives through the accepted platform decoder Interface; invalid, unsupported, unavailable, and operation-failure outcomes remain distinct and cannot become domain values through assertions or fallback substitution. | `contract` | `simulated` (generated-decoder test Adapter and malformed payload corpus) | `automated` | `pending` | Pending Milestone 4; producer proof remains linked to the Rust and platform plans |
-| FE-A2 | A valid saved model list renders immediately with visible cached provenance and real or explicitly unknown age; failed refresh remains visibly degraded and retryable; successful refresh replaces it with fresh authoritative state. | `user-workflow` | `representative` (built renderer in its supported desktop browser runtime) | `automated` | `pending` | Pending Milestones 1 and 4 |
+| FE-A1 | Every desktop RPC response or event used by renderer code arrives through the accepted platform decoder Interface; invalid, unsupported, unavailable, and operation-failure outcomes remain distinct and cannot become domain values through assertions or fallback substitution. | `contract` | `simulated` (generated-decoder test Adapter and malformed payload corpus) | `automated` | `pending` | [Selected consumers accepted](execution-ledger.md#2026-09-05--selected-desktop-consumer-checkpoint-accepted); remaining operation/event inventory and migrations prevent whole-claim acceptance |
+| FE-A2 | A valid saved model list renders immediately with visible cached provenance and real or explicitly unknown age; failed refresh remains visibly degraded and retryable; successful refresh replaces it with fresh authoritative state. | `user-workflow` | `representative` (built renderer in its supported desktop browser runtime) | `automated` | `pending` | [Linux cold/warm evidence accepted](execution-ledger.md#2026-09-05--selected-desktop-consumer-checkpoint-accepted); complete degradation/retry/age workflow remains pending |
 | FE-A3 | Installation progress has at most one request in flight for its current owner, begins only after the backend admits a requested lifecycle, and completions superseded by app/tag changes or unmount cannot mutate current state; success, failure, and cancellation remain distinguishable. | `integration` | `simulated` (controlled deferred request Adapter and fake clock) | `automated` | `satisfied` | [M0-S1 evidence](execution-ledger.md#2026-09-03--m0-s1-installation-progress-owner-accepted) plus accepted [PRG-I12 repair evidence](execution-ledger.md#2026-09-03--m3-s3a-status-reachability-terminal-retention-and-admission-order-accepted) |
 | FE-A4 | Affected modal and popup workflows expose names and state programmatically, support pointer and keyboard operation, contain and restore focus where modal, dismiss predictably, and preserve nested-dialog focus order. | `user-workflow` | `representative` (built renderer with keyboard and accessibility-tree observations) | `automated` | `satisfied` | [M2-S4 Chromium evidence](execution-ledger.md#2026-09-03--m2-s4-representative-chromium-evidence-accepted) |
 | FE-A5 | Installation progress and terminal outcomes are programmatically announced without duplicate noise, and the operating-system reduced-motion preference suppresses nonessential CSS and Framer Motion movement. | `user-workflow` | `representative` (built renderer with accessibility-tree and media-preference control) | `automated` | `satisfied` | [M3-S3b real-entry evidence](execution-ledger.md#2026-09-03--m3-s3b-popover-motion-and-terminal-semantics-accepted) |
 | FE-A6 | Both frontend build modes start through their real entry point; the default renderer exposes supported inference-plugin UI, while the library-only renderer omits that UI and still completes the core model-library workflow. | `user-workflow` | `representative` (built default and library-only renderers in the supported desktop browser runtime) | `automated` | `pending` | Pending Milestone 5; packaged-artifact claims remain in the platform plan |
-| FE-A7 | Frontend behavior documentation describes only the accepted cache provenance, keyboard/focus, reduced-motion, and variant behavior, and routes verification policy to the governance owner. | `focused` | `not-applicable` | `manual` | `pending` | Pending Milestones 3 through 5 |
-| FE-A8 | In Electron, one launcher-root owner prevents backend-consuming renderer content from mounting before a decoded ready state, presents every startup/selection recovery outcome without path disclosure or unsafe retry, and gives both normal-ready entries a first visible model-list frame without a painted checking frame; browser mode remains explicitly not applicable. | `integration` | `representative` (production builds and preload in sandboxed Electron) | `automated` | `pending` | [XR-S1 evidence](reports/launcher-root-recovery-consumer-evidence.md); main-owned in-frame compositor proof and composed conformance remain active |
+| FE-A7 | Frontend behavior documentation describes only the accepted cache provenance, keyboard/focus, reduced-motion, and variant behavior, and routes verification policy to the governance owner. | `focused` | `not-applicable` | `manual` | `pending` | M3 documentation accepted; remaining M4/M5 behavior documentation pending |
+| FE-A8 | In Electron, one launcher-root owner prevents backend-consuming renderer content from mounting before a decoded ready state, presents every startup/selection recovery outcome without path disclosure or unsafe retry, and gives both normal-ready entries a first visible model-list frame without a painted checking frame; browser mode remains explicitly not applicable. | `integration` | `representative` (production builds and preload in sandboxed Electron) | `automated` | `pending` | [Selected startup checkpoint accepted](execution-ledger.md#2026-09-05--selected-desktop-consumer-checkpoint-accepted); complete XR-S1 state/two-entry matrix still required |
 
 ## Scope
 
@@ -105,8 +109,10 @@ changes only owners whose current behavior cannot support the audited claims.
 - The Rust/backend model catalog is authoritative. Browser storage is a
   disposable projection used to satisfy the product requirement that the model
   list appear immediately at startup.
-- Existing version-1 snapshots have no capture time. They must be presented as
-  cached with unknown age; migration must not invent a timestamp or revision.
+- Version-1 snapshots are retired, not migrated. The accepted version-2
+  display cache requires the opaque launcher-root scope; mismatched or invalid
+  entries are discarded. Cached paths, tickets, activity, and actions are not
+  authority. A missing display scope means no cache, not an invented identity.
 - The producer currently exposes no catalog revision. Capture time and source
   may be recorded locally, but must not be described as producer revision.
 - Underlying IPC calls are not assumed cancellable. Superseded async work must
@@ -202,11 +208,10 @@ silently added to every local hook.
 - The package-local command name remains integration-owned until Milestone 5;
   the admitted implementation uses existing Electron/Vite/Node dependencies
   and the three-file owner split recorded in the admission report.
-- The exact decoded desktop Interface remains provider-owned until the Rust and
-  platform plans accept it. This plan will not draft a temporary schema.
-- Existing version-1 cache retention ends only when the minimum supported
-  upgrade policy excludes pre-remediation snapshots or an explicit release
-  decision authorizes removal.
+- Unmigrated desktop operations remain provider-owned. The selected catalog,
+  search, download, and ticket-recovery Interface is accepted; further
+  operations extend that canonical generation path rather than adding a
+  temporary schema.
 
 ## Systemic Finding Audit
 
@@ -258,12 +263,12 @@ silently added to every local hook.
 
 | Risk | Control |
 | --- | --- |
-| Immediate cache display is mistaken for current backend truth | Unknown-age legacy migration, explicit cached/degraded presentation, and successful-refresh replacement test |
+| Immediate cache display is mistaken for current backend truth | Root-scoped display-only cache, explicit cached/degraded presentation, and successful-refresh replacement test |
 | Late installation completion mutates a new app/tag | Serialized loop plus generation/current-owner checks and deferred-promise tests |
 | Shared modal/popover primitive changes feature behavior | Migrate one representative consumer first, test through the Interface, then migrate only matching consumers |
 | Nested dialogs restore focus to a removed element | Stack-aware restoration with connectivity fallback, exercised in representative runtime |
 | Accessibility tests pass in jsdom but fail in Chromium/Electron | Representative harness is a prerequisite for acceptance, not optional corroboration |
-| Generated contract timing blocks model remediation | Milestone 4 remains dependency-gated; no local duplicate schema is introduced |
+| Remaining contract migration drifts from its provider | Coordinate each remaining operation with canonical generation; selected catalog contracts are already accepted |
 | Governance and frontend both edit package scripts | Governance integrates first; Milestone 5 rebases and owns only the package-local renderer command |
 | A new harness becomes slow or flaky | Admission requires measured duration, deterministic fixtures/process cleanup, unique oracle, and a retention trigger |
 
@@ -506,10 +511,10 @@ sandbox-compatible preload decoder before this consumer was integrated.
 - `reports/launcher-root-recovery-consumer-evidence.md`
 - this plan, ledger, and issues files
 
-The held product source at this boundary is exactly the two type files, the
-provider and its test, the recovery view and its test, the window-actions hook
-and its test, and `index.tsx` listed above. No other uncommitted frontend source
-belongs to an independently acceptable tranche.
+This source boundary was integrated in `2b081fba`, including the synchronous
+decoded bootstrap and root-scoped display cache. The former uncommitted-source
+hold is superseded. Full XR-S1 acceptance still requires its complete composed
+startup/selection and two-entry first-visible-frame evidence.
 
 **Tasks:**
 
@@ -537,10 +542,10 @@ belongs to an independently acceptable tranche.
   presentation claim.
 - [ ] Prove all closed producer startup and selection values through the actual
   compiled preload and frontend semantics, reject malformed/extra payloads,
-  and run first-visible ready/recovery/unavailable/no-preload workflows through
-  a re-planned compositor owner. The marker challenge satisfied frame truth but
-  not immediate startup, and the hidden-capture alternative failed its marker
-  proof.
+  and run the complete first-visible ready/recovery/unavailable/no-preload
+  matrix through the accepted main-owned marker barrier. Accepted Linux
+  cold/warm library runs and sandbox preload conformance corroborate this
+  claim but do not alone cover every state in both entries.
 
 **Acceptance gate:** FE-A8, the accepted platform producer/decoder evidence,
 focused and full frontend gates, both production builds, and the representative
@@ -553,10 +558,11 @@ two-entry frame oracle.
 **Goal:** Consume the provider-owned decoded operation Interface and retain
 instant model display with explicit provenance, degradation, and recovery.
 
-**Dependency gate:** Accepted Rust DTO/error contract and platform-generated
-decoder Interface. This milestone must not start by inventing either locally.
+**Dependency gate:** Selected catalog/search/download/ticket contracts and
+their generated decoder are accepted in `2b081fba`. Remaining operations require
+their own coordinated provider handoff, not a whole-milestone source hold.
 
-**Pre-start re-plan gate:** Classify the link-health refresh rejection
+**Remaining-consumer gate:** Classify the link-health refresh rejection
 (`FE-I10`) and model-import picker rejection (`FE-I11`) against this
 milestone's decoded bridge/projection Seam. When an outcome shares that owner,
 add its exact consumers and behavior evidence to this milestone before source
@@ -593,20 +599,22 @@ neither finding may be deferred outside this program.
 - [ ] Remove assertions or fallback substitution that let invalid/unavailable
   results masquerade as domain values; retain wrappers only where the deletion
   test shows real renderer-domain composition or recovery.
-- [ ] Evolve the snapshot envelope to record local capture time and provenance,
-  while decoding version-1 snapshots as cached with unknown age.
-- [ ] Expose one typed projection outcome from `useModels` and render cached,
+- [x] Replace version-1 storage with a closed version-2 root-scoped display
+  projection; retain honest age semantics and omit all action authority.
+- [x] Expose one typed projection outcome from `useModels` and render cached,
   degraded, retrying, and fresh state without hiding the cached list.
-- [ ] On successful authoritative refresh, atomically replace the projection;
+- [x] On successful authoritative refresh, atomically replace the projection;
   on failure, preserve visible cached data and expose recovery.
-- [ ] Test valid/legacy/malformed storage, unavailable/invalid/failure results,
+- [x] Test valid/retired/malformed storage, unavailable/invalid/failure results,
   stale completion, retry, and fresh replacement through the Module Interface.
 - [ ] Run the representative immediate-startup and degradation workflow.
 
 **Acceptance gate:** FE-A1, FE-A2, and the applicable portion of FE-A7. Link
 provider contract/decoder evidence without claiming ownership of it.
 
-**Status:** `Blocked` pending accepted Rust DTO/error and platform decoder handoff
+**Status:** `Active`; selected consumer checkpoint accepted, remaining operation
+inventory/migration and complete FE-A1/FE-A2/FE-A7 evidence pending. See the
+[accepted checkpoint](execution-ledger.md#2026-09-05--selected-desktop-consumer-checkpoint-accepted).
 
 ### Milestone 5: Prove Default And Library-Only Renderer Behavior
 
@@ -673,11 +681,14 @@ environments, or the plan remains non-accepted with explicit issues.
 
 ## Blockers
 
-- No blocker prevents M0-S1. The program integration owner accepted the
-  critical Rust RPC disclosure evidence and released frontend source work.
-- Milestone 4 is dependency-gated on accepted Rust and platform contract work.
-- No harness blocker remains for Milestones 2, 3, and 5; the accepted report
-  admits the installed Electron/CDP environment without a new dependency.
+- No source blocker remains for the accepted catalog/recovery/cache/startup
+  boundary. Remaining link-health/import/conversion contracts require the
+  bounded provider/consumer handoff described above.
+- Complete XR-S1/M5 and whole M4 evidence remains outstanding; existing
+  Electron/CDP admission is available for the selected Linux workflow.
+- Windows/macOS runtime evidence is unavailable locally and remains with the
+  platform owner. It does not block independent Linux source work or imply
+  cross-platform acceptance.
 
 ## Re-Plan Triggers
 

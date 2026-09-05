@@ -10,15 +10,34 @@
 ## Current State
 
 - Plan lifecycle: `Active`.
-- Acceptance: `pending`.
+- Acceptance: `partial`.
 - Milestone 0 planning/ownership reconciliation is accepted.
 - Milestone 1's RPC diagnostic-disclosure slice is accepted; `RUST-A1` is
   satisfied by the linked real-process and interface evidence.
 - Milestone 2 is active for loopback desktop-RPC and local core-IPC producer
-  contract work following explicit program admission. Network exposure edits
-  remain gated by `RUST-I1`.
+  contract and lifecycle work following explicit program admission. `RUST-I1`
+  is resolved by loopback-only enforcement. Selected desktop contracts and
+  Linux artifact-collision correction are accepted; full milestones remain open.
 
 ## Slice Log
+
+### 2026-09-05 — Current authority reconciled; Verified Ambient restore admitted
+
+- Source `2b9553a0`, standards `1609c304`. Continued the canonical focused plan;
+  replaced stale selected-consumer, cutover, collision, and HF-unavailable holds
+  with the recorded accepted boundaries. Remaining plugin-startup work is not
+  complete merely because its product decision is resolved.
+- Inspection found a current-format restart gap: Verified Ambient quarantine
+  still carrying its exact admission is refused even though cleanup is already
+  durably verified. Admit only `hf/download.rs` and its regressions, reusing
+  retained restore-task ownership, exact settlement, and strict inventory reload.
+- Required evidence: real temporary store operations reaching the persisted
+  pre-settlement cutpoint; restored Error history without mutation capability;
+  exact follower progress; unchanged Pending/Recovery/hidden refusal. This is
+  neither process-kill evidence nor full unresolved-state recovery acceptance.
+- C4 remains subsequent work: builder importer callbacks are not yet awaited
+  before HF lifecycle settlement. No live download/migration tests or cross-target
+  claims are admitted. Parent and all four focused plan-contract checks pass.
 
 ### 2026-09-03 — Start `plan.md`; Milestone 1 RPC disclosure containment
 

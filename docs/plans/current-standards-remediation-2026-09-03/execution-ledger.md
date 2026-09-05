@@ -20,6 +20,27 @@
 
 ## Slice Log
 
+### 2026-09-05 — Reconcile accepted checkpoints and resume bounded C3 work
+
+- Continued the canonical parent and focused plans against standards
+  `1609c3049c4747b17e3702558f3141928d5161f2` and code `2b9553a0`.
+  Three agents separately reconciled frontend/desktop records and inspected
+  recovery; the root reconciled parent/Rust authority. Historical evidence is
+  retained, not replaced with new acceptance claims.
+- Superseded stale selected-contract, repo/path-consumer, preload, cache-v1,
+  uncommitted-draft, and RUST-I12 holds with the existing accepted commit and
+  evidence boundaries. Whole C3/C4, all-route contracts, full startup matrices,
+  plugin startup, streams, Torch, bindings, and release remain unfinished.
+- User has no local Windows/macOS hosts. Their runtime evidence remains
+  unavailable, not a blocker for independent Linux work; anticipated CI failure
+  is not an observed result.
+- Admitted one source checkpoint: current-format Verified Ambient cleanup
+  whose exact admission was not settled before restart, confined to
+  `hf/download.rs` and tests. Reuse the existing retained task and exact store
+  settlement; preserve Pending/Recovery/hidden refusal and reload strict
+  inventory. A seeded persisted cutpoint is not process-kill evidence. No live
+  download or migration operation is authorized by this checkpoint.
+
 ### 2026-09-03 — Program Start And Ownership Audit
 
 - Admission: explicit `start` operation for

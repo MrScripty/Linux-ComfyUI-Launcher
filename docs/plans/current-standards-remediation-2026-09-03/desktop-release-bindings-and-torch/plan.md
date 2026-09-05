@@ -2,20 +2,26 @@
 
 **Plan status:** `Active`
 
-**Current phase:** Approved bounded draft integration and Milestone 2
-first-visible-frame verification, following the user's 2026-09-05 acceptance
-of the correctness-safe roughly one-second causal marker barrier.
+**Current phase:** Milestones 1 and 2 incremental acceptance reconciliation
+after the committed desktop integration `2b081fba` and independent Linux
+classification correction `2b9553a0`. The selected generated contract, bundled
+sandboxed preload, root-scoped display bootstrap, and Linux presentation are
+accepted; broader transport and lifecycle objectives remain open.
 
-**Next slice:** Complete the coordinated RPC/preload/renderer contract and
-root-scoped display bootstrap under the parent plan's approved integration.
-Retain the marker barrier and verify no-bridge and immediate/delayed/never
-terminal cases plus actual Electron. Direct ready-to-show bootstrapping and
-hidden `capturePage` remain rejected alternatives. Stream ownership remains
-separate. Milestone 1 is not accepted by this bounded integration; Milestone 3
-runtime/deployment remains unavailable, and Milestone 4 remains pending
-required-real Windows/macOS evidence.
+**Next slice:** Bound DRBT-I11's model-library stream ownership through the
+existing Electron main/preload boundary on Linux: inspect subscribe, renderer
+close, late callback, and shutdown custody; admit an exact implementation write
+set and real Electron terminal-outcome oracle before changing source. Preserve
+the accepted generated contract and roughly one-second causal marker barrier;
+do not broaden to all RPC routes, Torch, release, or cross-target acceptance.
 
 **Acceptance status:** `pending`
+
+**Composed-design review:** `not-applicable` to this documentation-only
+reconciliation and the next read-only stream investigation: neither changes
+product composition. The investigation must record applicability and any
+required artifact probe before admitting stream implementation; this field
+does not waive review for that later design.
 
 **Execution ledger:** [execution-ledger.md](execution-ledger.md)
 
@@ -377,10 +383,14 @@ shared workflow change.
 typecheck/build, focused decoder tests, generator freshness, and built-RPC
 cross-process tests pass in their declared environments.
 
-**Status:** `Blocked` — Rust has closed the credential-disclosure prerequisite,
-but its canonical producer declaration still contains legacy operations and
-handler-owned event shapes. Generating now would freeze a partial second
-authority.
+**Status:** `Active` — `2b081fba` accepts the selected catalog, FTS, download,
+and ticket-recovery projection from canonical Rust declarations, with generated
+standalone decoding, actual-producer conformance, and current-source freshness
+in CI. Its accepted generator/output paths are documented in
+[Electron's contract boundary](../../../../electron/README.md); they supersede
+the proposed generator/output names above for that completed slice. Remaining
+Legacy routes, transport envelopes, and event contracts are not accepted by
+this checkpoint. DRBT-A1/A2 remain pending their complete gates.
 
 ### Milestone 2: Preserve Desktop Authority and Stream Lifecycle
 
@@ -430,7 +440,11 @@ plan consumes but does not redefine recovery and stream outcomes.
 switches library authority and no selected stream task can outlive shutdown
 without an observed typed result.
 
-**Status:** `Active`
+**Status:** `Active` — selected recovery/bootstrap/presentation integration is
+accepted in `2b081fba`, including the bundled preload and actual Linux GUI.
+This supersedes the producer/renderer integration hold, not stream ownership
+or required-real target filesystem and packaged-runtime evidence. DRBT-A3/A4
+remain pending their complete gates.
 
 ### Milestone 3: Make the Torch Surface Truthful and Schedulable
 
@@ -658,9 +672,14 @@ artifact plan.
 
 - Milestone 0 is accepted; the report and canonical matrices agree and are
   visible versioned inputs.
-- Milestone 1 is blocked until the Rust plan provides an accepted canonical
-  DTO/error declaration and projection capability; an absent capability is
-  recorded as `unavailable`, not replaced with hand-maintained schema.
+- Milestone 1's selected generation prerequisite is resolved by `2b081fba`.
+  Unselected Legacy routes and handler-owned events still require canonical
+  producer contracts and complete transport evidence; their absence does not
+  invalidate the accepted selected projection or block independent lifecycle
+  investigation.
+- Required-real Windows/macOS runtime evidence remains pending. Existing CI
+  configuration or cross-build success is neither runtime proof nor evidence
+  of failure; collect matching runner results before accepting those claims.
 - Any binding host, desktop target, Torch device/runtime class, or release
   channel without a real consumer and adequate environment remains blocked or
   removed from the accepted matrix.
