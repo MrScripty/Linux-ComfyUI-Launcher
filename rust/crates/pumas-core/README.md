@@ -47,6 +47,21 @@ coordinate filesystem state, metadata, index rows, and update events. A
 recoverable partial file, an automatically finalized download, and a complete
 model are different transitions even when the final UI presentation is simple.
 
+For managed HF downloads, Completed requires successful metadata publication
+and indexing before the durable download admission is settled. Startup
+finalization uses the same importer. An import failure retains the downloaded
+files and recovery admission rather than reporting completion; the existing
+resume or restart path can retry after the failure is resolved. Verified
+recovery-ticket work retains its separately constrained mutation contract.
+
+`PumasApi::shutdown_downloads()` closes download admission permanently and waits
+for owned effects, including download-owned importer work and notifications.
+Repeated callers share the result; cancelling a waiter does not cancel the
+drain. This is not shutdown of unrelated imports, search, inference plugins,
+or the application's runtime. Public completion notifications run after
+terminal settlement and destination release; their failure does not undo a
+completed download.
+
 ## Public Boundary
 
 Prefer the facade and typed domain records exported by `src/lib.rs`. Internal

@@ -5,6 +5,153 @@ use tempfile::TempDir;
 
 static REGISTRY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[tokio::test]
+async fn builder_retains_failed_download_import_and_retries_before_completion() {
+    use crate::model_library::download_store::{
+        DownloadAdmissionDomain, DownloadAdmissionRequest, DownloadPersistence,
+        PersistedDestinationIdentity, PersistedDownload,
+    };
+    use crate::models::DownloadStatus;
+
+    let temp = TempDir::new().unwrap();
+    let _registry = RegistryTestGuard::new(temp.path());
+    let library_root = temp.path().join("shared-resources/models");
+    let destination = library_root.join("vision/idea-research/grounding-dino-base");
+    std::fs::create_dir_all(&destination).unwrap();
+    let payload = b"not-a-real-model";
+    std::fs::write(destination.join("detector.onnx.part"), payload).unwrap();
+    std::fs::write(destination.join(".pumas_download"), b"{}").unwrap();
+    // A directory at the metadata file path makes the real importer fail
+    // without replacing its implementation or changing filesystem permissions.
+    std::fs::create_dir(destination.join("metadata.json")).unwrap();
+    std::fs::create_dir_all(temp.path().join("launcher-data")).unwrap();
+    let store = DownloadPersistence::new(&temp.path().join("launcher-data"));
+    let snapshot = PersistedDownload {
+        download_id: "builder-import-retry".into(),
+        repo_id: "IDEA-Research/grounding-dino-base".into(),
+        filename: "detector.onnx".into(),
+        filenames: vec!["detector.onnx".into()],
+        dest_dir: destination.clone(),
+        total_bytes: Some(payload.len() as u64),
+        status: DownloadStatus::Error,
+        download_request: DownloadRequest {
+            repo_id: "IDEA-Research/grounding-dino-base".into(),
+            family: "idea-research".into(),
+            official_name: "grounding-dino-base".into(),
+            model_type: Some("vision".into()),
+            quant: None,
+            filename: Some("detector.onnx".into()),
+            filenames: None,
+            pipeline_tag: Some("zero-shot-object-detection".into()),
+            bundle_format: None,
+            pipeline_class: None,
+            release_date: None,
+            download_url: None,
+            model_card_json: None,
+            license_status: Some("apache-2.0".into()),
+        },
+        created_at: chrono::Utc::now().to_rfc3339(),
+        known_sha256: None,
+        huggingface_evidence: None,
+    };
+    let mut client = HuggingFaceClient::new(temp.path().join("fixture-cache")).unwrap();
+    client
+        .configure_download_destination_root(&library_root)
+        .unwrap();
+    let library_identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(library_root.join(".pumas-library-id.json")).unwrap(),
+    )
+    .unwrap();
+    drop(client);
+    let request = DownloadAdmissionRequest {
+        snapshot,
+        domain: DownloadAdmissionDomain::Ambient,
+        destination: PersistedDestinationIdentity {
+            library_root: format!("uuid:{}", library_identity["library_id"].as_str().unwrap()),
+            relative_target: "vision/idea-research/grounding-dino-base".into(),
+        },
+        requested_payload_files: vec!["detector.onnx".into()],
+        execution_files: vec!["detector.onnx".into()],
+    };
+    let attempt = uuid::Uuid::new_v4().to_string();
+    store
+        .admit_download(&attempt, &request)
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let original_admission = serde_json::to_value(
+        &store
+            .load_lifecycle_inventory_strict()
+            .unwrap()
+            .queue_admissions["builder-import-retry"],
+    )
+    .unwrap();
+
+    let api = PumasApi::builder(temp.path())
+        .auto_create_dirs(true)
+        .with_process_manager(false)
+        .build()
+        .await
+        .expect("operational import failure must not prevent API startup");
+    let downloads = api.list_hf_downloads().await.unwrap();
+    assert_eq!(downloads.len(), 1, "failed import must remain tracked");
+    assert_eq!(downloads[0].download_id, "builder-import-retry");
+    assert_eq!(downloads[0].status, DownloadStatus::Error);
+    let inventory = store.load_lifecycle_inventory_strict().unwrap();
+    assert_eq!(inventory.downloads.len(), 1);
+    assert_eq!(inventory.downloads[0].status, DownloadStatus::Error);
+    assert_eq!(
+        serde_json::to_value(&inventory.queue_admissions["builder-import-retry"]).unwrap(),
+        original_admission,
+        "failed import must retain exact admission custody"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("detector.onnx")).unwrap(),
+        payload
+    );
+    assert!(api.model_library().index().list_all().unwrap().is_empty());
+    // Shutdown reports the retained importer failure, but must drain before
+    // the fixture repairs the obstruction and opens a fresh owning instance.
+    assert!(matches!(
+        api.shutdown_downloads().await,
+        Err(PumasError::DownloadShutdownFailed { failures }) if failures > 0
+    ));
+    drop(api);
+    std::fs::remove_dir(destination.join("metadata.json")).unwrap();
+
+    for _ in 0..2 {
+        let api = PumasApi::builder(temp.path())
+            .auto_create_dirs(true)
+            .with_process_manager(false)
+            .build()
+            .await
+            .unwrap();
+        let metadata = api
+            .model_library()
+            .load_metadata(&destination)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            metadata.repo_id.as_deref(),
+            Some("IDEA-Research/grounding-dino-base")
+        );
+        assert_eq!(metadata.match_source.as_deref(), Some("download"));
+        let model_id = metadata.model_id.as_ref().unwrap();
+        assert!(api.model_library().index().get(model_id).unwrap().is_some());
+        assert_eq!(api.model_library().index().count().unwrap(), 1);
+        assert!(api.list_hf_downloads().await.unwrap().is_empty());
+        let inventory = store.load_lifecycle_inventory_strict().unwrap();
+        assert!(inventory.downloads.is_empty());
+        assert!(inventory.queue_admissions.is_empty());
+        assert_eq!(
+            std::fs::read(destination.join("detector.onnx")).unwrap(),
+            payload
+        );
+        api.shutdown_downloads().await.unwrap();
+        drop(api);
+    }
+}
+
 struct RegistryTestGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }

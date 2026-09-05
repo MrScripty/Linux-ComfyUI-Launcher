@@ -13,12 +13,13 @@ frontend M4/M5, or general shutdown work.
 PRG-I19 C1/C2 and the incremental C3 admission, pause, cancellation, recovery,
 and current-only cutover checkpoints remain verified. Old download formats and
 partial relocation are retired, not compatibility obligations. C3 production
-restore/lifecycle and C4 awaited importer ownership remain open; hard-process
-crash recovery is not proved. Slices A/B, governance, frontend milestones 0–3,
+restore/lifecycle remains open; C4 awaited managed importer ownership is accepted
+within the Linux checkpoint below. Hard-process crash recovery is not proved.
+Slices A/B, governance, frontend milestones 0–3,
 and recorded incremental launcher/Torch work retain their evidence limits.
 
 The bounded Verified Ambient restore settlement is accepted after focused
-review, dual core suites, and strict lint. Remaining C3 and C4 require separate
+review, dual core suites, and strict lint. Remaining C3 requires separate
 exact admission. The
 [execution ledger](execution-ledger.md) retains dated findings and verification;
 the contracts below remain binding. Current blockers are listed in
@@ -232,14 +233,19 @@ Core and IPC preparation share atomic invocation/task custody; real effects and
 final interruption projection drain before retained HF/RPC results. Independent
 reviews, SD-1 through SD-4, dual core/RPC suites, and strict affected lint pass on
 Linux. This supersedes earlier abort-only descriptions for that population, not
-for importers or the application's whole runtime.
+for unrelated importers or the application's whole runtime.
 
-**Next slice:** Admit C4 awaited ordinary/restored download-import finalization
-before terminal settlement, with truthful metadata/index failure and notification
-ordering. The focused Rust owner records the exact write set and regressions
-before source changes. Physical-root grants and Pending replay remain held on
-that dependency. No live mutation, schema, or old-format support. Cargo/commits
-stay serial; full C3/M4 and program acceptance remain open.
+C4 awaited ordinary/restored managed-download import is accepted under the Rust
+plan's [importer admission](rust-library-and-rpc/plan.md#awaited-download-importer-admission).
+Metadata/index success precedes settlement; retained failures remain retryable;
+notifications follow release. C4-1 through C4-4, dual core/RPC suites, and strict
+affected lint pass on Linux.
+
+**Next slice:** Admit the physical-root execution grant identified in RUST-I13,
+including its exact effect/consumer population and independent-process evidence.
+The shutdown/importer prerequisites are accepted; grant implementation and
+Pending replay are not. No live mutation, schema, or old-format support.
+Cargo/commits stay serial; full C3/M4 and program acceptance remain open.
 
 The following checkpoints refine Slice C's integration order; they preserve its
 existing end-to-end criteria and do not authorize independent release or commit.

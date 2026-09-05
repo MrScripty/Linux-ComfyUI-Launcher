@@ -80,6 +80,8 @@ pub struct HuggingFaceClient {
     pub(super) search_cache: Option<Arc<HfSearchCache>>,
     /// Download persistence for crash recovery (optional)
     pub(super) persistence: Option<Arc<DownloadPersistence>>,
+    /// Required metadata/index mutation for configured ordinary downloads.
+    download_importer: Option<Arc<super::ModelImporter>>,
     /// Optional callback invoked when a download completes successfully.
     pub(super) completion_callback: Option<DownloadCompletionCallback>,
     /// Optional callback invoked after auxiliary files download but before weight files.
@@ -118,6 +120,7 @@ impl HuggingFaceClient {
             dest_locks: self.dest_locks.clone(),
             search_cache: self.search_cache.clone(),
             persistence: self.persistence.clone(),
+            download_importer: self.download_importer.clone(),
             completion_callback: self.completion_callback.clone(),
             aux_complete_callback: self.aux_complete_callback.clone(),
             auth_token: self.auth_token.clone(),
@@ -219,6 +222,7 @@ impl HuggingFaceClient {
             dest_locks: Arc::new(RwLock::new(HashMap::new())),
             search_cache: None,
             persistence: None,
+            download_importer: None,
             completion_callback: None,
             aux_complete_callback: None,
             auth_token: Arc::new(RwLock::new(initial_token)),
@@ -255,6 +259,10 @@ impl HuggingFaceClient {
     /// Set the download persistence store.
     pub fn set_persistence(&mut self, persistence: Arc<DownloadPersistence>) {
         self.persistence = Some(persistence);
+    }
+
+    pub(crate) fn set_download_importer(&mut self, importer: Arc<super::ModelImporter>) {
+        self.download_importer = Some(importer);
     }
 
     /// Get a reference to the download persistence store if available.

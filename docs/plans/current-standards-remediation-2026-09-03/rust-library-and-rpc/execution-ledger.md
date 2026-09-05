@@ -21,6 +21,65 @@
 
 ## Slice Log
 
+### 2026-09-05 — C4 awaited importer finalization accepted on Linux
+
+- Accept the slice based on `39e71eaf`, standards
+  `19764768dc8bd16892f98ae1adc6ac4954ca6650`. Builder injects one private concrete
+  importer; ordinary and byte-complete restored work await actual metadata/index
+  mutation through the existing owner before durable settlement. Physical guards
+  are released during import, logical custody is retained, and notifications
+  follow logical release. Verified Recovery remains no-import/no-callback.
+- Strict finalization preserves old metadata until atomic replacement, rejects
+  false success, and propagates real ordinary/Diffusers index failures. Generic
+  import policy is unchanged. Startup import failure retains exact admission and
+  payload as tracked Error while allowing API construction; repaired restart
+  establishes one indexed model and settles once. The builder's detached and
+  post-settlement import paths are deleted.
+- C4-1 holds a real final metadata write before indexing and proves no terminal
+  settlement or successor preparation. C4-2 exercises auxiliary and final import
+  barriers with cancellation/shutdown and success/panic outcomes. C4-3 includes
+  real SQLite rejection/retry, metadata obstruction, false-success refusal, and
+  the public builder failure/restart consumer. C4-4 proves actual same-destination
+  successor completion while notification is held and shutdown remains pending;
+  the existing notification-panic regression preserves Completed.
+- Importer and consumer subagents independently reviewed HF production ordering;
+  root reviewed the integrated source and completed HF fixtures after that worker
+  became unavailable. The first final-import fixture rerun exposed a mistaken
+  expectation of preliminary metadata: existing complete payloads skip that phase.
+  Keep the final fixture's absent metadata/index oracle, and use a missing-payload
+  variant to reach auxiliary import; marker-state assertions distinguish both.
+  No production workaround or weaker terminal assertion was added.
+- Final commands from `rust/`: `cargo test --offline -p pumas-library` with
+  default and `--no-default-features` each pass 1,232 tests, 11 existing ignores.
+  Equivalent `pumas-rpc` runs pass 114 and 74, with 10 existing ignores each.
+  `cargo clippy --offline -p pumas-library -p pumas-rpc --all-targets` passes
+  with `--all-features` and `--no-default-features`, both using `-- -D warnings`.
+  `cargo fmt --all -- --check`, diff checks, and all five plan contracts pass.
+  Focused importer/barrier/notification and builder regressions also pass.
+- Deciding integrated logs are in `/tmp/pumas-c4-final.ZOjPxw`. The live download
+  store SHA256 remains
+  `a0885e5fde0fc5f7c68f3c8726d8677bbbec73a9d030d92a945cce244d3b1575`.
+  No live mutation, GUI run, schema/dependency change, or Windows/macOS claim.
+  Next admit the physical-root grant; Pending replay, relocation, general runtime
+  teardown, full C3/M4, and program acceptance remain open.
+
+### 2026-09-05 — C4 awaited importer finalization admitted
+
+- Continue the explicit Rust plan at `39e71eaf`, standards `19764768dc8bd16892f98ae1adc6ac4954ca6650`.
+  Independent source traces identify both production final-import consumers in
+  builder, plus its auxiliary callback. All enqueue or run mutation after HF's
+  observed phase; ordinary notification also precedes logical destination release.
+- Awaiting the old importer would still permit false completion: it deletes
+  metadata without checking the result, skips existing-metadata branches, and
+  logs indexing failures. Select a private strict download mode sharing existing
+  import policy/writers, preserve generic import behavior, and require successful
+  metadata/index publication before HF settles. Retry keeps exact admission and
+  payload rather than inventing new authority or a cleanup fallback.
+- Root records the complete C4-1 through C4-4 admission before implementation.
+  HF and importer owners have non-overlapping source writes; root integrates the
+  builder and serial gates. The consumer reviewer owns read-only path/evidence
+  review. No new worktree, public callback protocol, dependency, or live mutation.
+
 ### 2026-09-05 — Explicit download shutdown accepted on Linux
 
 - Accept the coherent invocation-to-RPC slice admitted at `9907b492`, under

@@ -165,6 +165,12 @@ pub struct ModelImporter {
     library: Arc<ModelLibrary>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InPlaceImportMode {
+    PreserveExisting,
+    FinalizeDownload,
+}
+
 impl ModelImporter {
     /// Create a new model importer.
     ///
@@ -482,6 +488,7 @@ impl ModelImporter {
         &self,
         spec: &InPlaceImportSpec,
         validation: &DiffusersValidationResult,
+        mode: InPlaceImportMode,
     ) -> Result<ModelImportResult> {
         let model_dir = &spec.model_dir;
         let model_id = self.library.get_model_id(model_dir).ok_or_else(|| {
@@ -507,11 +514,28 @@ impl ModelImporter {
             expected_files: spec.expected_files.as_deref(),
             pipeline_tag: spec.pipeline_tag.as_deref(),
         };
-        let metadata = build_diffusers_bundle_metadata(&metadata_spec, validation, &model_id);
+        let mut metadata = build_diffusers_bundle_metadata(&metadata_spec, validation, &model_id);
+        if mode == InPlaceImportMode::FinalizeDownload {
+            metadata.huggingface_evidence = spec.huggingface_evidence.clone();
+            metadata.release_date = spec.release_date.clone();
+            metadata.download_url = spec.download_url.clone();
+            metadata.model_card = parse_model_card_json(spec.model_card_json.as_deref());
+            metadata.license_status = spec
+                .license_status
+                .clone()
+                .or_else(|| Some("license_unknown".into()));
+            if let Some(request) = &spec.download_request {
+                apply_download_artifact_metadata(
+                    &mut metadata,
+                    request,
+                    spec.huggingface_evidence.as_ref(),
+                );
+            }
+        }
         validate_metadata_v2_with_index(&metadata, self.library.index())?;
 
         let metadata_path = model_dir.join("metadata.json");
-        if path_exists(&metadata_path).await? {
+        if mode == InPlaceImportMode::PreserveExisting && path_exists(&metadata_path).await? {
             let model_id = self.library.get_model_id(model_dir);
             return Ok(ModelImportResult {
                 path: model_dir.display().to_string(),
@@ -525,6 +549,9 @@ impl ModelImporter {
 
         self.library.save_metadata(model_dir, &metadata).await?;
         if let Err(err) = self.library.index_model_dir(model_dir).await {
+            if mode == InPlaceImportMode::FinalizeDownload {
+                return Err(err);
+            }
             tracing::warn!("Failed to index in-place diffusers bundle: {}", err);
         }
 
@@ -538,22 +565,24 @@ impl ModelImporter {
         })
     }
 
-    /// Finalize a completed HuggingFace download through the normal in-place importer.
+    /// Finalize a completed HuggingFace download with metadata and index proof.
     ///
-    /// This keeps post-download bundle handling and ordinary file-based imports on the
-    /// same importer code path.
+    /// Success requires both the atomic metadata replacement and indexing to
+    /// succeed. Existing metadata is never deleted to force re-import. A retry
+    /// rebuilds from the retained download provenance even if an earlier attempt
+    /// saved metadata before indexing failed. The caller owns the async operation
+    /// through completion and retains download custody until this result settles.
     pub async fn finalize_downloaded_directory(
         &self,
         info: &DownloadCompletionInfo,
     ) -> Result<ModelImportResult> {
-        let metadata_path = info.dest_dir.join("metadata.json");
-        if path_exists(&metadata_path).await? {
-            tracing::info!(
-                "Removing stale metadata before re-import: {}",
-                metadata_path.display()
-            );
-            let _ = tokio::fs::remove_file(&metadata_path).await;
-        }
+        let model_id =
+            self.library
+                .get_model_id(&info.dest_dir)
+                .ok_or_else(|| PumasError::Validation {
+                    field: "download_finalization".into(),
+                    message: "Downloaded directory has no library model identity".into(),
+                })?;
 
         let spec = InPlaceImportSpec {
             model_dir: info.dest_dir.clone(),
@@ -572,7 +601,18 @@ impl ModelImporter {
             model_card_json: info.download_request.model_card_json.clone(),
             license_status: info.download_request.license_status.clone(),
         };
-        self.import_in_place(&spec).await
+        let result = self
+            .import_in_place_with_mode(&spec, InPlaceImportMode::FinalizeDownload)
+            .await?;
+        if !result.success || result.model_id.as_deref() != Some(model_id.as_str()) {
+            return Err(PumasError::Validation {
+                field: "download_finalization".into(),
+                message: result.error.unwrap_or_else(|| {
+                    "Downloaded model finalization did not establish its model identity".into()
+                }),
+            });
+        }
+        Ok(result)
     }
 
     /// Persist a preliminary metadata record for a queued/partial download.
@@ -1279,11 +1319,20 @@ impl ModelImporter {
     /// - Post-download finalization (HfClient downloads land in library tree)
     /// - Orphan recovery (directories with model files but no metadata.json)
     pub async fn import_in_place(&self, spec: &InPlaceImportSpec) -> Result<ModelImportResult> {
+        self.import_in_place_with_mode(spec, InPlaceImportMode::PreserveExisting)
+            .await
+    }
+
+    async fn import_in_place_with_mode(
+        &self,
+        spec: &InPlaceImportSpec,
+        mode: InPlaceImportMode,
+    ) -> Result<ModelImportResult> {
         let model_dir = &spec.model_dir;
         let metadata_path = model_dir.join("metadata.json");
 
         // Guard: skip if metadata already exists (idempotent)
-        if path_exists(&metadata_path).await? {
+        if mode == InPlaceImportMode::PreserveExisting && path_exists(&metadata_path).await? {
             let model_id = self.index_existing_metadata_if_missing(model_dir).await?;
             return Ok(ModelImportResult {
                 path: model_dir.display().to_string(),
@@ -1312,7 +1361,7 @@ impl ModelImporter {
         })?;
         if bundle_validation.validation_state == crate::models::AssetValidationState::Valid {
             return self
-                .import_library_owned_diffusers_directory(spec, &bundle_validation)
+                .import_library_owned_diffusers_directory(spec, &bundle_validation, mode)
                 .await;
         }
 
@@ -1597,7 +1646,7 @@ impl ModelImporter {
 
         // Concurrent import paths (download completion callback + reconciliation)
         // can race after the initial idempotency guard. Skip redundant rewrites.
-        if path_exists(&metadata_path).await? {
+        if mode == InPlaceImportMode::PreserveExisting && path_exists(&metadata_path).await? {
             let model_id = self.index_existing_metadata_if_missing(model_dir).await?;
             return Ok(ModelImportResult {
                 path: model_dir.display().to_string(),
@@ -1614,6 +1663,9 @@ impl ModelImporter {
 
         // Index the model
         if let Err(e) = self.library.index_model_dir(model_dir).await {
+            if mode == InPlaceImportMode::FinalizeDownload {
+                return Err(e);
+            }
             tracing::warn!("Failed to index in-place imported model: {}", e);
         }
 
@@ -1623,6 +1675,9 @@ impl ModelImporter {
         {
             if let Some(ref id) = model_id {
                 if let Err(e) = self.library.redetect_model_type(id).await {
+                    if mode == InPlaceImportMode::FinalizeDownload {
+                        return Err(e);
+                    }
                     tracing::warn!(
                         "Failed to redetect model type after in-place import for {}: {}",
                         id,
@@ -1858,6 +1913,243 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let library = Arc::new(ModelLibrary::new(temp_dir.path()).await.unwrap());
         (temp_dir, library)
+    }
+
+    fn completed_download(model_dir: &Path, diffusers: bool) -> DownloadCompletionInfo {
+        DownloadCompletionInfo {
+            download_id: "truthful-finalization".into(),
+            dest_dir: model_dir.to_path_buf(),
+            filename: if diffusers {
+                "model_index.json"
+            } else {
+                "detector.onnx"
+            }
+            .into(),
+            filenames: vec![if diffusers {
+                "model_index.json"
+            } else {
+                "detector.onnx"
+            }
+            .into()],
+            download_request: crate::model_library::DownloadRequest {
+                repo_id: "publisher/finalized-model".into(),
+                family: "publisher".into(),
+                official_name: "Finalized Model".into(),
+                model_type: Some(if diffusers { "diffusion" } else { "vision" }.into()),
+                pipeline_tag: Some(
+                    if diffusers {
+                        "text-to-image"
+                    } else {
+                        "zero-shot-object-detection"
+                    }
+                    .into(),
+                ),
+                bundle_format: diffusers.then_some(crate::models::BundleFormat::DiffusersDirectory),
+                release_date: Some("2026-09-05".into()),
+                download_url: Some("https://huggingface.co/publisher/finalized-model".into()),
+                license_status: Some("apache-2.0".into()),
+                quant: None,
+                filename: None,
+                filenames: Some(vec![if diffusers {
+                    "model_index.json"
+                } else {
+                    "detector.onnx"
+                }
+                .into()]),
+                pipeline_class: None,
+                model_card_json: None,
+            },
+            known_sha256: None,
+            huggingface_evidence: Some(HuggingFaceEvidence {
+                repo_id: Some("publisher/finalized-model".into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn downloaded_finalization_retains_metadata_and_retries_real_index_failure() {
+        assert_downloaded_finalization_index_retry(false).await;
+    }
+
+    #[tokio::test]
+    async fn downloaded_diffusers_finalization_retains_provenance_after_index_failure() {
+        assert_downloaded_finalization_index_retry(true).await;
+    }
+
+    async fn assert_downloaded_finalization_index_retry(diffusers: bool) {
+        let (_temp, library) = setup().await;
+        let importer = ModelImporter::new(library.clone());
+        let model_dir = if diffusers {
+            create_external_diffusers_bundle(&library.library_root().join("diffusion/publisher"))
+        } else {
+            let model_dir = library.build_model_path("vision", "publisher", "finalized-model");
+            std::fs::create_dir_all(&model_dir).unwrap();
+            std::fs::write(model_dir.join("detector.onnx"), b"downloaded payload").unwrap();
+            model_dir
+        };
+        let info = completed_download(&model_dir, diffusers);
+        let payload = std::fs::read(model_dir.join(&info.filename)).unwrap();
+        let connection = rusqlite::Connection::open(library.index().db_path()).unwrap();
+        connection.execute_batch("CREATE TRIGGER refuse_finalization_index BEFORE INSERT ON models BEGIN SELECT RAISE(ABORT, 'injected finalization index failure'); END;").unwrap();
+
+        let result = importer.finalize_downloaded_directory(&info).await;
+        assert!(
+            result.is_err(),
+            "an index rejection must not become successful finalization: {result:?}"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("injected finalization index failure"));
+        let metadata = library.load_metadata(&model_dir).unwrap().unwrap();
+        assert_eq!(
+            metadata.repo_id.as_deref(),
+            Some("publisher/finalized-model")
+        );
+        assert_eq!(metadata.expected_files, Some(info.filenames.clone()));
+        assert_eq!(
+            metadata.selected_artifact_files,
+            Some(info.filenames.clone())
+        );
+        assert_eq!(metadata.huggingface_evidence, info.huggingface_evidence);
+        assert_eq!(metadata.license_status.as_deref(), Some("apache-2.0"));
+        assert_eq!(metadata.release_date.as_deref(), Some("2026-09-05"));
+        assert_eq!(metadata.download_url, info.download_request.download_url);
+        let model_id = library.get_model_id(&model_dir).unwrap();
+        assert!(library.index().get(&model_id).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(model_dir.join(&info.filename)).unwrap(),
+            payload
+        );
+
+        connection
+            .execute_batch("DROP TRIGGER refuse_finalization_index;")
+            .unwrap();
+        let result = importer.finalize_downloaded_directory(&info).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.model_id.as_deref(), Some(model_id.as_str()));
+        let indexed = library.index().get(&model_id).unwrap().unwrap();
+        assert_eq!(indexed.official_name, "Finalized Model");
+        assert_eq!(
+            library.load_metadata(&model_dir).unwrap().unwrap().repo_id,
+            metadata.repo_id
+        );
+        assert_eq!(
+            library
+                .load_metadata(&model_dir)
+                .unwrap()
+                .unwrap()
+                .selected_artifact_id,
+            metadata.selected_artifact_id
+        );
+    }
+
+    #[tokio::test]
+    async fn downloaded_finalization_refuses_metadata_obstruction_and_retries() {
+        let (_temp, library) = setup().await;
+        let importer = ModelImporter::new(library.clone());
+        let model_dir = library.build_model_path("vision", "publisher", "finalized-model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let payload = model_dir.join("detector.onnx");
+        std::fs::write(&payload, b"downloaded payload").unwrap();
+        let stale = ModelMetadata {
+            model_id: library.get_model_id(&model_dir),
+            model_type: Some("vision".into()),
+            official_name: Some("Old Model".into()),
+            repo_id: Some("old/publisher".into()),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &stale).await.unwrap();
+        library.index_model_dir(&model_dir).await.unwrap();
+        let metadata_path = model_dir.join("metadata.json");
+        std::fs::remove_file(&metadata_path).unwrap();
+        std::fs::create_dir(&metadata_path).unwrap();
+        let sentinel = metadata_path.join("retained-evidence");
+        std::fs::write(&sentinel, b"do not remove").unwrap();
+        let info = completed_download(&model_dir, false);
+        assert!(importer.finalize_downloaded_directory(&info).await.is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not remove");
+        assert_eq!(std::fs::read(&payload).unwrap(), b"downloaded payload");
+        let model_id = library.get_model_id(&model_dir).unwrap();
+        assert_eq!(
+            library
+                .index()
+                .get(&model_id)
+                .unwrap()
+                .unwrap()
+                .official_name,
+            "Old Model"
+        );
+
+        // Repair only this test's obstruction; finalization never removes it.
+        std::fs::remove_file(&sentinel).unwrap();
+        std::fs::remove_dir(&metadata_path).unwrap();
+        assert!(
+            importer
+                .finalize_downloaded_directory(&info)
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(
+            library
+                .index()
+                .get(&model_id)
+                .unwrap()
+                .unwrap()
+                .official_name,
+            "Finalized Model"
+        );
+        assert_eq!(
+            library
+                .load_metadata(&model_dir)
+                .unwrap()
+                .unwrap()
+                .repo_id
+                .as_deref(),
+            Some("publisher/finalized-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn downloaded_finalization_refuses_false_success_without_deleting_metadata() {
+        let (_temp, library) = setup().await;
+        let importer = ModelImporter::new(library.clone());
+        let model_dir = library.build_model_path("vision", "publisher", "missing-payload");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let metadata = ModelMetadata {
+            model_id: library.get_model_id(&model_dir),
+            repo_id: Some("publisher/finalized-model".into()),
+            expected_files: Some(vec!["detector.onnx".into()]),
+            ..Default::default()
+        };
+        library.save_metadata(&model_dir, &metadata).await.unwrap();
+        let original = std::fs::read(model_dir.join("metadata.json")).unwrap();
+        let result = importer
+            .finalize_downloaded_directory(&completed_download(&model_dir, false))
+            .await;
+        assert!(
+            matches!(result, Err(PumasError::Validation { field, message }) if field == "download_finalization" && message == "No model files found in directory")
+        );
+        assert_eq!(
+            std::fs::read(model_dir.join("metadata.json")).unwrap(),
+            original
+        );
+        assert!(library
+            .index()
+            .get(&library.get_model_id(&model_dir).unwrap())
+            .unwrap()
+            .is_none());
+
+        let outside = TempDir::new().unwrap();
+        let result = importer
+            .finalize_downloaded_directory(&completed_download(outside.path(), false))
+            .await;
+        assert!(
+            matches!(result, Err(PumasError::Validation { field, .. }) if field == "download_finalization")
+        );
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
     fn create_test_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {

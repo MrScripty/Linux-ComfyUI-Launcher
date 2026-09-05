@@ -60,15 +60,99 @@ successful new cleanup. Failed observation cannot synthesize absence.
 Explicit download shutdown is accepted for the admitted Linux population:
 public Rust and IPC preparation, retained task/effect drainage, final interrupted
 state projection, and the RPC supervisor's shared result. Independent review,
-dual core/RPC suites, strict affected lint, and SD-1 through SD-4 pass. This does
-not accept importer completion, physical-root leases, or whole-runtime teardown.
+dual core/RPC suites, strict affected lint, and SD-1 through SD-4 pass. That
+checkpoint alone does not accept importer completion or whole-runtime teardown.
 
-**Next slice:** Admit C4's awaited download-import finalization for ordinary
-completion and byte-complete restore. Record the exact importer/HF/builder write
-set and deciding regressions before source changes. Importer metadata/index
-success must precede terminal settlement; notification-only callbacks follow
-logical destination release. A queued future or logged import failure is not
-completion. Reuse the lifecycle owner; keep Pending replay and root leases held.
+C4 awaited managed-download importer finalization is now accepted under the
+[importer admission](#awaited-download-importer-admission). Real metadata/index
+success precedes settlement, failures retain retry custody, and notifications
+follow logical release. C4-1 through C4-4 and dual core/RPC and lint gates pass.
+
+**Next slice:** Admit the physical-root execution grant identified by RUST-I13,
+now that bounded shutdown and managed importer ownership are accepted. Define
+its exact consumer/effect population and independent-process evidence before
+implementation. Pending replay, relocation, and whole-runtime teardown remain
+unaccepted; this checkpoint does not close C3/M4 or the program.
+
+## Awaited Download Importer Admission
+
+**Outcome and ownership:** configured HF clients await real auxiliary metadata
+and final importer work before terminal settlement. The builder injects a
+private concrete `ModelImporter` dependency, not an async public notification
+callback or a new task scheduler. The existing lifecycle context retains the
+actual async importer future through cancellation/shutdown, including its
+internal filesystem and index work. Drop physical destination guards before
+import; retain logical destination custody through import and settlement.
+Public notification callbacks remain synchronous, owner-observed, and separate
+from required mutation. Completion notifications follow logical release; a
+held notification must not block a same-destination successor.
+Only existing managed ordinary/restore paths gain importer ownership. Verified
+Recovery-domain ticket tasks retain their no-import/no-callback policy; this
+slice grants no extra ambient metadata authority to recovery capabilities.
+
+**Failure and restoration:** strict download finalization atomically replaces
+metadata through its existing writer without deleting the old file first, and
+requires successful indexing. All download-finalization branches reject false
+success, including metadata fast paths and Diffusers imports. Generic imports
+retain their existing separately scoped contract. Failure/panic/cancellation
+cannot produce Completed or settle admission prematurely; files and exact
+durable admission remain available for the existing resume/restart path. No
+new retry protocol or store format is introduced. Byte-complete restore uses
+the same awaited importer before settlement, still returns completion records,
+and does not newly invoke public callbacks. Operational import failure remains
+a tracked recoverable Error, not global startup failure; corrupt authoritative
+inventory still prevents startup. Remove builder's post-settlement import loop
+and importer-enqueueing callbacks rather than retaining a second implementation.
+
+**Write set and integration:** HF owner writes inline tests and
+`rust/crates/pumas-core/src/model_library/hf/{download,mod,types}.rs`; importer
+owner writes `rust/crates/pumas-core/src/model_library/importer.rs` and its inline
+tests. Consumer reviewer owns builder regressions in the existing
+`rust/crates/pumas-core/src/tests.rs`; root owns
+`rust/crates/pumas-core/src/api/builder.rs` and contract documentation in
+`rust/crates/pumas-core/README.md` and the shutdown Rustdoc in `src/api/hf.rs`,
+plus these plan/issue/ledger records and the
+parent plan/ledger. Shared interfaces, Cargo and commits integrate serially.
+No lifecycle scheduler rewrite, dependency, schema, live-data, RPC/UI, generic
+orphan import, relocation, physical-root grant, or Pending replay changes.
+
+**Evidence** (accepted; automated, representative Linux; see execution ledger):
+
+- `C4-1`, integration: real importer metadata/index success precedes ordinary
+  Completed and durable settlement; held import prevents successor effects.
+- `C4-2`, integration: cancellation and shutdown retain actual held importer
+  work; its error/panic remains observable and cleanup cannot overtake it.
+- `C4-3`, contract/integration: metadata/index failure and false import success
+  preserve recoverable state and payload; byte-complete public restore retries
+  successfully, reports completion once, and leaves a usable built API.
+- `C4-4`, integration: after settlement, a real same-destination successor
+  progresses while notification is held; notification panic cannot roll back
+  Completed and shutdown still observes notification work.
+
+Supporting gates are focused regressions, both full core configurations,
+affected RPC consumer tests, strict affected all-targets Clippy, workspace
+formatting and plan validation. No Windows/macOS runtime or new GUI claim.
+
+**Composed-design review: applicable.** Importer owns metadata/index policy;
+HF owns lifecycle ordering; builder only supplies the concrete dependency.
+Required interleaving is import, settlement, release, notification. Enqueueing
+and post-settlement mutation are accidental. Callers retain existing download
+and callback Interfaces; they do not acquire task registries or index policy.
+An import rule changes importer, a terminal-ordering rule changes HF, and
+configuration changes builder. One private injected dependency carries an
+owned Interface rather than representation knowledge; no generic adapter is
+justified. Importer failure tests remain independently executable, and real HF
+tests prove composition. Deleting the shared import path would spread indexing
+success and ordering knowledge back across ordinary/restore callers. Necessary
+mutation lifetime stays in the existing lifecycle owner; no extra scheduler,
+public callback protocol, or parallel completion authority is retained.
+
+**Development decision:** implement. Source tracing bounds all production
+import consumers to the two builder paths plus auxiliary metadata. The strict
+import mode and existing owner permit a reversible coherent correction.
+Re-plan on missing recovery authority, an importer effect escaping observation,
+or a new independently owned consumer; do not expand into general importer or
+runtime remediation merely because adjacent code remains imperfect.
 
 ## Explicit Download Shutdown Admission
 

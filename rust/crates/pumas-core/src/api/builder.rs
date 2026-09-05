@@ -482,70 +482,11 @@ impl PumasApiBuilder {
         })));
         let model_importer = model_library::ModelImporter::new(model_library.clone());
 
-        // Wire download completion -> in-place import (metadata + indexing)
+        // Import mutation belongs to the download lifecycle, not an external
+        // notification callback. Configure it before restoring completed bytes.
         if let Some(ref mut client) = hf_client {
-            let lib = model_library.clone();
-            let tasks = runtime_tasks.clone();
-            client.set_aux_complete_callback(std::sync::Arc::new(
-                move |info: model_library::AuxFilesCompleteInfo| {
-                    let lib = lib.clone();
-                    tasks.spawn(async move {
-                        let importer = model_library::ModelImporter::new(lib);
-                        if let Err(err) = importer.upsert_download_metadata_stub(&info).await {
-                            tracing::warn!(
-                                "Failed to persist partial download metadata for {}: {}",
-                                info.download_id,
-                                err
-                            );
-                        }
-                    });
-                },
-            ));
-
-            let lib = model_library.clone();
-            let tasks = runtime_tasks.clone();
-            client.set_completion_callback(std::sync::Arc::new(
-                move |info: model_library::DownloadCompletionInfo| {
-                    let lib = lib.clone();
-                    tasks.spawn(async move {
-                        let importer = model_library::ModelImporter::new(lib);
-                        match importer.finalize_downloaded_directory(&info).await {
-                            Ok(r) if r.success => {
-                                tracing::info!("Post-download import succeeded: {:?}", r.model_id);
-                            }
-                            Ok(r) => {
-                                tracing::warn!("Post-download import failed: {:?}", r.error);
-                            }
-                            Err(e) => {
-                                tracing::error!("Post-download import error: {}", e);
-                            }
-                        }
-                    });
-                },
-            ));
-
-            // Restore only after completion callbacks are wired so byte-complete
-            // crash recoveries can finalize and flow through the normal importer.
-            let auto_finalized = client.restore_persisted_downloads().await?;
-            for info in auto_finalized {
-                match model_importer.finalize_downloaded_directory(&info).await {
-                    Ok(result) if result.success => {
-                        tracing::info!(
-                            "Startup auto-finalization import succeeded: {:?}",
-                            result.model_id
-                        );
-                    }
-                    Ok(result) => {
-                        tracing::warn!(
-                            "Startup auto-finalization import failed: {:?}",
-                            result.error
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!("Startup auto-finalization import error: {}", error);
-                    }
-                }
-            }
+            client.set_download_importer(Arc::new(model_importer.clone()));
+            client.restore_persisted_downloads().await?;
         }
 
         // Initialize conversion manager

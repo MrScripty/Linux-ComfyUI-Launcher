@@ -131,7 +131,8 @@ impl PumasApi {
     ///
     /// Repeated callers receive the same result; cancelling a waiter does not
     /// cancel drainage. Recovery data is preserved. This does not shut down
-    /// search, importers, inference plugins, or the application's runtime.
+    /// search, unrelated import operations, inference plugins, or the application's runtime.
+    /// Import work owned by managed downloads is included in their drain.
     /// An API without an HF client has no download work to drain.
     pub async fn shutdown_downloads(&self) -> Result<()> {
         match &self.primary().hf_client {

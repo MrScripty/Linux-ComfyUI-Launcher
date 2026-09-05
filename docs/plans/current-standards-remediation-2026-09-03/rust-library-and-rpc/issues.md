@@ -73,10 +73,11 @@
   SD-1 through SD-4, independent reviews, dual core/RPC suites, and strict lint
   pass on Linux. Drop requests this drain but does not synchronously observe it.
 - **Disposition:** bounded predecessor custody and explicit download shutdown
-  accepted. Admit C4 awaited importer finalization next: builder callbacks still
-  enqueue work, restored completion settles before import, and importer metadata
-  removal/index failures can be logged or ignored. Awaiting that existing future
-  alone cannot justify terminal success. Whole-runtime teardown, general client
+  accepted. C4 awaited managed importer finalization is accepted under the
+  [bounded importer admission](plan.md#awaited-download-importer-admission): ordinary
+  and restored completion await strict metadata/index success, retained failures
+  remain retryable, and notifications follow destination release. Builder's
+  enqueue/post-settlement import paths are removed. Whole-runtime teardown, general client
   Drop drainage, physical-root execution grants, and Pending replay remain open.
   Revisit on an effect outside admitted custody, a demonstrated ownership gap, or a
   requirement for concurrent independent mutation engines.

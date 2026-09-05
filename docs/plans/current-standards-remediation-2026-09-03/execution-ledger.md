@@ -20,6 +20,21 @@
 
 ## Slice Log
 
+### 2026-09-05 — Managed download importer checkpoint accepted
+
+- C4 now awaits actual metadata/index success before ordinary/restored terminal
+  settlement, preserves failed imports for retry, and runs notifications after
+  logical destination release. Builder no longer enqueues required import work
+  outside the download owner. Recovery-ticket authority is unchanged.
+- Independent production reviews, root integration, C4-1 through C4-4, both core
+  configurations (1,232 passing each), both RPC configurations (114/74), strict
+  dual-feature lint, formatting, and five plan contracts pass on Linux. The
+  [Rust ledger](rust-library-and-rpc/execution-ledger.md) owns exact scope and logs.
+  Live data is unchanged; no GUI or Windows/macOS runtime evidence is claimed.
+- Next admit the physical-root execution grant. Bounded shutdown and managed
+  importer dependencies are accepted, but grant implementation, Pending replay,
+  full C3/M4, and the overall program are not complete.
+
 ### 2026-09-05 — End-to-end shutdown implementation admission
 
 - The bounded shutdown design checkpoint is accepted after two independent

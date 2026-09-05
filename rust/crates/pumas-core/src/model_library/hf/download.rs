@@ -490,6 +490,7 @@ struct PreparedDownloadTask {
     pause_flag: Arc<AtomicBool>,
     completion_callback: Option<DownloadCompletionCallback>,
     aux_complete_callback: Option<AuxFilesCompleteCallback>,
+    download_importer: Option<Arc<crate::model_library::ModelImporter>>,
     /// Status updates are intentionally disabled for verified recovery work.
     persistence: Option<Arc<DownloadPersistence>>,
     /// Terminal cleanup remains required for both ambient and recovery work.
@@ -501,13 +502,72 @@ struct PreparedDownloadTask {
     restore_finalization: Option<DownloadStatus>,
 }
 
+enum RestoredFinalizationError {
+    Operation(PumasError),
+    Import(PumasError),
+}
+
+impl From<PumasError> for RestoredFinalizationError {
+    fn from(error: PumasError) -> Self {
+        Self::Operation(error)
+    }
+}
+
+fn download_completion_info(state: &DownloadState) -> Option<DownloadCompletionInfo> {
+    state
+        .download_request
+        .as_ref()
+        .map(|request| DownloadCompletionInfo {
+            download_id: state.download_id.clone(),
+            dest_dir: state.dest_dir.clone(),
+            filename: state
+                .files
+                .iter()
+                .max_by_key(|file| file.size.unwrap_or(0))
+                .map(|file| file.filename.clone())
+                .unwrap_or_else(|| state.filename.clone()),
+            filenames: state
+                .files
+                .iter()
+                .map(|file| file.filename.clone())
+                .collect(),
+            download_request: request.clone(),
+            known_sha256: state.known_sha256.clone(),
+            huggingface_evidence: state.huggingface_evidence.clone(),
+        })
+}
+
+async fn import_completed_download(
+    importer: &Option<Arc<crate::model_library::ModelImporter>>,
+    context: &TaskContext,
+    info: Option<DownloadCompletionInfo>,
+) -> Result<()> {
+    let Some(importer) = importer.clone() else {
+        return Ok(());
+    };
+    let info = info.ok_or_else(|| PumasError::Config {
+        message: "Download import requires completion metadata".into(),
+    })?;
+    context
+        .run_fallible_async_named("finalize downloaded model import", move || async move {
+            importer
+                .finalize_downloaded_directory(&info)
+                .await
+                .map(|_| ())
+        })
+        .await
+        .map_err(|error| {
+            PumasError::Other(format!("Download import observation failed: {error}"))
+        })?
+}
+
 impl PreparedDownloadTask {
     async fn finalize_restored(
         &self,
         context: &TaskContext,
         initial_status: DownloadStatus,
-    ) -> Result<()> {
-        let destination_guard = self.destination_lock.clone().lock_owned().await;
+    ) -> std::result::Result<(), RestoredFinalizationError> {
+        let mut destination_guard = Some(self.destination_lock.clone().lock_owned().await);
         let (attempt, total_bytes) = {
             let mut states = self.downloads.write().await;
             let state = current_worker_state(
@@ -549,9 +609,9 @@ impl PreparedDownloadTask {
                 PumasError::Other(format!("Restore finalization owner failed: {error}"))
             })??;
         if !matches!(context.drain_blocking().await, Ok(0)) {
-            return Err(PumasError::Other(
-                "Restore finalization effects did not drain".into(),
-            ));
+            return Err(
+                PumasError::Other("Restore finalization effects did not drain".into()).into(),
+            );
         }
         {
             let mut states = self.downloads.write().await;
@@ -564,11 +624,31 @@ impl PreparedDownloadTask {
             if !complete {
                 state.status = initial_status;
                 state.task_registered = false;
-                return Err(PumasError::DownloadPaused);
+                return Err(PumasError::DownloadPaused.into());
             }
             // The file set is committed. A later pause must not interrupt its
             // exact durable settlement; cancellation still owns replacement.
             state.files_completed = state.files.len();
+        }
+        let info = self
+            .downloads
+            .read()
+            .await
+            .get(&self.download_id)
+            .and_then(download_completion_info);
+        drop(destination_guard.take());
+        import_completed_download(&self.download_importer, context, info)
+            .await
+            .map_err(RestoredFinalizationError::Import)?;
+        destination_guard = Some(self.destination_lock.clone().lock_owned().await);
+        {
+            let mut states = self.downloads.write().await;
+            current_worker_state(
+                &mut states,
+                &self.download_id,
+                context,
+                &[DownloadStatus::Downloading],
+            )?;
         }
         let persistence = self.persistence.clone().ok_or_else(|| PumasError::Config {
             message: "Restore finalization persistence is unavailable".into(),
@@ -585,7 +665,8 @@ impl PreparedDownloadTask {
         if !settled || !matches!(context.drain_blocking().await, Ok(0)) {
             return Err(PumasError::Other(
                 "Restore finalization settlement was not confirmed".into(),
-            ));
+            )
+            .into());
         }
         {
             let mut states = self.downloads.write().await;
@@ -633,11 +714,23 @@ impl PreparedDownloadTask {
                 task_context.generation(),
             ) => Some(acquired),
         };
+        let mut restore_import_failed = false;
         let outcome =
             if let (Some(true), Some(initial_status)) = (acquired, self.restore_finalization) {
-                AssertUnwindSafe(self.finalize_restored(&task_context, initial_status))
+                match AssertUnwindSafe(self.finalize_restored(&task_context, initial_status))
                     .catch_unwind()
                     .await
+                {
+                    Ok(Err(RestoredFinalizationError::Import(error))) => {
+                        restore_import_failed = true;
+                        Ok(Err(error))
+                    }
+                    Ok(result) => Ok(result.map_err(|error| match error {
+                        RestoredFinalizationError::Operation(error)
+                        | RestoredFinalizationError::Import(error) => error,
+                    })),
+                    Err(panic) => Err(panic),
+                }
             } else if acquired == Some(true) {
                 AssertUnwindSafe(HuggingFaceClient::run_download(
                     self.client,
@@ -651,8 +744,8 @@ impl PreparedDownloadTask {
                     self.pause_flag,
                     self.persistence.clone(),
                     self.terminal_cleanup_persistence.clone(),
-                    self.completion_callback,
                     self.aux_complete_callback,
+                    self.download_importer,
                     self.auth_header,
                     task_context.clone(),
                     self.destination_lock,
@@ -699,12 +792,34 @@ impl PreparedDownloadTask {
         // resumable artifacts. Only verified successful completion releases
         // the reservation; cancellation transfers it to its finalizer.
         if acquired == Some(true) && result.is_ok() {
+            let completion_info = if self.completion_callback.is_some() {
+                self.downloads
+                    .read()
+                    .await
+                    .get(&self.download_id)
+                    .and_then(download_completion_info)
+            } else {
+                None
+            };
             self.destination_executions.release(
                 &destination_path,
                 task_context.download_id(),
                 destination_domain,
                 task_context.generation(),
             );
+            if let (Some(callback), Some(info)) =
+                (self.completion_callback.clone(), completion_info)
+            {
+                let notification = task_context
+                    .run_fallible_blocking_named("invoke download-completion callback", move || {
+                        std::panic::catch_unwind(AssertUnwindSafe(|| callback(info)))
+                            .map_err(|_| "download completion callback panicked".to_string())
+                    })
+                    .await;
+                if !matches!(notification, Ok(Ok(()))) {
+                    warn!("Download completion notification failed after terminal settlement: {notification:?}");
+                }
+            }
         }
 
         // Terminal Error persistence is registered before the final owner
@@ -747,6 +862,7 @@ impl PreparedDownloadTask {
         };
         let nested_failures = task_context.drain_blocking().await.unwrap_or(1);
 
+        let mut error_projected = false;
         if let Err(error) = &result {
             if matches!(error, PumasError::DownloadPaused) {
                 info!("Download paused for {}", self.repo_id);
@@ -782,6 +898,7 @@ impl PreparedDownloadTask {
             if projected {
                 publish_download_snapshot_from_parts(&self.download_publications).await;
             }
+            error_projected = projected;
         }
         if nested_failures > 0 {
             error!(
@@ -793,6 +910,9 @@ impl PreparedDownloadTask {
                     "Download completion effects did not drain".into(),
                 ));
             }
+        }
+        if restore_import_failed && persist_error_ok && error_projected {
+            return Ok(false);
         }
         result.map(|()| true)
     }
@@ -2597,6 +2717,7 @@ impl HuggingFaceClient {
                 pause_flag: pause_flag.clone(),
                 completion_callback: self.completion_callback.clone(),
                 aux_complete_callback: self.aux_complete_callback.clone(),
+                download_importer: self.download_importer.clone(),
                 persistence: self.persistence.clone(),
                 terminal_cleanup_persistence: self.persistence.clone(),
                 auth_header,
@@ -2820,6 +2941,13 @@ impl HuggingFaceClient {
             .observe_ambient_admission("prepare-download-task", &download_id);
         let auth_header = self.auth_header_value().await;
         let destination_lock = self.destination_lock(&destination.identity()).await;
+        // Ticket recovery grants only its existing bound-file effects. It does
+        // not acquire the builder's ordinary metadata/import mutation policy.
+        let download_importer = if destination.is_recovery() {
+            None
+        } else {
+            self.download_importer.clone()
+        };
         PreparedDownloadTask {
             #[cfg(test)]
             download_base_url: self.download_base_url.clone(),
@@ -2835,6 +2963,7 @@ impl HuggingFaceClient {
             pause_flag,
             completion_callback,
             aux_complete_callback,
+            download_importer,
             persistence,
             terminal_cleanup_persistence,
             auth_header,
@@ -3050,8 +3179,8 @@ impl HuggingFaceClient {
         pause_flag: Arc<AtomicBool>,
         persistence: Option<Arc<DownloadPersistence>>,
         terminal_cleanup_persistence: Option<Arc<DownloadPersistence>>,
-        completion_callback: Option<DownloadCompletionCallback>,
         aux_complete_callback: Option<AuxFilesCompleteCallback>,
+        download_importer: Option<Arc<crate::model_library::ModelImporter>>,
         auth_header: Option<String>,
         task_context: TaskContext,
         destination_lock: Arc<TokioMutex<()>>,
@@ -3308,7 +3437,7 @@ impl HuggingFaceClient {
             // Auxiliary files have size: None (non-LFS), weight files have size: Some (LFS).
             if !aux_callback_fired && file_info.size.is_some() {
                 aux_callback_fired = true;
-                if let Some(ref callback) = aux_complete_callback {
+                if aux_complete_callback.is_some() || download_importer.is_some() {
                     let info = {
                         let downloads = downloads.read().await;
                         downloads.get(download_id).and_then(|state| {
@@ -3326,19 +3455,41 @@ impl HuggingFaceClient {
                         })
                     };
                     if let Some(info) = info {
-                        let callback = callback.clone();
                         drop(destination_guard.take());
-                        let callback_outcome = task_context
-                            .run_fallible_blocking_named(
-                                "invoke auxiliary-files-complete callback",
-                                move || {
-                                    std::panic::catch_unwind(AssertUnwindSafe(|| callback(info)))
+                        if let Some(importer) = download_importer.clone() {
+                            let import_info = info.clone();
+                            task_context
+                                .run_fallible_async_named(
+                                    "persist auxiliary download metadata",
+                                    move || async move {
+                                        importer.upsert_download_metadata_stub(&import_info).await
+                                    },
+                                )
+                                .await
+                                .map_err(|error| {
+                                    PumasError::Other(format!(
+                                        "Auxiliary metadata observation failed: {error}"
+                                    ))
+                                })??;
+                        }
+                        let callback_outcome = if let Some(callback) = aux_complete_callback.clone()
+                        {
+                            task_context
+                                .run_fallible_blocking_named(
+                                    "invoke auxiliary-files-complete callback",
+                                    move || {
+                                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            callback(info)
+                                        }))
                                         .map_err(|_| {
                                             "auxiliary-files-complete callback panicked".to_string()
                                         })
-                                },
-                            )
-                            .await;
+                                    },
+                                )
+                                .await
+                        } else {
+                            Ok(Ok(()))
+                        };
                         destination_guard = Some(destination_lock.clone().lock_owned().await);
 
                         let still_current = {
@@ -3693,6 +3844,24 @@ impl HuggingFaceClient {
         // download remains recoverable instead of becoming a false success.
         destination.remove_marker(&task_context).await?;
 
+        let completion_info = downloads
+            .read()
+            .await
+            .get(download_id)
+            .and_then(download_completion_info);
+        drop(destination_guard.take());
+        import_completed_download(&download_importer, &task_context, completion_info).await?;
+        destination_guard = Some(destination_lock.clone().lock_owned().await);
+        {
+            let mut states = downloads.write().await;
+            current_worker_state(
+                &mut states,
+                download_id,
+                &task_context,
+                &[DownloadStatus::Downloading],
+            )?;
+        }
+
         // A durable queue release is an assertion about completed effects.
         // Observe their joins (including retained failures) before writing it.
         match task_context.drain_blocking().await {
@@ -3765,7 +3934,7 @@ impl HuggingFaceClient {
         }
 
         // All files completed -- update status and fire callback
-        let completion_info = {
+        {
             let mut downloads = downloads.write().await;
             let state = current_worker_state(
                 &mut downloads,
@@ -3779,53 +3948,9 @@ impl HuggingFaceClient {
             state.task_registered = false;
             state.destination = None;
             state.lifecycle_failure_unverified = false;
-
-            state.download_request.as_ref().map(|req| {
-                // Use the primary (largest) filename for the completion info
-                let primary_filename = files
-                    .iter()
-                    .max_by_key(|f| f.size.unwrap_or(0))
-                    .map(|f| f.filename.clone())
-                    .unwrap_or_else(|| state.filename.clone());
-
-                DownloadCompletionInfo {
-                    download_id: download_id.to_string(),
-                    dest_dir: state.dest_dir.clone(),
-                    filename: primary_filename,
-                    filenames: files.iter().map(|f| f.filename.clone()).collect(),
-                    download_request: req.clone(),
-                    known_sha256: state.known_sha256.clone(),
-                    huggingface_evidence: state.huggingface_evidence.clone(),
-                }
-            })
-        };
+        }
         drop(destination_guard.take());
         publish_download_snapshot_from_parts(&download_publications).await;
-
-        // Terminal state and persistence are settled before external
-        // notification. The callback runs as owner-visible blocking work and
-        // only after the per-destination lease has been released.
-        if let (Some(ref callback), Some(info)) = (&completion_callback, completion_info) {
-            let callback = callback.clone();
-            drop(destination_guard.take());
-            match task_context
-                .run_fallible_blocking_named("invoke download-completion callback", move || {
-                    std::panic::catch_unwind(AssertUnwindSafe(|| callback(info)))
-                        .map_err(|_| "download completion callback panicked".to_string())
-                })
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    warn!("Download completion callback failed after terminal settlement: {error}");
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to observe download completion callback after terminal settlement: {error}"
-                    );
-                }
-            }
-        }
 
         Ok(())
     }
@@ -9434,6 +9559,359 @@ mod tests {
         assert!(callback_reentered_terminal_cancel.load(Ordering::SeqCst));
         assert!(persistence.load_all().is_empty());
         client.download_tasks.set_blocking_observer(None);
+    }
+
+    async fn imported_download_fixture(
+        root: &Path,
+    ) -> (
+        Arc<crate::model_library::ModelLibrary>,
+        HuggingFaceClient,
+        PathBuf,
+        DownloadRequest,
+    ) {
+        let library = Arc::new(
+            crate::model_library::ModelLibrary::new(root.join("library"))
+                .await
+                .unwrap(),
+        );
+        let destination = library.build_model_path("vision", "acme", "model");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("model.onnx"), b"data").unwrap();
+        let mut client = HuggingFaceClient::new(root.join("cache")).unwrap();
+        client
+            .configure_download_destination_root(library.library_root())
+            .unwrap();
+        client.set_persistence(Arc::new(DownloadPersistence::new(root)));
+        client.set_download_importer(Arc::new(crate::model_library::ModelImporter::new(
+            library.clone(),
+        )));
+        let mut request = recovery_test_request("acme/model", &["model.onnx".into()]);
+        request.model_type = Some("vision".into());
+        request.pipeline_tag = Some("image-classification".into());
+        cache_repo_tree(
+            &client,
+            &request.repo_id,
+            vec![LfsFileInfo {
+                filename: "model.onnx".into(),
+                size: 4,
+                sha256: "a".repeat(64),
+            }],
+            Vec::new(),
+        );
+        (library, client, destination, request)
+    }
+
+    #[tokio::test]
+    async fn real_import_precedes_completion_and_holds_destination_successor() {
+        let temp = TempDir::new().unwrap();
+        let (library, client, destination, request) = imported_download_fixture(temp.path()).await;
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered));
+        let (release, held) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let import_destination = destination.clone();
+        library.set_metadata_write_notifier(Some(Arc::new(move |_| {
+            if import_destination.join(".pumas_download").exists() {
+                return;
+            }
+            if let Some(entered) = entered.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = held.lock().unwrap().recv();
+            }
+        })));
+        let first = client
+            .start_download(&request, &destination, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let status_while_held = client.get_download_status(&first).await;
+        let inventory = client
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_lifecycle_inventory_strict()
+            .unwrap();
+        let index_while_held = library
+            .index()
+            .get(&library.get_model_id(&destination).unwrap())
+            .unwrap();
+        let metadata_while_held = library.load_metadata(&destination).unwrap();
+        let marker_while_held = destination.join(".pumas_download").exists();
+        std::fs::write(destination.join("successor.onnx"), b"next").unwrap();
+        let mut successor_request = request.clone();
+        successor_request.repo_id = "acme/successor".into();
+        successor_request.filename = Some("successor.onnx".into());
+        successor_request.filenames = Some(vec!["successor.onnx".into()]);
+        cache_repo_tree(
+            &client,
+            &successor_request.repo_id,
+            vec![LfsFileInfo {
+                filename: "successor.onnx".into(),
+                size: 4,
+                sha256: "b".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let successor_prepared = Arc::new(AtomicBool::new(false));
+        client.download_tasks.set_blocking_observer(Some(Arc::new({
+            let prepared = successor_prepared.clone();
+            move |operation| {
+                if operation == "prepare ambient destination" {
+                    prepared.store(true, Ordering::SeqCst);
+                }
+            }
+        })));
+        let successor = client
+            .start_download(&successor_request, &destination, None)
+            .await
+            .unwrap();
+        client.pause_download(&successor).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status(&successor).await != Some(DownloadStatus::Paused) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let successor_started_early = successor_prepared.load(Ordering::SeqCst);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status(&first).await != Some(DownloadStatus::Completed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(status_while_held, Some(DownloadStatus::Downloading));
+        assert!(inventory.queue_admissions.contains_key(&first));
+        assert!(index_while_held.is_none());
+        assert!(metadata_while_held.is_none());
+        assert!(!marker_while_held, "the barrier must hold final import");
+        assert!(!successor_started_early);
+        let metadata = library.load_metadata(&destination).unwrap().unwrap();
+        assert_eq!(metadata.repo_id.as_deref(), Some("acme/model"));
+        assert_eq!(metadata.match_source.as_deref(), Some("download"));
+        assert!(library
+            .index()
+            .get(&library.get_model_id(&destination).unwrap())
+            .unwrap()
+            .is_some());
+        let inventory = client
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_lifecycle_inventory_strict()
+            .unwrap();
+        assert!(!inventory.queue_admissions.contains_key(&first));
+        assert!(inventory.queue_admissions.contains_key(&successor));
+        client.download_tasks.set_blocking_observer(None);
+        library.set_metadata_write_notifier(None);
+        client.shutdown_downloads().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn held_completion_notification_allows_real_destination_successor() {
+        let temp = TempDir::new().unwrap();
+        let (library, mut client, destination, request) =
+            imported_download_fixture(temp.path()).await;
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered));
+        let (release, held) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        client.set_completion_callback(Arc::new(move |_| {
+            if let Some(entered) = entered.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = held.lock().unwrap().recv();
+            }
+        }));
+        let first = client
+            .start_download(&request, &destination, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let metadata_before_successor = library.load_metadata(&destination).unwrap().unwrap();
+        let indexed_before_successor = library
+            .index()
+            .get(&library.get_model_id(&destination).unwrap())
+            .unwrap();
+        let inventory_before_successor = client
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_lifecycle_inventory_strict()
+            .unwrap();
+        std::fs::write(destination.join("successor.onnx"), b"next").unwrap();
+        let mut successor_request = request.clone();
+        successor_request.repo_id = "acme/successor".into();
+        successor_request.filename = Some("successor.onnx".into());
+        successor_request.filenames = Some(vec!["successor.onnx".into()]);
+        cache_repo_tree(
+            &client,
+            &successor_request.repo_id,
+            vec![LfsFileInfo {
+                filename: "successor.onnx".into(),
+                size: 4,
+                sha256: "b".repeat(64),
+            }],
+            Vec::new(),
+        );
+        let successor = client
+            .start_download(&successor_request, &destination, None)
+            .await
+            .unwrap();
+        let progressed = tokio::time::timeout(Duration::from_secs(3), async {
+            while client.get_download_status(&successor).await != Some(DownloadStatus::Completed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let shutdown = client.shutdown_downloads();
+        tokio::pin!(shutdown);
+        let shutdown_pending = futures::poll!(&mut shutdown).is_pending();
+        release.send(()).unwrap();
+        progressed
+            .expect("logical release must let the successor complete before notification returns");
+        assert!(
+            shutdown_pending,
+            "shutdown must retain the held notification"
+        );
+        assert_eq!(
+            metadata_before_successor.repo_id.as_deref(),
+            Some("acme/model")
+        );
+        assert!(indexed_before_successor.is_some());
+        assert!(!inventory_before_successor
+            .queue_admissions
+            .contains_key(&first));
+        assert_eq!(
+            client.get_download_status(&first).await,
+            Some(DownloadStatus::Completed)
+        );
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_shutdown_drain_real_import_before_settlement() {
+        for final_import in [false, true] {
+            for (shutdown, fail_import) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let temp = TempDir::new().unwrap();
+                let (library, client, destination, request) =
+                    imported_download_fixture(temp.path()).await;
+                if !final_import {
+                    // A missing weight reaches auxiliary metadata before HTTP;
+                    // cancellation/shutdown at that barrier prevents any request.
+                    std::fs::remove_file(destination.join("model.onnx")).unwrap();
+                }
+                let client = Arc::new(client);
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                let entered = std::sync::Mutex::new(Some(entered));
+                let (release, held) = std::sync::mpsc::channel();
+                let held = std::sync::Mutex::new(held);
+                let import_destination = destination.clone();
+                library.set_metadata_write_notifier(Some(Arc::new(move |_| {
+                    if final_import && import_destination.join(".pumas_download").exists() {
+                        return;
+                    }
+                    if let Some(entered) = entered.lock().unwrap().take() {
+                        let _ = entered.send(());
+                        let _ = held.lock().unwrap().recv();
+                        assert!(!fail_import, "injected real importer write panic");
+                    }
+                })));
+                let download_id = client
+                    .start_download(&request, &destination, None)
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(3), ready)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let waiter = if shutdown {
+                    let client = client.clone();
+                    Some(tokio::spawn(
+                        async move { client.shutdown_downloads().await },
+                    ))
+                } else {
+                    assert!(client.cancel_download(&download_id).await.unwrap());
+                    None
+                };
+                if shutdown {
+                    while !client.download_tasks.is_closed() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                let before = client
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_lifecycle_inventory_strict()
+                    .unwrap();
+                let waiting = waiter.as_ref().is_none_or(|waiter| !waiter.is_finished());
+                let status = client.get_download_status(&download_id).await;
+                let marker_while_held = destination.join(".pumas_download").exists();
+                release.send(()).unwrap();
+                if let Some(waiter) = waiter {
+                    let outcome = tokio::time::timeout(Duration::from_secs(3), waiter)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(outcome.is_err(), fail_import);
+                } else {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while client.get_download_status(&download_id).await
+                            == Some(DownloadStatus::Cancelling)
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                assert!(waiting);
+                assert_eq!(marker_while_held, !final_import);
+                assert!(before.queue_admissions.contains_key(&download_id));
+                assert!(!before.quarantines.contains_key(&download_id));
+                assert_eq!(
+                    status,
+                    Some(if shutdown {
+                        DownloadStatus::Downloading
+                    } else {
+                        DownloadStatus::Cancelling
+                    })
+                );
+                assert_eq!(
+                    client.get_download_status(&download_id).await,
+                    Some(if shutdown || fail_import {
+                        DownloadStatus::Error
+                    } else {
+                        DownloadStatus::Cancelled
+                    })
+                );
+                if final_import {
+                    assert_eq!(
+                        std::fs::read(destination.join("model.onnx")).unwrap(),
+                        b"data"
+                    );
+                } else {
+                    assert!(!destination.join("model.onnx").exists());
+                }
+                library.set_metadata_write_notifier(None);
+                if !shutdown {
+                    assert_eq!(client.shutdown_downloads().await.is_err(), fail_import);
+                }
+            }
+        }
     }
 
     #[tokio::test]
