@@ -226,10 +226,11 @@ Cancellation predecessor custody is accepted after independent review and dual
 core gates. Interrupting a started finalizer cannot hide unfinished predecessor
 effects or their failures. This does not establish client Drop drainage.
 
-**Next slice:** Bound explicit HF shutdown ownership and integration with the
-identified RPC supervisor, including atomic admission closure and retained
-gated/in-transit custody, before source implementation. The Rust ledger owns
-the exact prerequisite evidence; no shutdown or lease Interface is added yet.
+**Next slice:** Implement explicit download shutdown end to end under the
+Rust plan's [shutdown admission](rust-library-and-rpc/plan.md#explicit-download-shutdown-admission).
+It covers core preparation before HF task registration, atomic invocation/task
+custody, interruption projection, and retained RPC shutdown results. The bounded
+design checkpoint is accepted; shutdown runtime evidence remains pending.
 Pending replay still depends on bounded M4 ownership and C4 coordination. No live
 mutation, schema, or old-format support. Cargo/commits stay serial.
 

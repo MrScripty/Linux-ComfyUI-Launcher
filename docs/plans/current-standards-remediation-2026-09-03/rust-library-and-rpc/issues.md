@@ -37,6 +37,18 @@
   wiring goes through core/HF forwarding, not the abort-only RuntimeTasks owner.
   A detached drain spawned by Drop or the existing outcome-discarding retired-
   task reaper is not sufficient.
+- **Shutdown admission bounded at `86640c60`:** installation temporarily removes
+  prepared entries before taking the active-map lock; rescue transfers entries
+  to retired storage after removal. A separate closing flag cannot make those
+  registries an atomic shutdown inventory. Core `api/hf.rs:310` can rename/write
+  metadata before HF task registration; start/restore also perform preparation
+  outside task custody, and progress/list/snapshot reads initiate reconciliation.
+  `ServerHandle::shutdown` consumes its join handle, so cancelling that waiter
+  preserves supervisor execution but loses access to its result.
+  The [shutdown admission](plan.md#explicit-download-shutdown-admission) replaces
+  the earlier owner-only wiring scope with one coherent invocation-to-RPC slice.
+  Existing artifact relocation policy is not accepted by observing its effects;
+  admitted relocation and importer ownership remain separate work.
 - **Accepted prerequisite:** cancellation now retains predecessor observation in
   the existing nested-task owner (`hf/lifecycle.rs` only). The started-finalizer
   interruption regression proves terminal observation cannot finish while
@@ -49,9 +61,10 @@
   teardown. A test-owned strong reference must not manufacture retention.
   Later lease gates include independent-process contention/release, same-client
   concurrency, idle handoff, root replacement refusal, and last-effect release.
-- **Disposition:** bounded predecessor-custody checkpoint accepted; explicit
-  shutdown, client Drop drainage, and lease acceptance remain open.
-  Revisit on shutdown admission, a demonstrated ownership gap, or a
+- **Disposition:** bounded predecessor custody and shutdown design accepted;
+  implement the admitted shutdown slice next. Runtime shutdown, client Drop
+  drainage, and lease acceptance remain open.
+  Revisit on an effect outside admitted custody, a demonstrated ownership gap, or a
   requirement for concurrent independent mutation engines.
 
 ## Open Decision Dependencies

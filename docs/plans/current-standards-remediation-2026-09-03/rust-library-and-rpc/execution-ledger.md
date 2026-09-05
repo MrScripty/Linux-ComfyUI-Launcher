@@ -21,6 +21,36 @@
 
 ## Slice Log
 
+### 2026-09-05 — Explicit shutdown implementation admitted
+
+- Continued the selected bounded design slice from `86640c60`. Current standards
+  are `3cb165f10dad2e25cebf78748c535bcde8ff10bb`; changes since `aff5b867` concern
+  standards-engine navigation and its records, not the routed normative policies.
+- Lifecycle and consumer subagents independently traced the reachable owner
+  population; root checked preparation, observer, and teardown call sites.
+  The investigation stopped when every selected path had a disposition and the
+  single-state/gated-observer mechanism could implement the declared contract.
+- Material findings: install/rescue can leave entries between separate maps;
+  core artifact preparation can rename and update metadata before HF admission;
+  restore/start preparation and read-triggered reconciliation also need ownership.
+  Cancelling the current consuming RPC shutdown waiter loses its result handle,
+  even though its supervisor continues running. RUST-I13 records these findings.
+- Accepted the plan's invocation-to-RPC admission and composed-design probe.
+  One retained driver must drain effects and perform the final in-memory shutdown
+  projection before publishing the shared result. This is not a per-waiter
+  projection after lifecycle shutdown. Both reviewers accepted existing Error
+  for interrupted active states, preserving paused/terminal state and durable
+  provenance; expected abort remains distinct from drain failure.
+- The codebase-design skill concentrated lifetime knowledge in the existing HF
+  owner and kept RPC dependent on its small shutdown Interface. Reject separate
+  closed flags, caller-only permits, untyped gate drops, and owner-only wiring
+  that omits the earlier core preparation path.
+- Development decision: implement the complete admitted shutdown slice next,
+  with SD-1 through SD-4 pending. Five plan contracts and whitespace checks pass.
+  This checkpoint changes only the five existing plan/ledger/issue records; no
+  source, runtime, live-library, shutdown, or new platform evidence is claimed.
+  Existing source verification remains the prior checkpoint's evidence.
+
 ### 2026-09-05 — Cancellation predecessor custody accepted
 
 - Accepted the bounded admission below after independent consumer review and

@@ -20,6 +20,19 @@
 
 ## Slice Log
 
+### 2026-09-05 — End-to-end shutdown implementation admission
+
+- The bounded shutdown design checkpoint is accepted after two independent
+  subagent investigations and root review. The Rust plan owns the complete
+  invocation-to-RPC contract, composed-design probe, exact write ownership, and
+  four pending behavior claims. RUST-I13 retains the discovered admission gaps.
+- Next implement that coherent slice, including preparation before HF task
+  registration, final interruption projection, and a retained RPC shutdown
+  result. Do not add another exploratory prerequisite or expose unused wiring.
+- Five plan contracts and whitespace checks pass. This is documentation-only
+  design evidence; source, live data, and prior runtime acceptance are unchanged.
+  Standards are now `3cb165f1`; routed normative policies are unchanged.
+
 ### 2026-09-05 — Cancellation custody checkpoint accepted
 
 - The existing task owner now retains predecessor observation independently of

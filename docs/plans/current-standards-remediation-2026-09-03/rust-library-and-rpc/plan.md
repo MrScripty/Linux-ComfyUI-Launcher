@@ -57,12 +57,120 @@ core gates. A retained observer keeps terminal observation incomplete until
 predecessor effects drain; inherited failures remain observable without failing
 successful new cleanup. Failed observation cannot synthesize absence.
 
-**Next slice:** Bound explicit HF shutdown ownership and integration with the
-identified RPC supervisor, including atomic admission closure and retained
-gated/in-transit custody, before source implementation. Its shared result must
-survive waiter cancellation. Client Drop proof remains separate from the accepted
-started-finalizer interruption regression. No unused shutdown/lease Interface
-or Pending replay.
+**Next slice:** Implement explicit download shutdown end to end under the
+[shutdown admission](#explicit-download-shutdown-admission): public invocation
+admission, retained task/effect drainage, and the RPC supervisor consuming the
+result. Do not expose a shutdown method before its admission paths are covered.
+The design checkpoint is accepted; runtime evidence remains pending.
+
+## Explicit Download Shutdown Admission
+
+**Outcome:** `PumasApi::shutdown_downloads(&self) -> Result<()>` and the HF
+equivalent close download admission permanently and observe owned work through
+completion. Repeated waiters receive the same retained result; cancellation of
+one waiter cannot cancel the drain. No configured HF client means nothing to
+drain, not an initialization failure. Expected shutdown aborts are not failures;
+unexpected task, effect, or observation failures remain bounded diagnostics.
+Shutdown preserves recovery data; it does not authorize cancellation deletion,
+Pending replay, queue release, importer completion, or whole-runtime shutdown.
+
+**Owned population and coordination:**
+
+- Use one lifecycle coordination contract for public invocation admission,
+  prepared/installed/retired task custody, transfers, closing, and the retained
+  result. Consolidate related registries behind owner state rather than adding
+  an independent closed flag beside separately sampled maps. Registration and
+  ownership transfer are atomic with closure. Gated Tokio observers may be
+  spawned and registered under that guard because spawning does not poll them;
+  gate release, effects, callbacks, and joins occur outside synchronous guards.
+- Include start, restore, recovery transitions/admission, pause/resume/cancel,
+  and reconciliation triggered by progress/list/snapshot reads. Admission starts
+  before the first effect, including core `start_hf_download` destination
+  preparation. Keep existing artifact-selection policy; move its blocking work
+  off the async path and retain its actual join under the invocation owner.
+- Already-running preparation remains owned; late task handoffs after closure
+  refuse without inferring rollback of durable admission. A permit held only by
+  the caller future is insufficient: its blocking closures and observers must
+  remain owned after caller cancellation. No new handoff may escape the closing
+  owner. Search and metadata access remain outside download shutdown.
+- After closure, mutation methods return an explicit lifecycle-closed error.
+  Progress/list/snapshot reads retain their existing shapes without launching
+  reconciliation. After admitted work and projectors drain, shutdown projects
+  interrupted active states to existing Error with a bounded shutdown-interrupted
+  reason before resolving its receipt. Preserve already paused/terminal states
+  and durable provenance. Expected interruption is not a drain failure; do not
+  infer Paused, Completed, queue release, or cleanup from abort alone. Reads
+  during closing remain last-observed state until that final projection.
+- Replace untyped start senders with private Work/Custody gates, preserving
+  their kind across predecessor transfers. Separate execution from observation.
+  Abort execution, start required observers, settle affected projection receipts
+  as an explicit shutdown outcome after entry drain, and join every retained
+  effect. Preserve already-terminal receipt outcomes; never acknowledge failure
+  as projected merely because shutdown observed it. Do not start cleanup merely
+  to drain its predecessor or wait indefinitely for a paused destination head.
+  Archive retired failures instead of discarding them during reaping.
+- The shutdown driver retains production ownership and publishes one shared
+  completion result. Merely spawning a detached Drop drain, holding a test-only
+  strong reference, or joining an outer task does not satisfy this contract.
+  Synchronous Drop is still request-only; runtime destruction is not drainage.
+
+**Consumer:** retain `Arc<AppState>` in the RPC supervisor until HF and catalog
+drains finish. Start both drains and observe both regardless of listener or
+drain errors; preserve labelled failures instead of chaining `Result::and`.
+Existing `ServerHandle` keeps drain execution alive after waiter cancellation,
+but its consumed join handle does not retain an observable result. Give repeated
+RPC shutdown waiters a shared receipt too; Drop requests shutdown without
+claiming completion. No new RPC endpoint, frontend method, or plugin shutdown.
+
+**Source/write ownership:** lifecycle owner writes
+`rust/crates/pumas-core/src/model_library/hf/{lifecycle,download,mod}.rs` and inline
+tests. Root integrates `rust/crates/pumas-core/src/api/hf.rs`, lifecycle errors in
+`rust/crates/pumas-core/src/error.rs`, and their existing consumer projections.
+RPC owner writes `rust/crates/pumas-rpc/src/server.rs` and inline tests; adjacent
+`main.rs`, `contract.rs`, and `catalog_projection.rs` changes are limited to this
+shutdown/result contract. The existing exhaustive conversion in
+`rust/crates/pumas-uniffi/src/bindings.rs` may adapt errors without adding a host
+shutdown surface. Root alone owns these plans/ledgers/issues, Cargo, and commits.
+No library relocation-policy, store/schema, importer, or live-data edits.
+
+**Required evidence** (all pending; automated, representative Linux):
+
+- `SD-1`, focused: closure versus prepared installation, retired transfer, and
+  gated finalizer/projection; no missed effect, new execution, or stranded receipt.
+- `SD-2`, integration: real held blocking preparation/write across shutdown and
+  caller cancellation; success/error/panic drains before the shared result.
+  Release test strong references and prove production ownership through a weak
+  reference after explicit shutdown has been requested.
+- `SD-3`, contract: repeated/cancelled shutdown waiters, no-client success,
+  explicit closed mutation errors, and non-reconciling read snapshots whose
+  final interruption projection cannot be overwritten by late projectors.
+- `SD-4`, integration: real RPC supervisor waits for both HF and catalog owners;
+  held work prevents completion, either/both failures survive, and cancelling a
+  waiter does not lose drainage or the result available to another waiter.
+
+Supporting gates: focused regressions, both core/RPC feature configurations,
+strict affected all-targets Clippy, workspace formatting, error-conversion checks,
+and all plan contracts. Windows/macOS runtime evidence remains unavailable.
+
+**Composed-design review: applicable.** Invocation/task/effect lifetime belongs
+to the HF lifecycle Module; download recovery policy stays in its existing
+owner, and RPC owns process teardown. Admission-to-custody transfer and receipt
+completion are required interleavings; separate-map gaps and read-triggered
+post-close work are accidental. Callers know only admission failure and awaited
+shutdown, not registry or gate layout. A new task role changes lifecycle tests;
+a recovery rule changes download policy; RPC error aggregation changes only
+teardown. Core passes a lifecycle Interface, not maps or task handles. These
+concerns can be tested independently, while the real supervisor path proves
+composition. Deleting retained admission/receipt machinery would push joins,
+closure races, and cancellation handling into callers; no new generic scheduler,
+registry mirror, trait hierarchy, or dependency is justified. Necessary lifetime
+coordination replaces scattered tracking inside the existing owner.
+
+**Development decision:** implement. The bounded investigation ends with this
+admission; no additional exploratory prerequisite is selected. Re-plan only if
+a reachable effect falls outside the owned invocation/task population, a caller
+cannot preserve the declared error/read contract, or completion requires C4
+importer ownership. No full C3/M4 or root-lease acceptance is inferred.
 
 Pending replay remains excluded. Investigation found three prerequisites:
 cross-client/process exclusion through cleanup drain; distinguishing persisted
