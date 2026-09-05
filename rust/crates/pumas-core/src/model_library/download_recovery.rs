@@ -2,10 +2,13 @@
 
 use crate::{ModelRecord, PumasError, Result};
 use cap_std::ambient_authority;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt;
 use cap_std::fs::{Dir, OpenOptions};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -16,6 +19,56 @@ const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const MAX_COLLECTION_ITEMS: usize = 512;
 const MAX_HF_REPO_ID_BYTES: usize = 96;
 const MAX_PORTABLE_PATH_COMPONENT_BYTES: usize = 255;
+const LIBRARY_ID_MARKER: &str = ".pumas-library-id.json";
+const LIBRARY_ID_LOCK: &str = ".pumas-library-id.lock";
+const MAX_LIBRARY_ID_BYTES: u64 = 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryIdDocument {
+    schema_version: u32,
+    library_id: String,
+}
+
+fn read_library_id(root: &Dir) -> io::Result<Option<uuid::Uuid>> {
+    let metadata = match root.symlink_metadata(LIBRARY_ID_MARKER) {
+        Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => metadata,
+        Ok(_) => return Err(invalid_library_id()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() > MAX_LIBRARY_ID_BYTES {
+        return Err(invalid_library_id());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = root.open_with(LIBRARY_ID_MARKER, &options)?.into_std();
+    if !file.metadata()?.is_file() {
+        return Err(invalid_library_id());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LIBRARY_ID_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_LIBRARY_ID_BYTES {
+        return Err(invalid_library_id());
+    }
+    let document: LibraryIdDocument =
+        serde_json::from_slice(&bytes).map_err(|_| invalid_library_id())?;
+    let id = uuid::Uuid::parse_str(&document.library_id).map_err(|_| invalid_library_id())?;
+    if document.schema_version != 1 || id.is_nil() {
+        return Err(invalid_library_id());
+    }
+    Ok(Some(id))
+}
+
+fn invalid_library_id() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Library identity marker is missing, changed, or invalid",
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FilesystemIdentity {
@@ -195,15 +248,6 @@ pub(crate) struct DestinationIdentity {
     relative: String,
 }
 
-impl DestinationIdentity {
-    pub(crate) fn persisted(&self) -> super::download_store::PersistedDestinationIdentity {
-        super::download_store::PersistedDestinationIdentity {
-            library_root: format!("unix:{}:{}", self.root.volume, self.root.file),
-            relative_target: self.relative.clone(),
-        }
-    }
-}
-
 /// One configured root opened by the composition owner after directory setup.
 #[derive(Clone)]
 pub(crate) struct DownloadDestinationRoot(Arc<RecoveryRoot>);
@@ -217,9 +261,11 @@ impl DownloadDestinationRoot {
         )
         .into());
         #[cfg(unix)]
-        RecoveryRoot::open(path)?
-            .map(|root| Self(Arc::new(root)))
-            .ok_or_else(|| invalid_capability_path().into())
+        {
+            let mut root = RecoveryRoot::open(path)?.ok_or_else(invalid_capability_path)?;
+            root.initialize_library_id()?;
+            Ok(Self(Arc::new(root)))
+        }
     }
 
     pub(crate) fn resolve(&self, path: &Path) -> io::Result<DownloadRecoveryDestination> {
@@ -265,6 +311,7 @@ struct RecoveryRoot {
     root_source_path: PathBuf,
     root_canonical_path: PathBuf,
     root_identity: FilesystemIdentity,
+    library_id: Option<uuid::Uuid>,
 }
 
 impl RecoveryRoot {
@@ -280,12 +327,13 @@ impl RecoveryRoot {
         };
         let root_canonical_path = std::fs::canonicalize(library_root).map_err(PumasError::from)?;
         let authority = Self {
+            library_id: read_library_id(&root)?,
             root,
             root_source_path: library_root.to_path_buf(),
             root_canonical_path,
             root_identity,
         };
-        if authority.require_current().is_err() {
+        if authority.require_physical_current().is_err() {
             return Ok(None);
         }
         Ok(Some(authority))
@@ -323,6 +371,14 @@ impl RecoveryRoot {
     }
 
     fn require_current(&self) -> io::Result<()> {
+        self.require_physical_current()?;
+        if read_library_id(&self.root)? != self.library_id {
+            return Err(invalid_library_id());
+        }
+        Ok(())
+    }
+
+    fn require_physical_current(&self) -> io::Result<()> {
         let canonical = std::fs::canonicalize(&self.root_source_path)?;
         if canonical != self.root_canonical_path {
             return Err(invalid_capability_path());
@@ -337,9 +393,106 @@ impl RecoveryRoot {
         }
         Ok(())
     }
+
+    #[cfg(unix)]
+    fn initialize_library_id(&mut self) -> Result<()> {
+        self.require_physical_current()?;
+        if self.library_id.is_some() {
+            return self.reconfirm_library_id();
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let lock = self.root.open_with(LIBRARY_ID_LOCK, &options)?.into_std();
+        if !lock.metadata()?.is_file() {
+            return Err(invalid_library_id().into());
+        }
+        fs2::FileExt::lock_exclusive(&lock)?;
+        self.require_physical_current()?;
+        // Another configured opener may have initialized it while we waited.
+        if let Some(id) = read_library_id(&self.root)? {
+            self.library_id = Some(id);
+            return self.reconfirm_library_id();
+        }
+        let validator = Self {
+            root: self.root.try_clone()?,
+            root_source_path: self.root_source_path.clone(),
+            root_canonical_path: self.root_canonical_path.clone(),
+            root_identity: self.root_identity,
+            library_id: None,
+        };
+        let target = crate::metadata::AtomicJsonTarget::from_capability(
+            self.root.try_clone()?,
+            std::ffi::OsStr::new(LIBRARY_ID_MARKER),
+            self.root_canonical_path.join(LIBRARY_ID_MARKER),
+            move || {
+                validator
+                    .require_physical_current()
+                    .map(|()| true)
+                    .map_err(Into::into)
+            },
+        )?;
+        let id = uuid::Uuid::new_v4();
+        match target.publish_json(&LibraryIdDocument {
+            schema_version: 1,
+            library_id: id.to_string(),
+        }) {
+            Ok(crate::metadata::AtomicPublication::Durable) => {}
+            Ok(crate::metadata::AtomicPublication::PublishedDurabilityUnknown { error }) => {
+                return Err(error)
+            }
+            Ok(crate::metadata::AtomicPublication::VisibilityUnknown { error, cleanup }) => {
+                return Err(crate::metadata::AtomicPublishFailure {
+                    stage: crate::metadata::AtomicPublishStage::Rename,
+                    kind: crate::metadata::AtomicPublishFailureKind::Filesystem,
+                    error,
+                    cleanup,
+                }
+                .into_error());
+            }
+            Err(failure) => return Err(failure.into_error()),
+        }
+        self.library_id = Some(id);
+        self.require_current()?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn reconfirm_library_id(&self) -> Result<()> {
+        self.require_current()?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let marker = self.root.open_with(LIBRARY_ID_MARKER, &options)?.into_std();
+        if !marker.metadata()?.is_file() {
+            return Err(invalid_library_id().into());
+        }
+        marker.sync_all()?;
+        self.require_current()?;
+        self.root.open(".")?.into_std().sync_all()?;
+        self.require_current()?;
+        Ok(())
+    }
 }
 
 impl DownloadRecoveryDestination {
+    /// Logical library identity survives remounts and clones; it grants no
+    /// filesystem authority. Physical identity still governs every effect.
+    pub(crate) fn persisted_identity(
+        &self,
+    ) -> Result<super::download_store::PersistedDestinationIdentity> {
+        self.authority.require_current()?;
+        let id = self.authority.library_id.ok_or_else(invalid_library_id)?;
+        Ok(super::download_store::PersistedDestinationIdentity {
+            library_root: format!("uuid:{id}"),
+            relative_target: self.model_relative.to_string_lossy().into_owned(),
+        })
+    }
+
     pub(crate) fn identity(&self) -> DestinationIdentity {
         DestinationIdentity {
             root: self.authority.root_identity,
@@ -1039,6 +1192,122 @@ fn invalid_capability_path() -> io::Error {
 mod tests {
     #[cfg(unix)]
     #[test]
+    fn readonly_recovery_inspection_does_not_initialize_library_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let record = partial_record(temp.path(), vec!["weights.gguf"]);
+        assert!(super::issue_download_recovery_ticket(temp.path(), &record)
+            .unwrap()
+            .is_some());
+        let root = std::sync::Arc::new(super::RecoveryRoot::open(temp.path()).unwrap().unwrap());
+        let destination = root.destination_for(&record).unwrap();
+        assert!(destination.persisted_identity().is_err());
+        assert!(!temp.path().join(super::LIBRARY_ID_MARKER).exists());
+        assert!(!temp.path().join(super::LIBRARY_ID_LOCK).exists());
+        super::DownloadDestinationRoot::open(temp.path()).unwrap();
+        assert!(
+            root.require_current().is_err(),
+            "an old markerless holder must not adopt a new ID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_library_identity_rejects_missing_changed_or_invalid_marker() {
+        for replacement in [
+            "missing",
+            "changed",
+            "corrupt",
+            "symlink",
+            "directory",
+            "oversized",
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let root = super::DownloadDestinationRoot::open(temp.path()).unwrap();
+            let destination = root.resolve(std::path::Path::new("model")).unwrap();
+            let marker = temp.path().join(super::LIBRARY_ID_MARKER);
+            std::fs::remove_file(&marker).unwrap();
+            match replacement {
+                "missing" => {},
+                "changed" => std::fs::write(&marker, serde_json::to_vec(&serde_json::json!({"schema_version":1,"library_id":uuid::Uuid::new_v4().to_string()})).unwrap()).unwrap(),
+                "corrupt" => std::fs::write(&marker, b"not-json").unwrap(),
+                "symlink" => std::os::unix::fs::symlink("missing-target", &marker).unwrap(),
+                "directory" => std::fs::create_dir(&marker).unwrap(),
+                _ => std::fs::write(&marker, vec![b' '; 1025]).unwrap(),
+            }
+            assert!(
+                destination.persisted_identity().is_err(),
+                "accepted {replacement}"
+            );
+            assert!(
+                destination.prepare().is_err(),
+                "effects survived {replacement}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_configured_roots_initialize_one_durable_library_identity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = temp.path().to_path_buf();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::DownloadDestinationRoot::open(&path)
+                        .unwrap()
+                        .resolve(std::path::Path::new("model"))
+                        .unwrap()
+                        .persisted_identity()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let identities = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(identities.iter().all(|id| id == &identities[0]));
+        let reopened = super::DownloadDestinationRoot::open(temp.path())
+            .unwrap()
+            .resolve(std::path::Path::new("model"))
+            .unwrap();
+        assert_eq!(reopened.persisted_identity().unwrap(), identities[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_library_identity_survives_a_change_of_physical_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let original = temp.path().join("original");
+        let moved = temp.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        let first = super::DownloadDestinationRoot::open(&original)
+            .unwrap()
+            .resolve(std::path::Path::new("model"))
+            .unwrap();
+        // A clone retains logical library identity, not filesystem authority.
+        std::fs::copy(
+            original.join(".pumas-library-id.json"),
+            moved.join(".pumas-library-id.json"),
+        )
+        .unwrap();
+        let second = super::DownloadDestinationRoot::open(&moved)
+            .unwrap()
+            .resolve(std::path::Path::new("model"))
+            .unwrap();
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(
+            first.persisted_identity().unwrap(),
+            second.persisted_identity().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn destination_identity_survives_aliases_missing_tail_and_creation() {
         let temp = tempfile::TempDir::new().unwrap();
         let root_path = temp.path().join("library");
@@ -1059,7 +1328,10 @@ mod tests {
                 .unwrap()
                 .identity()
         );
-        assert_eq!(identity.persisted().relative_target, "llm/model");
+        assert_eq!(
+            destination.persisted_identity().unwrap().relative_target,
+            "llm/model"
+        );
         let marker = serde_json::json!({"repo_id":"author/model", "files":["model.gguf"]});
         assert!(matches!(
             destination.write_marker(&marker).unwrap(),
@@ -1202,8 +1474,8 @@ mod tests {
             .unwrap();
         assert_eq!(ordinary.identity(), recovery.identity());
         assert_eq!(
-            ordinary.identity().persisted(),
-            recovery.identity().persisted()
+            ordinary.persisted_identity().unwrap(),
+            recovery.persisted_identity().unwrap()
         );
     }
 

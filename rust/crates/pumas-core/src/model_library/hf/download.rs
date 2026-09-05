@@ -1937,7 +1937,7 @@ impl HuggingFaceClient {
                 let files = admission.execution_files.clone();
                 let (destination, downloaded_bytes) =
                     tokio::task::spawn_blocking(move || -> Result<_> {
-                        if destination.identity().persisted() != expected {
+                        if destination.persisted_identity()? != expected {
                             return Err(PumasError::Other(
                                 "Persisted download destination identity changed".into(),
                             ));
@@ -2470,15 +2470,10 @@ impl HuggingFaceClient {
                 requested_payload_files.clone(),
                 huggingface_evidence.as_ref(),
             )?;
-            let admission_request = DownloadAdmissionRequest {
-                snapshot: persisted_download.clone().ok_or_else(|| {
-                    PumasError::Other("Durable download snapshot unavailable".into())
-                })?,
-                domain: DownloadAdmissionDomain::Ambient,
-                destination: destination.identity().persisted(),
-                requested_payload_files,
-                execution_files: files.iter().map(|file| file.filename.clone()).collect(),
-            };
+            let admission_snapshot = persisted_download
+                .clone()
+                .ok_or_else(|| PumasError::Other("Durable download snapshot unavailable".into()))?;
+            let execution_files = files.iter().map(|file| file.filename.clone()).collect();
             let prepared_download = PreparedDownloadTask {
                 #[cfg(test)]
                 download_base_url: self.download_base_url.clone(),
@@ -2541,12 +2536,20 @@ impl HuggingFaceClient {
                 TaskRole::AdmissionTransition,
                 move |task_context| async move {
                     let attempt = attempt_id.clone();
+                    let admission_destination = held_destination.clone();
                     #[cfg(test)]
                     let admission_observer = owner.clone();
                     let outcome = task_context
                         .run_fallible_blocking_named(
                             "durably admit download",
                             move || -> Result<_> {
+                                let admission_request = DownloadAdmissionRequest {
+                                    snapshot: admission_snapshot,
+                                    domain: DownloadAdmissionDomain::Ambient,
+                                    destination: admission_destination.persisted_identity()?,
+                                    requested_payload_files,
+                                    execution_files,
+                                };
                                 let before = persistence.load_lifecycle_inventory_strict()?;
                                 if before.hidden_admissions.values().any(|hidden| {
                                     hidden.request.destination == admission_request.destination
@@ -2568,18 +2571,18 @@ impl HuggingFaceClient {
                                         return Err(PumasError::Other("Destination has an unresolved earlier durable admission".into()));
                                     }
                                 }
-                                Ok((transition, inventory))
+                                Ok((transition, inventory, admission_request.destination))
                             },
                         )
                         .await;
                     let confirmed = match outcome {
-                        Ok(Ok((transition, inventory))) => transition.into_result().map(|_| inventory),
+                        Ok(Ok((transition, inventory, identity))) => transition.into_result().map(|_| (inventory, identity)),
                         Ok(Err(error)) => Err(error),
                         Err(error) => Err(PumasError::Other(format!(
                             "Download admission owner failed: {error}"
                         ))),
                     };
-                    let inventory = match confirmed {
+                    let (inventory, identity) = match confirmed {
                         Ok(confirmed) => confirmed,
                         Err(error) => {
                             let _ = admission_sender.send(Err(error));
@@ -2589,7 +2592,6 @@ impl HuggingFaceClient {
                     };
                     {
                         let mut states = states.write().await;
-                        let identity = held_destination.identity().persisted();
                         let mut predecessors = inventory
                             .queue_admissions
                             .iter()
@@ -3032,8 +3034,9 @@ impl HuggingFaceClient {
                         let persistence = persistence.clone();
                         let persisted_id = persisted_id.clone();
                         let attempt = attempt.clone();
-                        let identity = destination.identity().persisted();
+                        let destination = destination.clone();
                         move || -> Result<String> {
+                            let identity = destination.persisted_identity()?;
                             let inventory = persistence.load_lifecycle_inventory_strict()?;
                             let admission = inventory
                                 .queue_admissions
@@ -4960,7 +4963,7 @@ mod tests {
         let request = DownloadAdmissionRequest {
             snapshot: snapshot.clone(),
             domain: DownloadAdmissionDomain::Ambient,
-            destination: destination.identity().persisted(),
+            destination: destination.persisted_identity().unwrap(),
             requested_payload_files: files.clone(),
             execution_files: files,
         };
@@ -5860,8 +5863,8 @@ mod tests {
                 .unwrap()
                 .resolve(&destination)
                 .unwrap()
-                .identity()
-                .persisted(),
+                .persisted_identity()
+                .unwrap(),
             requested_payload_files: vec!["weights.gguf".into()],
             execution_files: vec!["weights.gguf".into()],
         };
@@ -6156,6 +6159,8 @@ mod tests {
     ) -> VerifiedDownloadRecovery {
         let model_dir = library_root.join("llm/acme/model");
         std::fs::create_dir_all(&model_dir).unwrap();
+        crate::model_library::download_recovery::DownloadDestinationRoot::open(library_root)
+            .unwrap();
         let record = ModelRecord {
             id: "llm/acme/model".to_string(),
             path: model_dir.display().to_string(),

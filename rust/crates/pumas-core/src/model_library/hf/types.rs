@@ -31,6 +31,12 @@ impl DownloadDestination {
         self.capability().identity()
     }
 
+    pub(super) fn persisted_identity(
+        &self,
+    ) -> crate::Result<super::super::download_store::PersistedDestinationIdentity> {
+        self.capability().persisted_identity()
+    }
+
     pub(super) fn display_path(&self) -> &std::path::Path {
         self.capability().display_path()
     }
